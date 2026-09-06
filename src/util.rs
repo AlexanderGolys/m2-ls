@@ -3,6 +3,7 @@
 use tower_lsp::lsp_types::Range as TextRange;
 use tower_lsp::lsp_types::*;
 
+/// Construct an LSP position with concise fixture syntax.
 #[macro_export]
 macro_rules! pos {
     () => {
@@ -13,6 +14,7 @@ macro_rules! pos {
     };
 }
 
+/// Construct the sentinel position after every real source position.
 #[macro_export]
 macro_rules! pos_max {
     () => {

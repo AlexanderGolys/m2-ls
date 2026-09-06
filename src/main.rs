@@ -2,6 +2,7 @@
 
 use std::backtrace::Backtrace;
 use std::collections::HashMap;
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::panic;
@@ -28,6 +29,7 @@ mod client_capabilities;
 mod diagnostic_registry;
 mod document;
 mod documentation;
+mod documentation_site;
 mod meta;
 mod node_metadata;
 mod object_registry;
@@ -72,6 +74,7 @@ use client_capabilities::{
 };
 use diagnostic_registry::DiagnosticPolicy;
 use document::DocumentSnapshot;
+use documentation_site::{build_documentation_book, generate_documentation_book};
 use package_index::SourceResolver;
 
 use crate::object_registry::ObjectRegistry;
@@ -873,8 +876,57 @@ fn server_info() -> ServerInfo {
     }
 }
 
+fn run_documentation_command() -> Option<std::result::Result<(), String>> {
+    let mut arguments = env::args_os().skip(1);
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("docs")) {
+        return None;
+    }
+    let result = (|| {
+        let input = arguments.next().map(PathBuf::from).ok_or_else(|| {
+            "usage: m2-ls docs <source-or-directory> [--output PATH] [--no-build]".to_string()
+        })?;
+        let mut output = PathBuf::from("target/m2-doc");
+        let mut build = true;
+        while let Some(argument) = arguments.next() {
+            if argument == "--output" {
+                output = arguments
+                    .next()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--output requires a path".to_string())?;
+            } else if argument == "--no-build" {
+                build = false;
+            } else {
+                return Err(format!(
+                    "unrecognized documentation option: {}",
+                    argument.to_string_lossy()
+                ));
+            }
+        }
+        let registry = ObjectRegistry::load(include_str!("./data/m2-index.jsonl"));
+        let generated = generate_documentation_book(&input, &output, &registry)
+            .map_err(|error| error.to_string())?;
+        if build {
+            build_documentation_book(&output).map_err(|error| error.to_string())?;
+        }
+        println!(
+            "generated {} documentation pages in {}",
+            generated.pages,
+            output.display()
+        );
+        Ok(())
+    })();
+    Some(result)
+}
+
 #[tokio::main]
 async fn main() {
+    if let Some(result) = run_documentation_command() {
+        if let Err(error) = result {
+            eprintln!("m2-ls docs: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     install_panic_logging();
     let stdin = io::stdin();
     let stdout = io::stdout();

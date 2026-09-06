@@ -31,6 +31,9 @@ pub fn hover_response(
                 analysis,
                 document.callable_at_position(position),
                 None,
+                document
+                    .documentation_for_binding(symbol)
+                    .map(|documentation| documentation.hover_markdown()),
             )
         } else {
             let (package, record) =
@@ -56,12 +59,17 @@ pub fn hover_response(
             .map(|(method, _)| method)
             .or_else(|| document.callable_at_position(position));
         let pinned_signature = local_installation_signature.map(|(_, signature)| signature);
+        let documentation = pinned_signature
+            .and_then(|installation| document.documentation_for_installation(installation.id))
+            .or_else(|| document.documentation_for_binding(symbol))
+            .map(|documentation| documentation.hover_markdown());
         return Some(local_symbol_hover(
             node_text,
             &symbol,
             analysis,
             local_method,
             pinned_signature,
+            documentation,
         ));
     }
 
@@ -87,6 +95,7 @@ fn local_symbol_hover(
     analysis: &Analysis,
     method: Option<&FunctionInfo>,
     pinned_signature: Option<&MethodInstallation>,
+    documentation: Option<&str>,
 ) -> Hover {
     let meta = symbol.meta();
     let title_signature = method
@@ -115,9 +124,12 @@ fn local_symbol_hover(
     let signatures = method
         .map(|method| local_method_signatures_markdown(analysis, method, pinned_signature))
         .unwrap_or_default();
+    let documentation = documentation
+        .map(|documentation| format!("\n\n{documentation}"))
+        .unwrap_or_default();
     let markdown = format!(
-        "**{}**{}{}\n\n{}{}",
-        name, title_signature, type_line, label, signatures
+        "**{}**{}{}\n\n{}{}{}",
+        name, title_signature, type_line, label, signatures, documentation
     );
 
     Hover {
@@ -275,7 +287,7 @@ mod tests {
             type_label: Some("Package".to_string()),
         };
 
-        let hover = local_symbol_hover("Doc", &symbol, &analysis, None, None);
+        let hover = local_symbol_hover("Doc", &symbol, &analysis, None, None, None);
         let HoverContents::Markup(markup) = hover.contents else {
             panic!("local hover should use markdown");
         };
@@ -299,7 +311,7 @@ mod tests {
             .function_at("p", pos!(1, 0))
             .expect("method should be registered");
 
-        let hover = local_symbol_hover("p", &symbol, &analysis, Some(method), None);
+        let hover = local_symbol_hover("p", &symbol, &analysis, Some(method), None, None);
         let HoverContents::Markup(markup) = hover.contents else {
             panic!("local hover should use markdown");
         };
@@ -336,6 +348,7 @@ mod tests {
             &analysis,
             Some(method),
             Some(pinned_signature),
+            None,
         );
         let HoverContents::Markup(markup) = hover.contents else {
             panic!("local hover should use markdown");
@@ -405,11 +418,11 @@ mod tests {
     }
 
     #[test]
-    fn hover_resolves_local_backtick_documentation_references() {
-        let text = "-- use `x`\nx := 1\n";
+    fn hover_resolves_local_wikilink_documentation_references() {
+        let text = "-- use [[x]]\nx := 1\n";
         let document = DocumentSnapshot::from_text(text.to_string(), &ObjectRegistry::default())
             .expect("fixture should parse");
-        let hover = hover_response(&document, pos!(0, 8), &ObjectRegistry::default())
+        let hover = hover_response(&document, pos!(0, 9), &ObjectRegistry::default())
             .expect("local documentation reference should have a hover");
         let HoverContents::Markup(markup) = hover.contents else {
             panic!("local hover should use markdown");
@@ -417,17 +430,17 @@ mod tests {
 
         assert!(markup.value.starts_with("**x**"));
         assert!(markup.value.contains("User-defined binding"));
-        assert_eq!(hover.range, Some(TextRange::new(pos!(0, 8), pos!(0, 9))));
+        assert_eq!(hover.range, Some(TextRange::new(pos!(0, 9), pos!(0, 10))));
     }
 
     #[test]
-    fn hover_resolves_indexed_backtick_documentation_references() {
-        let text = "-- use `ideal`\n";
+    fn hover_resolves_indexed_wikilink_documentation_references() {
+        let text = "-- use [[ideal]]\nx := 1\n";
         let document = DocumentSnapshot::from_text(text.to_string(), &ObjectRegistry::default())
             .expect("fixture should parse");
         let index = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
         let scoped = index.with_source_imports(text);
-        let hover = hover_response(&document, pos!(0, 8), &scoped)
+        let hover = hover_response(&document, pos!(0, 9), &scoped)
             .expect("indexed documentation reference should have a hover");
         let HoverContents::Markup(markup) = hover.contents else {
             panic!("indexed hover should use markdown");
@@ -438,7 +451,23 @@ mod tests {
             "got: {}",
             markup.value
         );
-        assert_eq!(hover.range, Some(TextRange::new(pos!(0, 8), pos!(0, 13))));
+        assert_eq!(hover.range, Some(TextRange::new(pos!(0, 9), pos!(0, 14))));
+    }
+
+    #[test]
+    fn local_hover_includes_attached_markdown_documentation() {
+        let text = "-- Computes **the answer** with [[ideal]].\nanswer := 42\nanswer\n";
+        let document = DocumentSnapshot::from_text(text.to_string(), &ObjectRegistry::default())
+            .expect("fixture should parse");
+        let hover = hover_response(&document, pos!(2, 2), &ObjectRegistry::default())
+            .expect("documented binding should have a hover");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("local hover should use markdown");
+        };
+
+        assert!(markup
+            .value
+            .contains("Computes **the answer** with `ideal`."));
     }
 
     #[test]

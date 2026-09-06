@@ -1,9 +1,11 @@
 //! Tree-sitter-guided formatting and folding ranges for Macaulay2 source.
 
-use m2_syn::{
-    ElseClause, FloatLiteral, ForLoop, IfStatement, IntegerLiteral, LambdaExpression, LoopBody,
-    RawStringLiteral, Sequence, StringLiteral, Symbol, ThenClause, Token, TryStatement, WhileLoop,
+use m2_syn::nodes::{
+    ElseClause, ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
+    ExprTry as TryStatement, ExprWhile as WhileLoop, FloatLiteral, IntegerLiteral, LoopBody,
+    RawStringLiteral, Sequence, StringLiteral, Symbol, ThenClause,
 };
+use m2_syn::Token;
 use tower_lsp::lsp_types::{
     DocumentFormattingOptions, FoldingRange, FoldingRangeKind, FoldingRangeProviderCapability,
     OneOf, TextEdit,

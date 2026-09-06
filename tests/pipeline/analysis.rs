@@ -1,6 +1,9 @@
 //! End-to-end analysis behavior observed through standard LSP capabilities.
 
 use serde_json::{json, Value};
+use std::fs;
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::support::{position, response_array, DocumentSession};
 
@@ -600,12 +603,6 @@ async fn output_references_follow_prior_cell_types_without_semantic_tokens() {
     );
     let mut session = DocumentSession::open(source).await;
 
-    assert!(
-        !session.diagnostic_codes().contains(&"E07"),
-        "valid output references should not produce missing-cell warnings: {:?}",
-        session.diagnostics()
-    );
-
     for (line, expected) in [(1, "ZZ"), (3, "ZZ"), (4, "String"), (5, "String")] {
         assert_eq!(hover_type_at(&mut session, line, 0).await, expected);
     }
@@ -633,7 +630,6 @@ async fn output_references_follow_prior_cell_types_without_semantic_tokens() {
             .any(|(line, character, _, _)| *line == 1 && *character == 4),
         "a resolved user binding named like an output reference must retain its semantic token"
     );
-    assert!(!session.diagnostic_codes().contains(&"E07"));
 
     session
         .replace("x = oo\ny = o0\nz = o9\nw = oooo\nsymbol oo\n")
@@ -641,21 +637,13 @@ async fn output_references_follow_prior_cell_types_without_semantic_tokens() {
     for line in 0..=3 {
         assert_eq!(hover_type_at(&mut session, line, 0).await, "Symbol");
     }
-    assert_eq!(diagnostic_lines(&session, "E07"), vec![0, 1, 2]);
-    for diagnostic in session
-        .diagnostics()
-        .iter()
-        .filter(|diagnostic| diagnostic["code"] == "E07")
-    {
-        assert_eq!(diagnostic["severity"], 2);
-        assert!(diagnostic["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("unassigned `Symbol`")));
-    }
 
-    session.replace("1\nw = oooo\nsymbol o9\n").await;
-    assert_eq!(hover_type_at(&mut session, 1, 0).await, "Symbol");
-    assert_eq!(diagnostic_lines(&session, "E07"), vec![1]);
+    session.replace("ooo =!= null\n").await;
+    assert!(
+        session.diagnostics().is_empty(),
+        "an unavailable output reference is a valid unassigned Symbol: {:?}",
+        session.diagnostics()
+    );
 
     session.shutdown().await;
 }
@@ -1749,8 +1737,8 @@ async fn document_links_resolve_and_completion_surfaces_contextual_choices() {
     let source = concat!(
         "-- header\n",
         "x = 1\n",
-        "-- use `x`\n",
-        "needsPackage \"J\"\n",
+        "-- use [[x]]\n",
+        "request = needsPackage \"J\"\n",
         "determinant(Str)\n",
         "\n",
     );
@@ -1793,6 +1781,158 @@ async fn document_links_resolve_and_completion_surfaces_contextual_choices() {
     assert!(empty_slot.is_null());
 
     session.shutdown().await;
+}
+
+#[tokio::test]
+async fn attached_markdown_is_visible_in_hover() {
+    let source = "-- Computes **the answer** with [[ideal]].\nanswer := 42\nanswer\n";
+    let mut session = DocumentSession::open(source).await;
+
+    let hover = session.request_at("textDocument/hover", "answer", 1).await;
+    assert!(
+        hover["contents"]["value"]
+            .as_str()
+            .is_some_and(|markdown| markdown.contains("Computes **the answer** with `ideal`.")),
+        "attached documentation should be part of the binding hover: {hover}"
+    );
+
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn attached_markdown_excludes_nested_assignments() {
+    let source = concat!(
+        "-- Documents only f.\n",
+        "f := x -> (g := y -> y; g x)\n",
+        "f\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+
+    let outer = session.request_at("textDocument/hover", "f", 1).await;
+    assert!(
+        outer["contents"]["value"]
+            .as_str()
+            .is_some_and(|markdown| markdown.contains("Documents only f.")),
+        "the directly following binding should own the documentation: {outer}"
+    );
+
+    let nested = session.request_at("textDocument/hover", "g", 0).await;
+    assert!(
+        nested["contents"]["value"]
+            .as_str()
+            .is_some_and(|markdown| !markdown.contains("Documents only f.")),
+        "a nested binding must not inherit the outer binding's documentation: {nested}"
+    );
+
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn method_installation_documentation_stays_with_its_signature() {
+    let source = concat!(
+        "p = method()\n",
+        "-- Handles integers.\n",
+        "p ZZ := value -> value\n",
+        "p\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+
+    let installation = session.request_at("textDocument/hover", "p", 1).await;
+    assert!(
+        installation["contents"]["value"]
+            .as_str()
+            .is_some_and(|markdown| markdown.contains("Handles integers.")),
+        "installation hover should include its own docs: {installation}"
+    );
+
+    let function = session.request_at("textDocument/hover", "p", 2).await;
+    assert!(
+        function["contents"]["value"]
+            .as_str()
+            .is_some_and(|markdown| !markdown.contains("Handles integers.")),
+        "installation docs should not replace the method function docs: {function}"
+    );
+
+    session.shutdown().await;
+}
+
+#[test]
+fn documentation_command_generates_only_attached_pages() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should follow the Unix epoch")
+        .as_nanos();
+    let fixture = std::env::temp_dir().join(format!("m2-ls-docs-{}-{nonce}", std::process::id()));
+    let source_dir = fixture.join("source");
+    let output_dir = fixture.join("book");
+    fs::create_dir_all(&source_dir).expect("temporary source directory should be created");
+    fs::write(
+        source_dir.join("Package.m2"),
+        concat!(
+            "-* Package **documentation**. *-\n",
+            "newPackage(\"Package\")\n",
+            "-- Computes [[helper]].\n",
+            "answer := 42\n",
+            "-- Helps with examples.\n",
+            "helper := 1\n",
+            "\n",
+            "-- Detached ordinary comment.\n",
+        ),
+    )
+    .expect("documentation fixture should be written");
+    fs::write(
+        source_dir.join("NotPackage.m2"),
+        "-* This is not package documentation. *-\nx = newPackage\n",
+    )
+    .expect("non-package fixture should be written");
+
+    // The Tree-sitter assets the book embeds are build outputs, not sources, so
+    // they are gitignored and absent on a clean checkout. Build a stand-in and
+    // point the command at it, keeping the test hermetic and independent of the
+    // working directory.
+    let assets = fixture.join("assets");
+    for (path, contents) in [
+        ("parsers/macaulay2.so", "stand-in parser"),
+        ("queries/macaulay2/highlights.scm", "; stand-in queries"),
+        ("theme/treesitter.css", "/* stand-in theme */"),
+    ] {
+        let asset = assets.join(path);
+        fs::create_dir_all(asset.parent().expect("asset path has a parent"))
+            .expect("asset directory should be created");
+        fs::write(&asset, contents).expect("asset fixture should be written");
+    }
+
+    let result = Command::new(env!("CARGO_BIN_EXE_m2-ls"))
+        .current_dir(&fixture)
+        .env("M2_LS_DOC_ASSETS", &assets)
+        .arg("docs")
+        .arg(&source_dir)
+        .arg("--output")
+        .arg(&output_dir)
+        .arg("--no-build")
+        .output()
+        .expect("documentation command should run");
+    assert!(
+        result.status.success(),
+        "documentation command failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("generated 3 documentation pages"));
+
+    let summary = fs::read_to_string(output_dir.join("src/SUMMARY.md"))
+        .expect("generated summary should exist");
+    assert!(summary.contains("[Package]"));
+    assert!(summary.contains("[answer]"));
+    assert!(summary.contains("[helper]"));
+    assert!(!summary.contains("Detached"));
+    assert!(!summary.contains("NotPackage"));
+
+    let answer = fs::read_to_string(output_dir.join("src/items/Package--answer.md"))
+        .expect("documented binding page should exist");
+    assert!(answer.contains("[helper](Package--helper.md)"));
+    assert!(output_dir.join("parsers/macaulay2.so").is_file());
+
+    fs::remove_dir_all(&fixture).expect("temporary documentation fixture should be removed");
 }
 
 #[tokio::test]
@@ -2104,6 +2244,11 @@ async fn lambda_return_values_receive_nontrivial_type_hints() {
     );
     let mut session = DocumentSession::open(source).await;
     session.set_expression_type_hints(false).await;
+    assert!(
+        !session.diagnostic_codes().contains(&"X01"),
+        "a line comment must remain whitespace between `return` and its value: {:?}",
+        session.diagnostics()
+    );
     let type_hints = inlay_hints(&mut session)
         .await
         .into_iter()

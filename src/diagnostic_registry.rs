@@ -2,6 +2,7 @@
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Range as TextRange};
 
+/// Supply the canonical diagnostic declarations to a generating macro.
 #[macro_export]
 macro_rules! diagnostic_declarations {
     ($consumer:ident) => {
@@ -52,6 +53,10 @@ macro_rules! diagnostic_declarations {
                         code: "S05", name: "simplifiable-expression", severity: HINT,
                         check: simplifiable_expression,
                     },
+                    RingVariableNaming {
+                        code: "S06", name: "ring-variable-naming", severity: HINT,
+                        check: ring_variable_naming,
+                    },
                 }
                 document {
                     UnusedBinding {
@@ -88,10 +93,6 @@ macro_rules! diagnostic_declarations {
                         code: "E06", name: "protect-computed-symbol", severity: WARNING,
                         check: protect_computed_symbol,
                     },
-                    MissingOutputCell {
-                        code: "E07", name: "missing-output-cell", severity: WARNING,
-                        check: missing_output_cell,
-                    },
                     InvalidControlTransfer {
                         code: "E08", name: "invalid-control-transfer", severity: ERROR,
                         check: invalid_control_transfer,
@@ -107,6 +108,12 @@ macro_rules! diagnostic_declarations {
                     ConditionType {
                         code: "T02", name: "condition-type", severity: WARNING,
                         check: condition_type,
+                    },
+                }
+                retired {
+                    MissingOutputCell {
+                        code: "E07", name: "missing-output-cell", severity: WARNING,
+                        check: missing_output_cell,
                     },
                 }
                 codomain {

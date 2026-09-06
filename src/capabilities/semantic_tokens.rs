@@ -264,6 +264,42 @@ mod tests {
         DocumentSnapshot::from_text(text.to_string(), builtins).expect("fixture should parse")
     }
 
+    /// `symbol` and `list` are spelled the same as the grammar's *named* node
+    /// kinds for identifiers and list expressions, so a kind-string-only match
+    /// classified them as expressions and let a builtin lookup recolor them.
+    /// They must read as keywords wherever they appear, exactly like `global`.
+    #[test]
+    fn keywords_colliding_with_node_kinds_stay_keywords() {
+        let text = concat!(
+            "protect symbol clearAll\n",
+            "protect global clearAll\n",
+            "f(symbol foo)\n",
+            "a = symbol b\n",
+            "squares = for i to 3 list i^2\n",
+        );
+        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let document = document(text, &builtins);
+        // `augments_syntax_tokens` is off so plain keywords are emitted too;
+        // the modifier tokens below are emitted either way.
+        let tokens = collect_tokens(&document, &builtins, false);
+
+        for (line, keyword, expected) in [
+            (0, "symbol", M2SemanticTokenType::Modifier),
+            (1, "global", M2SemanticTokenType::Modifier),
+            (2, "symbol", M2SemanticTokenType::Modifier),
+            (3, "symbol", M2SemanticTokenType::Modifier),
+            (4, "list", M2SemanticTokenType::Keyword),
+        ] {
+            let source_line = text.lines().nth(line).expect("fixture line");
+            let character = source_line.find(keyword).expect("keyword in fixture") as u32;
+            assert_eq!(
+                token_type_at(&tokens, line as u32, character),
+                Some(expected as u32),
+                "`{keyword}` on line {line} must classify as {expected:?}"
+            );
+        }
+    }
+
     /// Collect tokens for a single isolated document — no other workspace files,
     /// so the cross-file classification step contributes nothing.
     fn collect_tokens(
@@ -486,46 +522,48 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 M2SemanticTokenType::Keyword as u32,
                 M2SemanticTokenType::String as u32,
                 M2SemanticTokenType::Modifier as u32,
+                // `y` in `local y` — quoted, so a symbol rather than a value.
+                M2SemanticTokenType::EnumMember as u32,
             ]
         );
     }
 
     #[test]
-    fn semantic_tokens_color_backtick_mentions_as_properties() {
-        let text = "x := 1\n-- use `x` and `ideal`\n";
+    fn semantic_tokens_color_wikilinks_as_properties() {
+        let text = "x := 1\n-- use [[x]] and [[ideal]]\ny := 2\n";
         let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
 
-        let local = token_at(&tokens, 1, 8).expect("local documentation reference is tokenized");
+        let local = token_at(&tokens, 1, 9).expect("local documentation reference is tokenized");
         assert_eq!(local.token_type, M2SemanticTokenType::Property as u32);
         assert_eq!(local.token_modifiers_bitset, 0);
 
         let builtin =
-            token_at(&tokens, 1, 16).expect("builtin documentation reference is tokenized");
+            token_at(&tokens, 1, 19).expect("builtin documentation reference is tokenized");
         assert_eq!(builtin.token_type, M2SemanticTokenType::Property as u32);
         assert_eq!(builtin.token_modifiers_bitset, 0);
 
         assert_eq!(
-            token_at(&tokens, 1, 7).map(|token| token.token_type),
+            token_at(&tokens, 1, 8).map(|token| token.token_type),
             Some(M2SemanticTokenType::Comment as u32),
-            "the backtick delimiter remains comment-colored"
+            "the wiki-link delimiter remains comment-colored"
         );
     }
 
     #[test]
-    fn semantic_tokens_keep_backtick_mentions_when_augmenting_syntax() {
-        let text = "x := 1\n-- use `x`\n";
+    fn semantic_tokens_keep_wikilinks_when_augmenting_syntax() {
+        let text = "x := 1\n-- use [[x]]\ny := 2\n";
         let builtins = ObjectRegistry::default();
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, true);
 
         assert_eq!(
-            token_at(&tokens, 1, 8).map(|token| token.token_type),
+            token_at(&tokens, 1, 9).map(|token| token.token_type),
             Some(M2SemanticTokenType::Property as u32)
         );
         assert!(
-            token_at(&tokens, 1, 7).is_none(),
+            token_at(&tokens, 1, 8).is_none(),
             "syntax highlighting owns the surrounding comment"
         );
     }
@@ -559,7 +597,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
 
     #[test]
     fn comment_code_does_not_create_document_bindings() {
-        let text = "-- example `ghost := x -> x`\nghost\n";
+        let text = "-- example `ghost := x -> x`\ndocumented := 1\nghost\n";
         let builtins = ObjectRegistry::default();
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, true);
@@ -570,7 +608,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             Some(M2SemanticTokenType::Property as u32)
         );
         assert_eq!(
-            token_type_at(&tokens, 1, 0),
+            token_type_at(&tokens, 2, 0),
             Some(M2SemanticTokenType::EnumMember as u32),
             "the isolated snippet assignment must not bind the real document symbol"
         );
@@ -578,7 +616,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
 
     #[test]
     fn comment_code_uses_one_property_color_when_augmenting() {
-        let text = "-- example `if true then 1 + 2 else \"x\"`\n";
+        let text = "-- example `if true then 1 + 2 else \"x\"`\ndocumented := 1\n";
         let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, true);
@@ -594,6 +632,8 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
 
     #[test]
     fn semantic_tokens_classify_binding_qualifiers_as_modifiers() {
+        // Each line is a quote: the qualifier is a modifier keyword and the name
+        // it quotes is produced as a `Symbol` rather than evaluated.
         let text = "global x\nlocal y\nsymbol z\nthreadLocal w\nthreadVariable q";
         let builtins = ObjectRegistry::default();
 
@@ -605,14 +645,65 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 .iter()
                 .map(|token| token.token_type)
                 .collect::<Vec<_>>(),
-            vec![
+            [[
                 M2SemanticTokenType::Modifier as u32,
-                M2SemanticTokenType::Modifier as u32,
-                M2SemanticTokenType::Modifier as u32,
-                M2SemanticTokenType::Modifier as u32,
-                M2SemanticTokenType::Modifier as u32,
-            ]
+                M2SemanticTokenType::EnumMember as u32,
+            ]; 5]
+                .concat()
         );
+    }
+
+    #[test]
+    fn quoted_operators_and_punctuation_are_symbols_too() {
+        // Anything can follow a quote, not only names: operators, punctuation,
+        // and even a lone opening bracket. M2 hands them all back as symbols —
+        // `class(symbol +)` is `Keyword` — so the rule keys on the quote's
+        // operand rather than on that operand being an identifier.
+        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        for quoted in ["+", "==", ",", "(", "{", "#", ".."] {
+            let text = format!("a = symbol {quoted}\n");
+            let document = document(&text, &builtins);
+            let tokens = collect_tokens(&document, &builtins, true);
+
+            assert_eq!(
+                token_type_at(&tokens, 0, "a = symbol ".len() as u32),
+                Some(M2SemanticTokenType::EnumMember as u32),
+                "`symbol {quoted}` must classify its operand as a symbol"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_names_are_symbols_whatever_they_are_bound_to() {
+        // A quote produces the name as a `Symbol` instead of evaluating it, so
+        // the quoted occurrence must outrank the binding it would otherwise
+        // resolve to — here a local function.
+        let text = concat!(
+            "f = x -> x\n",
+            "a = symbol f\n",
+            "b = global f\n",
+            "c = local f\n",
+            "d = threadVariable f\n",
+            "e = threadLocal f\n",
+        );
+        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let document = document(text, &builtins);
+        let tokens = collect_tokens(&document, &builtins, true);
+
+        assert_eq!(
+            token_type_at(&tokens, 0, 0),
+            Some(M2SemanticTokenType::Function as u32),
+            "the binding itself is still a function"
+        );
+        for line in 1..=5u32 {
+            let source_line = text.lines().nth(line as usize).expect("fixture line");
+            let character = source_line.rfind('f').expect("quoted name") as u32;
+            assert_eq!(
+                token_type_at(&tokens, line, character),
+                Some(M2SemanticTokenType::EnumMember as u32),
+                "the quoted name on line {line} must classify as a symbol"
+            );
+        }
     }
 
     #[test]
@@ -909,8 +1000,14 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                         && token.token_modifiers_bitset & COMMAND_MODIFIER == COMMAND_MODIFIER
                 })
                 .count(),
-            4,
+            3,
             "direct, aliased, and locally rebound Command values stay function+command"
+        );
+        let quoted = token_at(&tokens, 2, 15).expect("the quoted clearAll is highlighted");
+        assert_eq!(
+            quoted.token_type,
+            M2SemanticTokenType::EnumMember as u32,
+            "`symbol clearAll` names the symbol, so the Command binding does not apply"
         );
         let original = token_at(&tokens, 0, 16).expect("indexed clearAll is highlighted");
         assert_eq!(original.token_type, M2SemanticTokenType::Function as u32);

@@ -2,12 +2,16 @@
 
 use std::cmp::Ordering;
 
-use m2_syn::visit::{self, Visit};
-use m2_syn::{
-    Assignment, AssignmentPack, AssignmentPackComponent, ElseClause, Expr, ForLoop, IfStatement,
-    LambdaExpression, LambdaParameters, LoopBody, ParallelAssignment, SimpleBinding, SourceFile,
-    Spanned, Symbol, ThenClause, Token, TryFallback, TryStatement, WhileLoop,
+use m2_syn::nodes::{
+    ArgumentListContent, AssignmentArgument as AssignmentPackComponent,
+    AssignmentList as AssignmentPack, ElseClause, Expr, ExprAssign as Assignment,
+    ExprAssignParallel as ParallelAssignment, ExprAssignSimple as SimpleBinding,
+    ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
+    ExprTry as TryStatement, ExprWhile as WhileLoop, LoopBody, SourceFile, Symbol, ThenClause,
+    TryFallback, WhenCondition,
 };
+use m2_syn::visit::{self, Visit};
+use m2_syn::{Spanned, Token};
 use tower_lsp::lsp_types::{Position, Range as TextRange};
 
 use crate::meta::BindingRole;
@@ -380,69 +384,93 @@ impl<'source, Source: SourceNavigation + ?Sized> TypedWalker<'source, Source> {
             self.bind_symbol(symbol, value, role, effect);
         }
     }
+
+    fn visit_for_parts(
+        &mut self,
+        owner: &ForLoop,
+        variable: &Symbol,
+        condition: Option<&WhenCondition>,
+        body: &LoopBody,
+        visit_domain: impl FnOnce(&mut Self),
+    ) {
+        self.with_owner_scope(owner, false, false, None, |walker| {
+            walker.bind_symbol(
+                variable,
+                None,
+                BindingRole::Parameter,
+                BindingEffect::Declare,
+            );
+            visit_domain(walker);
+            if let Some(condition) = condition {
+                walker.with_syntax_scope(condition, ControlFlowScope::LoopClause, |walker| {
+                    walker.visit_when_condition(condition)
+                });
+            }
+            walker.with_syntax_scope(body, ControlFlowScope::LoopClause, |walker| {
+                visit::visit_loop_body(walker, body)
+            });
+        });
+    }
 }
 
 impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, Source> {
-    fn visit_cell(&mut self, node: &'ast m2_syn::Cell) {
+    fn visit_cell(&mut self, node: &'ast m2_syn::nodes::Cell) {
         self.with_definition(node, |walker| visit::visit_cell(walker, node));
     }
 
-    fn visit_assignment(&mut self, node: &'ast Assignment) {
+    fn visit_expr_assign(&mut self, node: &'ast Assignment) {
         match node {
-            Assignment::SimpleBinding(SimpleBinding::GlobalBinding(binding)) => self.bind_symbol(
+            Assignment::Simple(SimpleBinding::Global(binding)) => self.bind_symbol(
                 &binding.variable,
                 Some(&binding.value),
                 BindingRole::Ordinary,
                 BindingEffect::Assign,
             ),
-            Assignment::SimpleBinding(SimpleBinding::LocalBinding(binding)) => self.bind_symbol(
+            Assignment::Simple(SimpleBinding::Local(binding)) => self.bind_symbol(
                 &binding.variable,
                 Some(&binding.value),
                 BindingRole::Ordinary,
                 BindingEffect::Declare,
             ),
-            Assignment::ParallelAssignment(ParallelAssignment::GlobalParallelAssignment(
-                assignment,
-            )) => self.bind_symbols(
-                symbols_in_assignment_pack(&assignment.argument_pack),
+            Assignment::Parallel(ParallelAssignment::Global(assignment)) => self.bind_symbols(
+                symbols_in_assignment_pack(&assignment.argument_list),
                 Some(&assignment.value),
                 BindingRole::Ordinary,
                 BindingEffect::Assign,
             ),
-            Assignment::ParallelAssignment(ParallelAssignment::LocalParallelAssignment(
-                assignment,
-            )) => self.bind_symbols(
-                symbols_in_assignment_pack(&assignment.argument_pack),
+            Assignment::Parallel(ParallelAssignment::Local(assignment)) => self.bind_symbols(
+                symbols_in_assignment_pack(&assignment.argument_list),
                 Some(&assignment.value),
                 BindingRole::Ordinary,
                 BindingEffect::Declare,
             ),
-            Assignment::EvaluatedAssignment(_)
-            | Assignment::Installation(_)
-            | Assignment::OperatorAssignment(_) => {}
+            Assignment::Evaluated(_)
+            | Assignment::Augmented(_)
+            | Assignment::Install(_)
+            | Assignment::Op(_) => {}
         }
-        visit::visit_assignment(self, node);
+        visit::visit_expr_assign(self, node);
     }
 
-    fn visit_lambda_expression(&mut self, node: &'ast LambdaExpression) {
+    fn visit_expr_lambda(&mut self, node: &'ast LambdaExpression) {
         self.with_owner_scope(
             node,
             true,
             true,
-            Some(typed_function_dispatch(&node.parameters)),
+            Some(typed_function_dispatch(node)),
             |walker| {
                 walker.bind_symbols(
-                    symbols_in_lambda_parameters(&node.parameters),
+                    symbols_in_lambda_parameters(node),
                     None,
                     BindingRole::Parameter,
                     BindingEffect::Declare,
                 );
-                visit::visit_lambda_expression(walker, node);
+                visit::visit_expr_lambda(walker, node);
             },
         );
     }
 
-    fn visit_if_statement(&mut self, node: &'ast IfStatement) {
+    fn visit_expr_if(&mut self, node: &'ast IfStatement) {
         self.with_syntax_scope(&node.condition, ControlFlowScope::Branch, |walker| {
             walker.visit_expr(&node.condition)
         });
@@ -456,31 +484,63 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, So
         }
     }
 
-    fn visit_for_loop(&mut self, node: &'ast ForLoop) {
-        self.with_owner_scope(node, false, false, None, |walker| {
-            walker.bind_symbol(
-                &node.variable,
-                None,
-                BindingRole::Parameter,
-                BindingEffect::Declare,
-            );
-            if let Some(domain) = node.iteration_domain.as_ref() {
-                walker.with_syntax_scope(domain, ControlFlowScope::LoopClause, |walker| {
-                    walker.visit_iteration_domain(domain)
-                });
-            }
-            if let Some(condition) = node.when_condition.as_ref() {
-                walker.with_syntax_scope(condition, ControlFlowScope::LoopClause, |walker| {
-                    walker.visit_when_condition(condition)
-                });
-            }
-            walker.with_syntax_scope(&node.body, ControlFlowScope::LoopClause, |walker| {
-                visit::visit_loop_body(walker, &node.body)
-            });
-        });
+    fn visit_expr_for(&mut self, node: &'ast ForLoop) {
+        match node {
+            ForLoop::Bare(for_loop) => self.visit_for_parts(
+                node,
+                &for_loop.variable,
+                for_loop.condition.as_ref(),
+                &for_loop.body,
+                |_| {},
+            ),
+            ForLoop::Range(for_loop) => self.visit_for_parts(
+                node,
+                &for_loop.variable,
+                for_loop.condition.as_ref(),
+                &for_loop.body,
+                |walker| {
+                    let lower_range = for_loop
+                        .lower_bound
+                        .as_ref()
+                        .and_then(|bound| syntax_range(bound, walker.source));
+                    let upper_range = for_loop
+                        .upper_bound
+                        .as_ref()
+                        .and_then(|bound| syntax_range(bound, walker.source));
+                    let domain_range = match (lower_range, upper_range) {
+                        (Some(lower), Some(upper)) => Some(TextRange::new(lower.start, upper.end)),
+                        (Some(range), None) | (None, Some(range)) => Some(range),
+                        (None, None) => None,
+                    };
+                    if let Some(range) = domain_range {
+                        walker.with_control_scope(range, ControlFlowScope::LoopClause, |walker| {
+                            if let Some(bound) = for_loop.lower_bound.as_ref() {
+                                walker.visit_range_bound_from(bound);
+                            }
+                            if let Some(bound) = for_loop.upper_bound.as_ref() {
+                                walker.visit_range_bound_to(bound);
+                            }
+                        });
+                    }
+                },
+            ),
+            ForLoop::In(for_loop) => self.visit_for_parts(
+                node,
+                &for_loop.variable,
+                for_loop.condition.as_ref(),
+                &for_loop.body,
+                |walker| {
+                    walker.with_syntax_scope(
+                        for_loop.collection.as_ref(),
+                        ControlFlowScope::LoopClause,
+                        |walker| walker.visit_expr(&for_loop.collection),
+                    );
+                },
+            ),
+        }
     }
 
-    fn visit_while_loop(&mut self, node: &'ast WhileLoop) {
+    fn visit_expr_while(&mut self, node: &'ast WhileLoop) {
         self.with_syntax_scope(&node.condition, ControlFlowScope::LoopClause, |walker| {
             walker.visit_expr(&node.condition)
         });
@@ -489,7 +549,7 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, So
         });
     }
 
-    fn visit_try_statement(&mut self, node: &'ast TryStatement) {
+    fn visit_expr_try(&mut self, node: &'ast TryStatement) {
         self.with_syntax_scope(&node.value, ControlFlowScope::Branch, |walker| {
             walker.visit_expr(&node.value)
         });
@@ -500,12 +560,12 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, So
         }
         if let Some(fallback) = node.fallback.as_ref() {
             match fallback {
-                TryFallback::ExceptDo(clause) => {
+                TryFallback::Except(clause) => {
                     self.with_syntax_scope(clause, ControlFlowScope::Branch, |walker| {
                         walker.visit_expr(&clause.value)
                     });
                 }
-                TryFallback::ElseClause(clause) => {
+                TryFallback::Else(clause) => {
                     self.with_syntax_scope(clause, ControlFlowScope::Branch, |walker| {
                         walker.visit_expr(&clause.expr)
                     });
@@ -515,28 +575,25 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, So
     }
 }
 
-fn symbols_in_lambda_parameters(parameters: &LambdaParameters) -> Vec<&Symbol> {
-    match parameters {
-        LambdaParameters::Variadic(symbol) => vec![&symbol.0],
-        LambdaParameters::FixedArity(parameters) => parameters
-            .0
-            .contents
-            .iter()
-            .flat_map(|parameters| parameters.iter())
-            .collect(),
+fn symbols_in_lambda_parameters(lambda: &LambdaExpression) -> Vec<&Symbol> {
+    match lambda {
+        LambdaExpression::Variadic(lambda) => vec![&lambda.argument],
+        LambdaExpression::List(lambda) => match lambda.arguments.contents.as_ref() {
+            None => Vec::new(),
+            Some(ArgumentListContent::Symbol(symbol)) => vec![symbol],
+            Some(ArgumentListContent::Pack(arguments)) => arguments.arguments.iter().collect(),
+        },
     }
 }
 
-fn typed_function_dispatch(parameters: &LambdaParameters) -> Dispatch {
-    match parameters {
-        LambdaParameters::Variadic(_) => Dispatch::Variadic,
-        LambdaParameters::FixedArity(parameters) => Dispatch::Fixed(
-            parameters
-                .0
-                .contents
-                .as_ref()
-                .map_or(0, m2_syn::Punctuated::len),
-        ),
+fn typed_function_dispatch(lambda: &LambdaExpression) -> Dispatch {
+    match lambda {
+        LambdaExpression::Variadic(_) => Dispatch::Variadic,
+        LambdaExpression::List(lambda) => Dispatch::Fixed(match &lambda.arguments.contents {
+            None => 0,
+            Some(ArgumentListContent::Symbol(_)) => 1,
+            Some(ArgumentListContent::Pack(arguments)) => arguments.arguments.len(),
+        }),
     }
 }
 
@@ -553,26 +610,31 @@ fn cst_function_dispatch(lambda: M2Node) -> Option<Dispatch> {
 
 fn symbols_in_assignment_pack(binding: &AssignmentPack) -> Vec<&Symbol> {
     let mut symbols = Vec::new();
-    if let Some(components) = &binding.0.contents {
-        collect_assignment_symbols(components, &mut symbols);
+    if let Some(components) = &binding.contents.contents {
+        match components {
+            m2_syn::nodes::AssignmentListContent::Argument(component) => {
+                collect_assignment_symbol(component, &mut symbols)
+            }
+            m2_syn::nodes::AssignmentListContent::Pack(components) => {
+                for component in &components.arguments {
+                    collect_assignment_symbol(component, &mut symbols);
+                }
+            }
+        }
     }
     symbols
 }
 
-fn collect_assignment_symbols<'ast>(
-    components: &'ast m2_syn::Punctuated<AssignmentPackComponent>,
+fn collect_assignment_symbol<'ast>(
+    component: &'ast AssignmentPackComponent,
     symbols: &mut Vec<&'ast Symbol>,
 ) {
-    for component in components {
-        match component {
-            AssignmentPackComponent::Symbol(symbol) => symbols.push(symbol),
-            AssignmentPackComponent::AssignmentPack(pack) => {
-                if let Some(nested) = &pack.0.contents {
-                    collect_assignment_symbols(nested, symbols);
-                }
-            }
-            AssignmentPackComponent::Empty(_) | AssignmentPackComponent::OperatorExpr(_) => {}
+    match component {
+        AssignmentPackComponent::Symbol(symbol) => symbols.push(symbol),
+        AssignmentPackComponent::List(pack) => {
+            symbols.extend(symbols_in_assignment_pack(pack));
         }
+        AssignmentPackComponent::Empty(_) | AssignmentPackComponent::Op(_) => {}
     }
 }
 

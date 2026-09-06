@@ -7,7 +7,7 @@ use crate::node_metadata::M2Node;
 use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry, ObjectRegistryView};
 use crate::source::DocumentSpan;
 use crate::typesystem::{TypeKnowledge, TypeRole};
-use m2_syn::{FloatLiteral, IntegerLiteral};
+use m2_syn::nodes::{FloatLiteral, IntegerLiteral};
 use tower_lsp::lsp_types::{SemanticTokenModifier, SemanticTokenType, SymbolKind};
 
 /// Indexed facts needed specifically for semantic-token classification.
@@ -142,6 +142,10 @@ pub enum SourceSemanticRole {
     OptionValue(ObjectName),
     PropertyKey,
     NamespaceArgument,
+    /// The name a quote yields as a `Symbol` rather than evaluating —
+    /// `symbol f`, `global f`, `local f`, `threadVariable f`, `threadLocal f`.
+    /// The quote wins over whatever `f` is otherwise bound to.
+    QuotedSymbol,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +293,7 @@ fn source_role_semantic_token(
                 .with_modifier(M2SemanticTokenModifier::Option)
         }
         SourceSemanticRole::PropertyKey => M2SemanticToken::new(M2SemanticTokenType::Property),
+        SourceSemanticRole::QuotedSymbol => M2SemanticToken::new(M2SemanticTokenType::EnumMember),
         SourceSemanticRole::NamespaceArgument => {
             M2SemanticToken::new(M2SemanticTokenType::Namespace)
         }

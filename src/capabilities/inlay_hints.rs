@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 
-use m2_syn::{LambdaExpression, NewStatement, Symbol, Token};
+use m2_syn::nodes::{ExprLambda as LambdaExpression, ExprNew as NewStatement, Symbol};
+use m2_syn::Token;
 use tower_lsp::lsp_types::{
     InlayHint, InlayHintKind, InlayHintLabel, InlayHintServerCapabilities, OneOf, Position,
     Range as TextRange,

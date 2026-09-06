@@ -2,10 +2,12 @@
 
 use super::*;
 use crate::diagnostic_declarations;
-use m2_syn::{
-    FloatLiteral, ForLoop, IfStatement, LambdaExpression, QuoteExpression, Symbol, Token,
-    TryStatement, WhileLoop,
+use m2_syn::nodes::{
+    ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
+    ExprQuote as QuoteExpression, ExprTry as TryStatement, ExprWhile as WhileLoop, FloatLiteral,
+    Symbol,
 };
+use m2_syn::Token;
 
 macro_rules! run_check_for_phase {
     (node, node, $kind:ident, $check:ident, $context:ident) => {{
@@ -113,7 +115,7 @@ impl<
     > NodeDiagnosticContext<'_, '_, '_, Source, Knowledge>
 {
     fn syntax_error(&mut self) {
-        if self.node.is_error() {
+        if self.node.is_error() && !self.node.is_recoverable_control_transfer_error() {
             self.analysis.diagnostics.push(self.kind.at(
                 self.source.remainder_of_line_range(self.node.start_byte()),
                 "Syntax error",
@@ -205,7 +207,7 @@ impl<
     }
 
     fn prefer_coalescence(&mut self) {
-        let Some(replacement) = coalescence_rewrite(self.node) else {
+        let Some(replacement) = simplification_of(self.node, coalescence_rewrite(self.node)) else {
             return;
         };
         self.analysis.diagnostics.push(self.kind.at(
@@ -215,18 +217,46 @@ impl<
     }
 
     fn simplifiable_expression(&mut self) {
-        let can_simplify = if self.node.is::<IfStatement>() {
-            if_null_branch_rewrite(self.node).is_some()
-                || if_condition_rewrite(self.node).is_some()
-                || else_if_chain_rewrite(self.node).is_some()
+        let rewrites = if self.node.is::<IfStatement>() {
+            [
+                if_null_branch_rewrite(self.node),
+                if_condition_rewrite(self.node),
+                else_if_chain_rewrite(self.node),
+            ]
+        } else if self.node.is::<TryStatement>() {
+            [try_statement_rewrite(self.node), None, None]
         } else {
-            self.node.is::<TryStatement>() && try_statement_rewrite(self.node).is_some()
+            return;
         };
+        let can_simplify = rewrites
+            .into_iter()
+            .any(|rewrite| simplification_of(self.node, rewrite).is_some());
         if can_simplify {
             self.analysis.diagnostics.push(self.kind.at(
                 self.source.range_for_node(self.node),
                 "This expression can be simplified",
             ));
+        }
+    }
+
+    fn ring_variable_naming(&mut self) {
+        let scope_idx = self
+            .analysis
+            .find_scope_at(self.source.position_for_node(self.node))
+            .unwrap_or(0);
+        let variables = self.analysis.ring_constructor_symbol_variables(
+            self.node,
+            self.source,
+            self.knowledge,
+            scope_idx,
+        );
+        for variable in variables {
+            let Some(message) = ring_variable_naming_message(variable.text()) else {
+                continue;
+            };
+            self.analysis
+                .diagnostics
+                .push(self.kind.at(self.source.range_for_node(variable), message));
         }
     }
 
@@ -255,11 +285,6 @@ impl<
     fn protect_computed_symbol(&mut self) {
         self.analysis
             .diagnose_protect_argument(self.kind, self.node, self.source, self.knowledge);
-    }
-
-    fn missing_output_cell(&mut self) {
-        self.analysis
-            .diagnose_output_reference(self.kind, self.node, self.source, self.knowledge);
     }
 
     fn invalid_control_transfer(&mut self) {
@@ -624,6 +649,13 @@ impl Analysis {
         if !node.is_control_transfer() {
             return;
         }
+        // The enclosing function or loop is what makes a transfer legal. Inside a
+        // region the grammar could not parse that structure is unknown, so a
+        // missing target says the parse failed, not that the transfer is
+        // misplaced — and claiming otherwise reports valid code as an error.
+        if node.ancestors().any(|ancestor| ancestor.is_error()) {
+            return;
+        }
         let target = self.control_transfer_target(node, source, knowledge);
         if target.is_some_and(|target| target.accepts(node)) {
             return;
@@ -646,41 +678,6 @@ impl Analysis {
         let keyword = node.child(0).unwrap_or(node);
         self.diagnostics
             .push(kind.at(source.range_for_node(keyword), message));
-    }
-
-    fn diagnose_output_reference(
-        &mut self,
-        kind: DiagnosticKind,
-        node: M2Node,
-        source: &(impl SourceNavigation + ?Sized),
-        knowledge: &(impl TypeKnowledge + ?Sized),
-    ) {
-        if !node.is::<Symbol>()
-            || node
-                .parent()
-                .is_some_and(|parent| parent.is::<QuoteExpression>())
-        {
-            return;
-        }
-        let Some(reference) = OutputReference::parse(node.text()) else {
-            return;
-        };
-        let position = source.position_for_node(node);
-        if self
-            .visible_source_binding_at(node.text(), position, knowledge)
-            .is_some()
-            || reference.referenced_value(node).is_some()
-        {
-            return;
-        }
-
-        self.diagnostics.push(kind.at(
-            source.range_for_node(node),
-            format!(
-                "`{}` does not reference an available output cell; it evaluates as an unassigned `Symbol`",
-                node.text()
-            ),
-        ));
     }
 
     fn diagnose_protect_argument(
@@ -1068,8 +1065,57 @@ fn flatten_parenthesized_else_if_chain(if_node: M2Node<'_>) -> Option<String> {
     Some(flattened)
 }
 
+/// The trailing run of digits in a name, with the name before it — `x0` splits
+/// into `x` and `0`. `None` when the name has no trailing digits (`xx`) or is
+/// only digits, neither of which names an index the author meant to write.
+fn split_trailing_index(name: &str) -> Option<(&str, &str)> {
+    let index_start = name
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| character.is_ascii_digit())
+        .last()
+        .map(|(byte, _)| byte)?;
+    let (base, index) = name.split_at(index_start);
+    (!base.is_empty()).then_some((base, index))
+}
+
+/// Why a multi-character ring variable is worth flagging: `x0` and `x1` are two
+/// unrelated symbols that merely look sequential, while `x_0` and `x_1` are one
+/// indexed family — subscriptable, printable as `x`, and writable as the range
+/// `x_0..x_9`. Single-character names need no such treatment.
+fn ring_variable_naming_message(name: &str) -> Option<String> {
+    if name.chars().count() <= 1 {
+        return None;
+    }
+    Some(match split_trailing_index(name) {
+        Some((base, index)) => format!(
+            "Ring variable `{name}` is a multi-character symbol, not an indexed \
+             variable; use `{base}_{index}` so the generators form one indexed \
+             family (`{base}_0`, `{base}_1`, ...)"
+        ),
+        None => format!(
+            "Ring variable `{name}` is a multi-character symbol; prefer a \
+             single-character name, or an indexed variable such as `{}_0`",
+            name.chars()
+                .next()
+                .expect("a multi-character name is non-empty")
+        ),
+    })
+}
+
+/// A rewrite counts as a simplification only when it actually changes the
+/// expression. Proposing the original text back raises a diagnostic that its own
+/// quick fix cannot clear, so the user is told to fix code that is already in its
+/// simplest form and the warning survives applying the action.
+fn simplification_of(node: M2Node<'_>, rewrite: Option<String>) -> Option<String> {
+    rewrite.filter(|replacement| replacement.trim() != node.text().trim())
+}
+
 fn simplify_condition(node: M2Node<'_>) -> Option<String> {
-    let original = node.text();
+    // A condition's span runs up to the `then` keyword, so it carries the
+    // separating whitespace. Comparing against the untrimmed text would make
+    // every `not name` look like a change and propose itself back.
+    let original = node.text().trim();
     if !node.is_prefix_expr() {
         return None;
     }
@@ -1215,6 +1261,162 @@ fn member_index_for_ambiguous_float_literal(float_text: &str) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::member_index_for_ambiguous_float_literal;
+
+    use super::*;
+    use crate::document::DocumentSnapshot;
+    use crate::object_registry::ObjectRegistry;
+
+    /// A control transfer is legal because of the function or loop enclosing it.
+    /// When the grammar cannot parse that enclosure the structure is unknown, so
+    /// reporting a scope violation turns a parser limitation into a false error
+    /// on valid code. M2 v1.26.05 accepts all three shapes below and each returns
+    /// `5`; the grammar currently fails on the lambda, so only the honest
+    /// "Syntax error" may remain.
+    #[test]
+    fn control_transfers_in_unparsed_regions_report_no_scope_violation() {
+        let builtins = ObjectRegistry::default();
+        for source in [
+            "f = () -> (\n    return -- note\n    5;\n)\n",
+            "f = () -> (\n    return -- note\n    5\n)\n",
+            "f = () -> (\n    return\n    5\n)\n",
+            "f = () -> (\n    while true do (\n        break -- note\n        5\n    )\n)\n",
+        ] {
+            let document = DocumentSnapshot::from_text(source.to_string(), &builtins)
+                .expect("fixture should parse");
+            let scope_claims = document
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("can only be used inside"))
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect::<Vec<_>>();
+
+            assert!(
+                scope_claims.is_empty(),
+                "{source:?} must not be reported as a misplaced transfer: {scope_claims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn misplaced_control_transfers_are_still_reported() {
+        // The guard above must not silence transfers in code that does parse.
+        let document = DocumentSnapshot::from_text(
+            "return 5
+"
+            .to_string(),
+            &ObjectRegistry::default(),
+        )
+        .expect("fixture should parse");
+
+        assert!(
+            document
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("can only be used inside")),
+            "a top-level return is still a scope violation: {:?}",
+            document
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ring_variables_prefer_indexed_names_over_multicharacter_symbols() {
+        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let messages = |source: &str| {
+            let document = DocumentSnapshot::from_text(source.to_string(), &builtins)
+                .expect("fixture should parse");
+            document
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.message.starts_with("Ring variable"))
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // A trailing index is what the author meant; name it as one.
+        let indexed = messages("R = QQ[x0, x1, x2]\n");
+        assert_eq!(
+            indexed.len(),
+            3,
+            "each multi-character variable is reported"
+        );
+        assert!(
+            indexed[0].contains("`x_0`") && indexed[2].contains("`x_2`"),
+            "the suggestion carries the index across: {indexed:?}"
+        );
+
+        // No trailing digits, so there is no index to suggest.
+        let doubled = messages("R = QQ[xx]\n");
+        assert_eq!(doubled.len(), 1);
+        assert!(
+            doubled[0].contains("single-character") && doubled[0].contains("`x_0`"),
+            "an unindexed multi-character name suggests both routes: {doubled:?}"
+        );
+
+        // Everything already idiomatic stays quiet.
+        for quiet in [
+            "R = QQ[x, y, z]\n",
+            "R = QQ[x_0, x_1]\n",
+            "R = QQ[x_0..x_3]\n",
+            "R = QQ[a..d]\n",
+            "R = QQ[x, Degrees => {1}]\n",
+            "counter = 0\nlongName = 1\n",
+        ] {
+            assert!(
+                messages(quiet).is_empty(),
+                "{quiet:?} must not be reported: {:?}",
+                messages(quiet)
+            );
+        }
+    }
+
+    /// A simplification diagnostic must be clearable by its own quick fix. A
+    /// condition's span reaches the `then` keyword and so carries the separating
+    /// space, which used to make `not name` compare unequal to itself and propose
+    /// the untouched line back — the warning then survived applying the action.
+    #[test]
+    fn simplification_is_not_reported_when_the_rewrite_changes_nothing() {
+        let text = concat!(
+            "f = () -> (\n",
+            "    if not completed then lineNumber = lineNumber - 1;\n",
+            "    g();\n",
+            ");\n",
+        );
+        let builtins = ObjectRegistry::default();
+        let document =
+            DocumentSnapshot::from_text(text.to_string(), &builtins).expect("fixture should parse");
+
+        assert!(
+            document.diagnostics().is_empty(),
+            "an already-simplest condition must not be reported: {:?}",
+            document
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+
+        let if_node = document
+            .root_node()
+            .descendants()
+            .find(|node| node.is::<IfStatement>())
+            .expect("fixture contains an if");
+        for rewrite in [
+            if_null_branch_rewrite(if_node),
+            if_condition_rewrite(if_node),
+            else_if_chain_rewrite(if_node),
+            coalescence_rewrite(if_node),
+        ] {
+            assert_eq!(
+                simplification_of(if_node, rewrite.clone()),
+                None,
+                "a rewrite equal to the original is not a simplification (got {rewrite:?})"
+            );
+        }
+    }
 
     #[test]
     fn ambiguous_member_access_helper_requires_dot_prefixed_float() {

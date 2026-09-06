@@ -7,7 +7,7 @@
 //! (local method records first, then the builtin/imported index), and report the
 //! active parameter as the number of completed arguments before the cursor.
 
-use m2_syn::{Sequence, Symbol};
+use m2_syn::nodes::{Sequence, Symbol};
 use tower_lsp::lsp_types::{
     ParameterInformation, ParameterLabel, Position, SignatureHelp, SignatureInformation,
 };

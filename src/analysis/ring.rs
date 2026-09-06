@@ -1,6 +1,7 @@
 //! Ring construction, generator rebinding, and ring-specific type rules.
 
-use m2_syn::{FloatLiteral, IntegerLiteral, NewStatement, Symbol, Token};
+use m2_syn::nodes::{ExprNew as NewStatement, FloatLiteral, IntegerLiteral, Symbol};
+use m2_syn::Token;
 
 use crate::node_metadata::visit_expression_nodes;
 
@@ -107,6 +108,43 @@ impl Analysis {
         self.registry
             .ring_generators
             .insert(ObjectName::new(ring_name), generators);
+    }
+
+    /// The variables a ring constructor spells out as plain symbols — `QQ[x, y]`
+    /// yields `x` and `y`. Indexed families (`x_0`, `x_0..x_3`), generated tables
+    /// (`Variables => 5`), and letter ranges (`a..d`) are not written as single
+    /// symbols and are left out, so callers see exactly the names an author typed.
+    pub(super) fn ring_constructor_symbol_variables<'tree>(
+        &self,
+        node: M2Node<'tree>,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+        scope_idx: usize,
+    ) -> Vec<M2Node<'tree>> {
+        if !node.is_space_application() {
+            return Vec::new();
+        }
+        let Some(head) = node.child_by_field_name("left") else {
+            return Vec::new();
+        };
+        let Some(variables) = RingGeneratorBinding::constructor_variables(node) else {
+            return Vec::new();
+        };
+        let constructs_a_ring = TypeChecker::new(self, knowledge)
+            .type_of(head, source, scope_idx)
+            .single()
+            .is_some_and(|head_type| knowledge.has_type_role(head_type, TypeRole::Ring));
+        if !constructs_a_ring {
+            return Vec::new();
+        }
+
+        RingGeneratorBinding::collect(variables)
+            .into_iter()
+            .filter(|binding| {
+                binding.kind == RingGeneratorKind::Direct && binding.node.is::<Symbol>()
+            })
+            .map(|binding| binding.node)
+            .collect()
     }
 
     fn ring_source_symbol<'tree>(&self, expression: M2Node<'tree>) -> Option<&'tree str> {

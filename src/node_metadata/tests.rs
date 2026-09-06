@@ -105,7 +105,7 @@ mod descendants_tests {
     //! every migrated call site relies on (parent before children, source order
     //! across siblings, root yielded exactly once, empty file safe).
     use super::*;
-    use m2_syn::{QuoteExpression, Sequence, SourceFile, Symbol};
+    use m2_syn::nodes::{ExprQuote as QuoteExpression, Sequence, SourceFile, Symbol};
 
     #[test]
     fn descendants_visit_parent_before_children_in_source_order() {

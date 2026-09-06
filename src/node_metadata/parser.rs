@@ -1,6 +1,6 @@
 //! Configured parser and owned syntax-tree lifecycle.
 
-use m2_syn::SourceFile;
+use m2_syn::nodes::SourceFile;
 use tree_sitter::{InputEdit, Parser, Tree};
 
 use super::M2Node;
@@ -63,17 +63,17 @@ impl M2Tree {
         M2Node::new(self.tree.root_node(), source)
     }
 
+    /// The typed syntax for this tree's source.
+    ///
+    /// An editing session spends most of its time mid-keystroke, where the
+    /// strict entry point rejects the whole document over one incomplete
+    /// expression. Recovery keeps the usable syntax instead, so analysis stays
+    /// on the typed tree rather than falling back to untyped traversal.
+    /// `None` means the source could not be lexed at all.
     pub fn typed_source_file(&self, source: &str) -> Option<SourceFile> {
-        let root = self.tree.root_node();
-        if root.has_error() {
-            return None;
-        }
-        let syntax = m2_syn::parse_file(source).ok()?;
-        let cell_count = (0..root.named_child_count())
-            .filter_map(|index| root.named_child(index as u32))
-            .filter(|child| !child.is_extra())
-            .count();
-        (syntax.cells.len() == cell_count).then_some(syntax)
+        m2_syn::parse_file_recovering(source)
+            .ok()
+            .map(|recovered| recovered.value)
     }
 
     /// Apply an incremental source edit before reparsing.

@@ -11,13 +11,15 @@ pub use diagnostics::{
     try_statement_rewrite,
 };
 
-use m2_syn::visit::{self, Visit};
-use m2_syn::{
-    AngleBarList, Array, BinaryExpr, ElseClause, Expr, FloatLiteral, ForLoop, IfStatement,
-    IntegerLiteral, LambdaExpression, List, LoopBody, NewStatement, OptionExpression,
-    QuoteExpression, RawStringLiteral, Reconstruct, Sequence, SourceFile, Spanned, StringLiteral,
-    Symbol, ThenClause, Token, WhileLoop,
+use m2_syn::nodes::{
+    AngleBarList, Array, ElseClause, Expr, ExprFor as ForLoop, ExprIf as IfStatement,
+    ExprLambda as LambdaExpression, ExprNew as NewStatement, ExprOpBinIndex, ExprOpBinMember,
+    ExprOpBinRegular as BinaryExpr, ExprOption as OptionExpression, ExprQuote as QuoteExpression,
+    ExprWhile as WhileLoop, FloatLiteral, IntegerLiteral, List, LoopBody, RawStringLiteral,
+    Sequence, SourceFile, StringLiteral, Symbol, ThenClause,
 };
+use m2_syn::visit::{self, Visit};
+use m2_syn::{Spanned, Token};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::ops::Deref;
@@ -26,7 +28,9 @@ use tower_lsp::lsp_types::{Position, Range as TextRange, SymbolKind};
 use crate::builtin_index::{CallableKind, MethodSignature};
 use crate::diagnostic_registry::{DiagnosticKind, M2Diagnostic};
 use crate::meta::{BindingRole, Meta, Metadata};
-use crate::node_metadata::{matches_token, token_spelling, visit_source_nodes, M2Node};
+use crate::node_metadata::{
+    matches_token, token_spelling, visit_source_nodes, M2Node, M2SyntaxKind,
+};
 use crate::object_registry::ObjectName;
 use crate::object_registry::{ObjectId, OperatorForm, TypeData, TypeId};
 use crate::semantic_token::{syntax_semantic_token_type, SourceSemanticRole, SourceSemanticToken};
@@ -974,7 +978,26 @@ impl Analysis {
             );
         }
 
+        self.record_quoted_symbol_role(node, source);
         self.record_namespace_role(node, source, knowledge);
+    }
+
+    /// A quote yields its operand as a `Symbol` instead of evaluating it, so the
+    /// quoted name reads as a symbol regardless of what it is bound to.
+    fn record_quoted_symbol_role(
+        &mut self,
+        node: M2Node,
+        source: &(impl SourceNavigation + ?Sized),
+    ) {
+        if !node.is::<QuoteExpression>() {
+            return;
+        }
+        if let Some(quoted) = node.child_by_field_name("token") {
+            self.register_source_semantic_role(
+                source.range_for_node(quoted),
+                SourceSemanticRole::QuotedSymbol,
+            );
+        }
     }
 
     fn register_option_roles(
@@ -2052,7 +2075,7 @@ where
         );
     }
 
-    fn register_property(&mut self, node: &BinaryExpr) {
+    fn register_property(&mut self, node: &(impl Spanned + ?Sized)) {
         let Some(expression) = self.root.descendant_for_syntax(node) else {
             return;
         };
@@ -2084,14 +2107,31 @@ where
     Source: SourceNavigation + ?Sized,
     Knowledge: PositionedTypeKnowledge + ?Sized,
 {
-    fn visit_option_expression(&mut self, node: &'ast OptionExpression) {
+    fn visit_expr_option(&mut self, node: &'ast OptionExpression) {
         self.register_option(node);
-        visit::visit_option_expression(self, node);
+        visit::visit_expr_option(self, node);
     }
 
-    fn visit_binary_expr(&mut self, node: &'ast BinaryExpr) {
+    fn visit_expr_op_bin_regular(&mut self, node: &'ast BinaryExpr) {
         self.register_property(node);
-        visit::visit_binary_expr(self, node);
+        visit::visit_expr_op_bin_regular(self, node);
+    }
+
+    fn visit_expr_op_bin_member(&mut self, node: &'ast ExprOpBinMember) {
+        self.register_property(node);
+        visit::visit_expr_op_bin_member(self, node);
+    }
+
+    fn visit_expr_op_bin_index(&mut self, node: &'ast ExprOpBinIndex) {
+        self.register_property(node);
+        visit::visit_expr_op_bin_index(self, node);
+    }
+
+    fn visit_expr_quote(&mut self, node: &'ast QuoteExpression) {
+        if let Some(quote) = self.root.descendant_for_syntax(node) {
+            self.analysis.record_quoted_symbol_role(quote, self.source);
+        }
+        visit::visit_expr_quote(self, node);
     }
 
     fn visit_string_literal(&mut self, node: &'ast StringLiteral) {
@@ -2127,13 +2167,7 @@ fn single_symbol_assignment_target<'tree>(node: M2Node<'tree>) -> Option<&'tree 
 }
 
 pub fn symbol_node_text<'tree>(node: M2Node<'tree>) -> Option<&'tree str> {
-    let quoted = node.parent().is_some_and(|parent| {
-        parent.is::<QuoteExpression>()
-            && parent
-                .child_by_field_name("token")
-                .is_some_and(|token| token.id() == node.id())
-    });
-    (node.is::<Symbol>() || quoted).then(|| node.text())
+    node.is_symbol_like().then(|| node.text())
 }
 
 fn is_expression_symbol(node: M2Node<'_>) -> bool {
@@ -2342,10 +2376,7 @@ fn method_installation_assignment_for_callable_node<'tree>(
 }
 
 /// The first direct clause of `node` of the given kind (`then`/`else`/`do`/…).
-fn clause_of<'tree, Syntax>(node: M2Node<'tree>) -> Option<M2Node<'tree>>
-where
-    Syntax: Reconstruct<m2_syn::treesitter::TreeSitterNode<'tree, 'tree>>,
-{
+fn clause_of<'tree, Syntax: M2SyntaxKind>(node: M2Node<'tree>) -> Option<M2Node<'tree>> {
     node.named_children().find(|child| child.is::<Syntax>())
 }
 

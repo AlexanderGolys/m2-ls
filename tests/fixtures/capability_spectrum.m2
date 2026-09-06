@@ -1,8 +1,8 @@
--- `localValue` is reused by the function below.
 toJSON := beforeImportValue -> beforeImportValue
 beforeImport = toJSON 1
 needsPackage "JSON"
 packageResult = toJSON 1
+-- [[localValue]] is reused by the function below.
 localValue=1
 double = value -> value + localValue
 result=double(2)

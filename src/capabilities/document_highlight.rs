@@ -1,6 +1,6 @@
 //! In-document highlighting for resolved symbols and compound-statement words.
 
-use m2_syn::{ForLoop, LambdaExpression, WhileLoop};
+use m2_syn::nodes::{ExprFor as ForLoop, ExprLambda as LambdaExpression, ExprWhile as WhileLoop};
 
 use crate::capabilities::navigation::{reference_ranges_resolved, unbound_reference_ranges};
 use crate::document::DocumentSnapshot;
@@ -463,21 +463,21 @@ mod tests {
     }
 
     #[test]
-    fn highlights_backtick_documentation_mentions_with_code_references() {
-        let text = "x := 1\n-- use `x`\nx\n";
-        assert_eq!(highlighted_words(text, 1, 8), vec!["x", "x", "x"],);
+    fn highlights_wikilink_documentation_mentions_with_code_references() {
+        let text = "x := 1\n-- use [[x]]\ny := x\n";
+        assert_eq!(highlighted_words(text, 1, 9), vec!["x", "x", "x"],);
     }
 
     #[test]
-    fn highlights_backtick_mentions_of_later_bindings() {
-        let text = "-- use `x`\nx := 1\nx\n";
-        assert_eq!(highlighted_words(text, 0, 8), vec!["x", "x", "x"]);
+    fn highlights_wikilink_mentions_of_later_bindings() {
+        let text = "-- use [[x]]\nx := 1\nx\n";
+        assert_eq!(highlighted_words(text, 0, 9), vec!["x", "x", "x"]);
     }
 
     #[test]
     fn highlights_unshadowed_builtin_names_but_excludes_keywords() {
         let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
-        let text = "ideal I\n-- call `ideal` again\nideal J\nif true then ideal K\n";
+        let text = "ideal I\n-- call [[ideal]] again\nx := ideal J\nif true then ideal K\n";
         let source_document = document(text);
         let words = document_highlights(&source_document, pos!(0, 1), &builtins)
             .expect("ordinary builtin should resolve")
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn highlights_repeated_unbound_names_without_an_index_record() {
-        let text = "futureName x\n-- see `futureName`\nfutureName y\n";
+        let text = "futureName x\n-- see [[futureName]]\ny := futureName\n";
         let document = document(text);
         let highlights = document_highlights(&document, pos!(0, 1), &ObjectRegistry::default())
             .expect("an unresolved non-keyword name is still highlightable");
@@ -527,7 +527,7 @@ mod tests {
                 .into_iter()
                 .map(|highlight| highlight.range.start)
                 .collect::<Vec<_>>(),
-            vec![pos!(), pos!(1, 8), pos!(2, 0),]
+            vec![pos!(), pos!(1, 9), pos!(2, 5)]
         );
     }
 

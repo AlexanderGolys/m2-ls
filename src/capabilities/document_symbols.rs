@@ -224,7 +224,7 @@ mod tests {
     use crate::document::DocumentSnapshot;
     use crate::node_metadata::{M2Node, M2Parser};
     use crate::object_registry::ObjectRegistry;
-    use m2_syn::{LambdaExpression, Symbol};
+    use m2_syn::nodes::{ExprLambda as LambdaExpression, Symbol};
     use tower_lsp::lsp_types::Range as TextRange;
 
     fn document(text: &str, builtins: &ObjectRegistry) -> DocumentSnapshot {

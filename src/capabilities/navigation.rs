@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use m2_syn::Symbol;
+use m2_syn::nodes::Symbol;
 use tower_lsp::lsp_types::request::{
     GotoDeclarationResponse, GotoImplementationResponse, GotoTypeDefinitionResponse,
 };
@@ -743,23 +743,23 @@ mod tests {
     }
 
     #[test]
-    fn backtick_documentation_mentions_are_scope_aware_references() {
-        let text = "x := 1\n-- use `x`\nx\n";
+    fn wikilink_documentation_mentions_are_scope_aware_references() {
+        let text = "x := 1\n-- use [[x]]\ny := x\n";
         let document = document(text);
-        let ranges = collect_reference_ranges(&document, pos!(1, 8), true);
+        let ranges = collect_reference_ranges(&document, pos!(1, 9), true);
 
         assert_eq!(
             ranges,
             vec![
                 TextRange::new(pos!(), pos!(0, 1)),
-                TextRange::new(pos!(1, 8), pos!(1, 9)),
-                TextRange::new(pos!(2, 0), pos!(2, 1)),
+                TextRange::new(pos!(1, 9), pos!(1, 10)),
+                TextRange::new(pos!(2, 5), pos!(2, 6)),
             ]
         );
         assert!(matches!(
             reference_target(
                 &document,
-                pos!(1, 8),
+                pos!(1, 9),
                 &WorkspaceIndex::default()
             ),
             Some(ReferenceTarget::Global(name)) if name == "x"
@@ -767,15 +767,15 @@ mod tests {
     }
 
     #[test]
-    fn backtick_documentation_mentions_resolve_later_bindings() {
-        let text = "-- use `x`\nx := 1\nx\n";
+    fn wikilink_documentation_mentions_resolve_later_bindings() {
+        let text = "-- use [[x]]\nx := 1\nx\n";
         let document = document(text);
-        let ranges = collect_reference_ranges(&document, pos!(0, 8), true);
+        let ranges = collect_reference_ranges(&document, pos!(0, 9), true);
 
         assert_eq!(
             ranges,
             vec![
-                TextRange::new(pos!(0, 8), pos!(0, 9)),
+                TextRange::new(pos!(0, 9), pos!(0, 10)),
                 TextRange::new(pos!(1, 0), pos!(1, 1)),
                 TextRange::new(pos!(2, 0), pos!(2, 1)),
             ]
@@ -783,7 +783,7 @@ mod tests {
         assert!(matches!(
             reference_target(
                 &document,
-                pos!(0, 8),
+                pos!(0, 9),
                 &WorkspaceIndex::default()
             ),
             Some(ReferenceTarget::Global(name)) if name == "x"
@@ -792,7 +792,7 @@ mod tests {
 
     #[test]
     fn goto_definition_does_not_jump_forward_from_documentation() {
-        let text = "-- use `x`\nx := 1\n";
+        let text = "-- use [[x]]\nx := 1\n";
         let document = document(text);
         let index =
             crate::object_registry::ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
@@ -803,7 +803,7 @@ mod tests {
             goto_definition_response(
                 &document,
                 &uri,
-                pos!(0, 8),
+                pos!(0, 9),
                 &scoped,
                 &SourceResolver::new(Vec::new()),
                 &WorkspaceIndex::default(),
@@ -813,8 +813,8 @@ mod tests {
     }
 
     #[test]
-    fn rename_from_code_updates_backtick_documentation_mentions() {
-        let text = "f := x -> (\n-- return `x`\nx + x)\n";
+    fn rename_from_code_updates_wikilink_documentation_mentions() {
+        let text = "f := x -> (\n-- Alias docs: [[x]]\ny := x;\ny + x)\n";
         let document = document(text);
         let uri = Url::parse("file:///t.m2").expect("uri");
         let edits = rename_edits(&document, &uri, pos!(0, 5), "value")
@@ -829,9 +829,9 @@ mod tests {
             edits,
             vec![
                 TextRange::new(pos!(0, 5), pos!(0, 6)),
-                TextRange::new(pos!(1, 11), pos!(1, 12)),
-                TextRange::new(pos!(2, 0), pos!(2, 1)),
-                TextRange::new(pos!(2, 4), pos!(2, 5)),
+                TextRange::new(pos!(1, 17), pos!(1, 18)),
+                TextRange::new(pos!(2, 5), pos!(2, 6)),
+                TextRange::new(pos!(3, 4), pos!(3, 5)),
             ]
         );
     }

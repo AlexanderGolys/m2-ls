@@ -3,13 +3,17 @@
 use std::cell::RefCell;
 use std::ops::Deref;
 
-use m2_syn::visit::{self, Visit};
-use m2_syn::{
-    AdjacentExpr, AngleBarList, Array, Assignment, EvaluatedAssignment, FloatLiteral, ForLoop,
-    IfStatement, Installation, IntegerLiteral, LambdaExpression, List, LoopBody, NewStatement,
-    OperatorAssignment, OptionExpression, ParallelAssignment, QuoteExpression, RawStringLiteral,
-    Sequence, SimpleBinding, StringLiteral, Token, TryStatement, WhileLoop,
+use m2_syn::nodes::{
+    AngleBarList, Array, ExprAssign as Assignment, ExprAssignEvaluated as EvaluatedAssignment,
+    ExprAssignInstall as Installation, ExprAssignOp as OperatorAssignment,
+    ExprAssignParallel as ParallelAssignment, ExprAssignSimple as SimpleBinding,
+    ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
+    ExprNew as NewStatement, ExprOpBinAdj as AdjacentExpr, ExprOption as OptionExpression,
+    ExprQuote as QuoteExpression, ExprTry as TryStatement, ExprWhile as WhileLoop, FloatLiteral,
+    IntegerLiteral, List, LoopBody, RawStringLiteral, Sequence, StringLiteral,
 };
+use m2_syn::visit::{self, Visit};
+use m2_syn::Token;
 
 use super::*;
 use crate::node_metadata::SyntaxNodeId;
@@ -330,7 +334,7 @@ where
     Source: SourceNavigation + ?Sized,
     Knowledge: PositionedTypeKnowledge + ?Sized,
 {
-    fn visit_assignment(&mut self, node: &'ast Assignment) {
+    fn visit_expr_assign(&mut self, node: &'ast Assignment) {
         if let Some(assignment) = self.root.descendant_for_syntax(node) {
             let scope_idx = self
                 .analysis
@@ -344,39 +348,36 @@ where
                 self.knowledge_provider,
             );
         }
-        visit::visit_assignment(self, node);
+        visit::visit_expr_assign(self, node);
     }
 
-    fn visit_lambda_expression(&mut self, node: &'ast LambdaExpression) {
+    fn visit_expr_lambda(&mut self, node: &'ast LambdaExpression) {
         if let Some(lambda) = self.root.descendant_for_syntax(node) {
             self.analysis.enrich_lambda_node(lambda, self.source);
         }
-        visit::visit_lambda_expression(self, node);
+        visit::visit_expr_lambda(self, node);
     }
 
-    fn visit_adjacent_expr(&mut self, node: &'ast AdjacentExpr) {
+    fn visit_expr_op_bin_adj(&mut self, node: &'ast AdjacentExpr) {
         if let Some(call) = self.root.descendant_for_syntax(node) {
             self.record_install_method_call(call);
         }
-        visit::visit_adjacent_expr(self, node);
+        visit::visit_expr_op_bin_adj(self, node);
     }
 }
 
 fn assignment_value(node: &Assignment) -> &Expr {
     match node {
-        Assignment::SimpleBinding(SimpleBinding::GlobalBinding(node)) => &node.value,
-        Assignment::SimpleBinding(SimpleBinding::LocalBinding(node)) => &node.value,
-        Assignment::ParallelAssignment(ParallelAssignment::GlobalParallelAssignment(node)) => {
-            &node.value
-        }
-        Assignment::ParallelAssignment(ParallelAssignment::LocalParallelAssignment(node)) => {
-            &node.value
-        }
-        Assignment::EvaluatedAssignment(EvaluatedAssignment { value, .. }) => value,
-        Assignment::Installation(Installation::MethodInstallation(node)) => &node.function,
-        Assignment::Installation(Installation::OperatorInstallation(node)) => &node.function,
-        Assignment::Installation(Installation::NewInstallation(node)) => &node.function,
-        Assignment::OperatorAssignment(OperatorAssignment { value_expr, .. }) => value_expr,
+        Assignment::Simple(SimpleBinding::Global(node)) => &node.value,
+        Assignment::Simple(SimpleBinding::Local(node)) => &node.value,
+        Assignment::Parallel(ParallelAssignment::Global(node)) => &node.value,
+        Assignment::Parallel(ParallelAssignment::Local(node)) => &node.value,
+        Assignment::Evaluated(EvaluatedAssignment { value, .. }) => value,
+        Assignment::Augmented(node) => &node.value,
+        Assignment::Install(Installation::Method(node)) => &node.function,
+        Assignment::Install(Installation::Op(node)) => &node.function,
+        Assignment::Install(Installation::New(node)) => &node.function,
+        Assignment::Op(OperatorAssignment { value_expr, .. }) => value_expr,
     }
 }
 
@@ -595,7 +596,7 @@ fn type_substitution(node: M2Node<'_>) -> TypeSubstitution<'_> {
         node if node.is::<IntegerLiteral>() => exact("ZZ"),
         node if node.is::<FloatLiteral>() => exact("RR"),
         node if node.is::<QuoteExpression>() => exact("Symbol"),
-        node if node.is::<m2_syn::Symbol>() => Symbol(node),
+        node if node.is::<m2_syn::nodes::Symbol>() => Symbol(node),
         node if node.is_assignment() => node
             .child_by_field_name("right")
             .map(Follow)
@@ -610,7 +611,7 @@ fn type_substitution(node: M2Node<'_>) -> TypeSubstitution<'_> {
         }
         node if node.is::<NewStatement>() => node
             .child_by_field_name("type")
-            .filter(|type_node| type_node.is::<m2_syn::Symbol>())
+            .filter(|type_node| type_node.is::<m2_syn::nodes::Symbol>())
             .map(|type_node| Exact(ObjectName::new(type_node.text())))
             .unwrap_or(Unknown),
         node if node.is::<IfStatement>() => {

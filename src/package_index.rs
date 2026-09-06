@@ -3,7 +3,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-use m2_syn::{Sequence, SourceFile, Symbol};
+use m2_syn::nodes::{Sequence, SourceFile, Symbol};
 use tower_lsp::lsp_types::{Location, Position, Range as TextRange, Url};
 
 #[cfg(test)]

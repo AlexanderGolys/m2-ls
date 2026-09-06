@@ -2,14 +2,16 @@
 
 use std::{collections::HashSet, iter};
 
-use m2_syn::treesitter::TreeSitterNode;
-use m2_syn::visit::{self, Visit};
-use m2_syn::{
-    AngleBarList, Array, Cell, Collection, ElseClause, Empty, Expr, ExprPack, FloatLiteral,
-    ForLoop, IfStatement, IntegerLiteral, List, LoopBody, NewStatement, QuoteExpression,
-    RawStringLiteral, Reconstruct, Sequence, SourceFile, Spanned, Statement, StringLiteral, Symbol,
-    ThenClause, Token, TryStatement, WhileLoop,
+use m2_syn::nodes::{
+    AngleBarList, Array, Cell, ElseClause, Empty, Expr, ExprCollection as Collection,
+    ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
+    ExprNew as NewStatement, ExprOption as OptionExpression, ExprPack,
+    ExprQuote as QuoteExpression, ExprTry as TryStatement, ExprWhile as WhileLoop, FloatLiteral,
+    IntegerLiteral, List, LoopBody, RawStringLiteral, Sequence, SourceFile, Statement,
+    StringLiteral, Symbol, ThenClause,
 };
+use m2_syn::visit::{self, Visit};
+use m2_syn::{Spanned, Token};
 use tree_sitter::{Node, Point};
 
 /// Snapshot-local identity of one Tree-sitter syntax node.
@@ -21,6 +23,125 @@ pub struct M2Node<'tree> {
     node: Node<'tree>,
     source: &'tree str,
 }
+
+pub trait M2SyntaxKind {
+    fn matches(node: M2Node<'_>) -> bool;
+}
+
+/// Every kind below names a *named* grammar node. Two of them — `symbol` and
+/// `list` — are also the spelling of an anonymous keyword token (`symbol x`,
+/// `for i to n list …`), and tree-sitter reports an anonymous token's kind as
+/// its literal text. Matching on the kind string alone would therefore read
+/// those keywords as an identifier or a list expression, so namedness is part
+/// of the match rather than something each caller has to remember.
+macro_rules! syntax_kinds {
+    ($($syntax:ty => $kind:literal),* $(,)?) => {
+        $(
+            impl M2SyntaxKind for $syntax {
+                fn matches(node: M2Node<'_>) -> bool {
+                    node.node.is_named() && node.raw_kind() == $kind
+                }
+            }
+        )*
+    };
+}
+
+syntax_kinds!(
+    AngleBarList => "angle_bar_list",
+    Array => "array",
+    ElseClause => "else_clause",
+    ForLoop => "for_loop",
+    IfStatement => "if_statement",
+    LambdaExpression => "lambda_expression",
+    List => "list",
+    LoopBody => "loop_body",
+    NewStatement => "new_statement",
+    OptionExpression => "option",
+    QuoteExpression => "quote_expression",
+    RawStringLiteral => "raw_string_literal",
+    Sequence => "sequence",
+    SourceFile => "source_file",
+    StringLiteral => "string_literal",
+    Symbol => "symbol",
+    ThenClause => "then_clause",
+    TryStatement => "try_statement",
+    WhileLoop => "while_loop",
+);
+
+impl M2SyntaxKind for FloatLiteral {
+    fn matches(node: M2Node<'_>) -> bool {
+        node.raw_kind() == "float_literal"
+            || (node.raw_kind() == "integer_literal" && node.text().contains('p'))
+    }
+}
+
+impl M2SyntaxKind for IntegerLiteral {
+    fn matches(node: M2Node<'_>) -> bool {
+        node.raw_kind() == "integer_literal" && !node.text().contains('p')
+    }
+}
+
+macro_rules! token_kinds {
+    ($([$($token:tt)*]),* $(,)?) => {
+        $(
+            impl M2SyntaxKind for Token![$($token)*] {
+                fn matches(node: M2Node<'_>) -> bool {
+                    !node.node.is_named()
+                        && node.text() == <Self as m2_syn::Token>::SPELLING
+                }
+            }
+        )*
+    };
+}
+
+token_kinds!(
+    [,], [:=], [;], [TEST], [break], [breakpoint], [catch], [continue], [do], [elapsedTime],
+    [elapsedTiming], [else], [finish], [for], [from], [global], [if], [in], [list], [local], [new],
+    [of], [profile], [return], [shield], [step], [symbol], [then], [threadLocal], [threadVariable],
+    [throw], [time], [timing], [to], [try], [when], [while],
+);
+
+/// Declares the token groups the rest of the crate asks about. A `Token!` type
+/// matches anonymous leaves only, so membership is the whole question and no
+/// group restates the namedness test.
+macro_rules! token_groups {
+    ($(
+        $(#[$group_doc:meta])*
+        $group:ident => [[$($first:tt)*] $(, [$($rest:tt)*])* $(,)?]
+    ),* $(,)?) => {
+        impl M2Node<'_> {
+            $(
+                $(#[$group_doc])*
+                pub fn $group(&self) -> bool {
+                    self.is::<Token![$($first)*]>()
+                        $(|| self.is::<Token![$($rest)*]>())*
+                }
+            )*
+        }
+    };
+}
+
+token_groups!(
+    is_comma => [[,]],
+
+    is_semicolon => [[;]],
+
+    /// An anonymous keyword token (`if`, `then`, `for`, `return`, `time`, ...) —
+    /// the bare keyword leaves, not the named clause/statement nodes that contain
+    /// them. Used for keyword highlighting.
+    is_keyword_token => [
+        [if], [then], [else], [from], [to], [when], [do], [in], [of], [list], [for], [while],
+        [break], [continue], [return], [try], [catch], [throw], [time], [timing], [elapsedTime],
+        [elapsedTiming], [profile], [shield], [TEST], [breakpoint], [finish], [new], [step],
+    ],
+
+    /// An anonymous binding-modifier keyword token (`global`, `local`, `symbol`,
+    /// `threadVariable`, `threadLocal`).
+    is_modifier_token => [[global], [local], [symbol], [threadVariable], [threadLocal]],
+
+    /// The `then`/`else` keyword tokens, which open the clauses an `if` indents.
+    is_then_or_else_keyword => [[then], [else]],
+);
 
 pub fn visit_source_nodes<'tree>(
     root: M2Node<'tree>,
@@ -82,9 +203,9 @@ where
         visit::visit_expr(self, node);
     }
 
-    fn visit_collection(&mut self, node: &'ast Collection) {
+    fn visit_expr_collection(&mut self, node: &'ast Collection) {
         self.record(node);
-        visit::visit_collection(self, node);
+        visit::visit_expr_collection(self, node);
     }
 
     fn visit_symbol(&mut self, node: &'ast Symbol) {
@@ -122,11 +243,8 @@ impl<'tree> M2Node<'tree> {
         &self.source[self.node.start_byte()..self.node.end_byte()]
     }
 
-    pub fn is<T>(&self) -> bool
-    where
-        T: Reconstruct<TreeSitterNode<'tree, 'tree>>,
-    {
-        T::matches(&TreeSitterNode::new(self.node, self.source.as_bytes()))
+    pub fn is<T: M2SyntaxKind>(&self) -> bool {
+        T::matches(*self)
     }
 
     pub fn is_symbol_like(&self) -> bool {
@@ -197,12 +315,49 @@ impl<'tree> M2Node<'tree> {
     }
 
     pub fn control_transfer_value(&self) -> Option<M2Node<'tree>> {
-        self.named_children().next().or_else(|| {
-            let parent = self.parent()?;
-            let left = parent.child_by_field_name("left")?;
-            (parent.is_space_application() && left.id() == self.id())
-                .then(|| parent.child_by_field_name("right"))
-                .flatten()
+        self.named_children()
+            .next()
+            .or_else(|| {
+                let parent = self.parent()?;
+                let left = parent.child_by_field_name("left")?;
+                (parent.is_space_application() && left.id() == self.id())
+                    .then(|| parent.child_by_field_name("right"))
+                    .flatten()
+            })
+            .or_else(|| self.commented_control_transfer_value())
+    }
+
+    fn commented_control_transfer_value(&self) -> Option<M2Node<'tree>> {
+        let error = self.parent().filter(M2Node::is_error)?;
+        if error.start_byte() != self.start_byte() || error.end_byte() != self.end_byte() {
+            return None;
+        }
+
+        let comment = error.next_named_sibling()?;
+        if !comment.is_line_comment() {
+            return None;
+        }
+
+        let mut sibling = comment.next_named_sibling()?;
+        while sibling.is_comment() {
+            sibling = sibling.next_named_sibling()?;
+        }
+        let statement = sibling.is_muted_statement().then_some(sibling)?;
+        let value = statement
+            .named_children()
+            .find(|child| !child.is_comment())?;
+        (value.start_position().row > self.end_position().row).then_some(value)
+    }
+
+    pub fn is_recoverable_control_transfer_error(&self) -> bool {
+        if !self.is_error() {
+            return false;
+        }
+        let mut children = self.named_children();
+        children.next().is_some_and(|transfer| {
+            transfer.is_control_transfer()
+                && children.next().is_none()
+                && transfer.commented_control_transfer_value().is_some()
         })
     }
 
@@ -300,14 +455,6 @@ impl<'tree> M2Node<'tree> {
         self.raw_kind()
     }
 
-    pub fn is_comma(&self) -> bool {
-        self.is::<Token![,]>()
-    }
-
-    pub fn is_semicolon(&self) -> bool {
-        self.is::<Token![;]>()
-    }
-
     /// The implicit-application operator: the `SPACE` token tree-sitter inserts
     /// between a function and its juxtaposed argument (`sin x`, `f(x)`).
     pub fn is_implicit_application(&self) -> bool {
@@ -327,58 +474,6 @@ impl<'tree> M2Node<'tree> {
     /// A closing collection delimiter: `)`, `}`, `]`, or `|>`.
     pub fn is_closing_delimiter(&self) -> bool {
         matches!(self.raw_kind(), ")" | "}" | "]" | "|>")
-    }
-
-    /// An anonymous keyword token (`if`, `then`, `for`, `return`, `time`, ...) —
-    /// the bare keyword leaves, not the named clause/statement nodes that contain
-    /// them. Used for keyword highlighting.
-    pub fn is_keyword_token(&self) -> bool {
-        !self.node.is_named()
-            && (self.is::<Token![if]>()
-                || self.is::<Token![then]>()
-                || self.is::<Token![else]>()
-                || self.is::<Token![from]>()
-                || self.is::<Token![to]>()
-                || self.is::<Token![when]>()
-                || self.is::<Token![do]>()
-                || self.is::<Token![in]>()
-                || self.is::<Token![of]>()
-                || self.is::<Token![list]>()
-                || self.is::<Token![for]>()
-                || self.is::<Token![while]>()
-                || self.is::<Token![break]>()
-                || self.is::<Token![continue]>()
-                || self.is::<Token![return]>()
-                || self.is::<Token![try]>()
-                || self.is::<Token![catch]>()
-                || self.is::<Token![throw]>()
-                || self.is::<Token![time]>()
-                || self.is::<Token![timing]>()
-                || self.is::<Token![elapsedTime]>()
-                || self.is::<Token![elapsedTiming]>()
-                || self.is::<Token![profile]>()
-                || self.is::<Token![shield]>()
-                || self.is::<Token![TEST]>()
-                || self.is::<Token![breakpoint]>()
-                || self.is::<Token![finish]>()
-                || self.is::<Token![new]>()
-                || self.is::<Token![step]>())
-    }
-
-    /// An anonymous binding-modifier keyword token (`global`, `local`, `symbol`,
-    /// `threadVariable`, `threadLocal`).
-    pub fn is_modifier_token(&self) -> bool {
-        !self.node.is_named()
-            && (self.is::<Token![global]>()
-                || self.is::<Token![local]>()
-                || self.is::<Token![symbol]>()
-                || self.is::<Token![threadVariable]>()
-                || self.is::<Token![threadLocal]>())
-    }
-
-    /// The `then`/`else` keyword tokens, which open the clauses an `if` indents.
-    pub fn is_then_or_else_keyword(&self) -> bool {
-        !self.node.is_named() && (self.is::<Token![then]>() || self.is::<Token![else]>())
     }
 }
 
@@ -559,6 +654,12 @@ impl<'tree> M2Node<'tree> {
             .map(|node| M2Node::new(node, source))
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    fn next_named_sibling(&self) -> Option<M2Node<'tree>> {
+        self.node
+            .next_named_sibling()
+            .map(|node| M2Node::new(node, self.source))
     }
 
     /// Return the smallest descendant spanning the requested point range.

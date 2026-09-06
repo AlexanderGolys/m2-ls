@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use m2_syn::{NewStatement, OptionExpression, Symbol};
+use m2_syn::nodes::{ExprNew as NewStatement, ExprOption as OptionExpression, Symbol};
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionResponse, CompletionTextEdit,
     Position, Range as TextRange, SymbolKind, TextEdit,

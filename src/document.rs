@@ -2,12 +2,15 @@
 //! analysis for LSP requests.
 
 use crate::node_metadata::{M2Node, M2Parser, M2Tree};
-use m2_syn::{LambdaExpression, SourceFile};
+use m2_syn::nodes::{ExprLambda as LambdaExpression, SourceFile};
 use tower_lsp::lsp_types::{Position, Range as TextRange, TextDocumentContentChangeEvent};
 use tree_sitter::{InputEdit, Point};
 
 use crate::analysis::{Analysis, BindingView, FunctionInfo};
-use crate::documentation::{collect_documentation, DocumentationReference, DocumentationSnippet};
+use crate::documentation::{
+    collect_documentation, DocumentationBlock, DocumentationIndex, DocumentationReference,
+    DocumentationSnippet,
+};
 use crate::object_registry::ObjectRegistry;
 use crate::package_index::collect_imported_packages_in_tree;
 use crate::source::{DocumentSource, SourceNavigation};
@@ -21,8 +24,7 @@ pub struct DocumentSnapshot {
     syntax: Option<SourceFile>,
     analysis: Analysis,
     object_registry: ObjectRegistry,
-    documentation_snippets: Vec<DocumentationSnippet>,
-    documentation_references: Vec<DocumentationReference>,
+    documentation: DocumentationIndex,
 }
 
 impl SourceNavigation for DocumentSnapshot {
@@ -33,7 +35,7 @@ impl SourceNavigation for DocumentSnapshot {
 
 /// The common first step of every reference / highlight / rename request: the
 /// source occurrence under the cursor together with its scope-aware binding.
-/// The occurrence may be a CST symbol or a backtick mention in documentation.
+/// The occurrence may be a CST symbol or an indexed documentation link.
 /// Resolved once per request and threaded through downstream collection.
 #[derive(Debug, Clone, Copy)]
 pub struct TargetSymbol<'a> {
@@ -53,16 +55,14 @@ impl DocumentSnapshot {
             collect_imported_packages_in_tree(root, typed_ast.as_ref(), &source);
         let knowledge = knowledge_provider.with_imports(&imported_packages);
         let analysis = Analysis::new_with_knowledge(root, typed_ast.as_ref(), &source, &knowledge);
-        let (documentation_snippets, documentation_references) =
-            collect_documentation(&source, root);
+        let documentation = collect_documentation(&source, root, &analysis);
         Some(Self {
             source,
             tree,
             syntax: typed_ast,
             analysis,
             object_registry: knowledge,
-            documentation_snippets,
-            documentation_references,
+            documentation,
         })
     }
 
@@ -154,15 +154,34 @@ impl DocumentSnapshot {
     }
 
     pub fn documentation_references(&self) -> &[DocumentationReference] {
-        &self.documentation_references
+        self.documentation.references()
     }
 
     pub fn documentation_snippets(&self) -> &[DocumentationSnippet] {
-        &self.documentation_snippets
+        self.documentation.snippets()
+    }
+
+    pub fn documentation_blocks(&self) -> &[DocumentationBlock] {
+        self.documentation.blocks()
+    }
+
+    pub fn documentation_for_binding(
+        &self,
+        binding: BindingView<'_>,
+    ) -> Option<&DocumentationBlock> {
+        self.documentation.for_binding(binding)
+    }
+
+    pub fn documentation_for_installation(
+        &self,
+        installation: crate::analysis::MethodInstallationId,
+    ) -> Option<&DocumentationBlock> {
+        self.documentation.for_installation(installation)
     }
 
     pub fn documentation_reference_at(&self, position: Position) -> Option<DocumentationReference> {
-        self.documentation_references
+        self.documentation
+            .references()
             .iter()
             .find(|reference| reference.contains(position))
             .cloned()
@@ -288,14 +307,12 @@ impl DocumentSnapshot {
         let knowledge = knowledge_provider.with_imports(&imported_packages);
         let analysis =
             Analysis::new_with_knowledge(root, typed_ast.as_ref(), &self.source, &knowledge);
-        let (documentation_snippets, documentation_references) =
-            collect_documentation(&self.source, root);
+        let documentation = collect_documentation(&self.source, root, &analysis);
         self.tree = tree;
         self.syntax = typed_ast;
         self.analysis = analysis;
         self.object_registry = knowledge;
-        self.documentation_snippets = documentation_snippets;
-        self.documentation_references = documentation_references;
+        self.documentation = documentation;
         Some(())
     }
 }

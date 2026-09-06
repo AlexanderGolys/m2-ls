@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/m2-ls.svg)](https://crates.io/crates/m2-ls)
 [![GitHub release](https://img.shields.io/github/v/release/AlexanderGolys/m2-ls?sort=semver)](https://github.com/AlexanderGolys/m2-ls/releases/latest)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://www.rust-lang.org/)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://www.rust-lang.org/)
 
 A language server for [Macaulay2](https://macaulay2.com/), built on
 Tree-sitter syntax analysis plus a generated database of Macaulay2 builtin
@@ -32,7 +32,7 @@ Type inference remains conservative where runtime behavior cannot be proven.
 - Document highlights for bindings, control-flow keywords, delimiters, and
   other related syntax.
 - Prepare rename and rename for local and workspace symbols, including
-  backtick documentation references.
+  wiki-link documentation references.
 - Hierarchical document symbols for bindings, assignments, and functions.
 - Workspace symbol search across indexed Macaulay2 files.
 - Type hierarchy preparation, supertypes, and subtypes for source and indexed
@@ -52,7 +52,7 @@ Type inference remains conservative where runtime behavior cannot be proven.
 
 ## Requirements
 
-- Rust 1.85 or newer with Cargo.
+- Rust 1.88 or newer with Cargo.
 - A `tree-sitter-macaulay2` grammar (fetched as a pinned dependency by Cargo).
 - Macaulay2 itself is only needed at runtime by your editor; the builtin
   metadata is checked in.
@@ -141,7 +141,7 @@ optional, so a configuration may specify only the values it wants to change.
 | Setting | Type | Default | Effect |
 | --- | --- | --- | --- |
 | `diagnostics.enabled` | boolean | `true` | Enables or suppresses all published diagnostics. |
-| `diagnostics.disabled` | string array | `[]` | Suppresses selected rules by stable name or code, such as `unused-binding` or `E07`. |
+| `diagnostics.disabled` | string array | `[]` | Suppresses selected rules by stable name or code, such as `unused-binding` or `T02`. |
 | `formatting.indentWidth` | non-negative integer or `null` | client value | Overrides the formatting request's `tabSize`; `0` is treated as `1`, while `null` uses the client value. |
 | `formatting.useTabs` | boolean or `null` | client value | Overrides the inverse of the formatting request's `insertSpaces`; `null` uses the client value. |
 | `formatting.softLineWidth` | non-negative integer or `null` | `100` | Preferred width used to choose safe parsed line-break positions; `0` or `null` disables the soft target. |

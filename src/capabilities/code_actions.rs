@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 
-use m2_syn::{IfStatement, StringLiteral, Symbol, Token, TryStatement};
+use m2_syn::nodes::{ExprIf as IfStatement, ExprTry as TryStatement, StringLiteral, Symbol};
+use m2_syn::Token;
 use tower_lsp::lsp_types::Range as TextRange;
 use tower_lsp::lsp_types::*;
 
