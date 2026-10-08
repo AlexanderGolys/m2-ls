@@ -10,7 +10,6 @@ repository = "https://github.com/AlexanderGolys/m2-ls"
 readme = "README.md"
 keywords = ["macaulay2", "lsp", "language-server", "tree-sitter"]
 categories = ["development-tools"]
-exclude = [".agents/"]
 
 [dependencies]
 tower-lsp = "0.20"

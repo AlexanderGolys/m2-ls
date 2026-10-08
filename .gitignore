@@ -1,7 +1,8 @@
 **/target
 *.py
 
-# Agent-local tooling
+# Local tooling
+.agents/
 .claude/
 .opencode/
 opencode.json
@@ -14,10 +15,7 @@ docs/theme/treesitter.css
 example_m2_code/
 examples/document1/
 
-# Root-level .md files are agent scratch (AGENTS/BUGS/TODO/TOTEST/...),
-# except the real project docs:
+# Root-level .md files are local notes, except the project docs:
 /*.md
 !/README.md
-!/CONTRIBUTIONS.md
-!/CHANGELOG.md
-!/ANALYSIS.md
+!/CONTRIBUTING.md

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Build m2-ls"
-  short_description: "Build and validate the m2-ls server"
-  default_prompt: "Use $build-m2-ls to build and validate the Macaulay2 language server."
