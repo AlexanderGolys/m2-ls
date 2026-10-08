@@ -8,10 +8,7 @@
 opencode.json
 .codex/
 
-docs/book/
-docs/parsers/
-docs/queries/
-docs/theme/treesitter.css
+docs/
 example_m2_code/
 examples/document1/
 

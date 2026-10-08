@@ -23,7 +23,6 @@ src/
   settings.rs             initialization and live workspace configuration
   capabilities/           one module per LSP feature
   data/m2-index.jsonl     generated builtin corpus
-docs/                     the user guide (mdBook)
 ```
 
 Analysis runs first and records what it learns on syntax nodes; the modules in
@@ -60,5 +59,5 @@ without it.
 
 ## Documentation
 
-Keep `README.md` short and user-facing. Feature and configuration details belong
-in the user guide under `docs/src/`; see `docs/src/local-book.md` to preview it.
+Keep `README.md` short and user-facing: what the server does, how to install
+and connect it, and the settings it accepts.

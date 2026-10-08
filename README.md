@@ -35,8 +35,8 @@ sizeLabel = L -> (
   symbols apart; inlay hints show inferred types.
 - **Keep it tidy.** A configurable whole-document formatter, folding, and
   document and workspace symbols.
-- **Document code in comments.** `--` comments above a definition become hover
-  docs with `[[wiki links]]`, and `m2-ls docs` turns them into a browsable book.
+- **Document code in comments.** `--` comments directly above a definition
+  become its hover docs, and `[[name]]` inside them links to other definitions.
 
 When a result depends on what the code does at runtime, `m2-ls` shows less
 rather than guess.
@@ -71,15 +71,32 @@ project root, which is the scope of workspace search and cross-file rename. To
 let go-to-definition reach the installed Macaulay2 library source, set
 `M2_LSP_SOURCE_PATH` to its root(s).
 
-## Learn more
+## Configuration
 
-The [user guide](docs/src/index.md) covers each feature in depth:
+Every setting is optional and applies without a restart. Send them under the
+`m2-ls` section of your client's settings (or as `initializationOptions`):
 
-- [Setup](docs/src/setup.md)
-- [Configuration](docs/src/configuration.md): diagnostics, formatting, and inlay
-  hints, all changeable without a restart
-- [Documentation in comments](docs/src/features/documentation.md)
-- [Known limitations](docs/src/limitations.md)
+```json
+{
+  "m2-ls": {
+    "diagnostics": { "disabled": ["unused-binding", "T02"] },
+    "formatting": { "indentWidth": 4, "hardLineWidth": 100 },
+    "inlayHints": { "expressionTypes": true }
+  }
+}
+```
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `diagnostics.enabled` | `true` | Shows or hides all diagnostics. |
+| `diagnostics.disabled` | `[]` | Hides rules by name or code, e.g. `unused-binding` or `T02`. |
+| `formatting.indentWidth`, `formatting.useTabs` | editor's choice | Indentation used by the formatter. |
+| `formatting.softLineWidth`, `formatting.hardLineWidth` | `100` | Preferred and forced wrapping widths; `0` disables. |
+| `formatting.controlFlowLayout` | `multilineCompactElse` | `compact`, `multiline`, or `multilineCompactElse`. |
+| `formatting.compactFactorOperators` | `false` | `2*x` instead of `2 * x`. |
+| `formatting.breakAfterSemicolon` | `true` | Starts the next statement on a new line. |
+| `inlayHints.expressionTypes` | `false` | Adds argument, subexpression, and call-result types. |
+| `inlayHints.allKnownTypes` | `false` | Also shows types that are obvious from literals. |
 
 ## Contributing
 
