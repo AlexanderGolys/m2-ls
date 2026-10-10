@@ -1,7 +1,6 @@
 //! Diagnostic detection over completed document analysis.
 
 use super::*;
-use crate::diagnostic_declarations;
 use m2_syn::nodes::{
     ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
     ExprQuote as QuoteExpression, ExprTry as TryStatement, ExprWhile as WhileLoop, FloatLiteral,
@@ -9,104 +8,33 @@ use m2_syn::nodes::{
 };
 use m2_syn::Token;
 
-macro_rules! run_check_for_phase {
-    (node, node, $kind:ident, $check:ident, $context:ident) => {{
-        $context.kind = DiagnosticKind::$kind;
-        $context.$check();
-    }};
-    (installation, installation, $kind:ident, $check:ident, $context:ident) => {{
-        $context.kind = DiagnosticKind::$kind;
-        $context.$check();
-    }};
-    (codomain, codomain, $kind:ident, $check:ident, $context:ident) => {{
-        $context.kind = DiagnosticKind::$kind;
-        $context.$check();
-    }};
-    (document, document, $kind:ident, $check:ident, $context:ident) => {{
-        $context.kind = DiagnosticKind::$kind;
-        $context.$check();
-    }};
-    ($expected:ident, $actual:ident, $kind:ident, $check:ident, $context:ident) => {};
+/// Which operator a parallel assignment uses; it decides what an operator
+/// target means (an installation under `:=`, an assignment under `=`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParallelAssignment {
+    /// `(...) := ...`
+    Local,
+    /// `(...) = ...`
+    Global,
 }
 
-macro_rules! node_diagnostic_checks {
-    (diagnostics { $($phase:ident { $($kind:ident {
-        code: $code:literal, name: $name:literal, severity: $severity:ident,
-        check: $check:ident
-        $(, action: $action:ident)? $(,)?
-    }),+ $(,)? })+ } standalone_actions { $($standalone:ident: $standalone_action:ident),* $(,)? }) => {
-        |context: &mut NodeDiagnosticContext<'_, '_, '_, _, _>| {
-            $($(run_check_for_phase!(node, $phase, $kind, $check, context);)+)+
-        }
-    };
-}
-
-macro_rules! installation_diagnostic_checks {
-    (diagnostics { $($phase:ident { $($kind:ident {
-        code: $code:literal, name: $name:literal, severity: $severity:ident,
-        check: $check:ident
-        $(, action: $action:ident)? $(,)?
-    }),+ $(,)? })+ } standalone_actions { $($standalone:ident: $standalone_action:ident),* $(,)? }) => {
-        |context: &mut InstallationDiagnosticContext<'_, '_, _>| {
-            $($(run_check_for_phase!(installation, $phase, $kind, $check, context);)+)+
-        }
-    };
-}
-
-macro_rules! codomain_diagnostic_checks {
-    (diagnostics { $($phase:ident { $($kind:ident {
-        code: $code:literal, name: $name:literal, severity: $severity:ident,
-        check: $check:ident
-        $(, action: $action:ident)? $(,)?
-    }),+ $(,)? })+ } standalone_actions { $($standalone:ident: $standalone_action:ident),* $(,)? }) => {
-        |context: &mut CodomainDiagnosticContext<'_, '_, '_, _, _>| {
-            $($(run_check_for_phase!(codomain, $phase, $kind, $check, context);)+)+
-        }
-    };
-}
-
-macro_rules! document_diagnostic_checks {
-    (diagnostics { $($phase:ident { $($kind:ident {
-        code: $code:literal, name: $name:literal, severity: $severity:ident,
-        check: $check:ident
-        $(, action: $action:ident)? $(,)?
-    }),+ $(,)? })+ } standalone_actions { $($standalone:ident: $standalone_action:ident),* $(,)? }) => {
-        |context: &mut DocumentDiagnosticContext<'_, '_, '_, _>| {
-            $($(run_check_for_phase!(document, $phase, $kind, $check, context);)+)+
-        }
-    };
-}
-
+/// The inputs every per-node check reads: the node under inspection, the
+/// analysis that findings are recorded into, and the source and type knowledge
+/// positioned at that node.
 struct NodeDiagnosticContext<'analysis, 'tree, 'source, Source: ?Sized, Knowledge: ?Sized> {
     analysis: &'analysis mut Analysis,
-    kind: DiagnosticKind,
     node: M2Node<'tree>,
     source: &'source Source,
     knowledge: &'source Knowledge,
 }
 
+/// The inputs every per-installation check reads. Findings go to a separate
+/// list because the installation is borrowed from the analysis itself.
 struct InstallationDiagnosticContext<'analysis, 'source, Knowledge: ?Sized> {
     analysis: &'analysis Analysis,
-    kind: DiagnosticKind,
     installation: &'analysis MethodInstallation,
     knowledge: &'source Knowledge,
     diagnostics: &'analysis mut Vec<M2Diagnostic>,
-}
-
-struct CodomainDiagnosticContext<'analysis, 'tree, 'source, Source: ?Sized, Knowledge: ?Sized> {
-    analysis: &'analysis Analysis,
-    kind: DiagnosticKind,
-    node: M2Node<'tree>,
-    source: &'source Source,
-    knowledge: &'source Knowledge,
-    diagnostics: &'analysis mut Vec<M2Diagnostic>,
-}
-
-struct DocumentDiagnosticContext<'analysis, 'tree, 'source, Source: ?Sized> {
-    analysis: &'analysis mut Analysis,
-    kind: DiagnosticKind,
-    root: M2Node<'tree>,
-    source: &'source Source,
 }
 
 impl<
@@ -114,21 +42,45 @@ impl<
         Knowledge: TypeKnowledge + PositionedTypeKnowledge + ?Sized,
     > NodeDiagnosticContext<'_, '_, '_, Source, Knowledge>
 {
+    /// Runs every check that inspects a single syntax node.
+    fn run_checks(&mut self) {
+        self.syntax_error();
+        self.missing_node();
+        self.ambiguous_float_member_access();
+        self.multiple_assignment_targets();
+        self.colon_equal_part_assignment();
+        self.parallel_assignment();
+        self.option_key_convention();
+        self.redundant_control_parentheses();
+        self.prefer_coalescence();
+        self.simplifiable_expression();
+        self.ring_variable_naming();
+        self.install_needs_colon_equals();
+        self.protect_argument();
+        self.invalid_control_transfer();
+        self.explicit_install_required();
+        self.condition_type();
+    }
+
     fn syntax_error(&mut self) {
         if self.node.is_error() && !self.node.is_recoverable_control_transfer_error() {
-            self.analysis.diagnostics.push(self.kind.at(
-                self.source.remainder_of_line_range(self.node.start_byte()),
-                "Syntax error",
-            ));
+            self.analysis
+                .diagnostics
+                .push(DiagnosticKind::SyntaxError.at(
+                    self.source.remainder_of_line_range(self.node.start_byte()),
+                    "Syntax error",
+                ));
         }
     }
 
     fn missing_node(&mut self) {
         if self.node.is_missing() {
-            self.analysis.diagnostics.push(self.kind.at(
-                self.source.range_for_node(self.node),
-                format!("Missing: {}", self.node.syntax_label()),
-            ));
+            self.analysis
+                .diagnostics
+                .push(DiagnosticKind::MissingNode.at(
+                    self.source.range_for_node(self.node),
+                    format!("Missing: {}", self.node.syntax_label()),
+                ));
         }
     }
 
@@ -136,7 +88,7 @@ impl<
         let Some(replacement) = ambiguous_float_member_access_rewrite(self.node) else {
             return;
         };
-        self.analysis.diagnostics.push(self.kind.at(
+        self.analysis.diagnostics.push(DiagnosticKind::AmbiguousFloatMemberAccess.at(
             self.source.range_for_node(self.node),
             format!(
                 "This is parsed as application to a float literal; use `{replacement}` for member access"
@@ -155,18 +107,65 @@ impl<
             return;
         };
         let operator = operator.text();
-        if (matches_token::<Token![=]>(operator) || matches_token::<Token![:=]>(operator))
-            && self
-                .analysis
-                .installation_for(self.node, self.source)
-                .is_none()
-            && !multiple_assignment_targets_are_symbols(left)
+        let assignment = if matches_token::<Token![:=]>(operator) {
+            ParallelAssignment::Local
+        } else if matches_token::<Token![=]>(operator) {
+            ParallelAssignment::Global
+        } else {
+            return;
+        };
+        if self
+            .analysis
+            .installation_for(self.node, self.source)
+            .is_none()
+            && !self.parallel_targets_are_assignable(left, assignment)
         {
-            self.analysis.diagnostics.push(self.kind.at(
-                self.source.range_for_node(left),
-                format!("{operator} multiple assignment targets must be symbols"),
-            ));
+            self.analysis
+                .diagnostics
+                .push(DiagnosticKind::MultipleAssignmentTargets.at(
+                    self.source.range_for_node(left),
+                    format!(
+                        "{operator} parallel assignment targets must be symbols, installation \
+                         targets such as `T + T` or `f ZZ`, parts such as `x#i` (with `=`), or \
+                         nested lists"
+                    ),
+                ));
         }
+    }
+
+    /// Whether every target of a parallel assignment is one M2 assigns
+    /// component-wise: a symbol, a nested list of such targets, an `x <- y`
+    /// target (grammatical; whether it installs anything is the `<-` check's
+    /// concern), or an operator expression. Under `=` an operator expression is
+    /// an ordinary assignment to that expression (`x + 1 = v`, `M_(0,0) = v`),
+    /// always valid; under `:=` it must be an installation target, so a shape
+    /// that installs nothing or a literal operand (`x + 1`) is rejected.
+    fn parallel_targets_are_assignable(
+        &self,
+        targets: M2Node,
+        assignment: ParallelAssignment,
+    ) -> bool {
+        if !targets.is_collection_expression() {
+            return true;
+        }
+        targets.collection_elements().all(|target| {
+            target.is::<Symbol>()
+                || target.has_binary_operator::<Token![<-]>()
+                || (target.is_collection_expression()
+                    && self.parallel_targets_are_assignable(target, assignment))
+                || (target.is_operator_expression()
+                    && (assignment == ParallelAssignment::Global
+                        || self.is_installation_target(target)))
+        })
+    }
+
+    /// Whether `target` can receive a `:=` installation: it has an installation
+    /// shape and no operand is a literal, which can never be a type.
+    fn is_installation_target(&self, target: M2Node) -> bool {
+        let position = self.source.position_for_node(target);
+        self.analysis
+            .installation_shape(target, position, self.knowledge)
+            .is_some_and(|(_, operands)| operands.iter().all(|operand| !operand.is_literal()))
     }
 
     fn colon_equal_part_assignment(&mut self) {
@@ -177,43 +176,45 @@ impl<
             return;
         };
         if left.has_binary_operator::<Token![#]>() {
-            self.analysis.diagnostics.push(self.kind.at(
-                self.source.range_for_node(left),
-                "`:=` cannot assign to parts; use `=` for part assignment",
-            ));
+            self.analysis
+                .diagnostics
+                .push(DiagnosticKind::ColonEqualPartAssignment.at(
+                    self.source.range_for_node(left),
+                    "`:=` cannot assign to parts; use `=` for part assignment",
+                ));
         }
-    }
-
-    fn parallel_assignment_arity(&mut self) {
-        self.parallel_assignment();
     }
 
     fn option_key_convention(&mut self) {
         self.analysis
-            .diagnose_option_key_convention(self.kind, self.node, self.source);
+            .diagnose_option_key_convention(self.node, self.source);
     }
 
     fn redundant_control_parentheses(&mut self) {
         let Some(inner) = redundant_control_parentheses_inner(self.node) else {
             return;
         };
-        self.analysis.diagnostics.push(self.kind.at(
-            self.source.range_for_node(self.node),
-            format!(
-                "Parentheses around this control expression are redundant; use `{}`",
-                inner.text()
-            ),
-        ));
+        self.analysis
+            .diagnostics
+            .push(DiagnosticKind::RedundantControlParentheses.at(
+                self.source.range_for_node(self.node),
+                format!(
+                    "Parentheses around this control expression are redundant; use `{}`",
+                    inner.text()
+                ),
+            ));
     }
 
     fn prefer_coalescence(&mut self) {
         let Some(replacement) = simplification_of(self.node, coalescence_rewrite(self.node)) else {
             return;
         };
-        self.analysis.diagnostics.push(self.kind.at(
-            self.source.range_for_node(self.node),
-            format!("This conditional can be simplified to `{replacement}`"),
-        ));
+        self.analysis
+            .diagnostics
+            .push(DiagnosticKind::PreferCoalescence.at(
+                self.source.range_for_node(self.node),
+                format!("This conditional can be simplified to `{replacement}`"),
+            ));
     }
 
     fn simplifiable_expression(&mut self) {
@@ -232,10 +233,12 @@ impl<
             .into_iter()
             .any(|rewrite| simplification_of(self.node, rewrite).is_some());
         if can_simplify {
-            self.analysis.diagnostics.push(self.kind.at(
-                self.source.range_for_node(self.node),
-                "This expression can be simplified",
-            ));
+            self.analysis
+                .diagnostics
+                .push(DiagnosticKind::SimplifiableExpression.at(
+                    self.source.range_for_node(self.node),
+                    "This expression can be simplified",
+                ));
         }
     }
 
@@ -254,9 +257,10 @@ impl<
             let Some(message) = ring_variable_naming_message(variable.text()) else {
                 continue;
             };
-            self.analysis
-                .diagnostics
-                .push(self.kind.at(self.source.range_for_node(variable), message));
+            self.analysis.diagnostics.push(
+                DiagnosticKind::RingVariableNaming
+                    .at(self.source.range_for_node(variable), message),
+            );
         }
     }
 
@@ -268,28 +272,25 @@ impl<
         else {
             return;
         };
-        self.analysis.diagnostics.push(self.kind.at(
-            self.source.range_for_node(self.node),
-            format!(
-                "Installing a method on `{name}` must use `:=`, not `=`: M2 rejects this \
+        self.analysis
+            .diagnostics
+            .push(DiagnosticKind::InstallNeedsColonEquals.at(
+                self.source.range_for_node(self.node),
+                format!(
+                    "Installing a method on `{name}` must use `:=`, not `=`: M2 rejects this \
                  (\"no method for storing values of function {name}\"). Use `:=`."
-            ),
-        ));
+                ),
+            ));
     }
 
-    fn protect_assigned_symbol(&mut self) {
+    fn protect_argument(&mut self) {
         self.analysis
-            .diagnose_protect_argument(self.kind, self.node, self.source, self.knowledge);
-    }
-
-    fn protect_computed_symbol(&mut self) {
-        self.analysis
-            .diagnose_protect_argument(self.kind, self.node, self.source, self.knowledge);
+            .diagnose_protect_argument(self.node, self.source, self.knowledge);
     }
 
     fn invalid_control_transfer(&mut self) {
         self.analysis
-            .diagnose_control_transfer(self.kind, self.node, self.source, self.knowledge);
+            .diagnose_control_transfer(self.node, self.source, self.knowledge);
     }
 
     fn explicit_install_required(&mut self) {
@@ -314,20 +315,31 @@ impl<
                     .is_some()
         };
         if is_classical_left_arrow_install {
-            self.analysis.diagnostics.push(self.kind.at(
+            self.analysis.diagnostics.push(DiagnosticKind::ExplicitInstallRequired.at(
                 self.source.range_for_node(self.node),
                 "Methods for `<-` must be installed with `installMethod(symbol <-, Type, function)`",
             ));
         }
-    }
-
-    fn parallel_assignment_type(&mut self) {
-        self.parallel_assignment();
+        let parallel_targets = self
+            .node
+            .is_assignment()
+            .then(|| self.node.child_by_field_name("left"))
+            .flatten()
+            .filter(|left| left.is_collection_expression());
+        for target in parallel_targets.map(left_arrow_targets).unwrap_or_default() {
+            self.analysis
+                .diagnostics
+                .push(DiagnosticKind::ExplicitInstallRequired.at(
+                    self.source.range_for_node(target),
+                    "`x <- y` cannot be an assignment target: `<-` is overloaded only with \
+                 `installMethod(symbol <-, Type, function)`",
+                ));
+        }
     }
 
     fn condition_type(&mut self) {
         self.analysis
-            .diagnose_condition_type(self.kind, self.node, self.source, self.knowledge);
+            .diagnose_condition_type(self.node, self.source, self.knowledge);
     }
 
     fn parallel_assignment(&mut self) {
@@ -347,17 +359,19 @@ impl<
         ) else {
             return;
         };
-        self.analysis.validate_parallel_assignment(
-            self.kind,
-            left,
-            right,
-            self.source,
-            self.knowledge,
-        );
+        self.analysis
+            .validate_parallel_assignment(left, right, self.source, self.knowledge);
     }
 }
 
 impl<Knowledge: TypeKnowledge + ?Sized> InstallationDiagnosticContext<'_, '_, Knowledge> {
+    /// Runs every check that inspects one method installation.
+    fn run_checks(&mut self) {
+        self.install_no_effect();
+        self.operator_not_flexible();
+        self.install_arity();
+    }
+
     fn install_no_effect(&mut self) {
         let method = &self.installation.method;
         if let MethodHead::Operator(operator) = &method.head {
@@ -365,10 +379,19 @@ impl<Knowledge: TypeKnowledge + ?Sized> InstallationDiagnosticContext<'_, '_, Kn
                 && matches_token::<Token![??]>(operator.token.name())
                 && self.installation.expected_rhs_arity() == method.domain.len()
             {
-                self.diagnostics.push(self.kind.at(
+                self.diagnostics.push(DiagnosticKind::InstallNoEffect.at(
                     self.installation.span,
                     "Installing a binary `??` method has no effect: M2 records the method, but `x ?? y` never dispatches to it. Install the prefix form `?? X := x -> ...` to customize how `X` behaves on the left of `??`.",
                 ));
+                return;
+            }
+        }
+        if let MethodHead::Operator(operator) = &method.head {
+            if matches_token::<Token![<-]>(operator.token.name()) {
+                if let Some(message) = self.left_arrow_install_without_effect() {
+                    self.diagnostics
+                        .push(DiagnosticKind::InstallNoEffect.at(self.installation.span, message));
+                }
                 return;
             }
         }
@@ -383,13 +406,39 @@ impl<Knowledge: TypeKnowledge + ?Sized> InstallationDiagnosticContext<'_, '_, Kn
         {
             return;
         }
-        self.diagnostics.push(self.kind.at(
+        self.diagnostics.push(DiagnosticKind::InstallNoEffect.at(
             self.installation.span,
             format!(
                 "Installing a method on `{name}` has no effect: `{name}` is not a method \
                  function. Define it with `{name} = method()` to make method installations take effect."
             ),
         ));
+    }
+
+    /// Why a `<-` installation is never called, if it is not. M2 evaluates
+    /// `x <- v` by assigning a symbol `x` directly and otherwise looking up the
+    /// one-type method `symbol <-` in the class of `x`
+    /// (`assigntofun` in M2's `d/evaluate.d`), so only a single non-symbol type
+    /// can receive the call; `installMethod` still accepts any other domain.
+    fn left_arrow_install_without_effect(&self) -> Option<String> {
+        let domain = &self.installation.method.domain;
+        let [target] = domain.as_slice() else {
+            return Some(format!(
+                "Installing a `<-` method for {} types has no effect: M2 dispatches `x <- v` on the \
+                 class of `x` alone, so this method is stored but never called. Install it for one \
+                 type with `installMethod(symbol <-, Type, (x, v) -> ...)`.",
+                domain.len()
+            ));
+        };
+        self.knowledge
+            .has_type_role(target, TypeRole::Symbol)
+            .then(|| {
+                format!(
+                    "Installing a `<-` method on `{target}` has no effect: a symbol on the left of \
+                     `<-` is assigned directly, before any method lookup, so `<-` can only be \
+                     overloaded for types that are not symbols."
+                )
+            })
     }
 
     fn operator_not_flexible(&mut self) {
@@ -406,7 +455,7 @@ impl<Knowledge: TypeKnowledge + ?Sized> InstallationDiagnosticContext<'_, '_, Kn
         {
             return;
         }
-        self.diagnostics.push(self.kind.at(
+        self.diagnostics.push(DiagnosticKind::OperatorNotFlexible.at(
             self.installation.span,
             format!(
                 "Cannot install a method on the {} operator `{}`: it is not flexible, so M2 rejects the assignment.",
@@ -423,7 +472,7 @@ impl<Knowledge: TypeKnowledge + ?Sized> InstallationDiagnosticContext<'_, '_, Kn
         if actual == expected {
             return;
         }
-        self.diagnostics.push(self.kind.at(
+        self.diagnostics.push(DiagnosticKind::InstallArity.at(
             self.installation.span,
             format!(
                 "This method's function takes {actual} argument(s) but the installation expects \
@@ -433,59 +482,10 @@ impl<Knowledge: TypeKnowledge + ?Sized> InstallationDiagnosticContext<'_, '_, Kn
     }
 }
 
-impl<Source: SourceNavigation + ?Sized, Knowledge: TypeKnowledge + ?Sized>
-    CodomainDiagnosticContext<'_, '_, '_, Source, Knowledge>
-{
-    fn missing_codomain(&mut self) {
-        let Some(deduction) =
-            self.analysis
-                .method_codomain_deduction(self.node, self.source, self.knowledge)
-        else {
-            return;
-        };
-        if !matches!(deduction.edit, MethodCodomainEdit::Add(_)) {
-            return;
-        }
-        self.diagnostics.push(self.kind.at(
-            deduction.diagnostic_range,
-            format!(
-                "This method's lambda has the deducible codomain `{}`. Add the codomain annotation.",
-                deduction.codomain
-            ),
-        ));
-    }
-
-    fn codomain_mismatch(&mut self) {
-        let Some(deduction) =
-            self.analysis
-                .method_codomain_deduction(self.node, self.source, self.knowledge)
-        else {
-            return;
-        };
-        if !matches!(deduction.edit, MethodCodomainEdit::Replace) {
-            return;
-        }
-        let Some(annotated) = deduction.annotated_codomain else {
-            return;
-        };
-        self.diagnostics.push(self.kind.at(
-            deduction.diagnostic_range,
-            format!(
-                "This method's inferred result type `{}` is incompatible with its annotated codomain `{annotated}`.",
-                deduction.codomain
-            ),
-        ));
-    }
-}
-
-impl<Source: SourceNavigation + ?Sized> DocumentDiagnosticContext<'_, '_, '_, Source> {
-    fn unused_bindings(&mut self) {
-        self.analysis
-            .diagnose_unused_bindings(self.kind, self.root, self.source);
-    }
-}
-
 impl Analysis {
+    /// Runs every diagnostic check over the document and records the findings:
+    /// per-node checks in source order, then installation and codomain checks,
+    /// then the document-wide unused-binding check.
     pub fn collect_diagnostics(
         &mut self,
         root: M2Node,
@@ -498,14 +498,13 @@ impl Analysis {
         if installations_enabled {
             for installation in &self.registry.installations {
                 let knowledge = knowledge.at_position(installation.span.start);
-                let mut context = InstallationDiagnosticContext {
+                InstallationDiagnosticContext {
                     analysis: self,
-                    kind: DiagnosticKind::SyntaxError,
                     installation,
                     knowledge: &knowledge,
                     diagnostics: &mut installation_diagnostics,
-                };
-                diagnostic_declarations!(installation_diagnostic_checks)(&mut context);
+                }
+                .run_checks();
             }
         }
         visit_source_nodes(root, syntax, |node| {
@@ -520,15 +519,11 @@ impl Analysis {
             }
         });
         self.diagnostics.extend(installation_diagnostics);
-        let mut context = DocumentDiagnosticContext {
-            analysis: self,
-            kind: DiagnosticKind::SyntaxError,
-            root,
-            source,
-        };
-        diagnostic_declarations!(document_diagnostic_checks)(&mut context);
+        self.diagnose_unused_bindings(root, source);
     }
 
+    /// Reports a method installation whose codomain annotation inference can
+    /// supply, or whose annotation contradicts the inferred result type.
     fn diagnose_installation_codomain(
         &self,
         node: M2Node,
@@ -540,15 +535,26 @@ impl Analysis {
             return;
         }
         let knowledge = knowledge_provider.at_position(source.position_for_node(node));
-        let mut context = CodomainDiagnosticContext {
-            analysis: self,
-            kind: DiagnosticKind::SyntaxError,
-            node,
-            source,
-            knowledge: &knowledge,
-            diagnostics: out,
+        let Some(deduction) = self.method_codomain_deduction(node, source, &knowledge) else {
+            return;
         };
-        diagnostic_declarations!(codomain_diagnostic_checks)(&mut context);
+        let codomain = &deduction.codomain;
+        let finding = match (&deduction.edit, &deduction.annotated_codomain) {
+            (MethodCodomainEdit::Add(_), _) => DiagnosticKind::InstallCodomainMissing.at(
+                deduction.diagnostic_range,
+                format!(
+                    "This method's lambda has the deducible codomain `{codomain}`. Add the codomain annotation."
+                ),
+            ),
+            (MethodCodomainEdit::Replace, Some(annotated)) => DiagnosticKind::InstallCodomainMismatch.at(
+                deduction.diagnostic_range,
+                format!(
+                    "This method's inferred result type `{codomain}` is incompatible with its annotated codomain `{annotated}`."
+                ),
+            ),
+            (MethodCodomainEdit::Replace, None) => return,
+        };
+        out.push(finding);
     }
 
     fn illegal_equals_install_head(
@@ -593,19 +599,17 @@ impl Analysis {
         knowledge_provider: &(impl PositionedTypeKnowledge + ?Sized),
     ) {
         let knowledge = knowledge_provider.at_position(source.position_for_node(node));
-        let mut context = NodeDiagnosticContext {
+        NodeDiagnosticContext {
             analysis: self,
-            kind: DiagnosticKind::SyntaxError,
             node,
             source,
             knowledge: &knowledge,
-        };
-        diagnostic_declarations!(node_diagnostic_checks)(&mut context);
+        }
+        .run_checks();
     }
 
     fn diagnose_condition_type(
         &mut self,
-        kind: DiagnosticKind,
         node: M2Node,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -630,7 +634,7 @@ impl Analysis {
         {
             return;
         }
-        self.diagnostics.push(kind.at(
+        self.diagnostics.push(DiagnosticKind::ConditionType.at(
             source.range_for_node(condition),
             format!(
                 "{construct} condition must have type `Boolean`, but this expression has type `{}`",
@@ -641,7 +645,6 @@ impl Analysis {
 
     fn diagnose_control_transfer(
         &mut self,
-        kind: DiagnosticKind,
         node: M2Node,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -676,13 +679,13 @@ impl Analysis {
             "`continue` can only be used inside a `list` or `do` loop body"
         };
         let keyword = node.child(0).unwrap_or(node);
-        self.diagnostics
-            .push(kind.at(source.range_for_node(keyword), message));
+        self.diagnostics.push(
+            DiagnosticKind::InvalidControlTransfer.at(source.range_for_node(keyword), message),
+        );
     }
 
     fn diagnose_protect_argument(
         &mut self,
-        kind: DiagnosticKind,
         node: M2Node,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -710,41 +713,38 @@ impl Analysis {
             return;
         }
         if argument.is::<Symbol>() {
-            if kind == DiagnosticKind::ProtectAssignedSymbol {
-                let name = argument.text();
-                let position = source.position_for_node(argument);
-                let has_source_binding = self.binding_id_at(name, position).is_some();
-                let has_builtin_binding = knowledge.get_record(&ObjectName::new(name)).is_some();
-                if has_source_binding || has_builtin_binding {
-                    self.diagnostics.push(kind.at(
+            let name = argument.text();
+            let position = source.position_for_node(argument);
+            let has_source_binding = self.binding_id_at(name, position).is_some();
+            let has_builtin_binding = knowledge.get_record(&ObjectName::new(name)).is_some();
+            if has_source_binding || has_builtin_binding {
+                self.diagnostics
+                    .push(DiagnosticKind::ProtectAssignedSymbol.at(
                         source.range_for_node(argument),
                         format!(
                             "`protect {name}` evaluates the current value of `{name}`; \
-                             use `protect symbol {name}` to protect the symbol itself"
+                         use `protect symbol {name}` to protect the symbol itself"
                         ),
                     ));
-                }
             }
             return;
         }
-        if kind == DiagnosticKind::ProtectComputedSymbol {
-            let inferred = self.infer_expression_static_type(argument, source, knowledge);
-            if inferred
-                .as_ref()
-                .is_none_or(|type_id| type_id.name() == "Symbol")
-            {
-                self.diagnostics.push(kind.at(
+        let inferred = self.infer_expression_static_type(argument, source, knowledge);
+        if inferred
+            .as_ref()
+            .is_none_or(|type_id| type_id.name() == "Symbol")
+        {
+            self.diagnostics
+                .push(DiagnosticKind::ProtectComputedSymbol.at(
                     source.range_for_node(argument),
                     "`protect` evaluates this expression to choose a Symbol at runtime; \
-                     the protected symbol is not statically apparent",
+                 the protected symbol is not statically apparent",
                 ));
-            }
         }
     }
 
     fn diagnose_option_key_convention(
         &mut self,
-        kind: DiagnosticKind,
         node: M2Node,
         source: &(impl SourceNavigation + ?Sized),
     ) {
@@ -765,15 +765,15 @@ impl Analysis {
         if !starts_lowercase || !is_function_option_context(node) {
             return;
         }
-        self.diagnostics.push(kind.at(
-            source.range_for_node(key),
-            format!("Option key `{key_text}` should be capitalized by Macaulay2 convention"),
-        ));
+        self.diagnostics
+            .push(DiagnosticKind::OptionKeyConvention.at(
+                source.range_for_node(key),
+                format!("Option key `{key_text}` should be capitalized by Macaulay2 convention"),
+            ));
     }
 
     fn validate_parallel_assignment(
         &mut self,
-        kind: DiagnosticKind,
         left: M2Node,
         right: M2Node,
         source: &(impl SourceNavigation + ?Sized),
@@ -785,9 +785,6 @@ impl Analysis {
 
         let target_nodes = left.collection_elements().collect::<Vec<_>>();
         if !right.is_collection_expression() {
-            if kind != DiagnosticKind::ParallelAssignmentType {
-                return;
-            }
             if target_nodes.len() < 2 || !knowledge.is_available() {
                 return;
             }
@@ -819,7 +816,7 @@ impl Analysis {
             {
                 return;
             }
-            self.diagnostics.push(kind.at(
+            self.diagnostics.push(DiagnosticKind::ParallelAssignmentType.at(
                 source.range_for_node(right),
                 format!(
                     "parallel assignment binds {} targets, but the right-hand side has incompatible type `{}`",
@@ -832,27 +829,24 @@ impl Analysis {
 
         let value_nodes = right.collection_elements().collect::<Vec<_>>();
         if target_nodes.len() != value_nodes.len() {
-            if kind == DiagnosticKind::ParallelAssignmentArity {
-                self.diagnostics.push(kind.at(
-                    source.range_for_node(left),
-                    format!(
-                        "parallel assignment binds {} targets but the right-hand side lists {}; their lengths must match",
-                        target_nodes.len(),
-                        value_nodes.len()
-                    ),
-                ));
-            }
+            self.diagnostics.push(DiagnosticKind::ParallelAssignmentArity.at(
+                source.range_for_node(left),
+                format!(
+                    "parallel assignment binds {} targets but the right-hand side lists {}; their lengths must match",
+                    target_nodes.len(),
+                    value_nodes.len()
+                ),
+            ));
             return;
         }
 
         for (target, value) in target_nodes.iter().zip(value_nodes.iter()) {
-            self.validate_parallel_assignment(kind, *target, *value, source, knowledge);
+            self.validate_parallel_assignment(*target, *value, source, knowledge);
         }
     }
 
     fn diagnose_unused_bindings(
         &mut self,
-        kind: DiagnosticKind,
         root: M2Node,
         source: &(impl SourceNavigation + ?Sized),
     ) {
@@ -885,7 +879,10 @@ impl Analysis {
                 } else {
                     "variable"
                 };
-                Some(kind.at(binding.range, format!("Unused {noun} {name}")))
+                Some(
+                    DiagnosticKind::UnusedBinding
+                        .at(binding.range, format!("Unused {noun} {name}")),
+                )
             })
             .collect::<Vec<_>>();
         self.diagnostics.extend(diagnostics);
@@ -1240,15 +1237,19 @@ fn is_null_value(node: M2Node<'_>) -> bool {
     node.is::<Symbol>() && node.text() == "null"
 }
 
-fn multiple_assignment_targets_are_symbols(node: M2Node) -> bool {
-    if !node.is_collection_expression() {
-        return true;
-    }
-
-    node.collection_elements().all(|child| {
-        child.is::<Symbol>()
-            || (child.is_collection_expression() && multiple_assignment_targets_are_symbols(child))
-    })
+/// The `x <- y` targets of a parallel assignment, at any nesting depth.
+fn left_arrow_targets(node: M2Node<'_>) -> Vec<M2Node<'_>> {
+    node.collection_elements()
+        .flat_map(|target| {
+            if target.has_binary_operator::<Token![<-]>() {
+                vec![target]
+            } else if target.is_collection_expression() {
+                left_arrow_targets(target)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect()
 }
 
 pub fn ambiguous_float_member_access_rewrite(node: M2Node<'_>) -> Option<String> {
@@ -1336,6 +1337,88 @@ mod tests {
                 .iter()
                 .map(|diagnostic| &diagnostic.message)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// The installation and assignment-shape diagnostics a source reports,
+    /// against the real builtin catalog.
+    fn installation_findings(builtins: &ObjectRegistry, source: &str) -> Vec<DiagnosticKind> {
+        let document = DocumentSnapshot::from_text(source.to_string(), builtins)
+            .expect("fixture should parse");
+        document
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.kind)
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    DiagnosticKind::InstallNoEffect
+                        | DiagnosticKind::InstallArity
+                        | DiagnosticKind::MultipleAssignmentTargets
+                        | DiagnosticKind::ExplicitInstallRequired
+                )
+            })
+            .collect()
+    }
+
+    /// M2 evaluates `x <- v` by assigning a symbol `x` directly and otherwise
+    /// calling the one-type method `symbol <-` of `class x` with `(x, v)`
+    /// (`assigntofun` in M2's `d/evaluate.d`). `installMethod` accepts any other
+    /// `<-` domain, but nothing ever calls those methods.
+    #[test]
+    fn left_arrow_methods_take_effect_only_for_one_non_symbol_type() {
+        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let findings = |installation: &str| {
+            installation_findings(
+                &builtins,
+                &format!("T = new Type of BasicList\n{installation}\n"),
+            )
+        };
+
+        assert_eq!(findings("installMethod(symbol <-, T, (x, v) -> v)"), []);
+        assert_eq!(
+            findings("installMethod(symbol <-, T, T, (x, y, v) -> v)"),
+            [DiagnosticKind::InstallNoEffect],
+            "a two-type method is never dispatched, and its three parameters are the right arity"
+        );
+        assert_eq!(
+            findings("installMethod(symbol <-, Symbol, (x, v) -> v)"),
+            [DiagnosticKind::InstallNoEffect]
+        );
+        assert_eq!(
+            findings("installMethod(symbol <-, Keyword, (x, v) -> v)"),
+            [DiagnosticKind::InstallNoEffect],
+            "a keyword is a symbol, so it is assigned before any lookup too"
+        );
+    }
+
+    /// Parallel assignment assigns each target by its own kind: symbols bind,
+    /// parts store, and operator or method targets install, all in one statement.
+    #[test]
+    fn parallel_assignment_targets_are_assigned_component_wise() {
+        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let findings = |source: &str| installation_findings(&builtins, source);
+
+        assert_eq!(
+            findings(concat!(
+                "T = new Type of BasicList\n",
+                "g = method()\n",
+                "(a, T + T, g ZZ, (b, c)) := (1, (x, y) -> x, n -> n, (3, 4))\n",
+            )),
+            []
+        );
+        assert_eq!(
+            findings("L = new MutableList from {0, 0}\n(p, L#0, (q, w)) = (1, 2, (3, 4))\n"),
+            []
+        );
+        assert_eq!(
+            findings("(a, 1) = (2, 3)\n"),
+            [DiagnosticKind::MultipleAssignmentTargets]
+        );
+        assert_eq!(
+            findings("T = new Type of BasicList\n(T <- T, d) := ((x, y, v) -> v, 8)\n"),
+            [DiagnosticKind::ExplicitInstallRequired],
+            "a `<-` target is grammatical but never installs a callable method"
         );
     }
 

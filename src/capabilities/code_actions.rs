@@ -12,8 +12,7 @@ use crate::analysis::{
     if_condition_rewrite, if_null_branch_rewrite, redundant_control_parentheses_inner,
     try_statement_rewrite, MethodCodomainEdit,
 };
-use crate::diagnostic_declarations;
-use crate::diagnostic_registry::{diagnostic_has_kind, DiagnosticKind};
+use crate::diagnostic_registry::DiagnosticKind;
 use crate::document::DocumentSnapshot;
 use crate::node_metadata::{token_spelling, M2Node};
 use crate::source::SourceNavigation;
@@ -27,42 +26,35 @@ struct CodeActionContext<'tree, 'request> {
     diagnostics: &'request [Diagnostic],
 }
 
-macro_rules! push_declared_action {
-    ($kind:ident, $context:ident, $actions:ident) => {};
-    ($kind:ident, $context:ident, $actions:ident, $action:ident) => {
-        if let Some(action) = $action($context) {
-            $actions.push(CodeActionOrCommand::CodeAction(action));
-        }
-    };
-}
+/// Builds one code action for the request, or `None` when it does not apply
+/// at the cursor.
+type CodeActionProducer = fn(&CodeActionContext<'_, '_>) -> Option<CodeAction>;
 
-macro_rules! declared_code_actions {
-    (diagnostics { $($phase:ident { $($kind:ident {
-        code: $code:literal, name: $name:literal, severity: $severity:ident,
-        check: $check:ident
-        $(, action: $action:ident)? $(,)?
-    }),+ $(,)? })+ } standalone_actions {
-        $($standalone:ident: $standalone_action:ident),* $(,)?
-    }) => {
-        |context: &CodeActionContext<'_, '_>| {
-            let mut actions = CodeActionResponse::new();
-            $($(push_declared_action!($kind, context, actions $(, $action)?);)+)+
-            $(
-                if let Some(action) = $standalone_action(context) {
-                    actions.push(CodeActionOrCommand::CodeAction(action));
-                }
-            )*
-            actions
-        }
-    };
-}
+/// Every code action m2-ls offers, in the order clients list them: quick fixes
+/// for a diagnostic, ordered by diagnostic code, then refactors that apply
+/// without one.
+const CODE_ACTION_PRODUCERS: &[CodeActionProducer] = &[
+    ambiguous_float_member_access_action,
+    colon_equal_part_assignment_action,
+    option_key_convention_action,
+    redundant_control_parentheses_action,
+    coalescence_action,
+    install_needs_colon_equals_action,
+    protect_assigned_symbol_action,
+    method_codomain_action,
+    convert_to_raw_string_action,
+    conditional_null_action,
+    simplify_try_action,
+    simplify_if_condition_action,
+    flatten_else_if_action,
+];
 
 fn diagnostic_at(context: &CodeActionContext<'_, '_>, kind: DiagnosticKind) -> Option<Diagnostic> {
     context
         .diagnostics
         .iter()
         .find(|diagnostic| {
-            diagnostic_has_kind(diagnostic, kind)
+            DiagnosticKind::from_lsp(diagnostic) == Some(kind)
                 && diagnostic.range.contains_position(context.position)
         })
         .cloned()
@@ -261,10 +253,9 @@ fn enclosing_node_with_range<'tree>(
     None
 }
 
-/// The code actions offered at `position`: every action from the registry
-/// whose producer returns `Some`. The deepest CST node covering `position` is
-/// resolved a single time here and threaded through the registry, so the
-/// tree-sitter descent happens once per request instead of once per producer.
+/// The code actions offered at `position`: every producer in
+/// [`CODE_ACTION_PRODUCERS`] that applies there. The deepest CST node covering
+/// `position` is resolved once here and shared by all producers.
 pub fn available_code_actions(
     document: &DocumentSnapshot,
     uri: &Url,
@@ -279,7 +270,11 @@ pub fn available_code_actions(
         cursor,
         diagnostics,
     };
-    let actions = diagnostic_declarations!(declared_code_actions)(&context);
+    let actions: CodeActionResponse = CODE_ACTION_PRODUCERS
+        .iter()
+        .filter_map(|produce| produce(&context))
+        .map(CodeActionOrCommand::CodeAction)
+        .collect();
     (!actions.is_empty()).then_some(actions)
 }
 

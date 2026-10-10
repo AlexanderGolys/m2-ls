@@ -1284,6 +1284,13 @@ impl Analysis {
             .collect::<Option<Vec<_>>>()?;
         let head = self.install_method_head(head_node, domain.len(), knowledge)?;
         let expected_rhs_arity = match &head {
+            // `<-` methods are installed like `(op, =)` assignment methods: the
+            // assigned value is one extra parameter after the domain.
+            MethodHead::Operator(operator)
+                if matches_token::<Token![<-]>(operator.token.name()) =>
+            {
+                domain.len() + 1
+            }
             MethodHead::Operator(operator) if operator.form == OperatorForm::Binary => 2,
             MethodHead::Function(_) | MethodHead::Operator(_) => domain.len(),
         };

@@ -3,10 +3,11 @@ use std::sync::RwLock;
 
 use serde::{de::Error as _, Deserialize, Deserializer};
 use serde_json::Value;
+use tower_lsp::lsp_types::Diagnostic;
 
 use crate::capabilities::formatting::{ControlFlowLayout, FormattingConfiguration};
 use crate::capabilities::inlay_hints::InlayHintOptions;
-use crate::diagnostic_registry::{DiagnosticKind, DiagnosticPolicy};
+use crate::diagnostic_registry::DiagnosticKind;
 
 #[derive(Debug)]
 pub struct SettingsStore<T> {
@@ -96,9 +97,17 @@ impl Default for DiagnosticSettings {
     }
 }
 
-impl DiagnosticPolicy for DiagnosticSettings {
-    fn allows(&self, diagnostic: DiagnosticKind) -> bool {
-        self.enabled && !self.disabled.contains(&diagnostic)
+impl DiagnosticSettings {
+    /// Whether findings of `kind` are shown: diagnostics are enabled and the
+    /// user has not disabled this one.
+    pub fn allows(&self, kind: DiagnosticKind) -> bool {
+        self.enabled && !self.disabled.contains(&kind)
+    }
+
+    /// Whether a diagnostic a client sent back is shown. Diagnostics another
+    /// server published have no kind here and are always kept.
+    pub fn allows_lsp_diagnostic(&self, diagnostic: &Diagnostic) -> bool {
+        DiagnosticKind::from_lsp(diagnostic).is_none_or(|kind| self.allows(kind))
     }
 }
 

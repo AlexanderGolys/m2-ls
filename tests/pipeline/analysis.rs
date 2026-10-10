@@ -1208,7 +1208,10 @@ async fn assignment_and_protection_diagnostics_preserve_source_sensitive_analysi
         )
         .await;
     assert_eq!(diagnostic_lines(&session, "X05"), vec![0]);
-    assert_eq!(diagnostic_lines(&session, "X04"), vec![1, 2]);
+    // Under `:=` the `x+1` target would have to be an installation, and the
+    // literal operand rules that out. Under `=` it is an ordinary assignment to
+    // the expression `x+1`, which is valid M2, so line 1 is never reported.
+    assert_eq!(diagnostic_lines(&session, "X04"), vec![2]);
 
     session
         .replace(

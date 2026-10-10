@@ -72,7 +72,6 @@ use client_capabilities::{
     refresh_if_changed, ClientSupport, InlayHintRefresh, SemanticTokensAugmentSyntax,
     TypeHierarchyDynamicRegistration, WorkspaceRefresh,
 };
-use diagnostic_registry::DiagnosticPolicy;
 use document::DocumentSnapshot;
 use documentation_site::{build_documentation_book, generate_documentation_book};
 use package_index::SourceResolver;

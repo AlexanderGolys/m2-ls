@@ -429,6 +429,15 @@ impl<'tree> M2Node<'tree> {
         self.raw_kind() == "binary_expression" && !self.is_adjacent_expr()
     }
 
+    /// A binary, adjacent (application), prefix, or postfix expression: what
+    /// m2-syn models as `ExprOp`.
+    pub fn is_operator_expression(&self) -> bool {
+        self.is_binary_expr()
+            || self.is_adjacent_expr()
+            || self.is_prefix_expr()
+            || self.is_postfix_expr()
+    }
+
     pub fn is_adjacent_expr(&self) -> bool {
         self.raw_kind() == "binary_expression"
             && self

@@ -634,7 +634,9 @@ fn collect_assignment_symbol<'ast>(
         AssignmentPackComponent::List(pack) => {
             symbols.extend(symbols_in_assignment_pack(pack));
         }
-        AssignmentPackComponent::Empty(_) | AssignmentPackComponent::Op(_) => {}
+        AssignmentPackComponent::Empty(_)
+        | AssignmentPackComponent::Op(_)
+        | AssignmentPackComponent::Evaluated(_) => {}
     }
 }
 

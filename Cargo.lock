@@ -395,9 +395,9 @@ dependencies = [
 
 [[package]]
 name = "m2-syn"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a986f563ad6281f21d6ab8bc323fba9e96d1dac9dd7c0641b3395ee9f96ad355"
+checksum = "44690998a7a2db8a46e09d6dcd48ac1c2447adf71a7dfd4678dc15eeb5aca471"
 dependencies = [
  "m2-syn-macros",
  "these-macros-should-be-illegal",
@@ -407,9 +407,9 @@ dependencies = [
 
 [[package]]
 name = "m2-syn-macros"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a67e075de7963e56731e7fe49939bb519b5ac348f3104acd106b03c2ebc7fe3f"
+checksum = "8b62b977467b3d98db573e897f30f71000af589650c1c3fe098ad64bcda9e3b5"
 dependencies = [
  "proc-macro2",
  "quote",
