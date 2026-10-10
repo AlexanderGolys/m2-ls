@@ -1025,6 +1025,11 @@ pub fn else_if_chain_rewrite(if_node: M2Node<'_>) -> Option<String> {
     flatten_then_if_chain(if_node).or_else(|| flatten_parenthesized_else_if_chain(if_node))
 }
 
+/// Moves a conditional nested in the `then` branch to the `else` position by
+/// negating the condition. When the `else` branch is itself a conditional, the
+/// swap only trades one nested branch for the other: the result is flattenable
+/// back into the original, so the quick fix would oscillate between the two
+/// forms without ever clearing its diagnostic.
 fn flatten_then_if_chain(if_node: M2Node<'_>) -> Option<String> {
     let condition = if_node.child_by_field_name("condition")?;
     let then_branch = clause_of::<ThenClause>(if_node).and_then(clause_value)?;
@@ -1033,6 +1038,9 @@ fn flatten_then_if_chain(if_node: M2Node<'_>) -> Option<String> {
         return None;
     }
     let else_branch = clause_of::<ElseClause>(if_node).and_then(clause_value)?;
+    if unwrap_parentheses(else_branch).is::<IfStatement>() {
+        return None;
+    }
     let nested_replacement =
         else_if_chain_rewrite(nested_if).unwrap_or_else(|| nested_if.text().to_string());
 
@@ -1140,6 +1148,9 @@ fn unwrap_parentheses(node: M2Node<'_>) -> M2Node<'_> {
     node
 }
 
+/// The negation of a condition, without the whitespace a condition's span
+/// carries up to the `then` keyword; callers supply their own separators, so
+/// keeping it would widen the gap before `then` on every rewrite.
 fn negated_condition_text(node: M2Node<'_>) -> String {
     if node.is_prefix_expr() {
         if let Some(operator) = node.child_by_field_name("operator") {
@@ -1148,7 +1159,7 @@ fn negated_condition_text(node: M2Node<'_>) -> String {
                     .named_children()
                     .find(|child| child.id() != operator.id())
                 {
-                    return child.text().to_string();
+                    return child.text().trim_end().to_string();
                 }
             }
         }
@@ -1159,14 +1170,20 @@ fn negated_condition_text(node: M2Node<'_>) -> String {
             node.child_by_field_name("left"),
             node.child_by_field_name("right"),
         ) {
-            return format!("{} {} {}", left.text(), negated_operator, right.text());
+            return format!(
+                "{} {} {}",
+                left.text(),
+                negated_operator,
+                right.text().trim_end()
+            );
         }
     }
 
+    let condition = node.text().trim_end();
     if node.is_binary_expr() {
-        format!("not ({})", node.text())
+        format!("not ({condition})")
     } else {
-        format!("not {}", node.text())
+        format!("not {condition}")
     }
 }
 
@@ -1371,6 +1388,35 @@ mod tests {
                 messages(quiet)
             );
         }
+    }
+
+    /// A conditional nested in both branches has no flatter else-if form: moving
+    /// the `then` conditional to the `else` position just swaps the two, and the
+    /// swapped form proposes the original back, so the quick fix oscillated.
+    #[test]
+    fn conditionals_in_both_branches_are_not_reported_as_flattenable() {
+        let text = concat!(
+            "f = (label, raw) -> (\n",
+            "    if label == \"Token\" then {}\n",
+            "    else if not isNode raw then if #raw == 0 then {} else toList(0 .. #raw - 1)\n",
+            "    else if #raw <= 1 then {}\n",
+            "    else toList(1 .. #raw - 1)\n",
+            "    )\n",
+        );
+        let builtins = ObjectRegistry::default();
+        let document =
+            DocumentSnapshot::from_text(text.to_string(), &builtins).expect("fixture should parse");
+
+        let simplifications = document
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.kind == DiagnosticKind::SimplifiableExpression)
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>();
+        assert!(
+            simplifications.is_empty(),
+            "swapping two nested conditionals is not a simplification: {simplifications:?}"
+        );
     }
 
     /// A simplification diagnostic must be clearable by its own quick fix. A
