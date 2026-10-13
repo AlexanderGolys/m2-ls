@@ -11,14 +11,15 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use tokio::{io, task};
-use tower_lsp::jsonrpc::{Error, Result};
-use tower_lsp::lsp_types::request::{
-    GotoDeclarationParams, GotoDeclarationResponse, GotoImplementationParams,
-    GotoImplementationResponse, GotoTypeDefinitionParams, GotoTypeDefinitionResponse,
+use tower_lsp::{
+    jsonrpc::{Error, Result},
+    lsp_types::request::{
+        GotoDeclarationParams, GotoDeclarationResponse, GotoImplementationParams,
+        GotoImplementationResponse, GotoTypeDefinitionParams, GotoTypeDefinitionResponse,
+    },
+    lsp_types::{Range as TextRange, *},
+    Client, LanguageServer, LspService, Server,
 };
-use tower_lsp::lsp_types::Range as TextRange;
-use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 #[macro_use]
 mod util;
@@ -26,7 +27,7 @@ mod analysis;
 mod builtin_index;
 mod capabilities;
 mod client_capabilities;
-mod diagnostic_registry;
+mod diagnostics;
 mod document;
 mod documentation;
 mod documentation_site;
@@ -36,6 +37,7 @@ mod object_registry;
 mod package_index;
 mod record_lsp;
 mod semantic_token;
+mod session;
 mod settings;
 mod source;
 #[cfg(test)]
@@ -45,7 +47,6 @@ mod workspace_index;
 
 use capabilities::code_actions::available_code_actions;
 use capabilities::completion::{completion_options, completion_response};
-use capabilities::diagnostics::{publish_diagnostics, visible_diagnostics};
 use capabilities::document_highlight::{
     document_highlight_provider_capability, document_highlights,
 };
@@ -72,11 +73,15 @@ use client_capabilities::{
     refresh_if_changed, ClientSupport, InlayHintRefresh, SemanticTokensAugmentSyntax,
     TypeHierarchyDynamicRegistration, WorkspaceRefresh,
 };
+use diagnostics::{publish_diagnostics, visible_diagnostics};
 use document::DocumentSnapshot;
 use documentation_site::{build_documentation_book, generate_documentation_book};
-use package_index::SourceResolver;
+use package_index::{
+    collect_imported_packages, preloaded_package_additions, Macaulay2Environment, SourceResolver,
+};
+use session::{ClientInput, ExitNotificationService, SessionEnd};
 
-use crate::object_registry::ObjectRegistry;
+use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::semantic_token::{LEGEND_MODIFIERS, LEGEND_TYPES};
 use crate::settings::{ServerSettings, SettingsStore};
 use crate::workspace_index::WorkspaceIndex;
@@ -92,21 +97,60 @@ struct Backend {
     semantic_tokens_augment_syntax: ClientSupport<SemanticTokensAugmentSyntax>,
     type_hierarchy_dynamic_registration: ClientSupport<TypeHierarchyDynamicRegistration>,
     inlay_hint_refresh: ClientSupport<InlayHintRefresh>,
+    /// The user's `init.m2`, which Macaulay2 runs before any document.
+    initialization_file: Option<InitializationFile>,
+}
+
+/// The user's `init.m2`. It runs before any document, so the packages it loads
+/// are loaded at startup and its global definitions are known in every file.
+#[derive(Debug)]
+struct InitializationFile {
+    uri: Url,
+    text: String,
+    /// Packages it loads that the builtin index knows, loaded into every
+    /// document's registry.
+    loaded_packages: Vec<ObjectName>,
+    /// Packages it loads that the builtin index does not know.
+    unknown_packages: Vec<ObjectName>,
+}
+
+impl InitializationFile {
+    /// The initialization file of `environment`, with the packages it loads
+    /// registered in `registry` as loaded at startup.
+    fn load(environment: &Macaulay2Environment, registry: &mut ObjectRegistry) -> Option<Self> {
+        let path = environment.initialization_file()?;
+        let text = fs::read_to_string(&path).ok()?;
+        let uri = Url::from_file_path(&path).ok()?;
+        let (loaded_packages, unknown_packages) = collect_imported_packages(&text)
+            .into_iter()
+            .map(|import| import.package)
+            .chain(preloaded_package_additions(&text))
+            .partition(|package| registry.load_package(package));
+        Some(Self {
+            uri,
+            text,
+            loaded_packages,
+            unknown_packages,
+        })
+    }
 }
 
 impl Backend {
     fn new(client: Client) -> Self {
-        let registry = ObjectRegistry::load(include_str!("./data/m2-index.jsonl"));
+        let environment = Macaulay2Environment::current();
+        let mut registry = ObjectRegistry::load(include_str!("./data/m2-index.jsonl"));
+        let initialization_file = InitializationFile::load(&environment, &mut registry);
         Backend {
             client,
             registry,
-            source_resolver: SourceResolver::from_environment(),
+            source_resolver: SourceResolver::discover(&environment),
             documents: DashMap::new(),
             workspace_index: Arc::new(WorkspaceIndex::default()),
             settings: SettingsStore::default(),
             semantic_tokens_augment_syntax: ClientSupport::default(),
             type_hierarchy_dynamic_registration: ClientSupport::default(),
             inlay_hint_refresh: ClientSupport::default(),
+            initialization_file,
         }
     }
 
@@ -198,7 +242,11 @@ impl Backend {
                 .map(|document| {
                     (
                         document.key().clone(),
-                        visible_diagnostics(document.value(), settings.diagnostics()),
+                        visible_diagnostics(
+                            document.value(),
+                            document.key(),
+                            settings.diagnostics(),
+                        ),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -278,6 +326,15 @@ impl LanguageServer for Backend {
         task::spawn_blocking(move || index.scan(&knowledge))
             .await
             .map_err(|_| Error::internal_error())?;
+        // `init.m2` runs before every file, so its global definitions are
+        // known everywhere, like those of a workspace file.
+        if let Some(initialization_file) = &self.initialization_file {
+            self.workspace_index.index_file(
+                &initialization_file.uri,
+                &initialization_file.text,
+                &self.registry,
+            );
+        }
         self.semantic_tokens_augment_syntax
             .negotiate(&params.capabilities);
         self.type_hierarchy_dynamic_registration
@@ -394,6 +451,30 @@ impl LanguageServer for Backend {
                 ),
             )
             .await;
+        if let Some(initialization_file) = &self.initialization_file {
+            if !initialization_file.loaded_packages.is_empty() {
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!(
+                            "Packages loaded by init.m2: {}",
+                            package_list(&initialization_file.loaded_packages)
+                        ),
+                    )
+                    .await;
+            }
+            if !initialization_file.unknown_packages.is_empty() {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!(
+                            "Packages loaded by init.m2 but missing from the builtin index: {}",
+                            package_list(&initialization_file.unknown_packages)
+                        ),
+                    )
+                    .await;
+            }
+        }
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -528,7 +609,7 @@ impl LanguageServer for Backend {
         Ok(self
             .with_document(uri, |document| {
                 let diagnostics = if params.context.diagnostics.is_empty() {
-                    visible_diagnostics(document, settings.diagnostics())
+                    visible_diagnostics(document, uri, settings.diagnostics())
                 } else {
                     params
                         .context
@@ -917,6 +998,15 @@ fn run_documentation_command() -> Option<std::result::Result<(), String>> {
     Some(result)
 }
 
+/// Package names as a comma-separated list for log messages.
+fn package_list(packages: &[ObjectName]) -> String {
+    packages
+        .iter()
+        .map(ObjectName::name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[tokio::main]
 async fn main() {
     if let Some(result) = run_documentation_command() {
@@ -927,10 +1017,19 @@ async fn main() {
         return;
     }
     install_panic_logging();
-    let stdin = io::stdin();
+    let session_end = SessionEnd::default();
+    let stdin = ClientInput::new(io::stdin(), session_end.clone());
     let stdout = io::stdout();
     let (service, socket) = LspService::new(Backend::new);
-    Server::new(stdin, stdout, socket)
-        .serve(TypeHierarchyCapabilityService::new(service))
-        .await;
+    let service = ExitNotificationService::new(
+        TypeHierarchyCapabilityService::new(service),
+        session_end.clone(),
+    );
+    tokio::select! {
+        () = Server::new(stdin, stdout, socket).serve(service) => {}
+        () = session_end.ended() => {}
+    }
+    // Returning from `main` would wait for tokio's blocking stdin reader, which
+    // outlives the session; the process ends here instead.
+    std::process::exit(session_end.exit_code());
 }

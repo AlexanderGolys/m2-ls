@@ -7,7 +7,7 @@ use tower_lsp::lsp_types::Diagnostic;
 
 use crate::capabilities::formatting::{ControlFlowLayout, FormattingConfiguration};
 use crate::capabilities::inlay_hints::InlayHintOptions;
-use crate::diagnostic_registry::DiagnosticKind;
+use crate::diagnostics::DiagnosticCode;
 
 #[derive(Debug)]
 pub struct SettingsStore<T> {
@@ -85,7 +85,7 @@ impl ServerSettings {
 pub struct DiagnosticSettings {
     enabled: bool,
     #[serde(deserialize_with = "deserialize_diagnostic_set")]
-    disabled: HashSet<DiagnosticKind>,
+    disabled: HashSet<DiagnosticCode>,
 }
 
 impl Default for DiagnosticSettings {
@@ -98,16 +98,16 @@ impl Default for DiagnosticSettings {
 }
 
 impl DiagnosticSettings {
-    /// Whether findings of `kind` are shown: diagnostics are enabled and the
-    /// user has not disabled this one.
-    pub fn allows(&self, kind: DiagnosticKind) -> bool {
-        self.enabled && !self.disabled.contains(&kind)
+    /// Whether findings filed under `code` are shown: diagnostics are enabled
+    /// and the user has not disabled this one.
+    pub fn allows(&self, code: DiagnosticCode) -> bool {
+        self.enabled && !self.disabled.contains(&code)
     }
 
     /// Whether a diagnostic a client sent back is shown. Diagnostics another
-    /// server published have no kind here and are always kept.
+    /// server published have no code here and are always kept.
     pub fn allows_lsp_diagnostic(&self, diagnostic: &Diagnostic) -> bool {
-        DiagnosticKind::from_lsp(diagnostic).is_none_or(|kind| self.allows(kind))
+        DiagnosticCode::from_lsp(diagnostic).is_none_or(|code| self.allows(code))
     }
 }
 
@@ -198,14 +198,14 @@ pub struct InlayHintSettings {
     all_known_types: bool,
 }
 
-fn deserialize_diagnostic_set<'de, D>(deserializer: D) -> Result<HashSet<DiagnosticKind>, D::Error>
+fn deserialize_diagnostic_set<'de, D>(deserializer: D) -> Result<HashSet<DiagnosticCode>, D::Error>
 where
     D: Deserializer<'de>,
 {
     Vec::<String>::deserialize(deserializer)?
         .into_iter()
         .map(|selector| {
-            DiagnosticKind::from_selector(&selector)
+            DiagnosticCode::from_selector(&selector)
                 .ok_or_else(|| D::Error::custom(format!("unknown diagnostic `{selector}`")))
         })
         .collect()
@@ -214,12 +214,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostics::catalog;
 
     #[test]
     fn defaults_enable_diagnostics_and_canonical_factor_spacing() {
         let settings = ServerSettings::from_value(&serde_json::json!({})).unwrap();
 
-        assert!(settings.diagnostics().allows(DiagnosticKind::UnusedBinding));
+        assert!(settings.diagnostics().allows(catalog::UNUSED_BINDING.code));
         assert_eq!(settings.formatting().line_widths(), (Some(100), Some(100)));
         assert_eq!(
             settings.formatting().control_flow_layout(),
@@ -253,11 +254,11 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(!settings.diagnostics().allows(DiagnosticKind::UnusedBinding));
+        assert!(!settings.diagnostics().allows(catalog::UNUSED_BINDING.code));
         assert!(!settings
             .diagnostics()
-            .allows(DiagnosticKind::OptionKeyConvention));
-        assert!(settings.diagnostics().allows(DiagnosticKind::SyntaxError));
+            .allows(catalog::OPTION_KEY_CONVENTION.code));
+        assert!(settings.diagnostics().allows(catalog::SYNTAX_ERROR.code));
         assert_eq!(settings.formatting().indent_width(), Some(2));
         assert_eq!(settings.formatting().use_tabs(), Some(false));
         assert_eq!(settings.formatting().line_widths(), (Some(88), Some(88)));
@@ -299,9 +300,7 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(DiagnosticKind::ALL
-            .iter()
-            .all(|diagnostic| !settings.diagnostics().allows(*diagnostic)));
+        assert!(DiagnosticCode::registered().all(|code| !settings.diagnostics().allows(code)));
     }
 
     #[test]

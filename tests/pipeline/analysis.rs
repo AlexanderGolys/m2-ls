@@ -992,12 +992,6 @@ async fn declarative_diagnostics_expose_their_coupled_quick_fixes() {
             ":=",
         ),
         (
-            "x = 1\nprotect x\n",
-            "E05",
-            "Protect the symbol itself",
-            "symbol ",
-        ),
-        (
             "gb(I, strategy => 4)\n",
             "S01",
             "Capitalize option key",
@@ -1215,25 +1209,10 @@ async fn assignment_and_protection_diagnostics_preserve_source_sensitive_analysi
 
     session
         .replace(
-            "assigned = target\nprotect assigned\nprotect unassigned\nprotect later\nlater = target\n",
-        )
-        .await;
-    assert_eq!(diagnostic_lines(&session, "E05"), vec![1]);
-
-    session
-        .replace(
             "x = y\nprotect symbol x\nprotect (if c then symbol x else symbol y)\nprotect (if c then 1 else symbol y)\nprotect (1 + 2)\n",
         )
         .await;
     assert_eq!(diagnostic_lines(&session, "E06"), vec![2, 3]);
-
-    session.replace("f = x -> protect x\n").await;
-    assert_eq!(diagnostic_lines(&session, "E05"), vec![0]);
-
-    session
-        .replace("protect ZZ\nx = y\nprotect = f\nprotect x\n")
-        .await;
-    assert_eq!(diagnostic_lines(&session, "E05"), vec![0]);
 
     session.replace("f := x -> x\nx = 1\n").await;
     assert!(!session.diagnostic_codes().contains(&"S02"));
@@ -1541,13 +1520,12 @@ async fn declarations_use_binding_identity_then_fall_back_to_the_first_unbound_r
         );
     }
 
+    // A builtin is declared by its package, not by its first use in the file;
+    // without configured Macaulay2 sources there is nowhere to go.
     let indexed_declaration = session
         .request_at("textDocument/declaration", "ZZ", 1)
         .await;
-    assert_eq!(
-        indexed_declaration["range"]["start"],
-        position(source, "ZZ", 0)
-    );
+    assert!(indexed_declaration.is_null(), "{indexed_declaration}");
 
     session.shutdown().await;
 }

@@ -781,6 +781,23 @@ impl<'tree> M2Node<'tree> {
         self.descendants().filter(M2Node::is_symbol_like)
     }
 
+    /// The symbols under this node that refer to a binding by name: every
+    /// symbol except member keys.
+    pub fn binding_references(&self) -> impl Iterator<Item = M2Node<'tree>> + '_ {
+        self.symbols().filter(|symbol| !symbol.is_member_key())
+    }
+
+    /// Whether this symbol is the key of a member access `x.k` or `x.?k`.
+    /// Macaulay2 reads `x.k` as `x#(global k)`, so the key is the symbol `k`
+    /// itself and never refers to a binding named `k`.
+    pub fn is_member_key(&self) -> bool {
+        self.is_symbol_like()
+            && self
+                .parent()
+                .and_then(|parent| parent.property_key())
+                .is_some_and(|key| key.id() == self.id())
+    }
+
     pub fn start_byte(&self) -> usize {
         self.node.start_byte()
     }

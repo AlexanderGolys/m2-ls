@@ -7,12 +7,13 @@ use m2_syn::Token;
 use tower_lsp::lsp_types::Range as TextRange;
 use tower_lsp::lsp_types::*;
 
-use crate::analysis::{
+use crate::analysis::MethodCodomainEdit;
+use crate::diagnostics::rewrites::{
     ambiguous_float_member_access_rewrite, coalescence_rewrite, else_if_chain_rewrite,
     if_condition_rewrite, if_null_branch_rewrite, redundant_control_parentheses_inner,
-    try_statement_rewrite, MethodCodomainEdit,
+    try_statement_rewrite, Coalescence,
 };
-use crate::diagnostic_registry::DiagnosticKind;
+use crate::diagnostics::{catalog, DiagnosticCode, DiagnosticRule};
 use crate::document::DocumentSnapshot;
 use crate::node_metadata::{token_spelling, M2Node};
 use crate::source::SourceNavigation;
@@ -40,7 +41,6 @@ const CODE_ACTION_PRODUCERS: &[CodeActionProducer] = &[
     redundant_control_parentheses_action,
     coalescence_action,
     install_needs_colon_equals_action,
-    protect_assigned_symbol_action,
     method_codomain_action,
     convert_to_raw_string_action,
     conditional_null_action,
@@ -49,19 +49,19 @@ const CODE_ACTION_PRODUCERS: &[CodeActionProducer] = &[
     flatten_else_if_action,
 ];
 
-fn diagnostic_at(context: &CodeActionContext<'_, '_>, kind: DiagnosticKind) -> Option<Diagnostic> {
+fn diagnostic_at(context: &CodeActionContext<'_, '_>, rule: &DiagnosticRule) -> Option<Diagnostic> {
     context
         .diagnostics
         .iter()
         .find(|diagnostic| {
-            DiagnosticKind::from_lsp(diagnostic) == Some(kind)
+            DiagnosticCode::from_lsp(diagnostic) == Some(rule.code)
                 && diagnostic.range.contains_position(context.position)
         })
         .cloned()
 }
 
 fn method_codomain_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, DiagnosticKind::InstallCodomainMissing)?;
+    let diagnostic = diagnostic_at(context, &catalog::INSTALL_CODOMAIN_MISSING)?;
     let mut current = Some(context.cursor);
     while let Some(node) = current {
         if node.is_assignment() {
@@ -102,7 +102,7 @@ fn method_codomain_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAct
 fn colon_equal_part_assignment_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
     assignment_operator_action(
         context,
-        DiagnosticKind::ColonEqualPartAssignment,
+        &catalog::COLON_EQUAL_PART_ASSIGNMENT,
         token_spelling::<Token![:=]>(),
         token_spelling::<Token![=]>(),
         "Use `=` for part assignment",
@@ -112,7 +112,7 @@ fn colon_equal_part_assignment_action(context: &CodeActionContext<'_, '_>) -> Op
 fn install_needs_colon_equals_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
     assignment_operator_action(
         context,
-        DiagnosticKind::InstallNeedsColonEquals,
+        &catalog::INSTALL_NEEDS_COLON_EQUALS,
         token_spelling::<Token![=]>(),
         token_spelling::<Token![:=]>(),
         "Use `:=` for method installation",
@@ -121,12 +121,12 @@ fn install_needs_colon_equals_action(context: &CodeActionContext<'_, '_>) -> Opt
 
 fn assignment_operator_action(
     context: &CodeActionContext<'_, '_>,
-    kind: DiagnosticKind,
+    rule: &DiagnosticRule,
     current_operator: &str,
     replacement: &str,
     title: &'static str,
 ) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, kind)?;
+    let diagnostic = diagnostic_at(context, rule)?;
     let mut current = Some(context.cursor);
     while let Some(node) = current {
         if node.binary_operator() == Some(current_operator) {
@@ -151,7 +151,7 @@ fn assignment_operator_action(
 }
 
 fn option_key_convention_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, DiagnosticKind::OptionKeyConvention)?;
+    let diagnostic = diagnostic_at(context, &catalog::OPTION_KEY_CONVENTION)?;
     let key = enclosing_node_with_range(context, diagnostic.range, |node| node.is::<Symbol>())?;
     let mut replacement = key.text().to_string();
     replacement.get_mut(..1)?.make_ascii_uppercase();
@@ -171,7 +171,7 @@ fn option_key_convention_action(context: &CodeActionContext<'_, '_>) -> Option<C
 }
 
 fn redundant_control_parentheses_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, DiagnosticKind::RedundantControlParentheses)?;
+    let diagnostic = diagnostic_at(context, &catalog::REDUNDANT_CONTROL_PARENTHESES)?;
     let parentheses =
         enclosing_node_with_range(context, diagnostic.range, |node| node.is_holder())?;
     let inner = redundant_control_parentheses_inner(parentheses)?;
@@ -188,17 +188,17 @@ fn redundant_control_parentheses_action(context: &CodeActionContext<'_, '_>) -> 
 }
 
 fn coalescence_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, DiagnosticKind::PreferCoalescence)?;
+    let diagnostic = diagnostic_at(context, &catalog::PREFER_COALESCENCE)?;
     let mut current = Some(context.cursor);
     while let Some(node) = current {
         if context.document.range_for_node(node) == diagnostic.range {
-            let replacement = coalescence_rewrite(node)?;
-            let range = diagnostic.range;
-            let title = if node.is_assignment() {
-                "Use `??=` coalescing assignment"
-            } else {
-                "Use `??` coalescence"
+            let (title, replacement) = match coalescence_rewrite(node)? {
+                Coalescence::Assignment(replacement) => {
+                    ("Use `??=` coalescing assignment", replacement)
+                }
+                Coalescence::Expression(replacement) => ("Use `??` coalescence", replacement),
             };
+            let range = diagnostic.range;
             return Some(
                 CodeActionSpec {
                     title,
@@ -214,31 +214,12 @@ fn coalescence_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction>
     None
 }
 
-fn protect_assigned_symbol_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, DiagnosticKind::ProtectAssignedSymbol)?;
-    let symbol = enclosing_node_with_range(context, diagnostic.range, |node| node.is::<Symbol>())?;
-    let start = context.document.position_for_node(symbol);
-    Some(
-        CodeActionSpec {
-            title: "Protect the symbol itself",
-            kind: CodeActionKind::QUICKFIX,
-            is_preferred: Some(true),
-            diagnostics: Some(vec![diagnostic]),
-        }
-        .build(
-            context.uri,
-            TextRange::new(start, start),
-            "symbol ".to_string(),
-        ),
-    )
-}
-
 fn enclosing_node_with_range<'tree>(
     context: &CodeActionContext<'tree, '_>,
     range: TextRange,
     matches: impl Fn(M2Node<'tree>) -> bool,
 ) -> Option<M2Node<'tree>> {
-    if let Some(symbol) = context.document.symbol_node_at_position(range.start) {
+    if let Some(symbol) = context.document.reference_node_at_position(range.start) {
         if matches(symbol) && context.document.range_for_node(symbol) == range {
             return Some(symbol);
         }
@@ -338,7 +319,7 @@ fn convert_to_raw_string_action(context: &CodeActionContext<'_, '_>) -> Option<C
 /// Quickfix for the ambiguous-float diagnostic (`x.3` parses as `x SPACE .3`):
 /// rewrite to the member access the user almost certainly meant (`x#3`).
 fn ambiguous_float_member_access_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, DiagnosticKind::AmbiguousFloatMemberAccess)?;
+    let diagnostic = diagnostic_at(context, &catalog::AMBIGUOUS_FLOAT_MEMBER_ACCESS)?;
     let expression = context
         .cursor
         .enclosing_node(|node| node.is_adjacent_expr() || node.is_binary_expr())?;
@@ -362,7 +343,7 @@ fn ambiguous_float_member_access_action(context: &CodeActionContext<'_, '_>) -> 
 /// Refactor: drop a redundant `else null` (or `then null`, negating the
 /// condition) from an `if` statement.
 fn conditional_null_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, DiagnosticKind::SimplifiableExpression)?;
+    let diagnostic = diagnostic_at(context, &catalog::SIMPLIFIABLE_EXPRESSION)?;
     let if_node = context
         .cursor
         .enclosing_node(|node| node.is::<IfStatement>())?;
@@ -386,7 +367,7 @@ fn conditional_null_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAc
 /// Refactor: simplify a `try` statement — drop a redundant `then` echo or a
 /// redundant `else null`.
 fn simplify_try_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, DiagnosticKind::SimplifiableExpression)?;
+    let diagnostic = diagnostic_at(context, &catalog::SIMPLIFIABLE_EXPRESSION)?;
     let try_node = context
         .cursor
         .enclosing_node(|node| node.is::<TryStatement>())?;
@@ -410,7 +391,7 @@ fn simplify_try_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction
 /// Refactor: push a leading `not` through a parenthesized comparison
 /// (`if not (a == b) then x` → `if a != b then x`).
 fn simplify_if_condition_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, DiagnosticKind::SimplifiableExpression)?;
+    let diagnostic = diagnostic_at(context, &catalog::SIMPLIFIABLE_EXPRESSION)?;
     let if_node = context
         .cursor
         .enclosing_node(|node| node.is::<IfStatement>())?;
@@ -432,7 +413,7 @@ fn simplify_if_condition_action(context: &CodeActionContext<'_, '_>) -> Option<C
 }
 
 fn flatten_else_if_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, DiagnosticKind::SimplifiableExpression)?;
+    let diagnostic = diagnostic_at(context, &catalog::SIMPLIFIABLE_EXPRESSION)?;
     let mut current = Some(context.cursor);
     let mut candidate = None;
     while let Some(node) = current {

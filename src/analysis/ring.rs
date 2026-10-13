@@ -114,7 +114,7 @@ impl Analysis {
     /// yields `x` and `y`. Indexed families (`x_0`, `x_0..x_3`), generated tables
     /// (`Variables => 5`), and letter ranges (`a..d`) are not written as single
     /// symbols and are left out, so callers see exactly the names an author typed.
-    pub(super) fn ring_constructor_symbol_variables<'tree>(
+    pub(crate) fn ring_constructor_symbol_variables<'tree>(
         &self,
         node: M2Node<'tree>,
         source: &(impl SourceNavigation + ?Sized),

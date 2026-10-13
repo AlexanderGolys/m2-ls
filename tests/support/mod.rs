@@ -1,7 +1,7 @@
 //! Shared framed-stdio language-server integration-test support.
 
 use std::collections::VecDeque;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::{env, fs};
@@ -27,7 +27,10 @@ pub(crate) struct LspProcess {
 
 impl LspProcess {
     pub(crate) async fn spawn() -> Self {
+        // An empty environment keeps the server from discovering the machine's
+        // Macaulay2 installation, so results do not depend on where tests run.
         let mut child = Command::new(env!("CARGO_BIN_EXE_m2-ls"))
+            .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -185,16 +188,30 @@ impl LspProcess {
         }
     }
 
+    /// Shuts the server down the way an editor does: `shutdown`, then `exit`,
+    /// with its input still open. The server must end on `exit` alone.
     pub(crate) async fn shutdown(mut self) {
         let result = self.request("shutdown", Value::Null).await;
         assert!(result.is_null());
         self.notify("exit", Value::Null).await;
-        drop(self.stdin);
         let status = timeout(RESPONSE_TIMEOUT, self.child.wait())
             .await
             .expect("the language server should exit after shutdown")
             .expect("the language-server process should be waitable");
         assert!(status.success(), "language server exited with {status}");
+    }
+
+    /// Closes the server's input without `shutdown`, as a client that crashed
+    /// or was killed does, and returns how the server then exits.
+    pub(crate) async fn disconnect(self) -> ExitStatus {
+        let Self {
+            mut child, stdin, ..
+        } = self;
+        drop(stdin);
+        timeout(RESPONSE_TIMEOUT, child.wait())
+            .await
+            .expect("the language server should exit once its client disconnects")
+            .expect("the language-server process should be waitable")
     }
 
     async fn handle_server_message(&mut self, message: Value) {

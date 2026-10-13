@@ -7,6 +7,7 @@ use tower_lsp::lsp_types::{Position, Range as TextRange, TextDocumentContentChan
 use tree_sitter::{InputEdit, Point};
 
 use crate::analysis::{Analysis, BindingView, FunctionInfo};
+use crate::diagnostics::{self, M2Diagnostic};
 use crate::documentation::{
     collect_documentation, DocumentationBlock, DocumentationIndex, DocumentationReference,
     DocumentationSnippet,
@@ -23,6 +24,7 @@ pub struct DocumentSnapshot {
     tree: M2Tree,
     syntax: Option<SourceFile>,
     analysis: Analysis,
+    diagnostics: Vec<M2Diagnostic>,
     object_registry: ObjectRegistry,
     documentation: DocumentationIndex,
 }
@@ -55,12 +57,15 @@ impl DocumentSnapshot {
             collect_imported_packages_in_tree(root, typed_ast.as_ref(), &source);
         let knowledge = knowledge_provider.with_imports(&imported_packages);
         let analysis = Analysis::new_with_knowledge(root, typed_ast.as_ref(), &source, &knowledge);
+        let diagnostics =
+            diagnostics::collect(&analysis, root, typed_ast.as_ref(), &source, &knowledge);
         let documentation = collect_documentation(&source, root, &analysis);
         Some(Self {
             source,
             tree,
             syntax: typed_ast,
             analysis,
+            diagnostics,
             object_registry: knowledge,
             documentation,
         })
@@ -100,15 +105,15 @@ impl DocumentSnapshot {
         self.syntax.as_ref()
     }
 
-    pub fn diagnostics(&self) -> &[crate::diagnostic_registry::M2Diagnostic] {
-        &self.analysis.diagnostics
+    pub fn diagnostics(&self) -> &[M2Diagnostic] {
+        &self.diagnostics
     }
 
     pub fn binding_at_position(&self, position: Position) -> Option<BindingView<'_>> {
         if let Some(reference) = self.documentation_reference_at(position) {
             return self.documentation_symbol(&reference);
         }
-        let node = self.symbol_node_at_position(position)?;
+        let node = self.reference_node_at_position(position)?;
         self.source_binding_at(node.text(), position)
     }
 
@@ -138,7 +143,7 @@ impl DocumentSnapshot {
         let (name, range) = if let Some(reference) = documentation_reference.as_ref() {
             (reference.name(self.text()), reference.range())
         } else {
-            let node = self.symbol_node_at_position(position)?;
+            let node = self.reference_node_at_position(position)?;
             (node.text(), self.range_for_node(node))
         };
         let symbol = if let Some(reference) = documentation_reference {
@@ -205,7 +210,7 @@ impl DocumentSnapshot {
         if let Some(reference) = self.documentation_reference_at(position) {
             return Some((reference.name(self.text()), reference.range()));
         }
-        let node = self.symbol_node_at_position(position)?;
+        let node = self.reference_node_at_position(position)?;
         Some((node.text(), self.range_for_node(node)))
     }
 
@@ -240,7 +245,9 @@ impl DocumentSnapshot {
         self.root_node().descendant_for_point_range(point, point)
     }
 
-    pub fn symbol_node_at_position(&self, position: Position) -> Option<M2Node<'_>> {
+    /// The symbol under the cursor that refers to a binding by name; `None`
+    /// on a member key, which names the symbol itself.
+    pub fn reference_node_at_position(&self, position: Position) -> Option<M2Node<'_>> {
         let point = self.point_for_position(position)?;
         let root = self.root_node();
         // When the cursor sits on the boundary between the anonymous SPACE
@@ -259,7 +266,7 @@ impl DocumentSnapshot {
             let mut node = start;
             loop {
                 if node.is_symbol_like() {
-                    return Some(node);
+                    return (!node.is_member_key()).then_some(node);
                 }
                 match node.parent() {
                     Some(parent) => node = parent,
@@ -307,10 +314,18 @@ impl DocumentSnapshot {
         let knowledge = knowledge_provider.with_imports(&imported_packages);
         let analysis =
             Analysis::new_with_knowledge(root, typed_ast.as_ref(), &self.source, &knowledge);
+        let diagnostics = diagnostics::collect(
+            &analysis,
+            root,
+            typed_ast.as_ref(),
+            &self.source,
+            &knowledge,
+        );
         let documentation = collect_documentation(&self.source, root, &analysis);
         self.tree = tree;
         self.syntax = typed_ast;
         self.analysis = analysis;
+        self.diagnostics = diagnostics;
         self.object_registry = knowledge;
         self.documentation = documentation;
         Some(())

@@ -175,7 +175,14 @@ fn goto_symbol_response(
         return locations_response(workspace_locations);
     }
 
+    if let Some((package, _)) = knowledge.get_record_with_package(&ObjectName::new(node_text)) {
+        return source_resolver
+            .package_location(&package)
+            .map(GotoDefinitionResponse::Scalar);
+    }
     match target {
+        // A name nothing defines becomes a global symbol where Macaulay2 first
+        // reads it, so that first occurrence declares it.
         NavigationTarget::Declaration => unbound_reference_ranges(document, node_text)
             .into_iter()
             .next()
@@ -185,13 +192,7 @@ fn goto_symbol_response(
                     range,
                 })
             }),
-        NavigationTarget::Definition => {
-            let (package, _) =
-                knowledge.get_record_with_package(&ObjectName(node_text.to_string()))?;
-            source_resolver
-                .package_location(&package)
-                .map(GotoDefinitionResponse::Scalar)
-        }
+        NavigationTarget::Definition => None,
     }
 }
 
@@ -203,7 +204,7 @@ pub fn goto_type_definition_response(
     workspace_index: &(impl WorkspaceDefinitionKnowledge + ?Sized),
     source_resolver: &SourceResolver,
 ) -> Option<GotoTypeDefinitionResponse> {
-    let node = document.symbol_node_at_position(position)?;
+    let node = document.reference_node_at_position(position)?;
     let inferred_type = document
         .binding_at_position(position)
         .and_then(|binding| binding.state.inferred_type.as_ref())
@@ -253,7 +254,7 @@ pub fn goto_implementation_response(
         .or_else(|| document.future_assignment_binding_at(name, position));
     let function = binding.and_then(|binding| analysis.function_for_binding(binding));
     let call_installations = function.and_then(|function| {
-        let callable = document.symbol_node_at_position(position)?;
+        let callable = document.reference_node_at_position(position)?;
         if analysis.is_method_installation_callable(callable, document) {
             return None;
         }
@@ -497,7 +498,7 @@ pub fn reference_ranges_resolved(
     let target_range = target.symbol.range;
 
     let mut references = Vec::new();
-    for node in document.root_node().symbols() {
+    for node in document.root_node().binding_references() {
         let node_text = node.text();
         if node_text == target_name {
             let range = document.range_for_node(node);
@@ -598,7 +599,7 @@ pub fn reference_target(
 pub fn global_reference_ranges(document: &DocumentSnapshot, name: &str) -> Vec<TextRange> {
     let analysis = document.analysis();
     let mut references = Vec::new();
-    for node in document.root_node().symbols() {
+    for node in document.root_node().binding_references() {
         if node.text() == name {
             let position = document.position_for_node(node);
             // A use is global unless a local binding shadows the name here.
@@ -634,7 +635,7 @@ pub fn unbound_reference_ranges(document: &DocumentSnapshot, name: &str) -> Vec<
     let analysis = document.analysis();
     let mut references = document
         .root_node()
-        .symbols()
+        .binding_references()
         .filter(|node| node.text() == name)
         .filter_map(|node| {
             let range = document.range_for_node(node);
@@ -718,6 +719,59 @@ mod tests {
                 TextRange::new(pos!(0, 16), pos!(0, 17)),
                 TextRange::new(pos!(0, 20), pos!(0, 21)),
             ]
+        );
+    }
+
+    /// `x.k` is `x#(global k)`: the key is the symbol `k` itself, so a binding
+    /// named `k` is neither referenced by it nor reachable from it.
+    #[test]
+    fn member_keys_are_not_references_to_a_binding_of_the_same_name() {
+        let text = "f := value -> (output.value = value; output.?value)\n";
+        let document = document(text);
+
+        assert_eq!(
+            collect_reference_ranges(&document, pos!(0, 5), true),
+            vec![
+                TextRange::new(pos!(0, 5), pos!(0, 10)),
+                TextRange::new(pos!(0, 30), pos!(0, 35)),
+            ],
+            "the parameter's references skip both member keys"
+        );
+        assert_eq!(
+            collect_reference_ranges(&document, pos!(0, 23), true),
+            Vec::<TextRange>::new(),
+            "a member key refers to no binding"
+        );
+        assert!(document.binding_at_position(pos!(0, 46)).is_none());
+    }
+
+    /// `x = v` assigns whatever local `x` is visible where it is written, even
+    /// from a nested branch or closure; M2 v1.26.05 returns `2` from
+    /// `(() -> (t := 1; if true then t = 2; t))()`. A closure written before
+    /// the local is declared still assigns the global symbol.
+    #[test]
+    fn assignment_to_an_enclosing_local_references_that_local() {
+        let ranges = |text: &str, line_column: u32| {
+            collect_reference_ranges(&document(text), pos!(0, line_column), true)
+                .into_iter()
+                .map(|range| range.start.character)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            ranges("f := v -> (t := v; if t === null then t = 1; t)", 11),
+            [11, 22, 38, 45],
+            "the branch assignment updates the local"
+        );
+        assert_eq!(
+            ranges("g := () -> (u := 1; h := () -> (u = 5); h(); u)", 12),
+            [12, 32, 45],
+            "the closure assignment updates the enclosing local"
+        );
+        assert_eq!(
+            ranges("k := () -> (h := () -> (w = 5); w := 1; w)", 32),
+            [32, 40],
+            "a closure written before the local is declared does not see it"
         );
     }
 
@@ -809,6 +863,42 @@ mod tests {
                 &WorkspaceIndex::default(),
             ),
             None
+        );
+    }
+
+    /// A builtin is declared by its package, not by its first use in the file;
+    /// only a name nothing defines is declared where it first appears.
+    #[test]
+    fn declaration_of_a_builtin_is_not_its_first_use() {
+        let text = "a = toString 1\nb = toString 2\nc = undefinedName\nd = undefinedName\n";
+        let document = document(text);
+        let index =
+            crate::object_registry::ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let scoped = index.with_source_imports(text);
+        let uri = Url::parse("file:///t.m2").expect("uri");
+        let declaration = |position| {
+            goto_declaration_response(
+                &document,
+                &uri,
+                position,
+                &scoped,
+                &SourceResolver::new(Vec::new()),
+                &WorkspaceIndex::default(),
+            )
+        };
+
+        assert_eq!(
+            declaration(pos!(1, 6)),
+            None,
+            "without Core sources there is no location for the builtin"
+        );
+        assert_eq!(
+            declaration(pos!(3, 6)),
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: TextRange::new(pos!(2, 4), pos!(2, 17)),
+            })),
+            "an undefined name is declared by its first occurrence"
         );
     }
 

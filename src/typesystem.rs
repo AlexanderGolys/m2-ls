@@ -68,11 +68,6 @@ pub struct LiteralOption {
 /// storage and resolution order. The complete [`ObjectRegistry`], an ordered
 /// package view, and syntax-only test knowledge all implement the same contract.
 pub trait TypeKnowledge: ObjectKnowledge + PositionedTypeKnowledge {
-    /// Whether external type facts are available for diagnostics.
-    fn is_available(&self) -> bool {
-        true
-    }
-
     /// Whether a later package inclusion shadows a global source definition of
     /// `name` made at `source_position`.
     fn shadows_source(&self, _name: &ObjectName, _source_position: Position) -> bool {
@@ -158,10 +153,6 @@ impl TypeKnowledge for ObjectRegistryView<'_> {
 }
 
 impl<T: TypeKnowledge + ?Sized> TypeKnowledge for &T {
-    fn is_available(&self) -> bool {
-        T::is_available(self)
-    }
-
     fn shadows_source(&self, name: &ObjectName, source_position: Position) -> bool {
         T::shadows_source(self, name, source_position)
     }

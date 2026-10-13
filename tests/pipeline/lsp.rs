@@ -1172,3 +1172,16 @@ async fn formatting_preserves_collection_and_assignment_control_flow_layout() {
 
     server.shutdown().await;
 }
+
+/// A client that disappears without `shutdown`, such as an editor that crashed
+/// or was killed, closes the server's input. The server must end as well, with
+/// the exit code the LSP specification gives a session ended without shutdown.
+#[tokio::test]
+async fn server_exits_when_the_client_disconnects() {
+    let workspace = TestWorkspace::new(SOURCE);
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    server.notify("initialized", json!({})).await;
+
+    assert_eq!(server.disconnect().await.code(), Some(1));
+}

@@ -1,22 +1,15 @@
 //! Staged analysis of one immutable document snapshot.
 
-mod diagnostics;
 mod first_pass;
 mod ring;
 mod typechecker;
 
-pub use diagnostics::{
-    ambiguous_float_member_access_rewrite, coalescence_rewrite, else_if_chain_rewrite,
-    if_condition_rewrite, if_null_branch_rewrite, redundant_control_parentheses_inner,
-    try_statement_rewrite,
-};
-
 use m2_syn::nodes::{
-    AngleBarList, Array, ElseClause, Expr, ExprFor as ForLoop, ExprIf as IfStatement,
-    ExprLambda as LambdaExpression, ExprNew as NewStatement, ExprOpBinIndex, ExprOpBinMember,
-    ExprOpBinRegular as BinaryExpr, ExprOption as OptionExpression, ExprQuote as QuoteExpression,
-    ExprWhile as WhileLoop, FloatLiteral, IntegerLiteral, List, LoopBody, RawStringLiteral,
-    Sequence, SourceFile, StringLiteral, Symbol, ThenClause,
+    ElseClause, Expr, ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
+    ExprNew as NewStatement, ExprOpBinIndex, ExprOpBinMember, ExprOpBinRegular as BinaryExpr,
+    ExprOption as OptionExpression, ExprQuote as QuoteExpression, ExprWhile as WhileLoop,
+    FloatLiteral, IntegerLiteral, List, LoopBody, RawStringLiteral, Sequence, SourceFile,
+    StringLiteral, Symbol, ThenClause,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Spanned, Token};
@@ -26,7 +19,6 @@ use std::ops::Deref;
 use tower_lsp::lsp_types::{Position, Range as TextRange, SymbolKind};
 
 use crate::builtin_index::{CallableKind, MethodSignature};
-use crate::diagnostic_registry::{DiagnosticKind, M2Diagnostic};
 use crate::meta::{BindingRole, Meta, Metadata};
 use crate::node_metadata::{
     matches_token, token_spelling, visit_source_nodes, M2Node, M2SyntaxKind,
@@ -43,7 +35,7 @@ use crate::util::TextRangeExt;
 use first_pass::{
     control_flow_scope, nested_symbols, walk, walk_cst, BindingEffect, BindingFact, ScopeTree,
 };
-use typechecker::TypeChecker;
+pub(crate) use typechecker::TypeChecker;
 
 /// Identity of one scoped symbol binding within an immutable analysis snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -168,13 +160,13 @@ pub struct MethodInstallation {
     pub span: TextRange,
     expected_rhs_arity: usize,
     pub rhs_lambda_dispatch: Option<Dispatch>,
-    syntax: MethodInstallationSyntax,
+    pub(crate) syntax: MethodInstallationSyntax,
     has_option_handler: bool,
     effect: MethodInstallationEffect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MethodInstallationSyntax {
+pub(crate) enum MethodInstallationSyntax {
     Classical,
     InstallMethod,
 }
@@ -243,7 +235,7 @@ enum LocalFunctionKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CallableHeadKind {
+pub(crate) enum CallableHeadKind {
     PlainFunction,
     MethodFunction,
     Unknown,
@@ -499,11 +491,10 @@ impl<'tree> ControlTransferTarget<'tree> {
 }
 
 /// Complete semantic analysis of one immutable document snapshot.
-/// It owns source facts, characterized method installations, and diagnostics;
-/// expression types are not retained after inference.
+/// It owns source facts and characterized method installations; expression
+/// types are not retained after inference.
 #[derive(Debug)]
 pub struct Analysis {
-    pub diagnostics: Vec<M2Diagnostic>,
     registry: SemanticRegistry,
 }
 
@@ -695,6 +686,42 @@ impl Analysis {
         None
     }
 
+    /// The local that `name = v` written at `position` assigns: a `:=` local
+    /// or parameter of an enclosing function, declared before the assignment.
+    /// M2 resolves the name where the assignment is written, so such a local is
+    /// assigned even from a nested branch or closure; a local declared later is
+    /// not yet visible there, and without any local the assignment targets the
+    /// global symbol.
+    fn assigned_local_binding(
+        &self,
+        name: &str,
+        position: Position,
+        scopes: &ScopeTree,
+    ) -> Option<BindingId> {
+        let mut scope = scopes.at(position);
+        while let Some(scope_idx) = scope.filter(|scope_idx| *scope_idx != 0) {
+            let declared = self
+                .registry
+                .bindings_by_name
+                .get(name)
+                .into_iter()
+                .flatten()
+                .filter_map(|binding_id| self.binding(*binding_id))
+                .filter(|binding| {
+                    binding.scope_idx == scope_idx
+                        && !binding.introduced_by_assignment
+                        && binding.range.start <= position
+                })
+                .max_by_key(|binding| (binding.range.start.line, binding.range.start.character))
+                .map(|binding| binding.binding_id);
+            if declared.is_some() {
+                return declared;
+            }
+            scope = scopes.parent(scope_idx);
+        }
+        None
+    }
+
     fn binding(&self, binding_id: BindingId) -> Option<&BindingInfo> {
         self.registry.bindings.get(binding_id.0 as usize)
     }
@@ -840,6 +867,10 @@ impl Analysis {
         self.registry.installations.get(id.0)
     }
 
+    pub fn installations(&self) -> &[MethodInstallation] {
+        &self.registry.installations
+    }
+
     pub fn assignment_facts(&self) -> &[AssignmentFact] {
         &self.registry.assignment_facts
     }
@@ -896,7 +927,7 @@ impl Analysis {
         out
     }
 
-    fn find_scope_at(&self, pos: Position) -> Option<usize> {
+    pub(crate) fn find_scope_at(&self, pos: Position) -> Option<usize> {
         self.registry.scopes.at(pos)
     }
 
@@ -907,7 +938,6 @@ impl Analysis {
         knowledge: &(impl PositionedTypeKnowledge + ?Sized),
     ) -> Self {
         let mut analysis = Analysis {
-            diagnostics: Vec::new(),
             registry: SemanticRegistry::default(),
         };
         analysis.registry.scopes = if let Some(syntax) = syntax {
@@ -926,7 +956,6 @@ impl Analysis {
         }
         analysis.collect_semantics(root, syntax, source, knowledge);
         analysis.registry.pending_source_semantic_roles.clear();
-        analysis.collect_diagnostics(root, syntax, source, knowledge);
         analysis
     }
 
@@ -1348,7 +1377,7 @@ impl Analysis {
         Some(MethodHead::Operator(Operator { token, form }))
     }
 
-    fn installation_shape<'tree>(
+    pub(crate) fn installation_shape<'tree>(
         &self,
         node: M2Node<'tree>,
         position: Position,
@@ -1463,7 +1492,7 @@ impl Analysis {
         TypeChecker::new(self, knowledge).resolve_type_id_at(&parent, position, knowledge)
     }
 
-    fn callable_head_kind(
+    pub(crate) fn callable_head_kind(
         &self,
         name: &str,
         position: Position,
@@ -1538,12 +1567,15 @@ impl Analysis {
             }
             BindingEffect::Assign => {
                 let position = fact.target.start;
-                let binding_id = self
-                    .binding_id_from_scope_in(name, fact.scope, position, scopes)
-                    .filter(|binding_id| {
-                        self.binding_anchor(*binding_id)
-                            .is_some_and(|binding| binding.scope_idx == fact.scope)
-                    });
+                let binding_id =
+                    self.assigned_local_binding(name, position, scopes)
+                        .or_else(|| {
+                            self.binding_id_from_scope_in(name, fact.scope, position, scopes)
+                                .filter(|binding_id| {
+                                    self.binding_anchor(*binding_id)
+                                        .is_some_and(|binding| binding.scope_idx == fact.scope)
+                                })
+                        });
                 if let Some(binding_id) = binding_id {
                     self.add_binding_state(binding_id, fact);
                 } else {
@@ -2152,7 +2184,7 @@ where
     }
 }
 
-fn assigned_lambda(node: M2Node<'_>) -> Option<M2Node<'_>> {
+pub(crate) fn assigned_lambda(node: M2Node<'_>) -> Option<M2Node<'_>> {
     let node = parenthesized_value(node)?;
     if node.is::<LambdaExpression>() {
         return Some(node);
@@ -2163,7 +2195,7 @@ fn assigned_lambda(node: M2Node<'_>) -> Option<M2Node<'_>> {
         .and_then(assigned_lambda)
 }
 
-fn method_codomain_annotation(node: M2Node<'_>) -> Option<M2Node<'_>> {
+pub(crate) fn method_codomain_annotation(node: M2Node<'_>) -> Option<M2Node<'_>> {
     node.is_option_assignment()
         .then(|| node.child_by_field_name("left"))
         .flatten()
@@ -2383,12 +2415,12 @@ fn method_installation_assignment_for_callable_node<'tree>(
 }
 
 /// The first direct clause of `node` of the given kind (`then`/`else`/`do`/…).
-fn clause_of<'tree, Syntax: M2SyntaxKind>(node: M2Node<'tree>) -> Option<M2Node<'tree>> {
+pub(crate) fn clause_of<'tree, Syntax: M2SyntaxKind>(node: M2Node<'tree>) -> Option<M2Node<'tree>> {
     node.named_children().find(|child| child.is::<Syntax>())
 }
 
 /// The value expression a clause wraps (`then E` → `E`): its single named child.
-fn clause_value(clause: M2Node) -> Option<M2Node> {
+pub(crate) fn clause_value(clause: M2Node) -> Option<M2Node> {
     clause
         .child_by_field_name("value")
         .or_else(|| clause.named_children().next())
@@ -2421,7 +2453,7 @@ fn new_statement_installation_assignment(node: M2Node<'_>) -> Option<M2Node<'_>>
         .flatten()
 }
 
-fn assignment_parts(node: M2Node<'_>) -> Option<(M2Node<'_>, M2Node<'_>, M2Node<'_>)> {
+pub(crate) fn assignment_parts(node: M2Node<'_>) -> Option<(M2Node<'_>, M2Node<'_>, M2Node<'_>)> {
     if node.is::<NewStatement>() {
         let assignment = new_statement_installation_assignment(node)?;
         return Some((
@@ -2469,7 +2501,7 @@ fn direct_callback_callable(lambda: M2Node<'_>) -> Option<M2Node<'_>> {
 /// `((a))` → `a`. A parenthesized expression whose final child is `muted`
 /// (`(a;)`) denotes null, so it has no value node. A non-parenthesized node is
 /// its own value. `()` and `(a, b)` are `Sequence` nodes, left untouched.
-fn parenthesized_value(node: M2Node) -> Option<M2Node> {
+pub(crate) fn parenthesized_value(node: M2Node) -> Option<M2Node> {
     let mut current = node;
     while current.is_holder() {
         current = current.final_value_child()?;

@@ -10,7 +10,7 @@ opencode.json
 
 docs/
 example_m2_code/
-examples/document1/
+example-workspace/
 
 # Root-level .md files are local notes, except the project docs:
 /*.md

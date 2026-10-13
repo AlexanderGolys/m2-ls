@@ -546,7 +546,7 @@ fn collect_mapped_m2_references(
     let Some(root) = parser.parse(candidate) else {
         return;
     };
-    for symbol in root.symbols() {
+    for symbol in root.binding_references() {
         let markdown_range = target.start + symbol.start_byte()..target.start + symbol.end_byte();
         if let Some(bytes) = text.source_range(markdown_range) {
             index.references.push(DocumentationReference {
@@ -591,13 +591,14 @@ fn collect_legacy_backtick_snippets(
         let Some(root) = parser.parse(candidate) else {
             continue;
         };
-        index
-            .references
-            .extend(root.symbols().map(|symbol| DocumentationReference {
-                span: source.span_for_bytes(
-                    source_start + symbol.start_byte()..source_start + symbol.end_byte(),
-                ),
-            }));
+        index.references.extend(
+            root.binding_references()
+                .map(|symbol| DocumentationReference {
+                    span: source.span_for_bytes(
+                        source_start + symbol.start_byte()..source_start + symbol.end_byte(),
+                    ),
+                }),
+        );
         index.snippets.push(DocumentationSnippet {
             bytes: source_start..node.start_byte() + close,
         });

@@ -32,11 +32,7 @@ impl TypeStore for NoTypeKnowledge {
     }
 }
 
-impl TypeKnowledge for NoTypeKnowledge {
-    fn is_available(&self) -> bool {
-        false
-    }
-}
+impl TypeKnowledge for NoTypeKnowledge {}
 
 impl PositionedTypeKnowledge for NoTypeKnowledge {
     type Knowledge<'a> = Self;

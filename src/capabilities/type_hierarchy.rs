@@ -47,7 +47,7 @@ impl<'a, K: PartitionedTypeKnowledge + ?Sized> TypeHierarchyContext<'a, K> {
         uri: &Url,
         position: Position,
     ) -> Option<Vec<TypeHierarchyItem>> {
-        let node = document.symbol_node_at_position(position)?;
+        let node = document.reference_node_at_position(position)?;
         let name = node.text();
         let range = document.range_for_node(node);
 

@@ -17,7 +17,7 @@ src/
   builtin_index.rs        in-memory form of the builtin corpus
   package_index.rs        imported-package discovery and source-file resolution
   workspace_index.rs      cross-file index of top-level definitions
-  diagnostic_registry.rs  every diagnostic's identity, name, and code
+  diagnostics.rs, diagnostics/  every diagnostic: catalog, checks, rewrites, publication
   documentation.rs        Markdown documentation attached to source items
   documentation_site.rs   mdBook generation for `m2-ls docs`
   settings.rs             initialization and live workspace configuration

@@ -195,7 +195,7 @@ fn call_signature_usage_for_hover(
 /// operator token of an expression.
 fn hoverable_symbol_or_operator_node(node: M2Node) -> bool {
     if node.is_symbol_like() {
-        return true;
+        return !node.is_member_key();
     }
 
     node.is_operator()
@@ -276,6 +276,19 @@ mod tests {
     use crate::source::DocumentSource;
     use crate::test_support::analyze;
     use tower_lsp::lsp_types::{HoverContents, Range as TextRange, SymbolKind};
+
+    /// The key of `output.value` is the symbol `value`, not the builtin
+    /// function `value` nor the parameter of that name, so it has no hover.
+    #[test]
+    fn member_keys_have_no_hover() {
+        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let document =
+            DocumentSnapshot::from_text("f = value -> output.value\n".to_string(), &builtins)
+                .expect("fixture should parse");
+
+        assert!(hover_response(&document, pos!(0, 20), &builtins).is_none());
+        assert!(hover_response(&document, pos!(0, 4), &builtins).is_some());
+    }
 
     #[test]
     fn local_hover_includes_known_static_type() {
