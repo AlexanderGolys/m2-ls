@@ -196,7 +196,13 @@ pub fn visible_diagnostics(
         .diagnostics()
         .iter()
         .filter(|diagnostic| settings.allows(diagnostic.rule.code))
-        .map(|diagnostic| diagnostic.to_lsp(uri))
+        .map(|diagnostic| {
+            let mut published = diagnostic.to_lsp(uri);
+            published.severity = published
+                .severity
+                .map(|severity| settings.published_severity(diagnostic.rule.code, severity));
+            published
+        })
         .collect()
 }
 

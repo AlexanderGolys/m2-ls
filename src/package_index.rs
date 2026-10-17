@@ -286,7 +286,37 @@ fn package_import<'tree>(application: M2Node<'tree>) -> Option<(M2Node<'tree>, &
 }
 
 fn package_import_argument(application: M2Node<'_>) -> Option<M2Node<'_>> {
-    binary_expression_left_symbol(application).filter(|name| is_package_import_trigger(name))?;
+    first_call_argument(application, is_package_import_trigger)
+}
+
+/// The function names whose string argument names a source file to run.
+fn is_file_load_trigger(name: &str) -> bool {
+    matches!(name, "load" | "needs" | "input")
+}
+
+/// The file paths a tree runs through `load`/`needs`/`input`, as written.
+pub fn collect_loaded_files_in_tree<'tree>(
+    root: M2Node<'tree>,
+    syntax: Option<&SourceFile>,
+) -> Vec<&'tree str> {
+    let mut files = Vec::new();
+    visit_source_nodes(root, syntax, |application| {
+        if let Some(path) = first_call_argument(application, is_file_load_trigger)
+            .and_then(|argument| argument.string_literal_inner_text())
+        {
+            files.push(path);
+        }
+    });
+    files
+}
+
+/// The first argument of `callee ARG` / `callee(ARG, …)` when `callee` is
+/// accepted by `is_trigger`.
+fn first_call_argument(
+    application: M2Node<'_>,
+    is_trigger: impl Fn(&str) -> bool,
+) -> Option<M2Node<'_>> {
+    binary_expression_left_symbol(application).filter(|name| is_trigger(name))?;
     let argument = application.child_by_field_name("right")?;
     let argument = if argument.is::<Sequence>() || argument.is_holder() {
         argument.collection_elements().next()?

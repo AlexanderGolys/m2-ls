@@ -1,13 +1,14 @@
-//! A workspace-wide index of top-level (global) navigation facts across every
-//! `.m2` file under the project roots, including files the editor has not opened.
+//! A workspace-wide index of top-level (global) navigation facts across the
+//! files the editor has open and every file they load (`load`/`needs`/`input`),
+//! transitively, including loaded files the editor has not opened.
 //!
 //! M2's top-level symbols are global once loaded, so a name-keyed index of every
 //! file's global facts is a faithful model: a name used in one file and defined
 //! or implemented at the top level of another resolves across the project.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::path::Path;
+use std::sync::Arc;
 
 use dashmap::DashMap;
 use tower_lsp::lsp_types::{Location, Range as TextRange, Url};
@@ -16,6 +17,7 @@ use crate::analysis::AssignmentFactKind;
 use crate::capabilities::document_symbols::{collect_workspace_symbols, WorkspaceSourceSymbol};
 use crate::document::DocumentSnapshot;
 use crate::object_registry::{ObjectName, ObjectRegistry};
+use crate::package_index::collect_loaded_files_in_tree;
 use crate::semantic_token::{local_symbol_semantic_token, M2SemanticTokenType};
 
 #[derive(Debug, Clone)]
@@ -102,8 +104,8 @@ impl<T: WorkspaceDefinitionKnowledge + ?Sized> WorkspaceDefinitionKnowledge for 
 }
 
 /// Global navigation index, keyed by symbol name, kept in sync with edits and
-/// on-disk changes. Open documents are indexed from their live text; unopened
-/// files from disk.
+/// on-disk changes. Open documents are indexed from their live text; the files
+/// they load, from disk.
 #[derive(Debug, Default)]
 pub struct WorkspaceIndex {
     definitions_by_name: DashMap<ObjectName, Vec<DefLocation>>,
@@ -111,49 +113,45 @@ pub struct WorkspaceIndex {
     method_declarations_by_name: DashMap<ObjectName, Vec<Url>>,
     names_by_file: DashMap<Url, Vec<ObjectName>>,
     symbols_by_file: DashMap<Url, Vec<WorkspaceSourceSymbol>>,
-    roots: RwLock<Vec<PathBuf>>,
+    /// Every indexed file, mapped to the files it loads.
+    loads_by_file: DashMap<Url, Vec<Url>>,
 }
 
 impl WorkspaceIndex {
-    pub fn set_roots(&self, roots: Vec<PathBuf>) {
-        *self.roots.write().expect("workspace roots lock poisoned") = roots;
-    }
-
-    fn roots(&self) -> Vec<PathBuf> {
-        self.roots
-            .read()
-            .expect("workspace roots lock poisoned")
-            .clone()
-    }
-
-    /// Walk every root and index all `.m2` files found. Intended to run off the
-    /// request path (e.g. `spawn_blocking`) since it touches the filesystem.
-    pub fn scan(&self, knowledge_provider: &ObjectRegistry) {
-        for root in self.roots() {
-            let mut files = Vec::new();
-            collect_m2_files(&root, &mut files);
-            for path in files {
-                let Ok(uri) = Url::from_file_path(&path) else {
-                    continue;
-                };
-                if self.names_by_file.contains_key(&uri) {
-                    continue;
-                }
-                let Ok(text) = fs::read_to_string(&path) else {
-                    continue;
-                };
-                self.index_file(&uri, &text, knowledge_provider);
+    /// Index `uri` from `text`, then every file it loads, transitively, from
+    /// disk. Files already indexed keep their facts, so an open document's live
+    /// text is never clobbered by its saved copy.
+    pub fn index_file(&self, uri: &Url, text: &str, knowledge_provider: &ObjectRegistry) {
+        let mut pending = self.index_source(uri, text, knowledge_provider);
+        while let Some(loaded) = pending.pop() {
+            if self.is_indexed(&loaded) {
+                continue;
             }
+            let Ok(path) = loaded.to_file_path() else {
+                continue;
+            };
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            pending.extend(self.index_source(&loaded, &text, knowledge_provider));
         }
     }
 
-    /// Replace the navigation facts recorded for `uri` with those parsed from `text`.
-    pub fn index_file(&self, uri: &Url, text: &str, knowledge_provider: &ObjectRegistry) {
+    pub fn is_indexed(&self, uri: &Url) -> bool {
+        self.loads_by_file.contains_key(uri)
+    }
+
+    /// Replace the navigation facts recorded for `uri` with those parsed from
+    /// `text`, returning the files it loads.
+    fn index_source(&self, uri: &Url, text: &str, knowledge_provider: &ObjectRegistry) -> Vec<Url> {
         self.remove_file(uri);
         let Some(snapshot) = DocumentSnapshot::from_text(text.to_string(), knowledge_provider)
         else {
-            return;
+            self.loads_by_file.insert(uri.clone(), Vec::new());
+            return Vec::new();
         };
+        let loads = loaded_file_uris(uri, &snapshot);
+        self.loads_by_file.insert(uri.clone(), loads.clone());
         let definitions = top_level_definitions(&snapshot);
         let implementations = top_level_implementations(&snapshot);
         let method_declarations = top_level_method_declarations(&snapshot);
@@ -162,7 +160,7 @@ impl WorkspaceIndex {
             self.symbols_by_file.insert(uri.clone(), symbols);
         }
         if definitions.is_empty() && implementations.is_empty() && method_declarations.is_empty() {
-            return;
+            return loads;
         }
         let mut names = Vec::with_capacity(
             definitions.len() + implementations.len() + method_declarations.len(),
@@ -204,9 +202,11 @@ impl WorkspaceIndex {
         names.sort();
         names.dedup();
         self.names_by_file.insert(uri.clone(), names);
+        loads
     }
 
     pub fn remove_file(&self, uri: &Url) {
+        self.loads_by_file.remove(uri);
         self.symbols_by_file.remove(uri);
         let Some((_, names)) = self.names_by_file.remove(uri) else {
             return;
@@ -244,20 +244,12 @@ impl WorkspaceIndex {
         }
     }
 
-    /// Every `.m2` file under the project roots, as URIs. Walks the filesystem,
-    /// so callers should keep it off the hot path.
-    pub fn workspace_file_uris(&self) -> Vec<Url> {
-        let mut uris = Vec::new();
-        for root in self.roots() {
-            let mut files = Vec::new();
-            collect_m2_files(&root, &mut files);
-            uris.extend(
-                files
-                    .iter()
-                    .filter_map(|path| Url::from_file_path(path).ok()),
-            );
-        }
-        uris
+    /// Every indexed file: the open documents and the files they load.
+    pub fn indexed_file_uris(&self) -> Vec<Url> {
+        self.loads_by_file
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 }
 
@@ -383,24 +375,22 @@ impl WorkspaceIndex {
     }
 }
 
-/// Recursively collect `.m2` files, skipping hidden, build, and vendored dirs.
-fn collect_m2_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+/// The existing files `snapshot` loads, resolved against the directory of
+/// `uri` as Macaulay2 resolves them against `currentFileDirectory`.
+fn loaded_file_uris(uri: &Url, snapshot: &DocumentSnapshot) -> Vec<Url> {
+    let Some(directory) = uri
+        .to_file_path()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+    else {
+        return Vec::new();
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if path.is_dir() {
-            if name.starts_with('.') || matches!(name.as_ref(), "target" | "node_modules") {
-                continue;
-            }
-            collect_m2_files(&path, out);
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("m2") {
-            out.push(path);
-        }
-    }
+    collect_loaded_files_in_tree(snapshot.root_node(), snapshot.syntax())
+        .into_iter()
+        .map(|loaded| directory.join(loaded))
+        .filter(|path| path.is_file())
+        .filter_map(|path| Url::from_file_path(path).ok())
+        .collect()
 }
 
 /// Parse `text` and return its global-scope definitions as `(name, range)`,

@@ -48,3 +48,4 @@ simplifyLess = if not (lessLeft < lessRight) then lessValue
 simplifyDoubleNot = if not not doubleNotValue then doubleNotResult
 keepSimpleIf = if simpleCondition then simpleResult
 rawDelimiter = "a\/\/\/b"
+

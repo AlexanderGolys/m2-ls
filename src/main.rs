@@ -12,7 +12,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::{io, task};
 use tower_lsp::{
-    jsonrpc::{Error, Result},
+    jsonrpc::Result,
     lsp_types::request::{
         GotoDeclarationParams, GotoDeclarationResponse, GotoImplementationParams,
         GotoImplementationResponse, GotoTypeDefinitionParams, GotoTypeDefinitionResponse,
@@ -83,7 +83,7 @@ use session::{ClientInput, ExitNotificationService, SessionEnd};
 
 use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::semantic_token::{LEGEND_MODIFIERS, LEGEND_TYPES};
-use crate::settings::{ServerSettings, SettingsStore};
+use crate::settings::{ServerSettings, SettingProblem, SettingsStore};
 use crate::workspace_index::WorkspaceIndex;
 
 #[derive(Debug)]
@@ -188,7 +188,7 @@ impl Backend {
         Some(request(document.value(), scoped))
     }
 
-    /// Collect occurrences of a global symbol across every workspace file
+    /// Collect occurrences of a global symbol across every indexed file
     /// other than `exclude`. Prefers a live open buffer (so unsaved edits are
     /// reflected) and falls back to parsing the on-disk file. Used by both
     /// `references` and `rename` so the cross-file scan lives in one place.
@@ -198,7 +198,7 @@ impl Backend {
         exclude: &'a Url,
     ) -> impl Iterator<Item = (Url, TextRange)> + 'a {
         self.workspace_index
-            .workspace_file_uris()
+            .indexed_file_uris()
             .into_iter()
             .filter(move |file_uri| file_uri != exclude)
             .flat_map(move |file_uri| {
@@ -226,6 +226,24 @@ impl Backend {
     async fn publish_document_diagnostics(&self, uri: Url, document: &DocumentSnapshot) {
         let settings = self.settings.snapshot();
         publish_diagnostics(&self.client, uri, document, settings.diagnostics()).await;
+    }
+
+    /// Tell the user, not just the log, which settings were ignored and why.
+    async fn report_setting_problems(&self, problems: &[SettingProblem]) {
+        if problems.is_empty() {
+            return;
+        }
+        let listed = problems
+            .iter()
+            .map(SettingProblem::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        self.client
+            .show_message(
+                MessageType::WARNING,
+                format!("m2-ls ignored invalid settings, keeping their defaults: {listed}"),
+            )
+            .await;
     }
 
     async fn apply_settings(
@@ -270,9 +288,10 @@ impl Backend {
             return;
         };
         let uri = params.uri;
-        self.workspace_index
-            .index_file(&uri, document.text(), &self.registry);
+        let text = document.text().to_string();
+        // Served before indexing, which may read the document's loads from disk.
         self.documents.insert(uri.clone(), document);
+        self.index_in_background(uri.clone(), text).await;
         if let Some(document) = self.documents.get(&uri) {
             self.publish_document_diagnostics(uri, document.value())
                 .await;
@@ -280,15 +299,31 @@ impl Backend {
     }
 
     async fn on_change(&self, uri: Url, changes: Vec<TextDocumentContentChangeEvent>) {
-        if let Some(mut document) = self.documents.get_mut(&uri) {
+        let text = {
+            let Some(mut document) = self.documents.get_mut(&uri) else {
+                return;
+            };
             if document.apply_changes(&changes, &self.registry).is_none() {
                 return;
             }
-            self.workspace_index
-                .index_file(&uri, document.text(), &self.registry);
+            document.text().to_string()
+        };
+        self.index_in_background(uri.clone(), text).await;
+        if let Some(document) = self.documents.get(&uri) {
             self.publish_document_diagnostics(uri, document.value())
                 .await;
         }
+    }
+
+    /// Index `text` as `uri`, plus the files it loads, on the blocking pool:
+    /// the session's one task also writes outgoing messages, so indexing it
+    /// in place would hold back every notification until it finishes.
+    async fn index_in_background(&self, uri: Url, text: String) {
+        let index = Arc::clone(&self.workspace_index);
+        let registry = self.registry.clone();
+        task::spawn_blocking(move || index.index_file(&uri, &text, &registry))
+            .await
+            .expect("workspace indexing task panicked");
     }
 }
 
@@ -319,13 +354,6 @@ fn install_panic_logging() {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        self.workspace_index.set_roots(workspace_roots(&params));
-        // Index every `.m2` file without blocking the async runtime.
-        let index = Arc::clone(&self.workspace_index);
-        let knowledge = self.registry.clone();
-        task::spawn_blocking(move || index.scan(&knowledge))
-            .await
-            .map_err(|_| Error::internal_error())?;
         // `init.m2` runs before every file, so its global definitions are
         // known everywhere, like those of a workspace file.
         if let Some(initialization_file) = &self.initialization_file {
@@ -342,19 +370,9 @@ impl LanguageServer for Backend {
         self.inlay_hint_refresh.negotiate(&params.capabilities);
 
         if let Some(options) = params.initialization_options.as_ref() {
-            match ServerSettings::from_value(options) {
-                Ok(settings) => {
-                    self.settings.replace(settings);
-                }
-                Err(error) => {
-                    self.client
-                        .log_message(
-                            MessageType::WARNING,
-                            format!("Ignoring invalid Macaulay2 LSP settings: {error}"),
-                        )
-                        .await;
-                }
-            }
+            let parsed = ServerSettings::from_value(options);
+            self.settings.replace(parsed.settings);
+            self.report_setting_problems(&parsed.problems).await;
         }
 
         Ok(InitializeResult {
@@ -497,19 +515,9 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
-        let settings = match ServerSettings::from_value(&params.settings) {
-            Ok(settings) => settings,
-            Err(error) => {
-                self.client
-                    .log_message(
-                        MessageType::WARNING,
-                        format!("Ignoring invalid Macaulay2 LSP settings: {error}"),
-                    )
-                    .await;
-                return;
-            }
-        };
-        if let Err(error) = self.apply_settings(settings, &self.client).await {
+        let parsed = ServerSettings::from_value(&params.settings);
+        self.report_setting_problems(&parsed.problems).await;
+        if let Err(error) = self.apply_settings(parsed.settings, &self.client).await {
             self.client
                 .log_message(
                     MessageType::WARNING,
@@ -530,8 +538,11 @@ impl LanguageServer for Backend {
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         for change in params.changes {
             // Open documents are indexed from their live buffer; ignore disk
-            // events for them to avoid clobbering unsaved edits.
-            if self.documents.contains_key(&change.uri) {
+            // events for them to avoid clobbering unsaved edits. Files neither
+            // open nor loaded by an open file stay out of the index.
+            if self.documents.contains_key(&change.uri)
+                || !self.workspace_index.is_indexed(&change.uri)
+            {
                 continue;
             }
             if change.typ == FileChangeType::DELETED {
@@ -928,27 +939,6 @@ impl LanguageServer for Backend {
     }
 }
 
-/// The project roots to index, preferring `workspaceFolders` and falling back
-/// to the (deprecated) `rootUri` single-folder field that older clients send.
-fn workspace_roots(params: &InitializeParams) -> Vec<PathBuf> {
-    if let Some(folders) = &params.workspace_folders {
-        let roots: Vec<PathBuf> = folders
-            .iter()
-            .filter_map(|folder| folder.uri.to_file_path().ok())
-            .collect();
-        if !roots.is_empty() {
-            return roots;
-        }
-    }
-    #[allow(deprecated)]
-    params
-        .root_uri
-        .as_ref()
-        .and_then(|uri| uri.to_file_path().ok())
-        .into_iter()
-        .collect()
-}
-
 fn server_info() -> ServerInfo {
     ServerInfo {
         name: env!("CARGO_PKG_NAME").to_string(),
@@ -1007,8 +997,25 @@ fn package_list(packages: &[ObjectName]) -> String {
         .join(", ")
 }
 
-#[tokio::main]
-async fn main() {
+/// Stack reserved for every runtime thread. Lowering and analysis recurse once
+/// per nesting level, and generated sources (e.g. polynomials with thousands of
+/// terms in one left-associated chain) nest far beyond the default 2 MiB worker
+/// stack. The reservation is virtual; pages are committed only when touched.
+const RUNTIME_THREAD_STACK_BYTES: usize = 1 << 30;
+
+fn main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(RUNTIME_THREAD_STACK_BYTES)
+        .enable_all()
+        .build()
+        .expect("tokio runtime builds");
+    // The session runs on a runtime thread, never on the default-sized main thread.
+    runtime
+        .block_on(runtime.spawn(serve()))
+        .expect("language server session task panicked");
+}
+
+async fn serve() {
     if let Some(result) = run_documentation_command() {
         if let Err(error) = result {
             eprintln!("m2-ls docs: {error}");

@@ -65,6 +65,7 @@ async fn workspace_symbols_include_reassignments_and_exclude_function_body_bindi
     let workspace = TestWorkspace::new(source);
     let mut server = LspProcess::spawn().await;
     server.initialize(&workspace.root_uri()).await;
+    server.open_document(&workspace.uri, source).await;
 
     let symbols = server
         .request("workspace/symbol", json!({"query": ""}))
@@ -84,23 +85,6 @@ async fn workspace_symbols_include_reassignments_and_exclude_function_body_bindi
     assert!(symbols
         .iter()
         .all(|symbol| { symbol["name"] != "localBinding" && symbol["name"] != "globalBinding" }));
-
-    server
-        .notify(
-            "textDocument/didOpen",
-            json!({
-                "textDocument": {
-                    "uri": workspace.uri,
-                    "languageId": "macaulay2",
-                    "version": 1,
-                    "text": source
-                }
-            }),
-        )
-        .await;
-    server
-        .wait_for_notification("textDocument/publishDiagnostics")
-        .await;
 
     let document_symbols = server
         .request(
@@ -124,6 +108,86 @@ async fn workspace_symbols_include_reassignments_and_exclude_function_body_bindi
     assert!(response_array(children)
         .iter()
         .any(|symbol| symbol["name"] == "globalBinding"));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn files_loaded_by_an_open_document_are_indexed_without_being_opened() {
+    let source = "load \"related.m2\"\ncrossFileResult\n";
+    let workspace = TestWorkspace::new(source);
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    server.open_document(&workspace.uri, source).await;
+
+    let symbols = server
+        .request("workspace/symbol", json!({"query": "crossFile"}))
+        .await;
+    assert!(
+        response_array(&symbols).iter().any(|symbol| {
+            symbol["name"] == "crossFileResult"
+                && symbol["location"]["uri"] == workspace.related_uri
+        }),
+        "a loaded file should be indexed from disk: {symbols}"
+    );
+
+    let definition = server
+        .request(
+            "textDocument/definition",
+            document_position(&workspace.uri, position(source, "crossFileResult", 0)),
+        )
+        .await;
+    assert!(
+        definition.to_string().contains(&workspace.related_uri),
+        "a use should resolve into the loaded file: {definition}"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_invalid_setting_is_shown_to_the_user_and_the_valid_ones_still_apply() {
+    let source = "f = x -> (unused := 1; x)\n";
+    let workspace = TestWorkspace::new(source);
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    let opened = server.open_document(&workspace.uri, source).await;
+    assert!(!response_array(&opened["params"]["diagnostics"]).is_empty());
+
+    server
+        .notify(
+            "workspace/didChangeConfiguration",
+            json!({
+                "settings": {
+                    "macaulay2": {
+                        "server": { "path": "m2-ls" },
+                        "diagnostics": {
+                            "enabled": false,
+                            "disabled": ["not-a-rule"]
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+
+    let message = server.wait_for_notification("window/showMessage").await;
+    let text = message["params"]["message"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("`diagnostics.disabled`: unknown diagnostic `not-a-rule`"),
+        "{message}"
+    );
+    assert!(
+        !text.contains("server"),
+        "client-owned keys are not reported: {message}"
+    );
+    let republished = server
+        .wait_for_notification("textDocument/publishDiagnostics")
+        .await;
+    assert!(
+        response_array(&republished["params"]["diagnostics"]).is_empty(),
+        "`enabled: false` should still apply: {republished}"
+    );
 
     server.shutdown().await;
 }
@@ -170,13 +234,8 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
         .request("workspace/symbol", json!({"query": "crossFile"}))
         .await;
     assert!(
-        response_array(&unopened_workspace_symbols)
-            .iter()
-            .any(|symbol| {
-                symbol["name"] == "crossFileResult"
-                    && symbol["location"]["uri"] == workspace.related_uri
-            }),
-        "workspace symbols should include files that have not been opened: {unopened_workspace_symbols}"
+        response_array(&unopened_workspace_symbols).is_empty(),
+        "files neither open nor loaded should stay out of the index: {unopened_workspace_symbols}"
     );
 
     let unopened_hover = server

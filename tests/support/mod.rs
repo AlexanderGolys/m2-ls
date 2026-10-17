@@ -144,6 +144,24 @@ impl LspProcess {
         self.send(message).await;
     }
 
+    /// Open `text` at `uri` and return the diagnostics published for it.
+    pub(crate) async fn open_document(&mut self, uri: &str, text: &str) -> Value {
+        self.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "macaulay2",
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        )
+        .await;
+        self.wait_for_notification("textDocument/publishDiagnostics")
+            .await
+    }
+
     pub(crate) async fn wait_for_notification(&mut self, method: &str) -> Value {
         if let Some(index) = self
             .pending
@@ -406,22 +424,12 @@ impl DocumentSession {
         .iter()
         .filter_map(|modifier| modifier.as_str().map(str::to_string))
         .collect();
+        // Only open documents and the files they load are indexed, so the
+        // related file joins the workspace by being open as well.
         server
-            .notify(
-                "textDocument/didOpen",
-                json!({
-                    "textDocument": {
-                        "uri": workspace.uri,
-                        "languageId": "macaulay2",
-                        "version": 1,
-                        "text": source
-                    }
-                }),
-            )
+            .open_document(&workspace.related_uri, related_source)
             .await;
-        let diagnostics = server
-            .wait_for_notification("textDocument/publishDiagnostics")
-            .await;
+        let diagnostics = server.open_document(&workspace.uri, source).await;
 
         Self {
             server,

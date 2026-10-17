@@ -2,7 +2,7 @@
 
 use m2_syn::nodes::{
     ElseClause, ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
-    ExprTry as TryStatement, ExprWhile as WhileLoop, FloatLiteral, IntegerLiteral, LoopBody,
+    ExprTry as TryStatement, ExprWhile as WhileLoop, FloatLiteral, IntegerLiteral, List, LoopBody,
     RawStringLiteral, Sequence, StringLiteral, Symbol, ThenClause,
 };
 use m2_syn::Token;
@@ -150,6 +150,7 @@ pub fn format_document_text(text: &str) -> String {
 pub fn format_document_text_with_options(text: &str, options: &FormatOptions) -> String {
     let newline = detect_line_ending(text);
     let formatted = normalize_whitespace(text, options);
+    let formatted = break_option_tables(&formatted, newline);
     let formatted = inline_empty_bodies(&formatted);
     let formatted = format_control_flow(&formatted, options, newline);
     let formatted = reindent_from_tree(&formatted, options, newline);
@@ -198,6 +199,77 @@ fn separate_line_end_bracket_closers(text: &str, newline: &'static str) -> Strin
         });
     }
     apply_format_edits(text, edits)
+}
+
+/// Lays out every hash-table construction, a `{…}` list of at least two
+/// options and nothing else, one option per line; re-indentation then indents
+/// the options and puts the closing brace back at the opener's level:
+///
+/// ```m2
+/// {
+///     x => 1,
+///     y => 2
+/// }
+/// ```
+fn break_option_tables(text: &str, newline: &'static str) -> String {
+    let Some(mut parser) = M2Parser::new() else {
+        return text.to_string();
+    };
+    let Some(root) = parser.parse(text) else {
+        return text.to_string();
+    };
+    let mut edits = Vec::new();
+    for table in root.descendants().filter(|node| is_option_table(*node)) {
+        let children = table.children().collect::<Vec<_>>();
+        for pair in children.windows(2) {
+            let [before, after] = pair else {
+                continue;
+            };
+            if before.is_opening_delimiter() || before.is_comma() || after.is_closing_delimiter() {
+                push_line_break_between(
+                    text,
+                    before.end_byte(),
+                    after.start_byte(),
+                    newline,
+                    &mut edits,
+                );
+            }
+        }
+    }
+    apply_format_edits(text, edits)
+}
+
+/// Whether `node` is a `{…}` list of at least two elements, all options.
+fn is_option_table(node: M2Node<'_>) -> bool {
+    if !node.is::<List>() {
+        return false;
+    }
+    let elements = node.collection_elements().collect::<Vec<_>>();
+    elements.len() >= 2 && elements.iter().all(M2Node::is_option_assignment)
+}
+
+/// Replaces the horizontal whitespace between two tokens on one line, possibly
+/// none, with a line break. Tokens already on separate lines, or with anything
+/// but spaces between them, are left as they are.
+fn push_line_break_between(
+    text: &str,
+    start_byte: usize,
+    end_byte: usize,
+    newline: &'static str,
+    edits: &mut Vec<FormatEdit>,
+) {
+    if start_byte > end_byte
+        || !text[start_byte..end_byte]
+            .bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        return;
+    }
+    edits.push(FormatEdit {
+        start_byte,
+        end_byte,
+        replacement: newline,
+    });
 }
 
 /// The line terminator the document already uses, so re-indentation preserves it
@@ -803,7 +875,10 @@ pub fn folding_ranges_for_text(text: &str) -> Vec<FormatFoldRange> {
 /// Per-line indentation depths derived from a tree-sitter parse of normalized
 /// text, plus the rows that lie inside a multiline string and must be left
 /// verbatim and the comment ranges that can be folded.
-/// `depth(row) = bracket_depth(row) + continuation(row)`.
+/// `depth(row) = bracket_base(row) + continuation(row)`, where a row inside
+/// multiline brackets sits one level deeper than the row its innermost bracket
+/// opened on, and a row beginning with that bracket's closer sits at the
+/// opener row's depth.
 struct TreeIndentLayout {
     depths: Vec<usize>,
     literal_rows: Vec<bool>,
@@ -841,12 +916,20 @@ impl TreeIndentLayout {
             })
             .collect();
 
-        let depths = (0..line_count)
-            .map(|row| {
-                bracket_depth(row, &brackets, &line_leads)
-                    + line_continuation(row, root, &line_leads, compact_factor_operators)
-            })
-            .collect();
+        let mut depths: Vec<usize> = Vec::with_capacity(line_count);
+        for row in 0..line_count {
+            let bracket_base = innermost_open_bracket_row(row, &brackets).map_or(0, |open_row| {
+                let opener_depth = depths[open_row];
+                if closes_at_line_start(row, open_row, &brackets, &line_leads) {
+                    opener_depth
+                } else {
+                    opener_depth + 1
+                }
+            });
+            depths.push(
+                bracket_base + line_continuation(row, root, &line_leads, compact_factor_operators),
+            );
+        }
 
         Self {
             depths,
@@ -1039,25 +1122,31 @@ fn line_leading_blank(text: &str, line_count: usize) -> Vec<usize> {
     leads
 }
 
-/// `bracket_depth(row)` = (distinct open-rows of multiline brackets currently
-/// open across this row) minus (distinct groups whose closer begins this row).
-/// The latter dedents a leading closing delimiter back to the opener level.
-fn bracket_depth(row: usize, brackets: &[BracketGroup], line_leads: &[usize]) -> usize {
+/// The row the innermost multiline bracket open across `row` opened on.
+/// Brackets opening on the same row form one indent level, so the row
+/// identifies it.
+fn innermost_open_bracket_row(row: usize, brackets: &[BracketGroup]) -> Option<usize> {
+    brackets
+        .iter()
+        .filter(|group| group.open_row < row && row <= group.close_row)
+        .map(|group| group.open_row)
+        .max()
+}
+
+/// Whether `row` begins with the closer of a bracket opened on `open_row`,
+/// which then dedents back to the opener's level.
+fn closes_at_line_start(
+    row: usize,
+    open_row: usize,
+    brackets: &[BracketGroup],
+    line_leads: &[usize],
+) -> bool {
     let leading_blank = line_leads.get(row).copied().unwrap_or(0);
-    let mut active = Vec::new();
-    let mut leading_closed = Vec::new();
-    for group in brackets {
-        if group.open_row < row && row <= group.close_row && !active.contains(&group.open_row) {
-            active.push(group.open_row);
-        }
-        if group.close_row == row
+    brackets.iter().any(|group| {
+        group.open_row == open_row
+            && group.close_row == row
             && group.closing_delimiter_column == leading_blank
-            && !leading_closed.contains(&group.open_row)
-        {
-            leading_closed.push(group.open_row);
-        }
-    }
-    active.len().saturating_sub(leading_closed.len())
+    })
 }
 
 /// `continuation(row)` is a flat +1 for a line that continues an expression or a
@@ -1087,7 +1176,7 @@ fn line_continuation(
 
     // (c) The first token is an `else`/`then` keyword whose controlling `if` is
     // not standalone (a ternary `x := if … then\n … else …`); a standalone `if`
-    // aligns its `else` via bracket_depth instead.
+    // aligns its `else` through its bracket instead.
     if is_dangling_clause_keyword(first, row, line_leads) {
         return 1;
     }
@@ -1834,6 +1923,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hash_table_constructions_put_one_option_per_line() {
+        assert_eq!(
+            format_document_text("a = f({x=>1,y=>2}, {c=>3}, {d=>4,e=>5, f})\n"),
+            "a = f({\n    x => 1,\n    y => 2\n}, {c => 3}, {d => 4, e => 5, f})\n",
+            "a single option, or a list mixing options with values, stays on one line"
+        );
+        assert_eq!(
+            format_document_text(
+                "h = new HashTable from {\"a\" => 1, \"b\" => {p => 2, q => 3}}\n"
+            ),
+            concat!(
+                "h = new HashTable from {\n",
+                "    \"a\" => 1,\n",
+                "    \"b\" => {\n",
+                "        p => 2,\n",
+                "        q => 3\n",
+                "    }\n",
+                "}\n",
+            ),
+            "nested tables are laid out at their own depth"
+        );
+    }
+
+    #[test]
+    fn hash_table_layout_is_stable() {
+        let formatted = format_document_text("t = {x => 1, y => 2}\n");
+        assert_eq!(formatted, "t = {\n    x => 1,\n    y => 2\n}\n");
+        assert_eq!(format_document_text(&formatted), formatted);
+    }
+
+    #[test]
     fn folds_consecutive_full_line_comments_as_one_range() {
         assert_eq!(
             folding_ranges_for_text(
@@ -2150,7 +2270,18 @@ mod tests {
             format_document_text(
                 "scan(docKeys, key -> (\nbaseName := recordNameFromDocKey key;\nif db#?key then result#baseName = append(result#baseName ?? {}, hashTable {\"key\" => key, \"raw\" => db#key});\n)\n);\n"
             ),
-            "scan(docKeys, key -> (\n    baseName := recordNameFromDocKey key;\n    if db#?key then\n        result#baseName = append(result#baseName ?? {}, hashTable {\"key\" => key, \"raw\" => db#key});\n)\n);\n"
+            concat!(
+                "scan(docKeys, key -> (\n",
+                "    baseName := recordNameFromDocKey key;\n",
+                "    if db#?key then\n",
+                "        result#baseName = append(result#baseName ?? {}, hashTable {\n",
+                "            \"key\" => key,\n",
+                "            \"raw\" => db#key\n",
+                "        });\n",
+                ")\n",
+                ");\n",
+            ),
+            "a bracket opened on a continuation line indents relative to that line"
         );
     }
 
@@ -2214,7 +2345,7 @@ mod tests {
                 "breakAfterSemicolon": false
             }
         }))
-        .unwrap();
+        .settings;
         let options = FormatOptions::from_configuration(8, false, settings.formatting());
 
         assert_eq!(

@@ -1845,7 +1845,7 @@ impl Analysis {
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<MethodCodomainDeduction> {
-        self.installation_for(assignment, source)?;
+        let installation = self.installation_for(assignment, source)?;
         let (left, _, right) = assignment_parts(assignment)?;
         let lambda = assigned_lambda(right)?;
         let body = lambda.child_by_field_name("body")?;
@@ -1855,6 +1855,11 @@ impl Analysis {
         }
 
         let annotation = method_codomain_annotation(right);
+        // Without a local annotation the installation inherits the method's
+        // `TypicalValue`; annotating that same type again adds nothing.
+        if annotation.is_none() && installation.method.codomain.as_ref() == Some(&codomain) {
+            return None;
+        }
         let annotated_codomain = annotation.map(|annotation| ObjectName::new(annotation.text()));
         if let Some(annotation) = annotation {
             match TypeChecker::new(self, knowledge).subtype_evidence(

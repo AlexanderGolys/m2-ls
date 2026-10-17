@@ -90,6 +90,7 @@ Every setting is optional and applies without a restart. Send them under the
 | --- | --- | --- |
 | `diagnostics.enabled` | `true` | Shows or hides all diagnostics. |
 | `diagnostics.disabled` | `[]` | Hides rules by name or code, e.g. `unused-binding` or `T02`. |
+| `diagnostics.warningsAsHint`, `diagnostics.warningsAsInfo` | `[]` | Shows these rules' warnings as hints or information instead. |
 | `formatting.indentWidth`, `formatting.useTabs` | editor's choice | Indentation used by the formatter. |
 | `formatting.softLineWidth`, `formatting.hardLineWidth` | `100` | Preferred and forced wrapping widths; `0` disables. |
 | `formatting.controlFlowLayout` | `multilineCompactElse` | `compact`, `multiline`, or `multilineCompactElse`. |
@@ -98,10 +99,20 @@ Every setting is optional and applies without a restart. Send them under the
 | `inlayHints.expressionTypes` | `false` | Adds argument, subexpression, and call-result types. |
 | `inlayHints.allKnownTypes` | `false` | Also shows types that are obvious from literals. |
 
+An invalid value only affects its own setting, which keeps its default; the
+server reports what it ignored in a warning message.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[GPL-3.0](LICENSE)
+The server source code is licensed under [MIT](LICENSE-MIT).
+
+The builtin catalog `src/data/m2-index.jsonl` is derived from the Macaulay2
+documentation and is distributed under the GNU General Public License, version 2
+or version 3 ([GPL-2.0](LICENSE-GPL-2.0), [GPL-3.0](LICENSE-GPL-3.0)), following
+Macaulay2's own terms. Documentation of individual Macaulay2 packages remains
+under the terms chosen by their authors. Because the catalog is embedded in the
+`m2-ls` executable, distributed binaries are also subject to the GPL.

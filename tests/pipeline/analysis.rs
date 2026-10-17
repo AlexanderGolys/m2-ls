@@ -924,6 +924,23 @@ async fn method_codomain_diagnostics_offer_annotation_quick_fixes() {
     session.replace("f ZZ := x -> mystery x\n").await;
     assert!(!session.diagnostic_codes().contains(&"T03"));
 
+    session
+        .replace("g = method(Dispatch => Thing, TypicalValue => List)\ng ZZ := x -> {x}\n")
+        .await;
+    assert!(
+        !session.diagnostic_codes().contains(&"T03"),
+        "a codomain equal to the inherited TypicalValue must not be suggested: {:?}",
+        session.diagnostics()
+    );
+
+    session
+        .replace("g = method(Dispatch => Thing, TypicalValue => List)\ng ZZ := x -> [x]\n")
+        .await;
+    assert!(
+        session.diagnostic_codes().contains(&"T03"),
+        "a codomain overriding the inherited TypicalValue is still worth suggesting"
+    );
+
     session.shutdown().await;
 }
 
