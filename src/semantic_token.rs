@@ -86,6 +86,7 @@ pub enum M2SemanticTokenModifier {
     File,
     Declaration,
     Builtin,
+    Unresolved,
 }
 
 impl M2SemanticTokenModifier {
@@ -100,6 +101,7 @@ pub const LEGEND_MODIFIERS: &[SemanticTokenModifier] = &[
     SemanticTokenModifier::new("file"),
     SemanticTokenModifier::DECLARATION,
     SemanticTokenModifier::new("builtin"),
+    SemanticTokenModifier::new("unresolved"),
 ];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -127,6 +129,12 @@ impl M2SemanticToken {
             token_type,
             modifiers: M2SemanticTokenModifiers(0),
         }
+    }
+
+    /// A name with no binding, indexed object, or workspace definition in
+    /// scope; at runtime it evaluates to its own `Symbol`.
+    pub const fn unresolved() -> Self {
+        Self::new(M2SemanticTokenType::Variable).with_modifier(M2SemanticTokenModifier::Unresolved)
     }
 
     pub const fn with_modifier(mut self, modifier: M2SemanticTokenModifier) -> Self {
@@ -207,7 +215,7 @@ where
         && context.source_token.is_expression_symbol
         && context.source_token.syntax_token_type.is_none()
     {
-        token = Some(M2SemanticToken::new(M2SemanticTokenType::EnumMember));
+        token = Some(M2SemanticToken::unresolved());
     }
     if token.is_none() && context.emit_syntax {
         token = context

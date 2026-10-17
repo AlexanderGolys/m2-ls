@@ -228,15 +228,13 @@ where
                     M2SemanticTokenType::Function | M2SemanticTokenType::Method
                 ) =>
             {
-                Some(M2SemanticToken::new(if is_bound {
-                    M2SemanticTokenType::Variable
+                Some(if is_bound {
+                    M2SemanticToken::new(M2SemanticTokenType::Variable)
                 } else {
-                    M2SemanticTokenType::EnumMember
-                }))
+                    M2SemanticToken::unresolved()
+                })
             }
-            None if source_token.is_expression_symbol => {
-                Some(M2SemanticToken::new(M2SemanticTokenType::EnumMember))
-            }
+            None if source_token.is_expression_symbol => Some(M2SemanticToken::unresolved()),
             token => token,
         }
     }
@@ -259,6 +257,7 @@ mod tests {
     const FILE_MODIFIER: u32 = M2SemanticTokenModifier::File.bit();
     const DECLARATION_MODIFIER: u32 = M2SemanticTokenModifier::Declaration.bit();
     const BUILTIN_MODIFIER: u32 = M2SemanticTokenModifier::Builtin.bit();
+    const UNRESOLVED_MODIFIER: u32 = M2SemanticTokenModifier::Unresolved.bit();
 
     fn document(text: &str, builtins: &ObjectRegistry) -> DocumentSnapshot {
         DocumentSnapshot::from_text(text.to_string(), builtins).expect("fixture should parse")
@@ -514,7 +513,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             vec![
                 M2SemanticTokenType::Comment as u32,
                 M2SemanticTokenType::Keyword as u32,
-                M2SemanticTokenType::EnumMember as u32,
+                M2SemanticTokenType::Variable as u32,
                 M2SemanticTokenType::Keyword as u32,
                 M2SemanticTokenType::Number as u32,
                 M2SemanticTokenType::Operator as u32,
@@ -609,7 +608,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         );
         assert_eq!(
             token_type_at(&tokens, 2, 0),
-            Some(M2SemanticTokenType::EnumMember as u32),
+            Some(M2SemanticTokenType::Variable as u32),
             "the isolated snippet assignment must not bind the real document symbol"
         );
     }
@@ -812,6 +811,45 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 M2SemanticTokenType::String as u32,    // exportFrom {"Pkg"} — list element
                 M2SemanticTokenType::String as u32,    // print "ordinary"
             ]
+        );
+    }
+
+    #[test]
+    fn new_package_binds_its_name_as_a_package() {
+        // `newPackage "P"` binds the global `P` to the package it creates, even
+        // from inside a function, so later references resolve as namespaces.
+        let text = concat!(
+            "newPackage(\"Pkg\", Version => \"0.1\")\n",
+            "Pkg\n",
+            "create = () -> newPackage \"Inner\"\n",
+            "Inner\n",
+        );
+        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let document = document(text, &builtins);
+        let tokens = collect_tokens(&document, &builtins, true);
+
+        for line in [1, 3] {
+            let token = token_at(&tokens, line, 0).expect("package reference is highlighted");
+            assert_eq!(token.token_type, M2SemanticTokenType::Namespace as u32);
+            assert_eq!(token.token_modifiers_bitset & UNRESOLVED_MODIFIER, 0);
+        }
+    }
+
+    #[test]
+    fn cross_file_package_reference_is_highlighted_as_a_namespace() {
+        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let workspace_index = WorkspaceIndex::default();
+        let package_uri = Url::parse("file:///Pkg.m2").expect("valid uri");
+        workspace_index.index_file(&package_uri, "newPackage \"Pkg\"\n", &builtins);
+
+        let main_uri = Url::parse("file:///main.m2").expect("valid uri");
+        let document = document("Pkg\n", &builtins);
+        let tokens =
+            collect_semantic_tokens(&document, &builtins, &workspace_index, &main_uri, false);
+
+        assert_eq!(
+            token_type_at(&tokens, 0, 0),
+            Some(M2SemanticTokenType::Namespace as u32)
         );
     }
 
@@ -1103,7 +1141,8 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             true,
         );
         let token = token_at(&tokens, 0, 0).expect("unassigned pkgFn should be highlighted");
-        assert_eq!(token.token_type, M2SemanticTokenType::EnumMember as u32);
+        assert_eq!(token.token_type, M2SemanticTokenType::Variable as u32);
+        assert_eq!(token.token_modifiers_bitset, UNRESOLVED_MODIFIER);
     }
 
     #[test]
@@ -1290,6 +1329,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 SemanticTokenModifier::new("file"),
                 SemanticTokenModifier::DECLARATION,
                 SemanticTokenModifier::new("builtin"),
+                SemanticTokenModifier::new("unresolved"),
             ]
         );
         assert_eq!(OPTION_MODIFIER, 1 << 0);
@@ -1297,6 +1337,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         assert_eq!(FILE_MODIFIER, 1 << 2);
         assert_eq!(DECLARATION_MODIFIER, 1 << 3);
         assert_eq!(BUILTIN_MODIFIER, 1 << 4);
+        assert_eq!(UNRESOLVED_MODIFIER, 1 << 5);
     }
 
     #[test]

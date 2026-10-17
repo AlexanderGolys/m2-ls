@@ -7,8 +7,8 @@ use m2_syn::nodes::{
     AssignmentList as AssignmentPack, ElseClause, Expr, ExprAssign as Assignment,
     ExprAssignParallel as ParallelAssignment, ExprAssignSimple as SimpleBinding,
     ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
-    ExprTry as TryStatement, ExprWhile as WhileLoop, LoopBody, SourceFile, Symbol, ThenClause,
-    TryFallback, WhenCondition,
+    ExprOpBinAdj as AdjacentExpr, ExprTry as TryStatement, ExprWhile as WhileLoop, LoopBody,
+    SourceFile, Symbol, ThenClause, TryFallback, WhenCondition,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Spanned, Token};
@@ -17,6 +17,7 @@ use tower_lsp::lsp_types::{Position, Range as TextRange};
 use crate::meta::BindingRole;
 use crate::node_metadata::{syntax_byte_range, M2Node};
 use crate::object_registry::ObjectName;
+use crate::package_index::declared_package_name;
 use crate::source::SourceNavigation;
 use crate::util::TextRangeExt;
 
@@ -58,6 +59,10 @@ impl Default for ScopeTree {
 pub(super) struct TraversalContext {
     pub scope: usize,
     pub assignment_scope: usize,
+    /// Where `:=` declares: the innermost function or `for` loop, each of which
+    /// owns a dictionary. `if`, `while`, and `try` clauses do not, so a local
+    /// declared in one stays visible after it.
+    pub declaration_scope: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +102,35 @@ impl BindingFact {
             potential_export,
         }
     }
+
+    /// The global binding `newPackage "P"` makes of `P`, anchored on the text
+    /// inside the name string.
+    fn package_declaration(
+        name: M2Node<'_>,
+        call: M2Node<'_>,
+        definition: TextRange,
+        source: &(impl SourceNavigation + ?Sized),
+    ) -> Option<Self> {
+        Some(Self {
+            name: ObjectName::new(name.string_literal_inner_text()?),
+            target: package_name_range(name, source)?,
+            value: Some(source.range_for_node(call)),
+            definition,
+            role: BindingRole::Ordinary,
+            effect: BindingEffect::Assign,
+            scope: 0,
+            potential_export: true,
+        })
+    }
+}
+
+/// Where the binding of a `newPackage` name string is anchored.
+pub(super) fn package_name_range(
+    name: M2Node<'_>,
+    source: &(impl SourceNavigation + ?Sized),
+) -> Option<TextRange> {
+    name.string_literal_inner_bytes()
+        .map(|bytes| source.range_for_bytes(bytes))
 }
 
 pub fn syntax_range(
@@ -119,6 +153,7 @@ pub(super) fn walk_cst(
         TraversalContext {
             scope: 0,
             assignment_scope: 0,
+            declaration_scope: 0,
         },
         &mut scopes,
         &mut collect,
@@ -144,10 +179,13 @@ fn walk_nested<'tree>(
         TraversalContext {
             scope,
             assignment_scope: scope,
+            declaration_scope: scope,
         }
     } else if node.is::<ForLoop>() {
+        let scope = scopes.push(node, source, inherited.scope, false, None);
         TraversalContext {
-            scope: scopes.push(node, source, inherited.scope, false, None),
+            scope,
+            declaration_scope: scope,
             ..inherited
         }
     } else {
@@ -168,6 +206,7 @@ fn walk_nested<'tree>(
             TraversalContext {
                 scope,
                 assignment_scope: kind.assignment_scope(scope, context.assignment_scope),
+                declaration_scope: context.declaration_scope,
             }
         });
         walk_nested(child, source, child_context, scopes, collect);
@@ -205,6 +244,15 @@ fn collect_bindings<'tree>(
         }
     }
 
+    if let Some(fact) = declared_package_name(node).and_then(|name| {
+        let definition = source_cell(node)
+            .filter(|cell| is_value_cell(*cell))
+            .unwrap_or(node);
+        BindingFact::package_declaration(name, node, source.range_for_node(definition), source)
+    }) {
+        collect(fact, scopes);
+    }
+
     if !node.is_assignment() {
         return;
     }
@@ -213,7 +261,11 @@ fn collect_bindings<'tree>(
     };
     let value = node.child_by_field_name("right");
     let (effect, scope, potential_export) = if node.has_binary_operator::<Token![:=]>() {
-        (BindingEffect::Declare, context.scope, context.scope == 0)
+        (
+            BindingEffect::Declare,
+            context.declaration_scope,
+            context.declaration_scope == 0,
+        )
     } else if node.has_binary_operator::<Token![=]>() {
         (
             BindingEffect::Assign,
@@ -242,10 +294,11 @@ fn collect_bindings<'tree>(
 
 pub fn walk(
     syntax: &SourceFile,
+    root: M2Node<'_>,
     source: &(impl SourceNavigation + ?Sized),
     mut collect: impl FnMut(BindingFact, &ScopeTree),
 ) -> ScopeTree {
-    let mut walker = TypedWalker::new(source);
+    let mut walker = TypedWalker::new(root, source);
     walker.visit_source_file(syntax);
     for fact in walker.bindings {
         collect(fact, &walker.scopes);
@@ -253,7 +306,8 @@ pub fn walk(
     walker.scopes
 }
 
-struct TypedWalker<'source, Source: ?Sized> {
+struct TypedWalker<'tree, 'source, Source: ?Sized> {
+    root: M2Node<'tree>,
     source: &'source Source,
     scopes: ScopeTree,
     bindings: Vec<BindingFact>,
@@ -261,15 +315,17 @@ struct TypedWalker<'source, Source: ?Sized> {
     definition: TextRange,
 }
 
-impl<'source, Source: SourceNavigation + ?Sized> TypedWalker<'source, Source> {
-    fn new(source: &'source Source) -> Self {
+impl<'tree, 'source, Source: SourceNavigation + ?Sized> TypedWalker<'tree, 'source, Source> {
+    fn new(root: M2Node<'tree>, source: &'source Source) -> Self {
         Self {
+            root,
             source,
             scopes: ScopeTree::default(),
             bindings: Vec::new(),
             context: TraversalContext {
                 scope: 0,
                 assignment_scope: 0,
+                declaration_scope: 0,
             },
             definition: source.full_range(),
         }
@@ -308,6 +364,7 @@ impl<'source, Source: SourceNavigation + ?Sized> TypedWalker<'source, Source> {
             } else {
                 inherited.assignment_scope
             },
+            declaration_scope: scope,
         };
         visit(self);
         self.context = inherited;
@@ -326,6 +383,7 @@ impl<'source, Source: SourceNavigation + ?Sized> TypedWalker<'source, Source> {
         self.context = TraversalContext {
             scope,
             assignment_scope: kind.assignment_scope(scope, inherited.assignment_scope),
+            declaration_scope: inherited.declaration_scope,
         };
         visit(self);
         self.context = inherited;
@@ -355,7 +413,7 @@ impl<'source, Source: SourceNavigation + ?Sized> TypedWalker<'source, Source> {
             return;
         };
         let scope = match effect {
-            BindingEffect::Declare => self.context.scope,
+            BindingEffect::Declare => self.context.declaration_scope,
             BindingEffect::Assign => self.context.assignment_scope,
         };
         self.bindings.push(BindingFact {
@@ -413,7 +471,7 @@ impl<'source, Source: SourceNavigation + ?Sized> TypedWalker<'source, Source> {
     }
 }
 
-impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, Source> {
+impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, '_, Source> {
     fn visit_cell(&mut self, node: &'ast m2_syn::nodes::Cell) {
         self.with_definition(node, |walker| visit::visit_cell(walker, node));
     }
@@ -450,6 +508,20 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, So
             | Assignment::Op(_) => {}
         }
         visit::visit_expr_assign(self, node);
+    }
+
+    fn visit_expr_op_bin_adj(&mut self, node: &'ast AdjacentExpr) {
+        if let Some(fact) = self.root.descendant_for_syntax(node).and_then(|call| {
+            BindingFact::package_declaration(
+                declared_package_name(call)?,
+                call,
+                self.definition,
+                self.source,
+            )
+        }) {
+            self.bindings.push(fact);
+        }
+        visit::visit_expr_op_bin_adj(self, node);
     }
 
     fn visit_expr_lambda(&mut self, node: &'ast LambdaExpression) {

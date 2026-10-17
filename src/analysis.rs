@@ -25,6 +25,7 @@ use crate::node_metadata::{
 };
 use crate::object_registry::ObjectName;
 use crate::object_registry::{ObjectId, OperatorForm, TypeData, TypeId};
+use crate::package_index::declared_package_name;
 use crate::semantic_token::{syntax_semantic_token_type, SourceSemanticRole, SourceSemanticToken};
 use crate::source::SourceNavigation;
 use crate::typesystem::{
@@ -33,7 +34,8 @@ use crate::typesystem::{
 };
 use crate::util::TextRangeExt;
 use first_pass::{
-    control_flow_scope, nested_symbols, walk, walk_cst, BindingEffect, BindingFact, ScopeTree,
+    control_flow_scope, nested_symbols, package_name_range, walk, walk_cst, BindingEffect,
+    BindingFact, ScopeTree,
 };
 pub(crate) use typechecker::TypeChecker;
 
@@ -941,7 +943,7 @@ impl Analysis {
             registry: SemanticRegistry::default(),
         };
         analysis.registry.scopes = if let Some(syntax) = syntax {
-            walk(syntax, source, |fact, scopes| {
+            walk(syntax, root, source, |fact, scopes| {
                 analysis.collect_binding_fact(fact, scopes);
             })
         } else {
@@ -1604,6 +1606,36 @@ impl Analysis {
             };
             self.enrich_symbol(definition, source, enrichment);
         }
+    }
+
+    /// A `newPackage` name string binds its global symbol to the new package.
+    fn enrich_package_declaration(
+        &mut self,
+        call: M2Node,
+        source: &(impl SourceNavigation + ?Sized),
+    ) {
+        let Some(binding_state) = declared_package_name(call)
+            .and_then(|name| package_name_range(name, source))
+            .and_then(|range| {
+                self.registry
+                    .binding_states_by_range
+                    .get(&source_range_key(range))
+                    .copied()
+            })
+        else {
+            return;
+        };
+        self.enrich_binding_state(
+            binding_state.binding,
+            binding_state.state,
+            BindingEnrichment {
+                presentation_kind: SymbolKind::NAMESPACE,
+                inferred_type: Some(InferredType::exact_from_id(TypeRole::Package.object_name())),
+                object_id: None,
+                indexed_element_type: None,
+                parent_type: None,
+            },
+        );
     }
 
     fn enrich_symbol(

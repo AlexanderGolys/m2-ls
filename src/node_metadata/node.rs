@@ -14,6 +14,8 @@ use m2_syn::visit::{self, Visit};
 use m2_syn::{Spanned, Token};
 use tree_sitter::{Node, Point};
 
+use crate::source::ByteRange;
+
 /// Snapshot-local identity of one Tree-sitter syntax node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SyntaxNodeId(usize);
@@ -559,6 +561,12 @@ impl<'tree> M2Node<'tree> {
     /// nesting are the parser's concern, not ours. Returns `None` for a non-string
     /// node or a literal missing a delimiter (e.g. an unterminated string).
     pub fn string_literal_inner_text(&self) -> Option<&'tree str> {
+        self.string_literal_inner_bytes()
+            .map(|bytes| &self.source[bytes])
+    }
+
+    /// The byte span of [`Self::string_literal_inner_text`].
+    pub fn string_literal_inner_bytes(&self) -> Option<ByteRange> {
         if !self.is_string_literal() {
             return None;
         }
@@ -569,7 +577,7 @@ impl<'tree> M2Node<'tree> {
         let open = self.node.child(0)?;
         let close = self.node.child((child_count - 1) as u32)?;
         let (start, end) = (open.end_byte(), close.start_byte());
-        (start <= end).then(|| &self.source[start..end])
+        (start <= end).then_some(start..end)
     }
 
     pub fn child_by_field_name(&self, name: &str) -> Option<M2Node<'tree>> {

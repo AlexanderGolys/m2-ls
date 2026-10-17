@@ -65,18 +65,18 @@ mod tests {
 
     /// `output.value` reads `output#(global value)`, so a local named `value`
     /// that only appears as a member key is still unused.
+    fn unused(source: &str) -> Vec<String> {
+        DocumentSnapshot::from_text(source.to_string(), &ObjectRegistry::default())
+            .expect("fixture should parse")
+            .diagnostics()
+            .iter()
+            .filter(|reported| reported.rule.code == catalog::UNUSED_BINDING.code)
+            .map(|reported| reported.finding.message.clone())
+            .collect()
+    }
+
     #[test]
     fn a_member_key_does_not_use_the_binding_it_is_named_after() {
-        let unused = |source: &str| {
-            DocumentSnapshot::from_text(source.to_string(), &ObjectRegistry::default())
-                .expect("fixture should parse")
-                .diagnostics()
-                .iter()
-                .filter(|reported| reported.rule.code == catalog::UNUSED_BINDING.code)
-                .map(|reported| reported.finding.message.clone())
-                .collect::<Vec<_>>()
-        };
-
         assert_eq!(
             unused("g = () -> (value := 1; output.value)\ng()\n"),
             ["Unused variable value"]
@@ -84,6 +84,37 @@ mod tests {
         assert_eq!(
             unused("g = () -> (value := 1; output#value)\ng()\n"),
             Vec::<String>::new()
+        );
+    }
+
+    /// `:=` makes a local of the enclosing function, so a name declared in an
+    /// `if`, `while`, or `try` clause is read by its siblings and by code after
+    /// it; only a `for` loop owns its body's locals.
+    #[test]
+    fn a_condition_declaration_is_used_by_its_branches_and_after() {
+        assert_eq!(
+            unused("f = x -> if (h := x) =!= null then (\" -- \", h)\nf 1\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            unused("f = x -> (if (h := x) =!= null then 1; h)\nf 1\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            unused("f = x -> (if x then (k := 5) else 7; k)\nf true\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            unused("f = x -> (while (h := x) =!= null do h)\nf 1\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            unused("f = x -> (try (k := x) else 7; k)\nf 1\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            unused("f = x -> (for i to x do (q := i); q)\nf 1\n"),
+            ["Unused variable q"]
         );
     }
 }

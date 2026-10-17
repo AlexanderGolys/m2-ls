@@ -158,6 +158,7 @@ impl Analysis {
     ) {
         let knowledge = knowledge_provider.at_position(source.position_for_node(node));
         let _ = self.record_install_method_call(node, source, &knowledge);
+        self.enrich_package_declaration(node, source);
         let mut next_scope_idx = current_scope_idx;
         let mut next_assignment_scope_idx = assignment_scope_idx;
 
@@ -361,6 +362,7 @@ where
     fn visit_expr_op_bin_adj(&mut self, node: &'ast AdjacentExpr) {
         if let Some(call) = self.root.descendant_for_syntax(node) {
             self.record_install_method_call(call);
+            self.analysis.enrich_package_declaration(call, self.source);
         }
         visit::visit_expr_op_bin_adj(self, node);
     }

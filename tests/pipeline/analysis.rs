@@ -179,22 +179,22 @@ fn token_at(
 }
 
 #[tokio::test]
-async fn unassigned_symbols_are_enum_members_until_their_binding() {
+async fn unassigned_symbols_are_unresolved_until_their_binding() {
     let source = "a = b\nZZ[a, b, c]\nb = c\n";
     let mut session = DocumentSession::open(source).await;
     let tokens = semantic_tokens(&mut session).await;
-    let enum_member = session.semantic_token_type("enumMember");
     let variable = session.semantic_token_type("variable");
+    let unresolved = (variable, session.semantic_token_modifier("unresolved"));
 
     for occurrence in [0, 1] {
         assert_eq!(token_at(&tokens, source, "a", occurrence).0, variable);
     }
     for occurrence in [0, 1] {
-        assert_eq!(token_at(&tokens, source, "b", occurrence).0, enum_member);
+        assert_eq!(token_at(&tokens, source, "b", occurrence), unresolved);
     }
     assert_eq!(token_at(&tokens, source, "b", 2).0, variable);
     for occurrence in [0, 1] {
-        assert_eq!(token_at(&tokens, source, "c", occurrence).0, enum_member);
+        assert_eq!(token_at(&tokens, source, "c", occurrence), unresolved);
     }
 
     session.shutdown().await;
@@ -422,23 +422,18 @@ async fn control_flow_conditions_require_booleans_without_function_coloring() {
         DocumentSession::open_with_related(source, "i = value -> value\nj = value -> value\n")
             .await;
     let tokens = semantic_tokens(&mut session).await;
+    let unresolved = (
+        session.semantic_token_type("variable"),
+        session.semantic_token_modifier("unresolved"),
+    );
 
-    assert_eq!(
-        token_at(&tokens, source, "i", 1).0,
-        session.semantic_token_type("enumMember")
-    );
-    assert_eq!(
-        token_at(&tokens, source, "i == 0", 0).0,
-        session.semantic_token_type("enumMember")
-    );
+    assert_eq!(token_at(&tokens, source, "i", 1), unresolved);
+    assert_eq!(token_at(&tokens, source, "i == 0", 0), unresolved);
     assert_eq!(
         token_at(&tokens, source, "i(0)", 0).0,
         session.semantic_token_type("function")
     );
-    assert_eq!(
-        token_at(&tokens, source, "j", 0).0,
-        session.semantic_token_type("enumMember")
-    );
+    assert_eq!(token_at(&tokens, source, "j", 0), unresolved);
     assert_eq!(
         token_at(&tokens, source, "callable", 1).0,
         session.semantic_token_type("variable")
@@ -1236,10 +1231,12 @@ async fn assignment_and_protection_diagnostics_preserve_source_sensitive_analysi
 
     session
         .replace(
-            "if condition then (\n  conditionalExport = true;\n  branchLocal := 1;\n);\nif conditionalExport == true then null\n",
+            "if condition then (\n  conditionalExport = true;\n);\nif conditionalExport == true then null\ng = () -> if condition then (\n  branchLocal := 1;\n)\n",
         )
         .await;
-    assert_eq!(diagnostic_lines(&session, "S02"), vec![2]);
+    // `:=` declares in the enclosing function, not the branch, so the unread
+    // local is reported there.
+    assert_eq!(diagnostic_lines(&session, "S02"), vec![5]);
 
     session.shutdown().await;
 }

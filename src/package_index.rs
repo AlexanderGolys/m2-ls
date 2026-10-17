@@ -310,6 +310,19 @@ pub fn collect_loaded_files_in_tree<'tree>(
     files
 }
 
+/// The function that creates a package and binds its name as a global symbol.
+const PACKAGE_CONSTRUCTOR: &str = "newPackage";
+
+/// The name string of `newPackage "P"` / `newPackage("P", …)`, which binds the
+/// global symbol `P` to the new package wherever the call runs.
+pub fn declared_package_name(application: M2Node<'_>) -> Option<M2Node<'_>> {
+    first_call_argument(application, |name| name == PACKAGE_CONSTRUCTOR).filter(|argument| {
+        argument
+            .string_literal_inner_text()
+            .is_some_and(|name| !name.is_empty())
+    })
+}
+
 /// The first argument of `callee ARG` / `callee(ARG, …)` when `callee` is
 /// accepted by `is_trigger`.
 fn first_call_argument(
