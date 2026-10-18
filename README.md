@@ -50,6 +50,34 @@ cargo install m2-ls
 Requires Rust 1.88 or newer. Macaulay2 itself is optional: the builtin
 catalog ships with the server.
 
+## Command-line tools
+
+Installation also provides `m2-lint` and `m2-fmt`, using the same diagnostics
+and formatter as the server:
+
+```sh
+m2-lint .                      # Recursively lint .m2 files
+m2-lint --deny-warnings file.m2 # Fail on warnings as well as errors
+m2-fmt .                       # Format .m2 files in place
+m2-fmt --check .                # Check formatting without writing (CI)
+m2-fmt --stdout file.m2         # Print one formatted file
+cat file.m2 | m2-fmt -          # Format stdin to stdout
+```
+
+Both commands accept multiple files or directories and default to the current
+directory. Directory scans skip hidden entries, `target`, and symlinks. Use `-`
+alone to read stdin. `--config settings.json` reads the same JSON settings as
+the server, including `diagnostics` and `formatting`; invalid values fail the
+command. No configuration file is loaded automatically.
+
+Exit status is `0` on success, `1` for lint errors (also warnings with
+`--deny-warnings`) or formatting differences with `--check`, and `2` for usage,
+configuration, or I/O errors. Lint hints and information are printed but do not
+fail the command. Diagnostic columns use one-based UTF-16 positions.
+
+For a local build, use `cargo run --bin m2-lint -- .` or
+`cargo run --bin m2-fmt -- --check .`; `cargo run` still starts the server.
+
 ## Connect your editor
 
 Neovim 0.11+:
@@ -83,7 +111,7 @@ Every setting is optional and applies without a restart. Send them under the
 {
   "m2-ls": {
     "diagnostics": { "disabled": ["unused-binding", "T02"] },
-    "formatting": { "indentWidth": 4, "hardLineWidth": 100 },
+    "formatting": { "indent": 4, "hardLineWidth": 100 },
     "inlayHints": { "expressionTypes": true }
   }
 }
@@ -94,16 +122,19 @@ Every setting is optional and applies without a restart. Send them under the
 | `diagnostics.enabled` | `true` | Shows or hides all diagnostics. |
 | `diagnostics.disabled` | `[]` | Hides rules by name or code, e.g. `unused-binding` or `T02`. |
 | `diagnostics.warningsAsHint`, `diagnostics.warningsAsInfo` | `[]` | Shows these rules' warnings as hints or information instead. |
-| `formatting.indentWidth`, `formatting.useTabs` | editor's choice | Indentation used by the formatter. |
-| `formatting.softLineWidth`, `formatting.hardLineWidth` | `100` | Preferred and forced wrapping widths; `0` disables. |
-| `formatting.controlFlowLayout` | `multilineCompactElse` | `compact`, `multiline`, or `multilineCompactElse`. |
-| `formatting.compactFactorOperators` | `false` | `2*x` instead of `2 * x`. |
-| `formatting.breakAfterSemicolon` | `true` | Starts the next statement on a new line. |
+| `formatting.indent`, `formatting.useTabs` | See source | Indentation used by the formatter. |
+| `formatting.softLineWidth`, `formatting.hardLineWidth` | See source | Preferred and forced wrapping widths; `0` disables. |
+| `formatting.controlFlowLayout` | See source | `compact`, `multiline`, or `multilineCompactElse`. |
+| `formatting.compactFactorOperators` | See source | `2*x` instead of `2 * x`. |
+| `formatting.breakAfterSemicolon` | See source | Starts the next statement on a new line. |
 | `inlayHints.expressionTypes` | `false` | Adds argument, subexpression, and call-result types. |
 | `inlayHints.allKnownTypes` | `false` | Also shows types that are obvious from literals. |
 | `semanticTokens.standardOnly` | `false` | Sends only LSP-standard token types and modifiers, for themes that style nothing else: `command` as `function`, `builtin` as `defaultLibrary`, and no `option`, `file`, or `unresolved`. |
 | `sources.enabled` | `true` | Lets navigation enter the Macaulay2 library source. |
 | `sources.paths` | `[]` | Extra places to find it: an `M2` executable, an installation prefix (a build tree's `usr-dist` included), or a directory to add to Macaulay2's `path`. |
+
+Formatting defaults are defined in [`FormattingSettings::default()`](src/settings.rs);
+omitted settings use those values.
 
 An invalid value only affects its own setting, which keeps its default; the
 server reports what it ignored in a warning message.

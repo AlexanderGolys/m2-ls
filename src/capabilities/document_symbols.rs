@@ -8,10 +8,11 @@
 use tower_lsp::lsp_types::Range as TextRange;
 use tower_lsp::lsp_types::*;
 
-use crate::analysis::AssignmentFactKind;
+use crate::analysis::{Analysis, AssignmentFactKind, MethodInstallation};
 use crate::document::DocumentSnapshot;
 use crate::meta::BindingRole;
 use crate::object_registry::ObjectName;
+use crate::typesystem::InferredType;
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceSourceSymbol {
@@ -36,7 +37,7 @@ pub fn collect_document_symbols(document: &DocumentSnapshot) -> Vec<DocumentSymb
                 .state
                 .inferred_type
                 .as_ref()
-                .and_then(crate::typesystem::InferredType::label),
+                .and_then(InferredType::label),
             kind: binding.state.presentation_kind,
             range: binding.state.definition_range,
             selection_range: binding.state.span,
@@ -97,8 +98,8 @@ pub fn collect_document_symbols(document: &DocumentSnapshot) -> Vec<DocumentSymb
 }
 
 fn method_signature_detail(
-    analysis: &crate::analysis::Analysis,
-    installation: &crate::analysis::MethodInstallation,
+    analysis: &Analysis,
+    installation: &MethodInstallation,
     target: &str,
 ) -> String {
     analysis
@@ -161,7 +162,7 @@ pub fn collect_workspace_symbols(
 }
 
 fn build_document_symbol_tree(
-    analysis: &crate::analysis::Analysis,
+    analysis: &Analysis,
     declarations: Vec<Declaration>,
 ) -> Vec<DocumentSymbol> {
     let mut container_scopes = vec![false; analysis.scope_count()];
@@ -183,7 +184,7 @@ fn build_document_symbol_tree(
 }
 
 fn nearest_container_scope(
-    analysis: &crate::analysis::Analysis,
+    analysis: &Analysis,
     container_scopes: &[bool],
     mut scope_idx: usize,
 ) -> usize {

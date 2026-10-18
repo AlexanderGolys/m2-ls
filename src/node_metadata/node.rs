@@ -245,6 +245,11 @@ impl<'tree> M2Node<'tree> {
         &self.source[self.node.start_byte()..self.node.end_byte()]
     }
 
+    /// The complete source snapshot backing this syntax node.
+    pub fn source_text(&self) -> &'tree str {
+        self.source
+    }
+
     pub fn is<T: M2SyntaxKind>(&self) -> bool {
         T::matches(*self)
     }
@@ -842,7 +847,7 @@ impl<'tree> M2Node<'tree> {
         self.node.is_missing()
     }
 
-    #[cfg(test)]
+    /// Whether this subtree contains a syntax error or missing token.
     pub fn has_error(&self) -> bool {
         self.node.has_error()
     }

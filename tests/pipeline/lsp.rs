@@ -471,7 +471,7 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
         (
             "tryResult",
             "Simplify try",
-            "try tryValue then tryResult",
+            "try tryValue then\n    tryResult",
         ),
         ("bareTryValue", "Simplify try", "try bareTryValue"),
         (
@@ -742,7 +742,7 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
                             "enabled": false
                         },
                         "formatting": {
-                            "indentWidth": 2,
+                            "indent": 2,
                             "useTabs": false,
                             "compactFactorOperators": false
                         },
@@ -1179,7 +1179,22 @@ async fn formatting_preserves_collection_and_assignment_control_flow_layout() {
     );
     let workspace = TestWorkspace::new(source);
     let mut server = LspProcess::spawn().await;
-    server.initialize(&workspace.root_uri()).await;
+    server
+        .initialize_with_options(
+            &workspace.root_uri(),
+            json!({
+                "formatting": {
+                    "indent": 4,
+                    "useTabs": false,
+                    "softLineWidth": null,
+                    "hardLineWidth": null,
+                    "controlFlowLayout": "multilineCompactElse",
+                    "compactFactorOperators": false,
+                    "breakAfterSemicolon": true
+                }
+            }),
+        )
+        .await;
     server
         .notify(
             "textDocument/didOpen",

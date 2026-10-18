@@ -7,7 +7,9 @@ the crate unless a task explicitly touches repository docs or metadata.
 
 ```text
 src/
-  main.rs                 stdio entry point and protocol wiring
+  main.rs                 stdio executable entry point
+  lib.rs                  shared modules and language-server protocol wiring
+  cli.rs, bin/            standalone m2-lint and m2-fmt commands
   document.rs             versioned snapshots: source, parse tree, analysis
   source.rs               indexed source text and the single position-conversion API
   analysis.rs, analysis/  staged analysis: scopes, bindings, installations, typechecking

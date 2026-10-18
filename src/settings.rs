@@ -5,7 +5,7 @@
 //! client sends them under the `m2-ls` section (`macaulay2` is accepted too):
 //!
 //! ```json
-//! { "m2-ls": { "formatting": { "indentWidth": 4 }, "sources": { "paths": ["~/M2"] } } }
+//! { "m2-ls": { "formatting": { "indent": 4 }, "sources": { "paths": ["~/M2"] } } }
 //! ```
 //!
 //! Settings are read leniently: a value that does not deserialize, an unknown
@@ -91,21 +91,19 @@ pub struct DiagnosticSettings {
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct FormattingSettings {
     /// Spaces per indentation level; the editor's tab size when unset.
-    pub indent_width: Option<u32>,
+    pub indent: Option<u32>,
     /// Whether to indent with tabs; the editor's choice when unset.
     pub use_tabs: Option<bool>,
-    /// The width lines are preferably wrapped at. Default `100`; `0` or
-    /// `null` disables it. It never exceeds `hardLineWidth`.
+    /// The width lines are preferably wrapped at; `0` or `null` disables it.
+    /// It never exceeds `hardLineWidth`.
     pub soft_line_width: Option<u32>,
-    /// The width lines are always wrapped at. Default `100`; `0` or `null`
-    /// disables it.
+    /// The width lines are always wrapped at; `0` or `null` disables it.
     pub hard_line_width: Option<u32>,
-    /// `compact`, `multiline`, or `multilineCompactElse` (the default).
+    /// `compact`, `multiline`, or `multilineCompactElse`.
     pub control_flow_layout: ControlFlowLayout,
-    /// `2*x` instead of `2 * x`. Default `false`.
+    /// `2*x` instead of `2 * x`.
     pub compact_factor_operators: bool,
-    /// Whether the next expression after `;` starts on a new line. Default
-    /// `true`.
+    /// Whether the next expression after `;` starts on a new line.
     pub break_after_semicolon: bool,
 }
 
@@ -163,13 +161,13 @@ impl Default for DiagnosticSettings {
 impl Default for FormattingSettings {
     fn default() -> Self {
         Self {
-            indent_width: None,
+            indent: None,
             use_tabs: None,
-            soft_line_width: Some(100),
-            hard_line_width: Some(100),
-            control_flow_layout: ControlFlowLayout::MultilineCompactElse,
+            soft_line_width: Some(78),
+            hard_line_width: Some(90),
+            control_flow_layout: ControlFlowLayout::default(),
             compact_factor_operators: false,
-            break_after_semicolon: true,
+            break_after_semicolon: false,
         }
     }
 }
@@ -337,13 +335,7 @@ mod tests {
         let settings = valid_settings(serde_json::json!({}));
 
         assert!(settings.diagnostics.allows(catalog::UNUSED_BINDING.code));
-        assert_eq!(settings.formatting.line_widths(), (Some(100), Some(100)));
-        assert_eq!(
-            settings.formatting.control_flow_layout,
-            ControlFlowLayout::MultilineCompactElse
-        );
-        assert!(!settings.formatting.compact_factor_operators);
-        assert!(settings.formatting.break_after_semicolon);
+        assert_eq!(settings.formatting, FormattingSettings::default());
         assert_eq!(settings.inlay_hints, InlayHintSettings::default());
         assert!(!settings.semantic_tokens.standard_only);
         assert_eq!(valid_settings(Value::Null), settings);
@@ -357,8 +349,9 @@ mod tests {
                     "disabled": ["unused-binding", "S01"]
                 },
                 "formatting": {
-                    "indentWidth": 2,
+                    "indent": 2,
                     "useTabs": false,
+                    "softLineWidth": 88,
                     "hardLineWidth": 88,
                     "controlFlowLayout": "multiline",
                     "compactFactorOperators": true,
@@ -379,7 +372,7 @@ mod tests {
             .diagnostics
             .allows(catalog::OPTION_KEY_CONVENTION.code));
         assert!(settings.diagnostics.allows(catalog::SYNTAX_ERROR.code));
-        assert_eq!(settings.formatting.indent_width, Some(2));
+        assert_eq!(settings.formatting.indent, Some(2));
         assert_eq!(settings.formatting.use_tabs, Some(false));
         assert_eq!(settings.formatting.line_widths(), (Some(88), Some(88)));
         assert_eq!(
@@ -408,7 +401,7 @@ mod tests {
                     "enabeld": false
                 },
                 "formatting": {
-                    "indentWidth": "two",
+                    "indent": "two",
                     "useTabs": true
                 },
                 "inlayHints": "on"
@@ -418,7 +411,7 @@ mod tests {
         let settings = &parsed.settings;
         assert!(!settings.diagnostics.allows(catalog::UNUSED_BINDING.code));
         assert!(settings.diagnostics.allows(catalog::SYNTAX_ERROR.code));
-        assert_eq!(settings.formatting.indent_width, None);
+        assert_eq!(settings.formatting.indent, None);
         assert_eq!(settings.formatting.use_tabs, Some(true));
         assert_eq!(settings.inlay_hints, InlayHintSettings::default());
 
@@ -437,7 +430,7 @@ mod tests {
             "{problems:?}"
         );
         assert!(
-            problems[2].starts_with("`formatting.indentWidth`: invalid type"),
+            problems[2].starts_with("`formatting.indent`: invalid type"),
             "{problems:?}"
         );
         assert!(

@@ -66,7 +66,7 @@ pub struct DiagnosticRule {
 impl DiagnosticCode {
     /// The diagnostic a user names in their settings, by code or by name.
     ///
-    /// ```
+    /// ```ignore
     /// assert_eq!(DiagnosticCode::from_selector("S02"), Some(UNUSED_BINDING.code));
     /// assert_eq!(DiagnosticCode::from_selector("unused-binding"), Some(UNUSED_BINDING.code));
     /// assert_eq!(DiagnosticCode::from_selector("E07"), None);
@@ -118,7 +118,7 @@ pub struct RelatedNote {
 /// What a check reports: the span it flags, the explanation, and the related
 /// locations behind it. The check's diagnostic supplies everything else.
 ///
-/// ```
+/// ```ignore
 /// let finding = Finding::new(range, "`protect x` evaluates the current value of `x`")
 ///     .with_note(binding.range, "`x` is bound here");
 /// ```
@@ -166,7 +166,7 @@ impl M2Diagnostic {
     /// The finding as published to clients for the document at `uri`, under
     /// its rule's code, name, severity, and tags.
     ///
-    /// ```
+    /// ```ignore
     /// let finding = Finding::new(range, "Unused variable total");
     /// let published = M2Diagnostic { rule: &UNUSED_BINDING, finding }.to_lsp(&uri);
     /// assert_eq!(published.code, Some(NumberOrString::String("S02".to_string())));

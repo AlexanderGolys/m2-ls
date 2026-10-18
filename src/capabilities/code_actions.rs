@@ -16,8 +16,11 @@ use crate::diagnostics::rewrites::{
 use crate::diagnostics::{catalog, DiagnosticCode, DiagnosticRule};
 use crate::document::DocumentSnapshot;
 use crate::node_metadata::{token_spelling, M2Node};
+use crate::settings::FormattingSettings;
 use crate::source::SourceNavigation;
 use crate::util::TextRangeExt;
+
+use super::formatting::{format_action_edit, FormatOptions};
 
 struct CodeActionContext<'tree, 'request> {
     document: &'tree DocumentSnapshot,
@@ -242,6 +245,7 @@ pub fn available_code_actions(
     uri: &Url,
     position: Position,
     diagnostics: &[Diagnostic],
+    formatting: &FormattingSettings,
 ) -> Option<CodeActionResponse> {
     let cursor = document.node_at_position_minimal(position)?;
     let context = CodeActionContext {
@@ -251,9 +255,18 @@ pub fn available_code_actions(
         cursor,
         diagnostics,
     };
+    let options = FormatOptions::from(formatting);
     let actions: CodeActionResponse = CODE_ACTION_PRODUCERS
         .iter()
         .filter_map(|produce| produce(&context))
+        .map(|mut action| {
+            if let Some(changes) = action.edit.as_mut().and_then(|edit| edit.changes.as_mut()) {
+                for edit in changes.values_mut().flatten() {
+                    format_action_edit(document, edit, &options);
+                }
+            }
+            action
+        })
         .map(CodeActionOrCommand::CodeAction)
         .collect();
     (!actions.is_empty()).then_some(actions)
@@ -491,4 +504,158 @@ fn unescape_string_literal_content(content: &str) -> Option<String> {
         }
     }
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capabilities::formatting::{format_document_with_options, ControlFlowLayout};
+    use crate::diagnostics::visible_diagnostics;
+    use crate::node_metadata::M2Parser;
+    use crate::object_registry::ObjectRegistry;
+    use crate::settings::DiagnosticSettings;
+
+    fn formatted(text: &str, settings: &FormattingSettings) -> String {
+        let mut parser = M2Parser::new().unwrap();
+        let root = parser.parse(text).unwrap();
+        assert!(!root.has_error(), "{text}");
+        format_document_with_options(root, &FormatOptions::from(settings))
+    }
+
+    #[test]
+    fn negated_lookup_has_no_simplification_or_parentheses_action() {
+        let source = concat!(
+            "if not linkStyles#?style then\n",
+            "        error(\"MarkdownDocs: unknown LinkStyle \", toString style);\n",
+        );
+        let document =
+            DocumentSnapshot::from_text(source.into(), &ObjectRegistry::default()).unwrap();
+        let uri = Url::parse("file:///test.m2").unwrap();
+        let diagnostics = visible_diagnostics(&document, &uri, &DiagnosticSettings::default());
+        assert!(
+            !diagnostics.iter().any(|diagnostic| {
+                matches!(DiagnosticCode::from_lsp(diagnostic), Some(code) if
+                code == catalog::SIMPLIFIABLE_EXPRESSION.code ||
+                code == catalog::REDUNDANT_CONTROL_PARENTHESES.code)
+            }),
+            "{diagnostics:?}"
+        );
+        assert!(available_code_actions(
+            &document,
+            &uri,
+            Position::new(0, 7),
+            &diagnostics,
+            &FormattingSettings::default(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn rewritten_expressions_are_formatted_in_context() {
+        let cases = [
+            (
+                "if not (left == right) then error(\"unknown LinkStyle\", toString style)",
+                "Simplify if condition",
+            ),
+            (
+                "if ready then value else null",
+                "Simplify unnecessary null branch",
+            ),
+            (
+                "if linkStyles#?style then null else error(\"unknown LinkStyle\", toString style)",
+                "Simplify unnecessary null branch",
+            ),
+            (
+                "if first and second then null else value",
+                "Simplify unnecessary null branch",
+            ),
+            (
+                "if first then one else (if second then two else three)",
+                "Flatten nested if into else-if chain",
+            ),
+            ("try value then value", "Simplify try"),
+            ("try value then result else null", "Simplify try"),
+            ("if (condition) then value", "Remove redundant parentheses"),
+            (
+                "if candidate =!= null then candidate else fallback",
+                "Use `??` coalescence",
+            ),
+        ];
+        let uri = Url::parse("file:///test.m2").unwrap();
+        for settings in [
+            FormattingSettings::default(),
+            FormattingSettings {
+                indent: Some(2),
+                soft_line_width: Some(40),
+                control_flow_layout: ControlFlowLayout::Compact,
+                ..FormattingSettings::default()
+            },
+            FormattingSettings {
+                use_tabs: Some(true),
+                control_flow_layout: ControlFlowLayout::Multiline,
+                ..FormattingSettings::default()
+            },
+        ] {
+            for (expression, title) in cases {
+                for newline in ["\n", "\r\n"] {
+                    let source = formatted(
+                        &format!("-- λ 😀\nf = () -> (\n{expression};\n42\n)\n")
+                            .replace('\n', newline),
+                        &settings,
+                    );
+                    let document =
+                        DocumentSnapshot::from_text(source.clone(), &ObjectRegistry::default())
+                            .unwrap();
+                    let diagnostics =
+                        visible_diagnostics(&document, &uri, &DiagnosticSettings::default());
+                    let diagnostic = diagnostics
+                        .iter()
+                        .find(|diagnostic| {
+                            matches!(DiagnosticCode::from_lsp(diagnostic), Some(code) if
+                            code == catalog::SIMPLIFIABLE_EXPRESSION.code ||
+                            code == catalog::REDUNDANT_CONTROL_PARENTHESES.code ||
+                            code == catalog::PREFER_COALESCENCE.code)
+                        })
+                        .unwrap_or_else(|| panic!("missing hint: {source}"));
+                    let actions = available_code_actions(
+                        &document,
+                        &uri,
+                        diagnostic.range.start,
+                        &diagnostics,
+                        &settings,
+                    )
+                    .unwrap();
+                    let action = actions
+                        .into_iter()
+                        .find_map(|action| match action {
+                            CodeActionOrCommand::CodeAction(action) if action.title == title => {
+                                Some(action)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("missing {title}: {source}"));
+                    let changes = action.edit.unwrap().changes.unwrap();
+                    let mut result = source.clone();
+                    for edit in changes[&uri].iter().rev() {
+                        result.replace_range(
+                            document.bytes_for_range(edit.range).unwrap(),
+                            &edit.new_text,
+                        );
+                    }
+                    assert_eq!(result, formatted(&result, &settings), "{title}: {source}");
+                    assert!(result.starts_with(&format!("-- λ 😀{newline}")));
+                    let rewritten =
+                        DocumentSnapshot::from_text(result, &ObjectRegistry::default()).unwrap();
+                    assert!(
+                        !rewritten.diagnostics().iter().any(|diagnostic| {
+                            diagnostic.rule.code == catalog::SIMPLIFIABLE_EXPRESSION.code
+                                || diagnostic.rule.code
+                                    == catalog::REDUNDANT_CONTROL_PARENTHESES.code
+                        }),
+                        "{title} must clear the hint without another simplification: {source}"
+                    );
+                }
+            }
+        }
+    }
 }

@@ -4,6 +4,7 @@ version = "1.2.0"
 authors = ["Alexander Golys <alexandergolys@gmail.com>"]
 description = "Language server for Macaulay2"
 edition = "2021"
+default-run = "m2-ls"
 rust-version = "1.88"
 license = "MIT AND (GPL-2.0-only OR GPL-3.0-only)"
 repository = "https://github.com/AlexanderGolys/m2-ls"

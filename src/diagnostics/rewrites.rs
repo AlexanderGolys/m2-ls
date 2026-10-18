@@ -514,6 +514,19 @@ fn simplify_condition(node: M2Node<'_>) -> Option<String> {
         .named_children()
         .find(|child| child.id() != operator.id())?;
     let inner = unwrap_parentheses(child);
+    // Only invert a comparison or cancel a second `not`. Adding grouping or
+    // normalizing whitespace around an unchanged negation is not simpler.
+    let inverts_comparison = inner
+        .binary_operator()
+        .and_then(negated_binary_operator)
+        .is_some();
+    let cancels_negation = inner.is_prefix_expr()
+        && inner
+            .child_by_field_name("operator")
+            .is_some_and(|operator| matches_token::<Token![not]>(operator.text()));
+    if !inverts_comparison && !cancels_negation {
+        return None;
+    }
     let simplified = negated_condition_text(inner);
     (simplified != original).then_some(simplified)
 }
@@ -559,7 +572,13 @@ fn negated_condition_text(node: M2Node<'_>) -> String {
     }
 
     let condition = node.text().trim_end();
-    if node.is_binary_expr() {
+    let needs_parentheses = node.is_binary_expr()
+        && node.binary_operator().is_none_or(|operator| {
+            binding_precedence(operator)
+                .zip(binding_precedence(token_spelling::<Token![not]>()))
+                .is_none_or(|(operand, negation)| operand <= negation)
+        });
+    if needs_parentheses {
         format!("not ({condition})")
     } else {
         format!("not {condition}")
@@ -592,6 +611,28 @@ fn negated_binary_operator(operator: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::node_metadata::M2Parser;
+
+    #[test]
+    fn negating_a_condition_only_groups_operators_looser_than_not() {
+        for (condition, negation) in [
+            ("linkStyles#?style", "not linkStyles#?style"),
+            ("first and second", "not (first and second)"),
+            ("first or second", "not (first or second)"),
+            ("isNode raw", "not isNode raw"),
+        ] {
+            let text = format!("if {condition} then null else value\n");
+            let mut parser = M2Parser::new().unwrap();
+            let root = parser.parse(&text).unwrap();
+            let conditional = root
+                .descendants()
+                .find(|node| node.is::<IfStatement>())
+                .unwrap();
+            assert_eq!(
+                if_null_branch_rewrite(conditional),
+                Some(format!("if {negation} then value"))
+            );
+        }
+    }
 
     /// The `??` form of the first `Syntax` node in `text`.
     fn coalescence_of_first<Syntax: crate::node_metadata::M2SyntaxKind>(
