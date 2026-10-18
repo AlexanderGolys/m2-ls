@@ -1440,3 +1440,98 @@ async fn navigation_enters_configured_library_sources_of_loaded_packages() {
     );
     disabled.shutdown().await;
 }
+
+#[tokio::test]
+async fn standard_only_semantic_tokens_apply_live_with_a_refresh() {
+    let source = "clearAll\n";
+    let workspace = TestWorkspace::new(source);
+    let mut server = LspProcess::spawn().await;
+    let initialized = server.initialize(&workspace.root_uri()).await;
+    server.open_document(&workspace.uri, source).await;
+
+    let legend = &initialized["capabilities"]["semanticTokensProvider"]["legend"];
+    let token_types = response_array(&legend["tokenTypes"]);
+    let type_index = |name: &str| {
+        token_types
+            .iter()
+            .position(|token_type| token_type == name)
+            .unwrap_or_else(|| panic!("the legend should offer {name}: {legend}")) as u64
+    };
+    let (command_type, function_type) = (type_index("command"), type_index("function"));
+
+    let clear_all_type = |tokens: &Value| response_array(&tokens["data"])[3].clone();
+    let semantic_tokens_request = json!({"textDocument": {"uri": workspace.uri}});
+    let tokens = server
+        .request(
+            "textDocument/semanticTokens/full",
+            semantic_tokens_request.clone(),
+        )
+        .await;
+    assert_eq!(
+        clear_all_type(&tokens),
+        json!(command_type),
+        "the clearAll Command is a command by default"
+    );
+
+    server
+        .notify(
+            "workspace/didChangeConfiguration",
+            json!({ "settings": { "m2-ls": { "semanticTokens": { "standardOnly": true } } } }),
+        )
+        .await;
+    server
+        .wait_for_server_request("workspace/semanticTokens/refresh")
+        .await;
+    let tokens = server
+        .request("textDocument/semanticTokens/full", semantic_tokens_request)
+        .await;
+    assert_eq!(
+        clear_all_type(&tokens),
+        json!(function_type),
+        "under standardOnly the same legend carries it as a function"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_imported_user_package_shows_only_its_exports() {
+    let source = "needsPackage \"Pkg\"\ndouble 2\nhelper 2\n";
+    let workspace = TestWorkspace::new(source);
+    let package_uri = workspace.write_file(
+        "Pkg.m2",
+        concat!(
+            "newPackage \"Pkg\"\n",
+            "export {\"double\"}\n",
+            "double = x -> 2 * x\n",
+            "helper = x -> x\n",
+            "endPackage \"Pkg\"\n",
+        ),
+    );
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    server.open_document(&workspace.uri, source).await;
+
+    let exported = server
+        .request(
+            "textDocument/definition",
+            document_position(&workspace.uri, position(source, "double", 0)),
+        )
+        .await;
+    assert!(
+        exported.to_string().contains(&package_uri),
+        "an exported name resolves into the imported package: {exported}"
+    );
+    let private = server
+        .request(
+            "textDocument/definition",
+            document_position(&workspace.uri, position(source, "helper", 0)),
+        )
+        .await;
+    assert!(
+        !private.to_string().contains(&package_uri),
+        "a private name of the package stays hidden: {private}"
+    );
+
+    server.shutdown().await;
+}

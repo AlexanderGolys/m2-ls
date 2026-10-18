@@ -5,11 +5,14 @@ use crate::builtin_index::Record;
 use crate::meta::{BindingRole, Metadata};
 use crate::node_metadata::M2Node;
 use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry, ObjectRegistryView};
+use crate::settings::SemanticTokenSettings;
 use crate::source::DocumentSpan;
-use crate::typesystem::{TypeKnowledge, TypeRole};
+use crate::typesystem::TypeKnowledge;
 use m2_syn::nodes::{FloatLiteral, IntegerLiteral};
-use tower_lsp::lsp_types::{SemanticTokenModifier, SemanticTokenType, SymbolKind};
-
+use strum::{EnumIter, IntoEnumIterator};
+use tower_lsp::lsp_types::{
+    SemanticTokenModifier, SemanticTokenType, SemanticTokensLegend, SymbolKind,
+};
 /// Indexed facts needed specifically for semantic-token classification.
 ///
 /// This is separate from [`TypeKnowledge`] because syntax/type analysis should
@@ -30,79 +33,127 @@ pub trait SemanticTokenKnowledge: TypeKnowledge {
     fn is_option_value_for_key(&self, option_key: &str, value_name: &str) -> bool;
 }
 
-/// The LSP-standard token types emitted for M2 syntax and indexed metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The token types m2-ls classifies M2 syntax and indexed metadata into,
+/// named for what they are in M2. Most are sent as an LSP-standard type
+/// ([`lsp_type`](Self::lsp_type)), possibly under another name (`Symbol` is
+/// `enumMember`); the M2-specific ones are sent as their own type and have a
+/// standard [`fallback`](Self::standard_fallback).
+///
+/// The legend lists the variants in declaration order, so a variant's
+/// discriminant is its legend index; reordering or adding variants needs no
+/// other change. Clients accept any legend entry, even when they declare only
+/// the standard ones, so every type is always offered;
+/// `semanticTokens.standardOnly` only chooses which entry a token is sent as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 #[repr(u32)]
 pub enum M2SemanticTokenType {
-    Type = 0,
-    Function = 1,
-    Variable = 2,
-    Parameter = 3,
-    Property = 4,
-    Namespace = 5,
-    EnumMember = 6,
-    Class = 7,
-    Keyword = 8,
-    String = 9,
-    Number = 10,
-    Operator = 11,
-    Comment = 12,
-    Method = 13,
-    Modifier = 14,
-    TypeParameter = 15,
+    Type,
+    Function,
+    Variable,
+    Parameter,
+    Property,
+    Namespace,
+    /// A name used as a `Symbol` rather than for a value: a protected symbol
+    /// (`Strategy`, an option value such as `Linear`) or a quoted name
+    /// (`symbol f`). Sent as `enumMember`, the standard type closest to it.
+    Symbol,
+    Keyword,
+    String,
+    Number,
+    Operator,
+    Comment,
+    Method,
+    Modifier,
+    TypeParameter,
+    /// A `Command` (run by naming it alone, e.g. `restart`) or a
+    /// `Manipulator` (applied to a file by `<<`, e.g. `endl`). Both are
+    /// `BasicList`s, disjoint from `Function`.
+    Command,
 }
 
 impl M2SemanticTokenType {
     pub const fn emit_with_syntax_highlighting(self) -> bool {
         matches!(self, Self::Modifier)
     }
+
+    /// The type's entry in the full legend.
+    pub const fn lsp_type(self) -> SemanticTokenType {
+        match self {
+            Self::Type => SemanticTokenType::TYPE,
+            Self::Function => SemanticTokenType::FUNCTION,
+            Self::Variable => SemanticTokenType::VARIABLE,
+            Self::Parameter => SemanticTokenType::PARAMETER,
+            Self::Property => SemanticTokenType::PROPERTY,
+            Self::Namespace => SemanticTokenType::NAMESPACE,
+            Self::Symbol => SemanticTokenType::ENUM_MEMBER,
+            Self::Keyword => SemanticTokenType::KEYWORD,
+            Self::String => SemanticTokenType::STRING,
+            Self::Number => SemanticTokenType::NUMBER,
+            Self::Operator => SemanticTokenType::OPERATOR,
+            Self::Comment => SemanticTokenType::COMMENT,
+            Self::Method => SemanticTokenType::METHOD,
+            Self::Modifier => SemanticTokenType::MODIFIER,
+            Self::TypeParameter => SemanticTokenType::TYPE_PARAMETER,
+            Self::Command => SemanticTokenType::new("command"),
+        }
+    }
+
+    /// The type a token is sent as under `standardOnly`: the closest standard
+    /// type for an M2-specific one, the type itself otherwise.
+    pub const fn standard_fallback(self) -> Self {
+        match self {
+            Self::Command => Self::Function,
+            standard => standard,
+        }
+    }
 }
 
-pub const LEGEND_TYPES: &[SemanticTokenType] = &[
-    SemanticTokenType::TYPE,
-    SemanticTokenType::FUNCTION,
-    SemanticTokenType::VARIABLE,
-    SemanticTokenType::PARAMETER,
-    SemanticTokenType::PROPERTY,
-    SemanticTokenType::NAMESPACE,
-    SemanticTokenType::ENUM_MEMBER,
-    SemanticTokenType::CLASS,
-    SemanticTokenType::KEYWORD,
-    SemanticTokenType::STRING,
-    SemanticTokenType::NUMBER,
-    SemanticTokenType::OPERATOR,
-    SemanticTokenType::COMMENT,
-    SemanticTokenType::METHOD,
-    SemanticTokenType::MODIFIER,
-    SemanticTokenType::TYPE_PARAMETER,
-    SemanticTokenType::DECORATOR,
-];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The modifiers m2-ls attaches to tokens. Like [`M2SemanticTokenType`],
+/// the legend lists the variants in declaration order, so a variant's
+/// discriminant is its bit position, and each M2-specific modifier has a
+/// standard [`fallback`](Self::standard_fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 #[repr(u32)]
 pub enum M2SemanticTokenModifier {
     Option,
-    Command,
     File,
     Declaration,
     Builtin,
     Unresolved,
+    /// The standard counterpart of [`Builtin`](Self::Builtin), sent in its
+    /// place under `standardOnly`.
+    DefaultLibrary,
 }
 
 impl M2SemanticTokenModifier {
+    /// The modifier's bit in an [`M2SemanticTokenModifiers`] set, which is
+    /// also its bit on the wire.
     pub const fn bit(self) -> u32 {
         1 << self as u32
     }
-}
 
-pub const LEGEND_MODIFIERS: &[SemanticTokenModifier] = &[
-    SemanticTokenModifier::new("option"),
-    SemanticTokenModifier::new("command"),
-    SemanticTokenModifier::new("file"),
-    SemanticTokenModifier::DECLARATION,
-    SemanticTokenModifier::new("builtin"),
-    SemanticTokenModifier::new("unresolved"),
-];
+    /// The modifier's entry in the full legend.
+    pub const fn lsp_modifier(self) -> SemanticTokenModifier {
+        match self {
+            Self::Option => SemanticTokenModifier::new("option"),
+            Self::File => SemanticTokenModifier::new("file"),
+            Self::Declaration => SemanticTokenModifier::DECLARATION,
+            Self::Builtin => SemanticTokenModifier::new("builtin"),
+            Self::Unresolved => SemanticTokenModifier::new("unresolved"),
+            Self::DefaultLibrary => SemanticTokenModifier::DEFAULT_LIBRARY,
+        }
+    }
+
+    /// The modifier a token carries under `standardOnly`; `None` when no
+    /// standard modifier means the same, so the modifier is not sent.
+    pub const fn standard_fallback(self) -> Option<Self> {
+        match self {
+            Self::Builtin => Some(Self::DefaultLibrary),
+            Self::Option | Self::File | Self::Unresolved => None,
+            Self::Declaration | Self::DefaultLibrary => Some(self),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct M2SemanticTokenModifiers(u32);
@@ -112,8 +163,8 @@ impl M2SemanticTokenModifiers {
         Self(self.0 | modifier.bit())
     }
 
-    pub const fn bits(self) -> u32 {
-        self.0
+    pub const fn contains(self, modifier: M2SemanticTokenModifier) -> bool {
+        self.0 & modifier.bit() != 0
     }
 }
 
@@ -140,6 +191,35 @@ impl M2SemanticToken {
     pub const fn with_modifier(mut self, modifier: M2SemanticTokenModifier) -> Self {
         self.modifiers = self.modifiers.with(modifier);
         self
+    }
+
+    /// The legend the `initialize` response states: every type and modifier.
+    pub fn legend() -> SemanticTokensLegend {
+        SemanticTokensLegend {
+            token_types: M2SemanticTokenType::iter()
+                .map(M2SemanticTokenType::lsp_type)
+                .collect(),
+            token_modifiers: M2SemanticTokenModifier::iter()
+                .map(M2SemanticTokenModifier::lsp_modifier)
+                .collect(),
+        }
+    }
+
+    /// The token as sent against [`legend`](Self::legend): its type index and
+    /// modifier bitset, standard fallbacks replacing M2-specific entries
+    /// under `standardOnly`.
+    pub fn encode(self, settings: &SemanticTokenSettings) -> (u32, u32) {
+        if !settings.standard_only {
+            return (self.token_type as u32, self.modifiers.0);
+        }
+        let modifiers = M2SemanticTokenModifier::iter()
+            .filter(|modifier| self.modifiers.contains(*modifier))
+            .filter_map(M2SemanticTokenModifier::standard_fallback)
+            .fold(
+                M2SemanticTokenModifiers::default(),
+                M2SemanticTokenModifiers::with,
+            );
+        (self.token_type.standard_fallback() as u32, modifiers.0)
     }
 }
 
@@ -247,10 +327,10 @@ pub fn local_symbol_semantic_token(
         Some(SymbolKind::FUNCTION) => M2SemanticTokenType::Function,
         Some(SymbolKind::VARIABLE) => M2SemanticTokenType::Variable,
         Some(SymbolKind::METHOD) => M2SemanticTokenType::Method,
-        Some(SymbolKind::CLASS) => M2SemanticTokenType::Class,
+        Some(SymbolKind::CLASS) => M2SemanticTokenType::Type,
         Some(SymbolKind::NAMESPACE) => M2SemanticTokenType::Namespace,
         Some(SymbolKind::PROPERTY) => M2SemanticTokenType::Property,
-        Some(SymbolKind::CONSTANT) => M2SemanticTokenType::EnumMember,
+        Some(SymbolKind::CONSTANT) => M2SemanticTokenType::Symbol,
         _ => M2SemanticTokenType::Variable,
     })
 }
@@ -287,7 +367,7 @@ fn source_role_semantic_token(
         }
         SourceSemanticRole::OptionKey => {
             let token_type = if is_unquoted_symbol && knowledge.is_protected_symbol(source_text) {
-                M2SemanticTokenType::EnumMember
+                M2SemanticTokenType::Symbol
             } else {
                 M2SemanticTokenType::Property
             };
@@ -297,11 +377,11 @@ fn source_role_semantic_token(
             if !knowledge.is_option_value_for_key(option_key.name(), source_text) {
                 return None;
             }
-            M2SemanticToken::new(M2SemanticTokenType::EnumMember)
+            M2SemanticToken::new(M2SemanticTokenType::Symbol)
                 .with_modifier(M2SemanticTokenModifier::Option)
         }
         SourceSemanticRole::PropertyKey => M2SemanticToken::new(M2SemanticTokenType::Property),
-        SourceSemanticRole::QuotedSymbol => M2SemanticToken::new(M2SemanticTokenType::EnumMember),
+        SourceSemanticRole::QuotedSymbol => M2SemanticToken::new(M2SemanticTokenType::Symbol),
         SourceSemanticRole::NamespaceArgument => {
             M2SemanticToken::new(M2SemanticTokenType::Namespace)
         }
@@ -314,20 +394,14 @@ fn local_symbol_static_type_token(
     type_name: &str,
     knowledge: &(impl SemanticTokenKnowledge + ?Sized),
 ) -> Option<M2SemanticToken> {
-    let mut token = knowledge.semantic_token_for_static_type(type_name)?;
+    let token = knowledge.semantic_token_for_static_type(type_name)?;
     match symbol.meta().symbol_kind {
-        _ if token.token_type == M2SemanticTokenType::Class
-            && knowledge.has_type_role(&ObjectName::new(type_name), TypeRole::Ring) =>
-        {
-            token.token_type = M2SemanticTokenType::Type;
-            Some(token)
-        }
         Some(SymbolKind::VARIABLE)
             if matches!(
                 token.token_type,
                 M2SemanticTokenType::String
                     | M2SemanticTokenType::Number
-                    | M2SemanticTokenType::EnumMember
+                    | M2SemanticTokenType::Symbol
             ) =>
         {
             None
@@ -451,9 +525,8 @@ pub fn semantic_token_from_knowledge(
     let data_type = &record.class;
     let subtype_of = |parent: &str| knowledge.is_subtype(data_type, &ObjectName::new(parent));
 
-    let is_command = subtype_of("Command");
+    let is_command = subtype_of("Command") || subtype_of("Manipulator");
     let is_file = subtype_of("File");
-    let is_manipulator = subtype_of("Manipulator");
     let is_scripted_functor = subtype_of("ScriptedFunctor");
     let is_compiled_function =
         subtype_of("CompiledFunction") || subtype_of("CompiledFunctionClosure");
@@ -471,62 +544,39 @@ pub fn semantic_token_from_knowledge(
     }
 
     if record_is_type_like(record) {
-        return Some(indexed_semantic_token(
-            if data_type.as_ref() == "Type" {
-                M2SemanticTokenType::Class
-            } else {
-                M2SemanticTokenType::Type
-            },
-            false,
-            false,
-            false,
-        ));
+        return Some(indexed_semantic_token(M2SemanticTokenType::Type, false));
     }
 
-    if subtype_of("Function") || is_scripted_functor || is_manipulator || is_command {
+    if is_command {
+        Some(indexed_semantic_token(M2SemanticTokenType::Command, false))
+    } else if subtype_of("Function") || is_scripted_functor {
         let has_installed_methods = record
             .callable()
             .is_some_and(|info| !info.methods.is_empty());
-        let token_type = if is_manipulator {
-            M2SemanticTokenType::Operator
-        } else if is_command || is_scripted_functor || is_compiled_function {
-            M2SemanticTokenType::Function
-        } else if has_installed_methods {
+        let token_type = if !is_scripted_functor && !is_compiled_function && has_installed_methods {
             M2SemanticTokenType::Method
         } else {
             M2SemanticTokenType::Function
         };
 
-        Some(indexed_semantic_token(
-            token_type,
-            is_command,
-            false,
-            is_manipulator,
-        ))
+        Some(indexed_semantic_token(token_type, false))
     } else if subtype_of("Package") {
         Some(indexed_semantic_token(
             M2SemanticTokenType::Namespace,
-            false,
-            false,
             false,
         ))
     } else if (subtype_of("Symbol") || is_file) && !subtype_of("Keyword") && !subtype_of("Operator")
     {
         let is_symbol_class = data_type.as_ref() == "Symbol";
         let token_type = if is_symbol_class {
-            M2SemanticTokenType::EnumMember
+            M2SemanticTokenType::Symbol
         } else {
             M2SemanticTokenType::Variable
         };
 
-        Some(indexed_semantic_token(token_type, false, is_file, false))
+        Some(indexed_semantic_token(token_type, is_file))
     } else {
-        Some(indexed_semantic_token(
-            M2SemanticTokenType::Variable,
-            false,
-            false,
-            false,
-        ))
+        Some(indexed_semantic_token(M2SemanticTokenType::Variable, false))
     }
 }
 
@@ -537,9 +587,7 @@ pub fn semantic_token_for_static_type_from_knowledge(
 ) -> Option<M2SemanticToken> {
     let type_name = ObjectName::new(type_name);
     let subtype_of = |parent: &str| knowledge.is_subtype(&type_name, &ObjectName::new(parent));
-    let is_command = subtype_of("Command");
     let is_file = subtype_of("File");
-    let is_manipulator = subtype_of("Manipulator");
     let is_type_valued = subtype_of("Type");
 
     let token_type = if type_name.name().starts_with("MethodFunction") {
@@ -547,56 +595,29 @@ pub fn semantic_token_for_static_type_from_knowledge(
     } else if subtype_of("Package") {
         M2SemanticTokenType::Namespace
     } else if is_type_valued {
-        if knowledge
-            .get_record(&type_name)
-            .is_some_and(|record| record.class.as_ref() == "Type")
-        {
-            M2SemanticTokenType::Class
-        } else {
-            M2SemanticTokenType::Type
-        }
-    } else if subtype_of("Function")
-        || subtype_of("ScriptedFunctor")
-        || is_manipulator
-        || is_command
-    {
-        if is_command {
-            M2SemanticTokenType::Function
-        } else if is_manipulator {
-            M2SemanticTokenType::Operator
-        } else {
-            M2SemanticTokenType::Function
-        }
+        M2SemanticTokenType::Type
+    } else if subtype_of("Command") || subtype_of("Manipulator") {
+        M2SemanticTokenType::Command
+    } else if subtype_of("Function") || subtype_of("ScriptedFunctor") {
+        M2SemanticTokenType::Function
     } else if is_file {
         M2SemanticTokenType::Variable
     } else if subtype_of("Symbol") {
-        M2SemanticTokenType::EnumMember
+        M2SemanticTokenType::Symbol
     } else {
         return None;
     };
 
-    Some(indexed_semantic_token(
-        token_type,
-        is_command,
-        is_file,
-        is_manipulator,
-    ))
+    Some(indexed_semantic_token(token_type, is_file))
 }
 
-fn indexed_semantic_token(
-    token_type: M2SemanticTokenType,
-    is_command: bool,
-    is_file: bool,
-    is_manipulator: bool,
-) -> M2SemanticToken {
-    let mut token = M2SemanticToken::new(token_type);
-    if is_command || is_manipulator {
-        token = token.with_modifier(M2SemanticTokenModifier::Command);
-    }
+fn indexed_semantic_token(token_type: M2SemanticTokenType, is_file: bool) -> M2SemanticToken {
+    let token = M2SemanticToken::new(token_type);
     if is_file {
-        token = token.with_modifier(M2SemanticTokenModifier::File);
+        token.with_modifier(M2SemanticTokenModifier::File)
+    } else {
+        token
     }
-    token
 }
 
 fn record_is_type_like(record: &Record) -> bool {

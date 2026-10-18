@@ -39,6 +39,7 @@ mod semantic_token;
 mod session;
 mod settings;
 mod source;
+mod source_package;
 #[cfg(test)]
 mod test_support;
 mod typesystem;
@@ -70,7 +71,7 @@ use capabilities::type_hierarchy::{
 };
 use client_capabilities::{
     refresh_if_changed, ClientSupport, InlayHintRefresh, SemanticTokensAugmentSyntax,
-    TypeHierarchyDynamicRegistration, WorkspaceRefresh,
+    SemanticTokensRefresh, TypeHierarchyDynamicRegistration, WorkspaceRefresh,
 };
 use diagnostics::{publish_diagnostics, visible_diagnostics};
 use document::DocumentSnapshot;
@@ -79,9 +80,9 @@ use package_index::{InitializationFile, Macaulay2Environment, SourceResolver};
 use session::{ClientInput, ExitNotificationService, SessionEnd};
 
 use crate::object_registry::ObjectRegistry;
-use crate::semantic_token::{LEGEND_MODIFIERS, LEGEND_TYPES};
+use crate::semantic_token::M2SemanticToken;
 use crate::settings::{ServerSettings, SettingProblem, SettingsStore, SourceSettings};
-use crate::workspace_index::WorkspaceIndex;
+use crate::workspace_index::{WorkspaceIndex, WorkspaceView};
 
 #[derive(Debug)]
 struct Backend {
@@ -95,6 +96,7 @@ struct Backend {
     semantic_tokens_augment_syntax: ClientSupport<SemanticTokensAugmentSyntax>,
     type_hierarchy_dynamic_registration: ClientSupport<TypeHierarchyDynamicRegistration>,
     inlay_hint_refresh: ClientSupport<InlayHintRefresh>,
+    semantic_tokens_refresh: ClientSupport<SemanticTokensRefresh>,
     /// The user's `init.m2`, which Macaulay2 runs before any document.
     initialization_file: Option<InitializationFile>,
 }
@@ -116,6 +118,7 @@ impl Backend {
             semantic_tokens_augment_syntax: ClientSupport::default(),
             type_hierarchy_dynamic_registration: ClientSupport::default(),
             inlay_hint_refresh: ClientSupport::default(),
+            semantic_tokens_refresh: ClientSupport::default(),
             initialization_file,
         }
     }
@@ -154,19 +157,71 @@ impl Backend {
         Some(request(document.value(), scoped))
     }
 
-    /// Run a navigation request against the library sources indexed so far;
-    /// while it wanted packages that were not indexed yet, index them off the
-    /// session task and run it again.
+    /// The source analyzed at `position` of `document`, with the workspace as
+    /// it sees it: the TEST block containing the position, analyzed as the
+    /// session `check` runs it in, or else the document itself.
+    fn source_at<'a>(
+        &'a self,
+        document: &'a DocumentSnapshot,
+        position: Position,
+    ) -> (&'a DocumentSnapshot, WorkspaceView<'a>) {
+        match document.package_test_at(position) {
+            Some(test) => (
+                &test.snapshot,
+                WorkspaceView::PackageTest(&self.workspace_index),
+            ),
+            None => (document, WorkspaceView::Document(&self.workspace_index)),
+        }
+    }
+
+    /// What the symbol at `position` of `document` refers to. In a TEST block,
+    /// a name the block binds itself lives in the block's own session, so it
+    /// is local to the block; only the names it gets from the workspace are
+    /// shared with other sources.
+    fn reference_target_at(
+        &self,
+        document: &DocumentSnapshot,
+        uri: &Url,
+        position: Position,
+    ) -> Option<ReferenceTarget> {
+        let (source, workspace) = self.source_at(document, position);
+        let target = reference_target(source, uri, position, &workspace)?;
+        let bound_by_test =
+            !std::ptr::eq(source, document) && source.binding_at_position(position).is_some();
+        Some(if bound_by_test {
+            ReferenceTarget::Local
+        } else {
+            target
+        })
+    }
+
+    /// Run a request at `position` against the source analyzed there (see
+    /// [`Self::source_at`]) and the packages it has loaded.
+    fn with_source_at<R>(
+        &self,
+        uri: &Url,
+        position: Position,
+        request: impl FnOnce(&DocumentSnapshot, &ObjectRegistry, WorkspaceView) -> R,
+    ) -> Option<R> {
+        let document = self.documents.get(uri)?;
+        let (source, workspace) = self.source_at(document.value(), position);
+        Some(request(source, source.object_registry(), workspace))
+    }
+
+    /// Run a navigation request at `position` against the library sources
+    /// indexed so far; while it wanted packages that were not indexed yet,
+    /// index them off the session task and run it again.
     async fn navigate<R>(
         &self,
         uri: &Url,
-        request: impl Fn(&DocumentSnapshot, &ObjectRegistry, &LibrarySources) -> R,
+        position: Position,
+        request: impl Fn(&DocumentSnapshot, &ObjectRegistry, WorkspaceView, &LibrarySources) -> R,
     ) -> Option<R> {
         loop {
             let library_index = self.library.snapshot();
             let library = library_index.sources();
-            let response = self.with_scoped_document(uri, |document, knowledge| {
-                request(document, knowledge, &library)
+            let response = self.with_source_at(uri, position, |document, knowledge, workspace| {
+                request(document, knowledge, workspace, &library)
             });
             let wanted_packages = library.into_wanted_packages();
             if wanted_packages.is_empty() {
@@ -249,7 +304,9 @@ impl Backend {
     async fn apply_settings(
         &self,
         settings: ServerSettings,
-        refresh_client: &(impl WorkspaceRefresh<InlayHintRefresh> + ?Sized),
+        refresh_client: &(impl WorkspaceRefresh<InlayHintRefresh>
+              + WorkspaceRefresh<SemanticTokensRefresh>
+              + ?Sized),
     ) -> Result<()> {
         let previous = self.settings.replace(settings.clone());
         if previous.sources != settings.sources {
@@ -278,12 +335,19 @@ impl Backend {
             }
         }
 
-        refresh_if_changed(
+        let inlay_hints = refresh_if_changed(
             &self.inlay_hint_refresh,
             refresh_client,
             previous.inlay_hints != settings.inlay_hints,
         )
-        .await
+        .await;
+        let semantic_tokens = refresh_if_changed(
+            &self.semantic_tokens_refresh,
+            refresh_client,
+            previous.semantic_tokens != settings.semantic_tokens,
+        )
+        .await;
+        inlay_hints.and(semantic_tokens)
     }
 
     async fn on_open(&self, params: TextDocumentItem) {
@@ -365,6 +429,7 @@ impl LanguageServer for Backend {
         self.type_hierarchy_dynamic_registration
             .negotiate(&params.capabilities);
         self.inlay_hint_refresh.negotiate(&params.capabilities);
+        self.semantic_tokens_refresh.negotiate(&params.capabilities);
 
         if let Some(options) = params.initialization_options.as_ref() {
             let parsed = ServerSettings::from_value(options);
@@ -408,10 +473,7 @@ impl LanguageServer for Backend {
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
-                            legend: SemanticTokensLegend {
-                                token_types: LEGEND_TYPES.into(),
-                                token_modifiers: LEGEND_MODIFIERS.into(),
-                            },
+                            legend: M2SemanticToken::legend(),
                             full: Some(SemanticTokensFullOptions::Bool(true)),
                             range: None,
                             work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -495,7 +557,7 @@ impl LanguageServer for Backend {
             self.client
                 .log_message(
                     MessageType::WARNING,
-                    format!("Failed to refresh Macaulay2 inlay hints: {error}"),
+                    format!("Failed to refresh Macaulay2 inlay hints or semantic tokens: {error}"),
                 )
                 .await;
         }
@@ -531,7 +593,7 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .with_scoped_document(uri, |document, knowledge| {
+            .with_source_at(uri, position, |document, knowledge, _| {
                 hover_response(document, position, &knowledge.at(position))
             })
             .flatten())
@@ -541,7 +603,7 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         Ok(self
-            .with_scoped_document(uri, |document, knowledge| {
+            .with_source_at(uri, position, |document, knowledge, _| {
                 completion_response(document, position, &knowledge.at(position))
             })
             .flatten())
@@ -551,7 +613,7 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .with_scoped_document(uri, |document, knowledge| {
+            .with_source_at(uri, position, |document, knowledge, _| {
                 signature_help_response(document, position, &knowledge.at(position))
             })
             .flatten())
@@ -563,12 +625,14 @@ impl LanguageServer for Backend {
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri;
         let augments_syntax_tokens = self.semantic_tokens_augment_syntax.is_supported();
+        let settings = self.settings.snapshot().semantic_tokens;
         Ok(self.with_scoped_document(&uri, |document, knowledge| {
             let tokens = collect_semantic_tokens(
                 document,
                 knowledge,
                 &self.workspace_index,
                 &uri,
+                &settings,
                 augments_syntax_tokens,
             );
             SemanticTokensResult::Tokens(SemanticTokens {
@@ -591,8 +655,9 @@ impl LanguageServer for Backend {
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = &params.text_document.uri;
         let settings = self.settings.snapshot();
+        let position = params.range.start;
         Ok(self
-            .with_document(uri, |document| {
+            .with_source_at(uri, position, |document, _, _| {
                 let diagnostics = if params.context.diagnostics.is_empty() {
                     visible_diagnostics(document, uri, &settings.diagnostics)
                 } else {
@@ -603,7 +668,7 @@ impl LanguageServer for Backend {
                         .filter(|diagnostic| settings.diagnostics.allows_lsp_diagnostic(diagnostic))
                         .collect()
                 };
-                available_code_actions(document, uri, params.range.start, &diagnostics)
+                available_code_actions(document, uri, position, &diagnostics)
             })
             .flatten())
     }
@@ -612,7 +677,16 @@ impl LanguageServer for Backend {
         let uri = &params.text_document.uri;
         let options = self.settings.snapshot().inlay_hints;
         Ok(self.with_scoped_document(uri, |document, knowledge| {
-            inlay_hints_response(document, params.range, options, knowledge)
+            let mut hints = inlay_hints_response(document, params.range, options, knowledge);
+            for test in document.package_tests() {
+                hints.extend(inlay_hints_response(
+                    &test.snapshot,
+                    params.range,
+                    options,
+                    test.snapshot.object_registry(),
+                ));
+            }
+            hints
         }))
     }
 
@@ -623,7 +697,7 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .with_scoped_document(uri, |document, knowledge| {
+            .with_source_at(uri, position, |document, knowledge, _| {
                 document_highlights(document, position, &knowledge.at(position))
             })
             .flatten())
@@ -642,11 +716,12 @@ impl LanguageServer for Backend {
                 Some(document) => document,
                 None => return Ok(None),
             };
-            match reference_target(document.value(), position, &self.workspace_index) {
+            match self.reference_target_at(document.value(), uri, position) {
                 None | Some(ReferenceTarget::Local) => {
-                    // A local binding's references never leave the document.
+                    // A local binding's references never leave its source.
+                    let (source, _) = self.source_at(document.value(), position);
                     return Ok(Some(references_response(
-                        document.value(),
+                        source,
                         uri,
                         position,
                         include_declaration,
@@ -682,7 +757,7 @@ impl LanguageServer for Backend {
         let uri = &params.text_document.uri;
         let position = params.position;
         Ok(self
-            .with_document(uri, |document| {
+            .with_source_at(uri, position, |document, _, _| {
                 prepare_rename_range(document, position).map(PrepareRenameResponse::Range)
             })
             .flatten())
@@ -705,11 +780,12 @@ impl LanguageServer for Backend {
                 Some(document) => document,
                 None => return Ok(None),
             };
-            match reference_target(document.value(), position, &self.workspace_index) {
+            match self.reference_target_at(document.value(), uri, position) {
                 None => return Ok(None),
                 Some(ReferenceTarget::Local) => {
-                    // A local binding renames only within its own document.
-                    return Ok(rename_edits(document.value(), uri, position, new_name));
+                    // A local binding renames only within its own source.
+                    let (source, _) = self.source_at(document.value(), position);
+                    return Ok(rename_edits(source, uri, position, new_name));
                 }
                 Some(ReferenceTarget::Global(name)) => {
                     let edits = global_reference_ranges(document.value(), &name)
@@ -748,7 +824,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .with_scoped_document(&uri, |document, knowledge| {
+            .with_source_at(&uri, position, |document, knowledge, _| {
                 self.type_hierarchy_context(&self.library.snapshot())
                     .prepare(document, &knowledge.at(position), &uri, position)
             })
@@ -810,13 +886,13 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .navigate(uri, |document, knowledge, library| {
+            .navigate(uri, position, |document, knowledge, workspace, library| {
                 goto_definition_response(
                     document,
                     uri,
                     position,
                     &knowledge.at(position),
-                    &self.workspace_index,
+                    &workspace,
                     library,
                 )
             })
@@ -831,13 +907,13 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .navigate(uri, |document, knowledge, library| {
+            .navigate(uri, position, |document, knowledge, workspace, library| {
                 goto_declaration_response(
                     document,
                     uri,
                     position,
                     &knowledge.at(position),
-                    &self.workspace_index,
+                    &workspace,
                     library,
                 )
             })
@@ -852,13 +928,13 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .navigate(uri, |document, knowledge, library| {
+            .navigate(uri, position, |document, knowledge, workspace, library| {
                 goto_type_definition_response(
                     document,
                     uri,
                     position,
                     &knowledge.at(position),
-                    &self.workspace_index,
+                    &workspace,
                     library,
                 )
             })
@@ -873,13 +949,13 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .navigate(uri, |document, knowledge, library| {
+            .navigate(uri, position, |document, knowledge, workspace, library| {
                 goto_implementation_response(
                     document,
                     position,
                     uri,
                     &knowledge.at(position),
-                    &self.workspace_index,
+                    &workspace,
                     library,
                 )
             })
@@ -899,13 +975,13 @@ impl LanguageServer for Backend {
         let uri = request.text_document.uri;
         let position = request.position;
         let response = self
-            .navigate(&uri, |document, knowledge, library| {
+            .navigate(&uri, position, |document, knowledge, workspace, library| {
                 goto_definition_response(
                     document,
                     &uri,
                     position,
                     &knowledge.at(position),
-                    &self.workspace_index,
+                    &workspace,
                     library,
                 )
             })

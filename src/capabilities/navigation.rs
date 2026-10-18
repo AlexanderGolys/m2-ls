@@ -621,6 +621,7 @@ pub enum ReferenceTarget {
 /// elsewhere in the workspace, is `Global`.
 pub fn reference_target(
     document: &DocumentSnapshot,
+    uri: &Url,
     position: Position,
     workspace_index: &(impl WorkspaceDefinitionKnowledge + ?Sized),
 ) -> Option<ReferenceTarget> {
@@ -630,7 +631,7 @@ pub fn reference_target(
         Some(binding) if binding.scope_idx != 0 => Some(ReferenceTarget::Local),
         Some(_) => Some(ReferenceTarget::Global(name)),
         None => workspace_index
-            .is_defined(&name)
+            .is_defined(&name, uri)
             .then_some(ReferenceTarget::Global(name)),
     }
 }
@@ -663,6 +664,17 @@ pub fn global_reference_ranges(document: &DocumentSnapshot, name: &str) -> Vec<T
             .is_some_and(|binding| binding.scope_idx != 0);
         if !shadowed {
             references.push(range);
+        }
+    }
+    // A TEST block sees the document's globals only through its package's
+    // exports, so it shares only the exported ones.
+    for test in document.package_tests() {
+        let package_exports_name =
+            document.packages().declarations().iter().any(|package| {
+                package.name == test.package && package.export_named(name).is_some()
+            });
+        if package_exports_name {
+            references.extend(global_reference_ranges(&test.snapshot, name));
         }
     }
     references.sort_by_key(|range| (range.start, range.end));
@@ -730,6 +742,11 @@ mod tests {
     fn document(text: &str) -> DocumentSnapshot {
         DocumentSnapshot::from_text(text.to_string(), &ObjectRegistry::default())
             .expect("fixture should parse")
+    }
+
+    /// The document every fixture stands for.
+    fn test_uri() -> Url {
+        Url::parse("file:///t.m2").expect("uri")
     }
 
     /// The library of a machine without Macaulay2 sources.
@@ -862,6 +879,7 @@ mod tests {
         assert!(matches!(
             reference_target(
                 &document,
+                &test_uri(),
                 pos!(1, 9),
                 &WorkspaceIndex::default()
             ),
@@ -886,6 +904,7 @@ mod tests {
         assert!(matches!(
             reference_target(
                 &document,
+                &test_uri(),
                 pos!(0, 9),
                 &WorkspaceIndex::default()
             ),
@@ -1077,7 +1096,7 @@ mod tests {
                 Vec::new()
             }
 
-            fn is_defined(&self, name: &str) -> bool {
+            fn is_defined(&self, name: &str, _exclude: &Url) -> bool {
                 name == "shared"
             }
 
@@ -1094,18 +1113,18 @@ mod tests {
         // Lambda parameter -> local (references stay in-file).
         let local = document("f := x -> (x + x)");
         assert!(matches!(
-            reference_target(&local, pos!(0, 5), &index),
+            reference_target(&local, &test_uri(), pos!(0, 5), &index),
             Some(ReferenceTarget::Local)
         ));
         // Top-level binding -> global.
         let global = document("y = 5\nz = y");
         assert!(matches!(
-            reference_target(&global, pos!(), &index),
+            reference_target(&global, &test_uri(), pos!(), &index),
             Some(ReferenceTarget::Global(name)) if name == "y"
         ));
         let external = document("shared");
         assert!(matches!(
-            reference_target(&external, pos!(), &KnownGlobal),
+            reference_target(&external, &test_uri(), pos!(), &KnownGlobal),
             Some(ReferenceTarget::Global(name)) if name == "shared"
         ));
     }

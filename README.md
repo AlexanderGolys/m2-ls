@@ -70,6 +70,9 @@ Any other LSP client: run `m2-ls` over stdio for `.m2` files and give it a
 project root, which is the scope of workspace search and cross-file rename.
 Navigation also enters the Macaulay2 library source of the loaded packages when
 it can find them; point `sources.paths` at an installation it does not find.
+Packages you write are read from source: importing `P` whose `P.m2` sits next
+to the importing file makes only the names `P` exports visible, and the code of
+each `TEST` block is analyzed like the session `check` runs it in.
 
 ## Configuration
 
@@ -98,6 +101,7 @@ Every setting is optional and applies without a restart. Send them under the
 | `formatting.breakAfterSemicolon` | `true` | Starts the next statement on a new line. |
 | `inlayHints.expressionTypes` | `false` | Adds argument, subexpression, and call-result types. |
 | `inlayHints.allKnownTypes` | `false` | Also shows types that are obvious from literals. |
+| `semanticTokens.standardOnly` | `false` | Sends only LSP-standard token types and modifiers, for themes that style nothing else: `command` as `function`, `builtin` as `defaultLibrary`, and no `option`, `file`, or `unresolved`. |
 | `sources.enabled` | `true` | Lets navigation enter the Macaulay2 library source. |
 | `sources.paths` | `[]` | Extra places to find it: an `M2` executable, an installation prefix (a build tree's `usr-dist` included), or a directory to add to Macaulay2's `path`. |
 

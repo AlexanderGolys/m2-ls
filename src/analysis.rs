@@ -1885,6 +1885,16 @@ impl Analysis {
         if codomain == TypeRole::Thing.object_name() {
             return None;
         }
+        // The annotation is evaluated where the method is installed. A codomain
+        // named by a value of the lambda's own scope, such as `T` in
+        // `(T, x) -> new T from x`, exists only when the method runs, so no
+        // annotation can state it.
+        let names_the_same_object = self
+            .binding_id_at(codomain.name(), source.position_for_node(assignment))
+            == self.binding_id_at(codomain.name(), source.position_for_node(body));
+        if !names_the_same_object {
+            return None;
+        }
 
         let annotation = method_codomain_annotation(right);
         // Without a local annotation the installation inherits the method's
@@ -2086,6 +2096,17 @@ impl Analysis {
                     .get_binding_at(name.name(), installation.span.start)
                     .and_then(|binding| binding.state.object_id)
                 else {
+                    // A library method function: the installation inherits its
+                    // recorded `TypicalValue`.
+                    if installation.method.codomain.is_none() {
+                        installation.method.codomain = knowledge
+                            .resolve_object(name)
+                            .and_then(|indexed_id| knowledge.object(&indexed_id))
+                            .and_then(|record| record.callable())
+                            .and_then(|callable| callable.typical_value.as_ref())
+                            .and_then(|type_id| knowledge.type_name(type_id))
+                            .cloned();
+                    }
                     return MethodInstallationEffect::Effective;
                 };
                 let Some(function) = self.registry.callable_objects.get_mut(object_id.0) else {

@@ -17,6 +17,7 @@ use crate::analysis::{Analysis, MethodInstallation};
 use crate::node_metadata::{visit_source_nodes, M2Node};
 use crate::object_registry::{ObjectRegistry, ObjectRegistryView};
 use crate::source::{DocumentSource, SourceNavigation};
+use crate::source_package::SourcePackages;
 
 /// What the node occasion provides: the node, the analysis of its document,
 /// and the source and the type knowledge positioned at the node.
@@ -35,12 +36,13 @@ struct InstallationContext<'context> {
     knowledge: &'context ObjectRegistryView<'context>,
 }
 
-/// What the document occasion provides: the analysis, the syntax root, and the
-/// source of the document.
+/// What the document occasion provides: the analysis, the syntax root, the
+/// source of the document, and the packages it declares.
 struct DocumentContext<'context, 'tree> {
     analysis: &'context Analysis,
     root: M2Node<'tree>,
     source: &'context DocumentSource,
+    packages: &'context SourcePackages,
 }
 
 /// The diagnostics spawned for one document, in the order they were found.
@@ -64,6 +66,7 @@ pub fn collect(
     syntax: Option<&SourceFile>,
     source: &DocumentSource,
     knowledge: &ObjectRegistry,
+    packages: &SourcePackages,
 ) -> Vec<M2Diagnostic> {
     let mut sink = DiagnosticSink::default();
     visit_source_nodes(root, syntax, |node| {
@@ -89,6 +92,7 @@ pub fn collect(
         analysis,
         root,
         source,
+        packages,
     };
     document::spawn(&context, &mut sink);
     sink.diagnostics

@@ -13,6 +13,27 @@ use crate::source::SourceNavigation;
 /// Spawns every diagnostic that needs the whole document.
 pub(super) fn spawn(context: &DocumentContext, sink: &mut DiagnosticSink) {
     unused_binding(context, sink);
+    missing_end_package(context, sink);
+}
+
+fn missing_end_package(context: &DocumentContext, sink: &mut DiagnosticSink) {
+    for declaration in context
+        .packages
+        .declarations()
+        .iter()
+        .filter(|declaration| declaration.closing.is_none())
+    {
+        let name = &declaration.name;
+        sink.spawn(
+            &catalog::MISSING_END_PACKAGE,
+            Finding::new(
+                declaration.name_range,
+                format!(
+                    "Package {name} is never closed; end its section with endPackage \"{name}\""
+                ),
+            ),
+        );
+    }
 }
 
 fn unused_binding(context: &DocumentContext, sink: &mut DiagnosticSink) {
@@ -20,6 +41,7 @@ fn unused_binding(context: &DocumentContext, sink: &mut DiagnosticSink) {
         analysis,
         root,
         source,
+        ..
     } = context;
     let mut used_bindings = HashSet::new();
     for node in root.binding_references() {

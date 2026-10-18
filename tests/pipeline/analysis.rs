@@ -565,7 +565,7 @@ async fn source_type_descendants_are_classified_through_the_typechecker() {
     let source = "TT = new Type\nTTT = new TT\nTTT\n";
     let mut session = DocumentSession::open(source).await;
     let tokens = semantic_tokens(&mut session).await;
-    let class = session.semantic_token_type("class");
+    let type_token = session.semantic_token_type("type");
 
     for line in 0..=2 {
         assert_eq!(
@@ -574,8 +574,8 @@ async fn source_type_descendants_are_classified_through_the_typechecker() {
                 .find_map(|(token_line, character, token_type, _)| {
                     (*token_line == line && *character == 0).then_some(*token_type)
                 }),
-            Some(class),
-            "line {} should classify its binding as a class",
+            Some(type_token),
+            "line {} should classify its binding as a type",
             line + 1
         );
     }
@@ -2331,7 +2331,7 @@ async fn scopes_bindings_and_callable_metadata_drive_editor_capabilities() {
         "local callables should be function tokens"
     );
     assert_ne!(
-        function_modifiers & (1 << 3),
+        function_modifiers & session.semantic_token_modifier("declaration"),
         0,
         "the callable declaration should carry the declaration modifier"
     );
@@ -2439,5 +2439,176 @@ async fn numeric_literal_promotion_preserves_the_ring_element_type() {
         assert_eq!(hover_type_at(&mut session, line, 0).await, expected);
     }
 
+    session.shutdown().await;
+}
+
+const PACKAGE_WITH_TEST: &str = concat!(
+    "newPackage \"Pkg\"\n",
+    "export {\"double\"}\n",
+    "double = x -> 2 * x\n",
+    "helper = x -> x\n",
+    "TEST ///\n",
+    "result := double 3\n",
+    "assert(result == 6)\n",
+    "helper\n",
+    "///\n",
+    "endPackage \"Pkg\"\n",
+);
+
+#[tokio::test]
+async fn a_package_must_close_its_section_with_end_package() {
+    let mut session = DocumentSession::open(PACKAGE_WITH_TEST).await;
+    assert!(!session.diagnostic_codes().contains(&"E10"));
+
+    let unclosed = PACKAGE_WITH_TEST.replace("endPackage \"Pkg\"\n", "");
+    replace_and_assert_diagnostic(&mut session, &unclosed, "E10", true).await;
+    assert_eq!(diagnostic_lines(&session, "E10"), [0]);
+
+    let mismatched = PACKAGE_WITH_TEST.replace("endPackage \"Pkg\"", "endPackage \"Other\"");
+    replace_and_assert_diagnostic(&mut session, &mismatched, "E10", true).await;
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_block_code_is_analyzed_as_a_session_that_loaded_the_package() {
+    let mut session = DocumentSession::open(PACKAGE_WITH_TEST).await;
+
+    let tokens = semantic_tokens(&mut session).await;
+    let function = session.semantic_token_type("function");
+    let unresolved = session.semantic_token_modifier("unresolved");
+    assert_eq!(
+        token_at(&tokens, PACKAGE_WITH_TEST, "double", 2).0,
+        function,
+        "an exported global is seen in the TEST block"
+    );
+    assert_ne!(
+        token_at(&tokens, PACKAGE_WITH_TEST, "helper", 1).1 & unresolved,
+        0,
+        "an unexported global is not"
+    );
+    assert_eq!(
+        token_at(&tokens, PACKAGE_WITH_TEST, "assert", 0).0,
+        function
+    );
+
+    let definition = session
+        .request_at("textDocument/definition", "double", 2)
+        .await;
+    assert!(
+        definition.to_string().contains("\"line\":2"),
+        "an exported name in a TEST block resolves to the package's definition: {definition}"
+    );
+    let private = session
+        .request_at("textDocument/definition", "helper", 1)
+        .await;
+    assert!(
+        response_array_or_empty(&private).is_empty(),
+        "a private name resolves to nothing in a TEST block: {private}"
+    );
+
+    let references = session
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": session.uri()},
+                "position": position(PACKAGE_WITH_TEST, "result", 1),
+                "context": {"includeDeclaration": true}
+            }),
+        )
+        .await;
+    assert_eq!(
+        response_array(&references).len(),
+        2,
+        "a TEST block's own binding has its references inside the block: {references}"
+    );
+    let exported_references = session
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": session.uri()},
+                "position": position(PACKAGE_WITH_TEST, "double", 1),
+                "context": {"includeDeclaration": true}
+            }),
+        )
+        .await;
+    assert_eq!(
+        response_array(&exported_references).len(),
+        2,
+        "the package's definition and the TEST block's use: {exported_references}"
+    );
+
+    let broken = PACKAGE_WITH_TEST.replace("assert(result == 6)", "assert(result == ]");
+    session.replace(&broken).await;
+    assert!(
+        diagnostic_lines(&session, "X01")
+            .iter()
+            .chain(&diagnostic_lines(&session, "X02"))
+            .any(|line| (5..=7).contains(line)),
+        "a syntax error in a TEST block is reported in it: {:?}",
+        session.diagnostics()
+    );
+    session.shutdown().await;
+}
+
+fn response_array_or_empty(result: &Value) -> Vec<Value> {
+    result.as_array().cloned().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn an_instance_of_a_type_parameter_has_no_deducible_codomain() {
+    let source = concat!(
+        "MarkdownType = new Type of List\n",
+        "MarkdownType Thing := (T, x) -> new T from if instance(x, VisibleList) then toList x else {x}\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    assert!(
+        diagnostic_lines(&session, "T03").is_empty(),
+        "`T` is a parameter, not a type name: {:?}",
+        session.diagnostics()
+    );
+
+    let global = concat!(
+        "MarkdownType = new Type of List\n",
+        "wrap = method()\n",
+        "wrap Thing := x -> new MarkdownType from {x}\n",
+    );
+    replace_and_assert_diagnostic(&mut session, global, "T03", true).await;
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_codomain_known_only_at_run_time_is_not_suggested_as_an_annotation() {
+    let source = concat!(
+        "MarkdownType = new Type of List\n",
+        "MarkdownType Thing := (T, x) -> new T from if instance(x, VisibleList) then toList x else {x}\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    assert!(
+        diagnostic_lines(&session, "T03").is_empty(),
+        "`T` is a parameter, so no annotation can name it: {:?}",
+        session.diagnostics()
+    );
+
+    let global = concat!(
+        "MarkdownType = new Type of List\n",
+        "wrap = method()\n",
+        "wrap Thing := x -> new MarkdownType from {x}\n",
+    );
+    replace_and_assert_diagnostic(&mut session, global, "T03", true).await;
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_installation_of_a_library_method_inherits_its_typical_value() {
+    let source = concat!(
+        "MarkdownMath = new Type of List\n",
+        "toString MarkdownMath := x -> \"$\" | concatenate toList x | \"$\"\n",
+    );
+    let session = DocumentSession::open(source).await;
+    assert!(
+        diagnostic_lines(&session, "T03").is_empty(),
+        "`toString` already has the typical value `String`: {:?}",
+        session.diagnostics()
+    );
     session.shutdown().await;
 }

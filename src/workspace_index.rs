@@ -1,18 +1,24 @@
 //! A workspace-wide index of top-level (global) navigation facts across the
-//! files the editor has open and every file they load (`load`/`needs`/`input`),
-//! transitively, including loaded files the editor has not opened.
+//! files the editor has open, every file they load (`load`/`needs`/`input`),
+//! and every user package they import, transitively, including files the
+//! editor has not opened.
 //!
 //! M2's top-level symbols are global once loaded, so a name-keyed index of every
 //! file's global facts is a faithful model: a name used in one file and defined
 //! or implemented at the top level of another resolves across the project.
+//!
+//! Packages are the exception. A global defined inside a `newPackage` section
+//! lands in the package's private dictionary: the files of the package see it,
+//! everyone else sees only the names the package exports. A file belongs to a
+//! package by declaring it, or by being loaded from inside its section.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use dashmap::DashMap;
-use tower_lsp::lsp_types::{Location, Range as TextRange, Url};
+use tower_lsp::lsp_types::{Location, Position, Range as TextRange, Url};
 
 use crate::analysis::AssignmentFactKind;
 use crate::capabilities::document_symbols::{collect_workspace_symbols, WorkspaceSourceSymbol};
@@ -20,6 +26,8 @@ use crate::document::DocumentSnapshot;
 use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::package_index::collect_loaded_files_in_tree;
 use crate::semantic_token::{local_symbol_semantic_token, M2SemanticTokenType};
+use crate::source::SourceNavigation;
+use crate::source_package::{PackageDeclaration, PackageExport};
 
 #[derive(Debug, Clone)]
 struct DefLocation {
@@ -43,10 +51,48 @@ struct ImplementationLocation {
     requires_declaration: bool,
 }
 
+/// One export of an indexed package.
+#[derive(Debug, Clone)]
+struct IndexedExport {
+    /// The file declaring the package.
+    file: Url,
+    /// The exporting package.
+    package: ObjectName,
+    export: PackageExport,
+}
+
+/// Whether the index hides a package's unexported globals from the files
+/// outside the package.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PackagePrivacy {
+    /// Files outside a package see only its exports: the user's workspace.
+    #[default]
+    Enforced,
+    /// Every global is visible: the library sources, whose corpus records
+    /// already decide which names a document sees before the sources are
+    /// asked where they are defined.
+    Waived,
+}
+
+/// Who a workspace query answers for, deciding which package globals it sees
+/// and which file's definitions its own analysis already knows.
+#[derive(Debug, Clone, Copy)]
+enum WorkspaceViewer<'a> {
+    /// A document, whose own definitions its analysis answers for. It sees
+    /// the private globals of the package it belongs to.
+    Document(&'a Url),
+    /// A TEST block. Analyzed on its own, it knows none of the definitions
+    /// of the document holding it, and sees every package, its own
+    /// included, only through the exports.
+    PackageTest,
+}
+
 pub trait WorkspaceSymbolKnowledge {
     fn matching_symbols(&self, query: &str) -> Vec<WorkspaceSourceSymbol>;
 }
 
+/// The method implementations of the workspace. `exclude` is the requesting
+/// document: its analysis answers for its own implementations.
 pub trait WorkspaceImplementationKnowledge {
     fn implementations(&self, name: &str, kind: ImplementationKind, exclude: &Url)
         -> Vec<Location>;
@@ -74,11 +120,13 @@ impl<T: WorkspaceSymbolKnowledge + ?Sized> WorkspaceSymbolKnowledge for Arc<T> {
     }
 }
 
+/// The global definitions of the workspace. `exclude` is the requesting
+/// document: its analysis answers for its own definitions.
 pub trait WorkspaceDefinitionKnowledge {
     fn declarations(&self, name: &str, exclude: &Url) -> Vec<Location>;
     fn definitions(&self, name: &str, exclude: &Url) -> Vec<Location>;
     fn type_definitions(&self, name: &str, exclude: &Url) -> Vec<Location>;
-    fn is_defined(&self, name: &str) -> bool;
+    fn is_defined(&self, name: &str, exclude: &Url) -> bool;
     fn semantic_token_type(&self, name: &str, exclude: &Url) -> Option<M2SemanticTokenType>;
 }
 
@@ -95,8 +143,8 @@ impl<T: WorkspaceDefinitionKnowledge + ?Sized> WorkspaceDefinitionKnowledge for 
         self.as_ref().type_definitions(name, exclude)
     }
 
-    fn is_defined(&self, name: &str) -> bool {
-        self.as_ref().is_defined(name)
+    fn is_defined(&self, name: &str, exclude: &Url) -> bool {
+        self.as_ref().is_defined(name, exclude)
     }
 
     fn semantic_token_type(&self, name: &str, exclude: &Url) -> Option<M2SemanticTokenType> {
@@ -106,22 +154,47 @@ impl<T: WorkspaceDefinitionKnowledge + ?Sized> WorkspaceDefinitionKnowledge for 
 
 /// Global navigation index, keyed by symbol name, kept in sync with edits and
 /// on-disk changes. Open documents are indexed from their live text; the files
-/// they load, from disk.
+/// they load and the user packages they import, from disk.
 #[derive(Debug, Default)]
 pub struct WorkspaceIndex {
     definitions_by_name: DashMap<ObjectName, Vec<DefLocation>>,
     implementations_by_name: DashMap<ObjectName, Vec<ImplementationLocation>>,
-    method_declarations_by_name: DashMap<ObjectName, Vec<Url>>,
+    method_declarations_by_name: DashMap<ObjectName, Vec<Location>>,
     names_by_file: DashMap<Url, Vec<ObjectName>>,
     symbols_by_file: DashMap<Url, Vec<WorkspaceSourceSymbol>>,
-    /// Every indexed file, mapped to the files it loads.
+    /// Every indexed file, mapped to the files it loads and the user packages
+    /// it imports.
     loads_by_file: DashMap<Url, Vec<Url>>,
+    /// The packages each indexed file declares.
+    declared_packages_by_file: DashMap<Url, Vec<PackageDeclaration>>,
+    /// The package a file belongs to because it is loaded from inside the
+    /// package's section.
+    package_of_loaded_file: DashMap<Url, ObjectName>,
+    privacy: PackagePrivacy,
+}
+
+/// The workspace as the source a request is analyzed in sees it.
+#[derive(Debug, Clone, Copy)]
+pub enum WorkspaceView<'index> {
+    /// A document of the workspace.
+    Document(&'index WorkspaceIndex),
+    /// A TEST block, analyzed as the session `check` runs it in.
+    PackageTest(&'index WorkspaceIndex),
 }
 
 impl WorkspaceIndex {
-    /// Index `uri` from `text`, then every file it loads, transitively, from
-    /// disk. Files already indexed keep their facts, so an open document's live
-    /// text is never clobbered by its saved copy.
+    /// The index of one package's library sources.
+    pub fn of_library_sources() -> Self {
+        Self {
+            privacy: PackagePrivacy::Waived,
+            ..Self::default()
+        }
+    }
+
+    /// Index `uri` from `text`, then every file it loads and every user
+    /// package it imports, transitively, from disk. Files already indexed keep
+    /// their facts, so an open document's live text is never clobbered by its
+    /// saved copy.
     pub fn index_file(&self, uri: &Url, text: &str, knowledge_provider: &ObjectRegistry) {
         let loaded = self.index_source(uri, text, knowledge_provider);
         self.index_files_from_disk(loaded, knowledge_provider);
@@ -173,7 +246,7 @@ impl WorkspaceIndex {
     }
 
     /// Replace the navigation facts recorded for `uri` with those parsed from
-    /// `text`, returning the files it loads.
+    /// `text`, returning the files it loads and the user packages it imports.
     fn index_source(&self, uri: &Url, text: &str, knowledge_provider: &ObjectRegistry) -> Vec<Url> {
         self.remove_file(uri);
         let Some(snapshot) = DocumentSnapshot::from_text(text.to_string(), knowledge_provider)
@@ -181,7 +254,17 @@ impl WorkspaceIndex {
             self.loads_by_file.insert(uri.clone(), Vec::new());
             return Vec::new();
         };
-        let loads = loaded_file_uris(uri, &snapshot);
+        let declarations = snapshot.packages().declarations().to_vec();
+        if !declarations.is_empty() {
+            self.declared_packages_by_file
+                .insert(uri.clone(), declarations);
+        }
+        let mut loads = self.record_loaded_files(uri, &snapshot);
+        loads.extend(imported_user_package_files(
+            uri,
+            &snapshot,
+            knowledge_provider,
+        ));
         self.loads_by_file.insert(uri.clone(), loads.clone());
         let definitions = top_level_definitions(&snapshot);
         let implementations = top_level_implementations(&snapshot);
@@ -222,12 +305,12 @@ impl WorkspaceIndex {
                 });
             names.push(name);
         }
-        for name in method_declarations {
+        for (name, range) in method_declarations {
             let name = ObjectName::new(name);
             self.method_declarations_by_name
                 .entry(name.clone())
                 .or_default()
-                .push(uri.clone());
+                .push(Location::new(uri.clone(), range));
             names.push(name);
         }
         names.sort();
@@ -236,9 +319,36 @@ impl WorkspaceIndex {
         loads
     }
 
+    /// The existing files `snapshot` (the document `uri`) loads, resolved
+    /// against the directory of `uri` as Macaulay2 resolves them against
+    /// `currentFileDirectory`. A file loaded from inside a package's section
+    /// is recorded as belonging to that package.
+    fn record_loaded_files(&self, uri: &Url, snapshot: &DocumentSnapshot) -> Vec<Url> {
+        let Some(directory) = file_directory(uri) else {
+            return Vec::new();
+        };
+        let mut loaded_files = Vec::new();
+        for load in collect_loaded_files_in_tree(snapshot.root_node(), snapshot.syntax()) {
+            let path = directory.join(load.path);
+            let Some(loaded) = path
+                .is_file()
+                .then(|| Url::from_file_path(path).ok())
+                .flatten()
+            else {
+                continue;
+            };
+            if let Some(package) = self.package_at(uri, snapshot.position_for_node(load.call)) {
+                self.package_of_loaded_file.insert(loaded.clone(), package);
+            }
+            loaded_files.push(loaded);
+        }
+        loaded_files
+    }
+
     pub fn remove_file(&self, uri: &Url) {
         self.loads_by_file.remove(uri);
         self.symbols_by_file.remove(uri);
+        self.declared_packages_by_file.remove(uri);
         let Some((_, names)) = self.names_by_file.remove(uri) else {
             return;
         };
@@ -264,7 +374,7 @@ impl WorkspaceIndex {
             }
             let declarations_empty =
                 if let Some(mut declarations) = self.method_declarations_by_name.get_mut(&name) {
-                    declarations.retain(|declaration| declaration != uri);
+                    declarations.retain(|declaration| &declaration.uri != uri);
                     declarations.is_empty()
                 } else {
                     false
@@ -281,6 +391,230 @@ impl WorkspaceIndex {
             .iter()
             .map(|entry| entry.key().clone())
             .collect()
+    }
+
+    /// The package whose private dictionary a global defined at `position`
+    /// of `uri` lands in: the package whose section there contains it in a
+    /// file declaring packages, the package loading the file otherwise.
+    fn package_at(&self, uri: &Url, position: Position) -> Option<ObjectName> {
+        match self.declared_packages_by_file.get(uri) {
+            Some(declarations) => declarations
+                .iter()
+                .find(|declaration| declaration.contains(position))
+                .map(|declaration| declaration.name.clone()),
+            None => self
+                .package_of_loaded_file
+                .get(uri)
+                .map(|package| package.value().clone()),
+        }
+    }
+
+    /// Whether `uri` is one of the files of `package`: the file declaring
+    /// it, or a file loaded from inside its section.
+    fn belongs_to_package(&self, uri: &Url, package: &ObjectName) -> bool {
+        self.declared_packages_by_file
+            .get(uri)
+            .is_some_and(|declarations| {
+                declarations
+                    .iter()
+                    .any(|declaration| &declaration.name == package)
+            })
+            || self
+                .package_of_loaded_file
+                .get(uri)
+                .is_some_and(|loaded_into| loaded_into.value() == package)
+    }
+
+    /// Every export of `name` by an indexed package, with the file declaring
+    /// the package.
+    fn exports_named(&self, name: &str) -> Vec<IndexedExport> {
+        self.declared_packages_by_file
+            .iter()
+            .flat_map(|declarations| {
+                let uri = declarations.key().clone();
+                declarations
+                    .value()
+                    .iter()
+                    .filter_map(|declaration| {
+                        declaration.export_named(name).map(|export| IndexedExport {
+                            file: uri.clone(),
+                            package: declaration.name.clone(),
+                            export: export.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Whether `viewer` sees the global `name` defined at `range` of `uri`.
+    fn is_visible(
+        &self,
+        viewer: WorkspaceViewer<'_>,
+        name: &str,
+        uri: &Url,
+        range: TextRange,
+    ) -> bool {
+        if self.privacy == PackagePrivacy::Waived {
+            return true;
+        }
+        let Some(owner) = self.package_at(uri, range.start) else {
+            return true;
+        };
+        // `newPackage` binds the package's own name in `PackageDictionary`,
+        // which every session sees.
+        if owner.name() == name {
+            return true;
+        }
+        let is_member = match viewer {
+            WorkspaceViewer::Document(requester) => self.belongs_to_package(requester, &owner),
+            WorkspaceViewer::PackageTest => false,
+        };
+        is_member
+            || self
+                .exports_named(name)
+                .iter()
+                .any(|indexed| indexed.package == owner && indexed.export.definition.name() == name)
+    }
+
+    /// Whether `viewer`'s own analysis answers for the file `uri`.
+    fn answers_for_itself(viewer: WorkspaceViewer<'_>, uri: &Url) -> bool {
+        matches!(viewer, WorkspaceViewer::Document(requester) if requester == uri)
+    }
+
+    /// The definitions of `name` that `viewer` sees and `include` accepts. A
+    /// name a package exports as a synonym resolves to the definitions of
+    /// the global it stands for; an exported name without a global definition
+    /// is a symbol created by the export itself, which then defines it.
+    fn locations(
+        &self,
+        name: &str,
+        viewer: WorkspaceViewer<'_>,
+        include: impl Fn(&DefLocation) -> bool,
+    ) -> Vec<Location> {
+        let defined_in = |definition: &str, package: Option<&ObjectName>| {
+            self.definitions_by_name
+                .get(definition)
+                .map(|locations| {
+                    locations
+                        .iter()
+                        .filter(|location| !Self::answers_for_itself(viewer, &location.uri))
+                        .filter(|location| include(location))
+                        .filter(|location| match package {
+                            Some(package) => {
+                                self.package_at(&location.uri, location.range.start)
+                                    .as_ref()
+                                    == Some(package)
+                            }
+                            None => self.is_visible(viewer, name, &location.uri, location.range),
+                        })
+                        .map(|location| Location::new(location.uri.clone(), location.range))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let mut locations = defined_in(name, None);
+        let exports = self.exports_named(name);
+        for indexed in &exports {
+            if indexed.export.definition.name() != name {
+                locations.extend(defined_in(
+                    indexed.export.definition.name(),
+                    Some(&indexed.package),
+                ));
+            }
+        }
+        if locations.is_empty() {
+            locations.extend(
+                exports
+                    .into_iter()
+                    .filter(|indexed| !Self::answers_for_itself(viewer, &indexed.file))
+                    .map(|indexed| Location::new(indexed.file, indexed.export.range)),
+            );
+        }
+        locations
+    }
+
+    fn semantic_token_type_for(
+        &self,
+        name: &str,
+        viewer: WorkspaceViewer<'_>,
+    ) -> Option<M2SemanticTokenType> {
+        let token_type_of = |definition: &str| {
+            self.definitions_by_name
+                .get(definition)
+                .and_then(|locations| {
+                    locations
+                        .iter()
+                        .filter(|location| !Self::answers_for_itself(viewer, &location.uri))
+                        .find(|location| {
+                            self.is_visible(viewer, definition, &location.uri, location.range)
+                        })
+                        .map(|location| location.semantic_token_type)
+                })
+        };
+        token_type_of(name).or_else(|| {
+            let exports = self.exports_named(name);
+            exports
+                .iter()
+                .find_map(|IndexedExport { export, .. }| {
+                    (export.definition.name() != name)
+                        .then(|| token_type_of(export.definition.name()))
+                        .flatten()
+                })
+                .or_else(|| (!exports.is_empty()).then_some(M2SemanticTokenType::Symbol))
+        })
+    }
+
+    fn implementations_for(
+        &self,
+        name: &str,
+        kind: ImplementationKind,
+        viewer: WorkspaceViewer<'_>,
+    ) -> Vec<Location> {
+        let method_declarations = self
+            .method_declarations_by_name
+            .get(name)
+            .map(|declarations| declarations.clone())
+            .unwrap_or_default();
+        let mut locations =
+            self.implementations_by_name
+                .get(name)
+                .map_or_else(Vec::new, |locations| {
+                    locations
+                        .iter()
+                        .filter(|location| {
+                            !Self::answers_for_itself(viewer, &location.uri)
+                                && location.kind == kind
+                                && self.is_visible(viewer, name, &location.uri, location.range)
+                                && (!location.requires_declaration
+                                    || method_declarations
+                                        .iter()
+                                        .any(|declaration| declaration.uri != location.uri))
+                        })
+                        .map(|location| Location {
+                            uri: location.uri.clone(),
+                            range: location.range,
+                        })
+                        .collect::<Vec<_>>()
+                });
+        locations.sort_by(|left, right| {
+            left.uri
+                .as_str()
+                .cmp(right.uri.as_str())
+                .then_with(|| left.range.start.cmp(&right.range.start))
+        });
+        locations
+    }
+
+    fn has_method_declaration_for(&self, name: &str, viewer: WorkspaceViewer<'_>) -> bool {
+        self.method_declarations_by_name
+            .get(name)
+            .is_some_and(|declarations| {
+                declarations.iter().any(|declaration| {
+                    !Self::answers_for_itself(viewer, &declaration.uri)
+                        && self.is_visible(viewer, name, &declaration.uri, declaration.range)
+                })
+            })
     }
 }
 
@@ -310,76 +644,95 @@ impl WorkspaceImplementationKnowledge for WorkspaceIndex {
         kind: ImplementationKind,
         exclude: &Url,
     ) -> Vec<Location> {
-        let method_declarations = self
-            .method_declarations_by_name
-            .get(name)
-            .map(|declarations| declarations.clone())
-            .unwrap_or_default();
-        let mut locations =
-            self.implementations_by_name
-                .get(name)
-                .map_or_else(Vec::new, |locations| {
-                    locations
-                        .iter()
-                        .filter(|location| {
-                            &location.uri != exclude
-                                && location.kind == kind
-                                && (!location.requires_declaration
-                                    || method_declarations
-                                        .iter()
-                                        .any(|declaration| declaration != &location.uri))
-                        })
-                        .map(|location| Location {
-                            uri: location.uri.clone(),
-                            range: location.range,
-                        })
-                        .collect::<Vec<_>>()
-                });
-        locations.sort_by(|left, right| {
-            left.uri
-                .as_str()
-                .cmp(right.uri.as_str())
-                .then_with(|| left.range.start.cmp(&right.range.start))
-        });
-        locations
+        self.implementations_for(name, kind, WorkspaceViewer::Document(exclude))
     }
 
     fn has_method_declaration(&self, name: &str, exclude: &Url) -> bool {
-        self.method_declarations_by_name
-            .get(name)
-            .is_some_and(|declarations| declarations.iter().any(|uri| uri != exclude))
+        self.has_method_declaration_for(name, WorkspaceViewer::Document(exclude))
     }
 }
 
 impl WorkspaceDefinitionKnowledge for WorkspaceIndex {
     fn declarations(&self, name: &str, exclude: &Url) -> Vec<Location> {
-        self.locations(name, exclude, |location| location.is_declaration)
+        self.locations(name, WorkspaceViewer::Document(exclude), |location| {
+            location.is_declaration
+        })
     }
 
     fn definitions(&self, name: &str, exclude: &Url) -> Vec<Location> {
-        self.locations(name, exclude, |_| true)
+        self.locations(name, WorkspaceViewer::Document(exclude), |_| true)
     }
 
     fn type_definitions(&self, name: &str, exclude: &Url) -> Vec<Location> {
-        self.locations(name, exclude, |location| {
-            matches!(
-                location.semantic_token_type,
-                M2SemanticTokenType::Type | M2SemanticTokenType::Class
-            )
+        self.locations(name, WorkspaceViewer::Document(exclude), |location| {
+            location.semantic_token_type == M2SemanticTokenType::Type
         })
     }
 
-    fn is_defined(&self, name: &str) -> bool {
-        self.definitions_by_name.contains_key(name)
+    fn is_defined(&self, name: &str, exclude: &Url) -> bool {
+        !self.definitions(name, exclude).is_empty()
     }
 
     fn semantic_token_type(&self, name: &str, exclude: &Url) -> Option<M2SemanticTokenType> {
-        self.definitions_by_name.get(name).and_then(|locations| {
-            locations
-                .iter()
-                .find(|location| &location.uri != exclude)
-                .map(|location| location.semantic_token_type)
+        self.semantic_token_type_for(name, WorkspaceViewer::Document(exclude))
+    }
+}
+
+impl WorkspaceView<'_> {
+    /// Who the view answers for, given the document `exclude` asking.
+    fn viewer<'a>(&'a self, exclude: &'a Url) -> (&'a WorkspaceIndex, WorkspaceViewer<'a>) {
+        match self {
+            Self::Document(index) => (index, WorkspaceViewer::Document(exclude)),
+            Self::PackageTest(index) => (index, WorkspaceViewer::PackageTest),
+        }
+    }
+}
+
+/// For a TEST block, `exclude` is the document holding it, whose analysis does
+/// not answer for the block's session; the block sees that document like any
+/// other file of its package, through the exports.
+impl WorkspaceDefinitionKnowledge for WorkspaceView<'_> {
+    fn declarations(&self, name: &str, exclude: &Url) -> Vec<Location> {
+        let (index, viewer) = self.viewer(exclude);
+        index.locations(name, viewer, |location| location.is_declaration)
+    }
+
+    fn definitions(&self, name: &str, exclude: &Url) -> Vec<Location> {
+        let (index, viewer) = self.viewer(exclude);
+        index.locations(name, viewer, |_| true)
+    }
+
+    fn type_definitions(&self, name: &str, exclude: &Url) -> Vec<Location> {
+        let (index, viewer) = self.viewer(exclude);
+        index.locations(name, viewer, |location| {
+            location.semantic_token_type == M2SemanticTokenType::Type
         })
+    }
+
+    fn is_defined(&self, name: &str, exclude: &Url) -> bool {
+        !self.definitions(name, exclude).is_empty()
+    }
+
+    fn semantic_token_type(&self, name: &str, exclude: &Url) -> Option<M2SemanticTokenType> {
+        let (index, viewer) = self.viewer(exclude);
+        index.semantic_token_type_for(name, viewer)
+    }
+}
+
+impl WorkspaceImplementationKnowledge for WorkspaceView<'_> {
+    fn implementations(
+        &self,
+        name: &str,
+        kind: ImplementationKind,
+        exclude: &Url,
+    ) -> Vec<Location> {
+        let (index, viewer) = self.viewer(exclude);
+        index.implementations_for(name, kind, viewer)
+    }
+
+    fn has_method_declaration(&self, name: &str, exclude: &Url) -> bool {
+        let (index, viewer) = self.viewer(exclude);
+        index.has_method_declaration_for(name, viewer)
     }
 }
 
@@ -402,42 +755,37 @@ impl WorkspaceIndex {
             })
             .unwrap_or_default()
     }
-
-    fn locations(
-        &self,
-        name: &str,
-        exclude: &Url,
-        include: impl Fn(&DefLocation) -> bool,
-    ) -> Vec<Location> {
-        self.definitions_by_name
-            .get(name)
-            .map(|locations| {
-                locations
-                    .iter()
-                    .filter(|location| &location.uri != exclude && include(location))
-                    .map(|location| Location {
-                        uri: location.uri.clone(),
-                        range: location.range,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
 }
 
-/// The existing files `snapshot` loads, resolved against the directory of
-/// `uri` as Macaulay2 resolves them against `currentFileDirectory`.
-fn loaded_file_uris(uri: &Url, snapshot: &DocumentSnapshot) -> Vec<Url> {
-    let Some(directory) = uri
-        .to_file_path()
+/// The directory holding the file `uri`.
+fn file_directory(uri: &Url) -> Option<PathBuf> {
+    uri.to_file_path()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
-    else {
+}
+
+/// The main files of the user packages `snapshot` (the document `uri`)
+/// imports: a package the corpus does not know, found as `P.m2` in the
+/// directory of `uri`. Macaulay2 searches its `path`, which starts with the
+/// session's current directory, and a document's own directory is where its
+/// session runs.
+fn imported_user_package_files(
+    uri: &Url,
+    snapshot: &DocumentSnapshot,
+    knowledge_provider: &ObjectRegistry,
+) -> Vec<Url> {
+    let Some(directory) = file_directory(uri) else {
         return Vec::new();
     };
-    collect_loaded_files_in_tree(snapshot.root_node(), snapshot.syntax())
-        .into_iter()
-        .map(|loaded| directory.join(loaded))
+    snapshot
+        .imported_packages()
+        .iter()
+        .filter(|import| {
+            knowledge_provider
+                .catalog_package_id(&import.package)
+                .is_none()
+        })
+        .map(|import| directory.join(format!("{}.m2", import.package)))
         .filter(|path| path.is_file())
         .filter_map(|path| Url::from_file_path(path).ok())
         .collect()
@@ -517,7 +865,7 @@ fn top_level_implementations(
     implementations
 }
 
-fn top_level_method_declarations(snapshot: &DocumentSnapshot) -> Vec<String> {
+fn top_level_method_declarations(snapshot: &DocumentSnapshot) -> Vec<(String, TextRange)> {
     let analysis = snapshot.analysis();
     let mut declarations = analysis
         .binding_states()
@@ -527,9 +875,13 @@ fn top_level_method_declarations(snapshot: &DocumentSnapshot) -> Vec<String> {
                 .function_for_binding(*binding)
                 .is_some_and(|function| function.is_method_function())
         })
-        .map(|binding| binding.name.name().to_string())
+        .map(|binding| (binding.name.name().to_string(), binding.state.span))
         .collect::<Vec<_>>();
-    declarations.sort();
+    declarations.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.start.cmp(&right.1.start))
+    });
     declarations.dedup();
     declarations
 }
@@ -598,7 +950,50 @@ mod tests {
 
         assert_eq!(
             index.semantic_token_type("Greeting", &reference),
-            Some(M2SemanticTokenType::Class)
+            Some(M2SemanticTokenType::Type)
         );
+    }
+
+    #[test]
+    fn a_package_shows_only_its_exports_outside_itself() {
+        let builtins = ObjectRegistry::default();
+        let index = WorkspaceIndex::default();
+        let package = Url::parse("file:///Pkg.m2").expect("uri");
+        let script = Url::parse("file:///script.m2").expect("uri");
+        index.index_file(
+            &package,
+            concat!(
+                "newPackage \"Pkg\"\n",
+                "export {\"pub\", \"Syn\" => \"pub\", \"Flag\"}\n",
+                "pub = x -> x\n",
+                "priv = x -> x\n",
+                "endPackage \"Pkg\"\n",
+                "after = 1\n",
+            ),
+            &builtins,
+        );
+
+        assert_eq!(index.definitions("pub", &script).len(), 1);
+        assert!(index.definitions("priv", &script).is_empty());
+        assert!(!index.is_defined("priv", &script));
+        assert_eq!(
+            index.definitions("Syn", &script),
+            index.definitions("pub", &script),
+            "a synonym resolves to the global it stands for"
+        );
+        assert_eq!(
+            index.definitions("Flag", &script)[0].range.start,
+            pos!(1, 31),
+            "an export without a definition is defined by the export"
+        );
+        assert_eq!(
+            index.semantic_token_type("Flag", &script),
+            Some(M2SemanticTokenType::Symbol)
+        );
+        assert_eq!(index.definitions("after", &script).len(), 1);
+
+        let test_view = WorkspaceView::PackageTest(&index);
+        assert_eq!(test_view.definitions("pub", &package).len(), 1);
+        assert!(test_view.definitions("priv", &package).is_empty());
     }
 }

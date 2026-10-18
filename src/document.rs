@@ -3,7 +3,10 @@
 
 use crate::node_metadata::{M2Node, M2Parser, M2Tree};
 use m2_syn::nodes::{ExprLambda as LambdaExpression, SourceFile};
+use std::sync::Mutex;
+use std::thread;
 use tower_lsp::lsp_types::{Position, Range as TextRange, TextDocumentContentChangeEvent};
+
 use tree_sitter::{InputEdit, Point};
 
 use crate::analysis::{Analysis, BindingView, FunctionInfo};
@@ -12,9 +15,10 @@ use crate::documentation::{
     collect_documentation, DocumentationBlock, DocumentationIndex, DocumentationReference,
     DocumentationSnippet,
 };
-use crate::object_registry::ObjectRegistry;
-use crate::package_index::collect_imported_packages_in_tree;
+use crate::object_registry::{ObjectName, ObjectRegistry};
+use crate::package_index::{collect_imported_packages_in_tree, PackageImport};
 use crate::source::{DocumentSource, SourceNavigation};
+use crate::source_package::{PackageTestBlock, SourcePackages};
 
 /// One immutable source, syntax, and semantic-analysis snapshot served to LSP
 /// requests.
@@ -27,6 +31,25 @@ pub struct DocumentSnapshot {
     diagnostics: Vec<M2Diagnostic>,
     object_registry: ObjectRegistry,
     documentation: DocumentationIndex,
+    imported_packages: Vec<PackageImport>,
+    packages: SourcePackages,
+    package_tests: Vec<PackageTest>,
+}
+
+/// A TEST block analyzed as the session `check` runs it in: the block's code
+/// alone, in a session that loaded its package. Its snapshot shares the
+/// document's LSP positions, so whatever it answers for the block holds in
+/// the document as is.
+#[derive(Debug)]
+pub struct PackageTest {
+    /// The package whose exports the block sees.
+    pub package: ObjectName,
+    /// The packages the block's session loads along with the package.
+    pub exported_packages: Vec<ObjectName>,
+    /// The block's code between its `///` delimiters.
+    pub body_range: TextRange,
+    /// The block's code analyzed on its own.
+    pub snapshot: DocumentSnapshot,
 }
 
 impl SourceNavigation for DocumentSnapshot {
@@ -49,18 +72,44 @@ pub struct TargetSymbol<'a> {
 impl DocumentSnapshot {
     pub fn from_text(text: String, knowledge_provider: &ObjectRegistry) -> Option<Self> {
         let source = DocumentSource::new(text);
-        let mut parser = M2Parser::new()?;
-        let tree = parser.parse_tree(source.text(), None)?;
+        let tree = M2Parser::new()?.parse_tree(source.text(), None)?;
+        Some(Self::analyze(source, tree, knowledge_provider, Vec::new()))
+    }
+
+    /// Analyze `source`, parsed as `tree`, against the packages
+    /// `knowledge_provider` has loaded plus those the source imports, then
+    /// each of its TEST blocks against the same packages plus the block's,
+    /// reusing the analysis of the unchanged `previous_tests`.
+    fn analyze(
+        source: DocumentSource,
+        tree: M2Tree,
+        knowledge_provider: &ObjectRegistry,
+        previous_tests: Vec<PackageTest>,
+    ) -> Self {
         let typed_ast = tree.typed_source_file(source.text());
         let root = tree.root(source.text());
         let imported_packages =
             collect_imported_packages_in_tree(root, typed_ast.as_ref(), &source);
         let knowledge = knowledge_provider.with_imports(&imported_packages);
         let analysis = Analysis::new_with_knowledge(root, typed_ast.as_ref(), &source, &knowledge);
-        let diagnostics =
-            diagnostics::collect(&analysis, root, typed_ast.as_ref(), &source, &knowledge);
+        let packages = SourcePackages::collect(root, &source);
+        let mut diagnostics = diagnostics::collect(
+            &analysis,
+            root,
+            typed_ast.as_ref(),
+            &source,
+            &knowledge,
+            &packages,
+        );
         let documentation = collect_documentation(&source, root, &analysis);
-        Some(Self {
+        let package_tests =
+            PackageTest::analyze_all(&packages, &source, knowledge_provider, previous_tests);
+        diagnostics.extend(
+            package_tests
+                .iter()
+                .flat_map(|test| test.snapshot.diagnostics.iter().cloned()),
+        );
+        Self {
             source,
             tree,
             syntax: typed_ast,
@@ -68,7 +117,10 @@ impl DocumentSnapshot {
             diagnostics,
             object_registry: knowledge,
             documentation,
-        })
+            imported_packages,
+            packages,
+            package_tests,
+        }
     }
 
     pub fn apply_changes(
@@ -107,6 +159,29 @@ impl DocumentSnapshot {
 
     pub fn diagnostics(&self) -> &[M2Diagnostic] {
         &self.diagnostics
+    }
+
+    /// The packages the document imports, each from where it takes effect.
+    pub fn imported_packages(&self) -> &[PackageImport] {
+        &self.imported_packages
+    }
+
+    /// The packages the document declares.
+    pub fn packages(&self) -> &SourcePackages {
+        &self.packages
+    }
+
+    /// The document's TEST blocks, each analyzed on its own.
+    pub fn package_tests(&self) -> &[PackageTest] {
+        &self.package_tests
+    }
+
+    /// The TEST block whose code contains `position`, which answers for it in
+    /// place of the document.
+    pub fn package_test_at(&self, position: Position) -> Option<&PackageTest> {
+        self.package_tests
+            .iter()
+            .find(|test| test.body_range.start <= position && position <= test.body_range.end)
     }
 
     pub fn binding_at_position(&self, position: Position) -> Option<BindingView<'_>> {
@@ -306,30 +381,109 @@ impl DocumentSnapshot {
         self.source
             .replace_range(start_byte..old_end_byte, replacement);
 
-        let mut parser = M2Parser::new()?;
-        let tree = parser.parse_tree(self.text(), Some(&edited_tree))?;
-        let typed_ast = tree.typed_source_file(self.text());
-        let root = tree.root(self.text());
-        let imported_packages =
-            collect_imported_packages_in_tree(root, typed_ast.as_ref(), &self.source);
-        let knowledge = knowledge_provider.with_imports(&imported_packages);
-        let analysis =
-            Analysis::new_with_knowledge(root, typed_ast.as_ref(), &self.source, &knowledge);
-        let diagnostics = diagnostics::collect(
-            &analysis,
-            root,
-            typed_ast.as_ref(),
-            &self.source,
-            &knowledge,
-        );
-        let documentation = collect_documentation(&self.source, root, &analysis);
-        self.tree = tree;
-        self.syntax = typed_ast;
-        self.analysis = analysis;
-        self.diagnostics = diagnostics;
-        self.object_registry = knowledge;
-        self.documentation = documentation;
+        let tree = M2Parser::new()?.parse_tree(self.text(), Some(&edited_tree))?;
+        let source = std::mem::replace(&mut self.source, DocumentSource::new(String::new()));
+        let previous_tests = std::mem::take(&mut self.package_tests);
+        *self = Self::analyze(source, tree, knowledge_provider, previous_tests);
         Some(())
+    }
+}
+
+impl PackageTest {
+    /// The TEST blocks of `packages`, declared in `source`, each analyzed
+    /// alone against `knowledge_provider` plus the packages its package
+    /// exports along. A block whose code, positions, and session match a
+    /// test of `previous` keeps that analysis; the others are analyzed in
+    /// parallel.
+    fn analyze_all(
+        packages: &SourcePackages,
+        source: &DocumentSource,
+        knowledge_provider: &ObjectRegistry,
+        mut previous: Vec<PackageTest>,
+    ) -> Vec<PackageTest> {
+        let mut tests = Vec::with_capacity(packages.tests().len());
+        let mut pending = Vec::new();
+        for (ordinal, block) in packages.tests().iter().enumerate() {
+            let isolated_source = block.isolated_source(source.text());
+            let exported_packages = packages
+                .declarations()
+                .iter()
+                .find(|declaration| declaration.name == block.package)
+                .expect("a TEST block belongs to a package the document declares")
+                .exported_packages
+                .clone();
+            match previous.iter().position(|test| {
+                test.package == block.package
+                    && test.exported_packages == exported_packages
+                    && test.snapshot.text() == isolated_source
+            }) {
+                Some(unchanged) => tests.push((ordinal, previous.swap_remove(unchanged))),
+                None => pending.push((ordinal, block, isolated_source, exported_packages)),
+            }
+        }
+
+        let workers = thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(pending.len());
+        let queue = Mutex::new(pending.into_iter());
+        let analyzed = Mutex::new(Vec::new());
+        thread::scope(|scope| {
+            for _ in 0..workers {
+                thread::Builder::new()
+                    .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
+                    .spawn_scoped(scope, || loop {
+                        // Taken in its own statement, so the lock is released
+                        // before the block is analyzed.
+                        let next_block = queue.lock().expect("queue lock").next();
+                        let Some((ordinal, block, isolated_source, exported_packages)) = next_block
+                        else {
+                            break;
+                        };
+                        if let Some(test) = Self::analyze(
+                            block,
+                            isolated_source,
+                            exported_packages,
+                            knowledge_provider,
+                        ) {
+                            analyzed
+                                .lock()
+                                .expect("analyzed lock")
+                                .push((ordinal, test));
+                        }
+                    })
+                    .expect("TEST analysis worker starts");
+            }
+        });
+        tests.extend(analyzed.into_inner().expect("analyzed lock"));
+        tests.sort_by_key(|(ordinal, _)| *ordinal);
+        tests.into_iter().map(|(_, test)| test).collect()
+    }
+
+    /// `block`, whose isolated code is `isolated_source`, analyzed against
+    /// `knowledge_provider` plus `exported_packages`.
+    fn analyze(
+        block: &PackageTestBlock,
+        isolated_source: String,
+        exported_packages: Vec<ObjectName>,
+        knowledge_provider: &ObjectRegistry,
+    ) -> Option<Self> {
+        let session_imports = exported_packages
+            .iter()
+            .map(|exported| PackageImport {
+                package: exported.clone(),
+                effective_from: pos!(),
+            })
+            .collect::<Vec<_>>();
+        let snapshot = DocumentSnapshot::from_text(
+            isolated_source,
+            &knowledge_provider.with_imports(&session_imports),
+        )?;
+        Some(Self {
+            package: block.package.clone(),
+            exported_packages,
+            body_range: block.body_range,
+            snapshot,
+        })
     }
 }
 
@@ -417,5 +571,47 @@ mod tests {
             binding.state.inferred_type,
             Some(crate::typesystem::InferredType::exact("String"))
         );
+    }
+
+    #[test]
+    fn package_tests_follow_edits_inside_and_around_them() {
+        let text = "newPackage \"Pkg\"\nTEST ///\nfirst = 1\n///\nendPackage \"Pkg\"\n";
+        let mut document =
+            DocumentSnapshot::from_text(text.to_string(), &ObjectRegistry::default())
+                .expect("the document should parse");
+        let edit = |line, character, text: &str| TextDocumentContentChangeEvent {
+            range: Some(TextRange::new(
+                Position::new(line, character),
+                Position::new(line, character),
+            )),
+            range_length: None,
+            text: text.to_string(),
+        };
+
+        document
+            .apply_changes(&[edit(4, 17, "\nafter = 2")], &ObjectRegistry::default())
+            .expect("an edit after the TEST block should parse");
+        assert_eq!(
+            document.package_tests()[0].snapshot.text().trim(),
+            "first = 1"
+        );
+
+        document
+            .apply_changes(&[edit(0, 0, "before = 0\n")], &ObjectRegistry::default())
+            .expect("an edit before the TEST block should parse");
+        assert_eq!(
+            document.package_tests()[0].body_range.start,
+            Position::new(2, 8)
+        );
+
+        document
+            .apply_changes(&[edit(3, 0, "second = 2\n")], &ObjectRegistry::default())
+            .expect("an edit inside the TEST block should parse");
+        let test = &document.package_tests()[0];
+        assert!(test
+            .snapshot
+            .analysis()
+            .bindings()
+            .any(|binding| binding.name.name() == "second"));
     }
 }

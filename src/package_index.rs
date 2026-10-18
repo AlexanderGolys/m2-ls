@@ -618,17 +618,27 @@ fn is_file_load_trigger(name: &str) -> bool {
     matches!(name, "load" | "needs" | "input")
 }
 
-/// The file paths a tree runs through `load`/`needs`/`input`, as written.
+/// One `load`/`needs`/`input` call running a source file.
+#[derive(Debug, Clone, Copy)]
+pub struct FileLoad<'tree> {
+    /// The call running the file.
+    pub call: M2Node<'tree>,
+    /// The file's path as written, relative to the directory of the file
+    /// making the call.
+    pub path: &'tree str,
+}
+
+/// The source files a tree runs through `load`/`needs`/`input`.
 pub fn collect_loaded_files_in_tree<'tree>(
     root: M2Node<'tree>,
     syntax: Option<&SourceFile>,
-) -> Vec<&'tree str> {
+) -> Vec<FileLoad<'tree>> {
     let mut files = Vec::new();
-    visit_source_nodes(root, syntax, |application| {
-        if let Some(path) = first_call_argument(application, is_file_load_trigger)
+    visit_source_nodes(root, syntax, |call| {
+        if let Some(path) = first_call_argument(call, is_file_load_trigger)
             .and_then(|argument| argument.string_literal_inner_text())
         {
-            files.push(path);
+            files.push(FileLoad { call, path });
         }
     });
     files
@@ -649,7 +659,7 @@ pub fn declared_package_name(application: M2Node<'_>) -> Option<M2Node<'_>> {
 
 /// The first argument of `callee ARG` / `callee(ARG, …)` when `callee` is
 /// accepted by `is_trigger`.
-fn first_call_argument(
+pub fn first_call_argument(
     application: M2Node<'_>,
     is_trigger: impl Fn(&str) -> bool,
 ) -> Option<M2Node<'_>> {

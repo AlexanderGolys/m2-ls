@@ -16,6 +16,7 @@ src/
   object_registry.rs      canonical object identities and registry lookup
   builtin_index.rs        in-memory form of the builtin corpus
   package_index.rs        imported-package discovery and source-file resolution
+  source_package.rs       packages declared in source: sections, exports, TEST blocks
   workspace_index.rs      cross-file index of top-level definitions
   diagnostics.rs, diagnostics/  every diagnostic: catalog, checks, rewrites, publication
   documentation.rs        Markdown documentation attached to source items

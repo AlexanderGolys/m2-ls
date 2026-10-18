@@ -288,6 +288,22 @@ EXPLICIT_INSTALL_REQUIRED {
         severity: ERROR,
     }
 
+    /// A `newPackage` section that no matching `endPackage` closes. Macaulay2
+    /// closes a package left open when its file ends, but everything after
+    /// the declaration then stays private to the package, so every package
+    /// has to close itself.
+    ///
+    /// ```m2
+    /// newPackage "Example"
+    /// export {"double"}
+    /// double = x -> 2 * x
+    /// ```
+MISSING_END_PACKAGE {
+        code: "E10",
+        name: "missing-end-package",
+        severity: ERROR,
+    }
+
     /// A parallel assignment whose right side has a type that cannot supply
     /// several values.
     ///

@@ -82,6 +82,9 @@ impl LspProcess {
                     "workspace": {
                         "inlayHint": {
                             "refreshSupport": true
+                        },
+                        "semanticTokens": {
+                            "refreshSupport": true
                         }
                     },
                     "textDocument": {
@@ -317,7 +320,6 @@ impl LspProcess {
 /// A unique on-disk workspace removed when its test finishes.
 pub(crate) struct TestWorkspace {
     root: std::path::PathBuf,
-    source_path: std::path::PathBuf,
     pub(crate) uri: String,
     related_source_path: std::path::PathBuf,
     pub(crate) related_uri: String,
@@ -349,11 +351,19 @@ impl TestWorkspace {
 
         Self {
             root,
-            source_path,
             uri,
             related_source_path,
             related_uri,
         }
+    }
+
+    /// Write `text` to the file `name` of the workspace, returning its URI.
+    pub(crate) fn write_file(&self, name: &str, text: &str) -> String {
+        let path = self.root.join(name);
+        fs::write(&path, text).expect("the workspace file should be written");
+        Url::from_file_path(&path)
+            .expect("the workspace file path should become a URI")
+            .to_string()
     }
 
     pub(crate) fn root_uri(&self) -> String {
@@ -365,9 +375,7 @@ impl TestWorkspace {
 
 impl Drop for TestWorkspace {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.source_path);
-        let _ = fs::remove_file(&self.related_source_path);
-        let _ = fs::remove_dir(&self.root);
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 

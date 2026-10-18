@@ -178,7 +178,7 @@ fn index_package_sources(
         .chain(load_sequence_files(&main_file))
         .filter_map(|path| Url::from_file_path(path).ok())
         .collect();
-    let sources = WorkspaceIndex::default();
+    let sources = WorkspaceIndex::of_library_sources();
     sources.index_files_from_disk(files, registry);
     Some(Arc::new(sources))
 }

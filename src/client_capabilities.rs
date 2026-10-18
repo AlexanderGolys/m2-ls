@@ -76,6 +76,26 @@ impl WorkspaceRefresh<InlayHintRefresh> for Client {
 }
 
 #[derive(Debug)]
+pub struct SemanticTokensRefresh;
+
+impl ClientCapability for SemanticTokensRefresh {
+    fn supported_by(capabilities: &ClientCapabilities) -> bool {
+        capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.semantic_tokens.as_ref())
+            .and_then(|semantic_tokens| semantic_tokens.refresh_support)
+            .unwrap_or(false)
+    }
+}
+
+impl WorkspaceRefresh<SemanticTokensRefresh> for Client {
+    fn refresh(&self) -> impl Future<Output = jsonrpc::Result<()>> + Send {
+        self.semantic_tokens_refresh()
+    }
+}
+
+#[derive(Debug)]
 pub struct SemanticTokensAugmentSyntax;
 
 impl ClientCapability for SemanticTokensAugmentSyntax {
@@ -152,6 +172,9 @@ mod tests {
             "workspace": {
                 "inlayHint": {
                     "refreshSupport": true
+                },
+                "semanticTokens": {
+                    "refreshSupport": true
                 }
             },
             "textDocument": {
@@ -170,6 +193,7 @@ mod tests {
         .unwrap();
 
         assert!(InlayHintRefresh::supported_by(&capabilities));
+        assert!(SemanticTokensRefresh::supported_by(&capabilities));
         assert!(SemanticTokensAugmentSyntax::supported_by(&capabilities));
         assert!(TypeHierarchyDynamicRegistration::supported_by(
             &capabilities

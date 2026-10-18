@@ -67,6 +67,7 @@ pub struct ServerSettings {
     pub diagnostics: DiagnosticSettings,
     pub formatting: FormattingSettings,
     pub inlay_hints: InlayHintSettings,
+    pub semantic_tokens: SemanticTokenSettings,
     pub sources: SourceSettings,
 }
 
@@ -116,6 +117,23 @@ pub struct InlayHintSettings {
     pub expression_types: bool,
     /// Also the types that are obvious from literals. Default `false`.
     pub all_known_types: bool,
+}
+
+/// `semanticTokens.*`: the vocabulary semantic highlighting is sent in.
+///
+/// The legend always offers every M2-specific type and modifier besides the
+/// standard ones: clients render any legend entry, even when they declare
+/// only the standard ones, so their declaration cannot tell what they style.
+/// These settings choose which entries tokens are sent as, and a change
+/// takes effect at once through a semantic-token refresh.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct SemanticTokenSettings {
+    /// Only LSP-standard token types and modifiers: M2-specific types are
+    /// sent as their closest standard type (`command` as `function`),
+    /// `builtin` as `defaultLibrary`, and the other M2-specific modifiers
+    /// are dropped. Default `false`.
+    pub standard_only: bool,
 }
 
 /// `sources.*`: where navigation finds the Macaulay2 library sources.
@@ -327,6 +345,7 @@ mod tests {
         assert!(!settings.formatting.compact_factor_operators);
         assert!(settings.formatting.break_after_semicolon);
         assert_eq!(settings.inlay_hints, InlayHintSettings::default());
+        assert!(!settings.semantic_tokens.standard_only);
         assert_eq!(valid_settings(Value::Null), settings);
     }
 
@@ -348,6 +367,9 @@ mod tests {
                 "inlayHints": {
                     "expressionTypes": true,
                     "allKnownTypes": true
+                },
+                "semanticTokens": {
+                    "standardOnly": true
                 }
             }
         }));
@@ -373,6 +395,7 @@ mod tests {
                 all_known_types: true,
             }
         );
+        assert!(settings.semantic_tokens.standard_only);
     }
 
     #[test]
