@@ -1,9 +1,6 @@
 //! End-to-end analysis behavior observed through standard LSP capabilities.
 
 use serde_json::{json, Value};
-use std::fs;
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::support::{position, response_array, DocumentSession};
 
@@ -1849,85 +1846,6 @@ async fn method_installation_documentation_stays_with_its_signature() {
     );
 
     session.shutdown().await;
-}
-
-#[test]
-fn documentation_command_generates_only_attached_pages() {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock should follow the Unix epoch")
-        .as_nanos();
-    let fixture = std::env::temp_dir().join(format!("m2-ls-docs-{}-{nonce}", std::process::id()));
-    let source_dir = fixture.join("source");
-    let output_dir = fixture.join("book");
-    fs::create_dir_all(&source_dir).expect("temporary source directory should be created");
-    fs::write(
-        source_dir.join("Package.m2"),
-        concat!(
-            "-* Package **documentation**. *-\n",
-            "newPackage(\"Package\")\n",
-            "-- Computes [[helper]].\n",
-            "answer := 42\n",
-            "-- Helps with examples.\n",
-            "helper := 1\n",
-            "\n",
-            "-- Detached ordinary comment.\n",
-        ),
-    )
-    .expect("documentation fixture should be written");
-    fs::write(
-        source_dir.join("NotPackage.m2"),
-        "-* This is not package documentation. *-\nx = newPackage\n",
-    )
-    .expect("non-package fixture should be written");
-
-    // The Tree-sitter assets the book embeds are build outputs, not sources, so
-    // they are gitignored and absent on a clean checkout. Build a stand-in and
-    // point the command at it, keeping the test hermetic and independent of the
-    // working directory.
-    let assets = fixture.join("assets");
-    for (path, contents) in [
-        ("parsers/macaulay2.so", "stand-in parser"),
-        ("queries/macaulay2/highlights.scm", "; stand-in queries"),
-        ("theme/treesitter.css", "/* stand-in theme */"),
-    ] {
-        let asset = assets.join(path);
-        fs::create_dir_all(asset.parent().expect("asset path has a parent"))
-            .expect("asset directory should be created");
-        fs::write(&asset, contents).expect("asset fixture should be written");
-    }
-
-    let result = Command::new(env!("CARGO_BIN_EXE_m2-ls"))
-        .current_dir(&fixture)
-        .env("M2_LS_DOC_ASSETS", &assets)
-        .arg("docs")
-        .arg(&source_dir)
-        .arg("--output")
-        .arg(&output_dir)
-        .arg("--no-build")
-        .output()
-        .expect("documentation command should run");
-    assert!(
-        result.status.success(),
-        "documentation command failed: {}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    assert!(String::from_utf8_lossy(&result.stdout).contains("generated 3 documentation pages"));
-
-    let summary = fs::read_to_string(output_dir.join("src/SUMMARY.md"))
-        .expect("generated summary should exist");
-    assert!(summary.contains("[Package]"));
-    assert!(summary.contains("[answer]"));
-    assert!(summary.contains("[helper]"));
-    assert!(!summary.contains("Detached"));
-    assert!(!summary.contains("NotPackage"));
-
-    let answer = fs::read_to_string(output_dir.join("src/items/Package--answer.md"))
-        .expect("documented binding page should exist");
-    assert!(answer.contains("[helper](Package--helper.md)"));
-    assert!(output_dir.join("parsers/macaulay2.so").is_file());
-
-    fs::remove_dir_all(&fixture).expect("temporary documentation fixture should be removed");
 }
 
 #[tokio::test]

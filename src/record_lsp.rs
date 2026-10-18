@@ -38,6 +38,8 @@ pub trait LspKnowledge: TypeKnowledge {
     fn option_value_usage_names(&self, value_name: &str, limit: usize) -> Vec<String>;
 
     fn doc_markdown(&self, name: &ObjectName) -> Option<String>;
+
+    fn loaded_packages(&self) -> Vec<ObjectName>;
 }
 
 /// Package-addressed record lookup used by static type-hierarchy navigation.
@@ -258,6 +260,10 @@ impl LspKnowledge for ObjectRegistry {
     fn doc_markdown(&self, name: &ObjectName) -> Option<String> {
         ObjectRegistry::doc_markdown(self, name).map(str::to_string)
     }
+
+    fn loaded_packages(&self) -> Vec<ObjectName> {
+        self.loaded_packages_at(pos_max!())
+    }
 }
 
 impl LspKnowledge for ObjectRegistryView<'_> {
@@ -310,6 +316,10 @@ impl LspKnowledge for ObjectRegistryView<'_> {
 
     fn doc_markdown(&self, name: &ObjectName) -> Option<String> {
         self.get_record(name)?.markdown().map(str::to_string)
+    }
+
+    fn loaded_packages(&self) -> Vec<ObjectName> {
+        ObjectRegistryView::loaded_packages(self)
     }
 }
 

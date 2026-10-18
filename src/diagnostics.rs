@@ -77,7 +77,18 @@ impl DiagnosticCode {
             .find(|rule| selector == rule.code.0 || selector == rule.name)
             .map(|rule| rule.code)
     }
+}
 
+/// A settings entry naming a diagnostic, by code or by name.
+impl<'de> serde::Deserialize<'de> for DiagnosticCode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let selector = String::deserialize(deserializer)?;
+        Self::from_selector(&selector)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown diagnostic `{selector}`")))
+    }
+}
+
+impl DiagnosticCode {
     /// The code of a diagnostic a client sends back with a code-action
     /// request; `None` for diagnostics another server published.
     pub fn from_lsp(diagnostic: &Diagnostic) -> Option<Self> {

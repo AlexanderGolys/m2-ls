@@ -174,7 +174,7 @@ async fn an_invalid_setting_is_shown_to_the_user_and_the_valid_ones_still_apply(
     let message = server.wait_for_notification("window/showMessage").await;
     let text = message["params"]["message"].as_str().unwrap_or_default();
     assert!(
-        text.contains("`diagnostics.disabled`: unknown diagnostic `not-a-rule`"),
+        text.contains("`diagnostics.disabled[0]`: unknown diagnostic `not-a-rule`"),
         "{message}"
     );
     assert!(
@@ -1243,4 +1243,200 @@ async fn server_exits_when_the_client_disconnects() {
     server.notify("initialized", json!({})).await;
 
     assert_eq!(server.disconnect().await.code(), Some(1));
+}
+
+/// A Macaulay2 build tree (`Layout#2`) in an arbitrary place, holding a Core loaded through
+/// its `loadsequence` and a package that loads a file of its own directory.
+struct LibraryFixture {
+    root: std::path::PathBuf,
+}
+
+impl LibraryFixture {
+    fn new() -> Self {
+        let root = env::temp_dir().join(format!("m2-ls-library-{}", std::process::id()));
+        let packages = root.join("usr-dist/common/share/Macaulay2");
+        std::fs::create_dir_all(packages.join("Core")).expect("Core directory");
+        std::fs::create_dir_all(root.join("usr-dist/x86_64-Linux/lib/Macaulay2"))
+            .expect("machine directory");
+        std::fs::create_dir_all(packages.join("Saturation")).expect("package directory");
+        let files = [
+            ("Core/Core.m2", "toString = x -> x\n"),
+            ("Core/loadsequence", "betti.m2\n"),
+            ("Core/betti.m2", "betti = method()\nbetti Ideal := I -> I\n"),
+            (
+                "Saturation.m2",
+                "saturationHelper = I -> I\nload \"./Saturation/impl.m2\"\n",
+            ),
+            (
+                "Saturation/impl.m2",
+                "saturate = method()\nsaturate Ideal := I -> saturationHelper I\nbetti Module := M -> M\n",
+            ),
+        ];
+        for (path, text) in files {
+            std::fs::write(packages.join(path), text).expect("library source");
+        }
+        Self { root }
+    }
+
+    fn uri(&self, path: &str) -> String {
+        tower_lsp::lsp_types::Url::from_file_path(
+            self.root.join("usr-dist/common/share/Macaulay2").join(path),
+        )
+        .expect("library path URI")
+        .to_string()
+    }
+
+    fn sources_settings(&self, enabled: bool) -> Value {
+        json!({
+            "sources": {
+                "enabled": enabled,
+                "paths": [self.root.join("usr-dist")]
+            }
+        })
+    }
+}
+
+impl Drop for LibraryFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// The `(uri, start line)` of every location `method` answers at `position`.
+async fn locations_at(
+    server: &mut LspProcess,
+    method: &str,
+    uri: &str,
+    position: Value,
+) -> Vec<(String, u64)> {
+    let response = server
+        .request(method, document_position(uri, position))
+        .await;
+    let locations = match &response {
+        Value::Array(locations) => locations.clone(),
+        Value::Null => Vec::new(),
+        location => vec![location.clone()],
+    };
+    let mut lines = locations
+        .iter()
+        .map(|location| {
+            (
+                location["uri"].as_str().expect("location URI").to_string(),
+                location["range"]["start"]["line"]
+                    .as_u64()
+                    .expect("location line"),
+            )
+        })
+        .collect::<Vec<_>>();
+    lines.sort();
+    lines
+}
+
+#[tokio::test]
+async fn navigation_enters_configured_library_sources_of_loaded_packages() {
+    let library = LibraryFixture::new();
+    let source = "I = ideal 1\nbetti I\nsaturate I\ntoString I\n";
+    let workspace = TestWorkspace::new(source);
+    let mut server = LspProcess::spawn().await;
+    server
+        .initialize_with_options(&workspace.root_uri(), library.sources_settings(true))
+        .await;
+    server.open_document(&workspace.uri, source).await;
+
+    assert_eq!(
+        locations_at(
+            &mut server,
+            "textDocument/definition",
+            &workspace.uri,
+            position(source, "betti", 0)
+        )
+        .await,
+        vec![(library.uri("Core/betti.m2"), 0)],
+        "Core's files are the ones its loadsequence lists"
+    );
+    assert_eq!(
+        locations_at(
+            &mut server,
+            "textDocument/definition",
+            &workspace.uri,
+            position(source, "toString", 0)
+        )
+        .await,
+        vec![(library.uri("Core/Core.m2"), 0)]
+    );
+    assert_eq!(
+        locations_at(
+            &mut server,
+            "textDocument/definition",
+            &workspace.uri,
+            position(source, "ideal", 0)
+        )
+        .await,
+        Vec::new(),
+        "a Core name no library file assigns has no definition to jump to"
+    );
+    assert_eq!(
+        locations_at(
+            &mut server,
+            "textDocument/definition",
+            &workspace.uri,
+            position(source, "saturate", 0)
+        )
+        .await,
+        vec![(library.uri("Saturation/impl.m2"), 0)],
+        "a package's definitions come from the files it loads"
+    );
+    assert_eq!(
+        locations_at(
+            &mut server,
+            "textDocument/implementation",
+            &workspace.uri,
+            position(source, "betti", 0)
+        )
+        .await,
+        vec![
+            (library.uri("Core/betti.m2"), 1),
+            (library.uri("Saturation/impl.m2"), 2),
+        ],
+        "every loaded package may install a library method"
+    );
+
+    let package_file = library.uri("Saturation/impl.m2");
+    let package_source = std::fs::read_to_string(
+        library
+            .root
+            .join("usr-dist/common/share/Macaulay2/Saturation/impl.m2"),
+    )
+    .expect("package source");
+    server.open_document(&package_file, &package_source).await;
+    assert_eq!(
+        locations_at(
+            &mut server,
+            "textDocument/definition",
+            &package_file,
+            position(&package_source, "saturationHelper", 0)
+        )
+        .await,
+        vec![(library.uri("Saturation.m2"), 0)],
+        "inside a library file, the package's private names resolve"
+    );
+    server.shutdown().await;
+
+    let mut disabled = LspProcess::spawn().await;
+    disabled
+        .initialize_with_options(&workspace.root_uri(), library.sources_settings(false))
+        .await;
+    disabled.open_document(&workspace.uri, source).await;
+    let definition = disabled
+        .request(
+            "textDocument/definition",
+            document_position(&workspace.uri, position(source, "betti", 0)),
+        )
+        .await;
+    assert_eq!(
+        definition,
+        Value::Null,
+        "disabled library navigation finds no sources"
+    );
+    disabled.shutdown().await;
 }

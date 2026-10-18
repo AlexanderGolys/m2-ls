@@ -11,9 +11,10 @@ use tower_lsp::lsp_types::Range as TextRange;
 use tower_lsp::lsp_types::*;
 
 use crate::document::{DocumentSnapshot, TargetSymbol};
+use crate::library_index::LibrarySources;
 use crate::node_metadata::M2Node;
 use crate::object_registry::ObjectName;
-use crate::package_index::{package_source_string, SourceResolver};
+use crate::package_index::package_source_string;
 use crate::record_lsp::LspKnowledge;
 use crate::source::SourceNavigation;
 use crate::workspace_index::{
@@ -70,21 +71,35 @@ enum NavigationTarget {
     Definition,
 }
 
+impl NavigationTarget {
+    fn locations(
+        self,
+        index: &(impl WorkspaceDefinitionKnowledge + ?Sized),
+        name: &str,
+        exclude: &Url,
+    ) -> Vec<Location> {
+        match self {
+            NavigationTarget::Declaration => index.declarations(name, exclude),
+            NavigationTarget::Definition => index.definitions(name, exclude),
+        }
+    }
+}
+
 pub fn goto_declaration_response(
     document: &DocumentSnapshot,
     uri: &Url,
     position: Position,
     knowledge: &(impl LspKnowledge + ?Sized),
-    source_resolver: &SourceResolver,
     workspace_index: &(impl WorkspaceDefinitionKnowledge + ?Sized),
+    library: &LibrarySources,
 ) -> Option<GotoDeclarationResponse> {
     goto_symbol_response(
         document,
         uri,
         position,
         knowledge,
-        source_resolver,
         workspace_index,
+        library,
         NavigationTarget::Declaration,
     )
 }
@@ -94,16 +109,16 @@ pub fn goto_definition_response(
     uri: &Url,
     position: Position,
     knowledge: &(impl LspKnowledge + ?Sized),
-    source_resolver: &SourceResolver,
     workspace_index: &(impl WorkspaceDefinitionKnowledge + ?Sized),
+    library: &LibrarySources,
 ) -> Option<GotoDefinitionResponse> {
     goto_symbol_response(
         document,
         uri,
         position,
         knowledge,
-        source_resolver,
         workspace_index,
+        library,
         NavigationTarget::Definition,
     )
 }
@@ -113,8 +128,8 @@ fn goto_symbol_response(
     uri: &Url,
     position: Position,
     knowledge: &(impl LspKnowledge + ?Sized),
-    source_resolver: &SourceResolver,
     workspace_index: &(impl WorkspaceDefinitionKnowledge + ?Sized),
+    library: &LibrarySources,
     target: NavigationTarget,
 ) -> Option<GotoDefinitionResponse> {
     let node = document.node_at_position_minimal(position)?;
@@ -123,7 +138,7 @@ fn goto_symbol_response(
     if let NavigationTarget::Definition = target {
         if let Some(string_node) = node.enclosing_node(M2Node::is_string_literal) {
             if let Some(package_name) = crate::package_index::package_source_string(string_node) {
-                if let Some(path) = source_resolver.resolve_package_file(package_name) {
+                if let Some(path) = library.source_resolver().resolve_package_file(package_name) {
                     if let Ok(uri) = Url::from_file_path(path) {
                         return Some(GotoDefinitionResponse::Scalar(Location {
                             uri,
@@ -167,18 +182,25 @@ fn goto_symbol_response(
         }));
     }
 
-    let workspace_locations = match target {
-        NavigationTarget::Declaration => workspace_index.declarations(node_text, uri),
-        NavigationTarget::Definition => workspace_index.definitions(node_text, uri),
-    };
+    let workspace_locations = target.locations(workspace_index, node_text, uri);
     if !workspace_locations.is_empty() {
         return locations_response(workspace_locations);
     }
 
-    if let Some((package, _)) = knowledge.get_record_with_package(&ObjectName::new(node_text)) {
-        return source_resolver
-            .package_location(&package)
-            .map(GotoDefinitionResponse::Scalar);
+    let record_package = knowledge
+        .get_record_with_package(&ObjectName::new(node_text))
+        .map(|(package, _)| ObjectName::new(package));
+    let library_locations = library.locations(uri, record_package.clone(), |sources| {
+        target.locations(sources, node_text, uri)
+    });
+    if !library_locations.is_empty() {
+        return locations_response(library_locations);
+    }
+    // A library name is defined by its package, so it has a location only in
+    // that package's `.m2` sources: none when they are not on disk, or when
+    // they do not assign it, as for a builtin of the interpreter.
+    if record_package.is_some() {
+        return None;
     }
     match target {
         // A name nothing defines becomes a global symbol where Macaulay2 first
@@ -202,7 +224,7 @@ pub fn goto_type_definition_response(
     position: Position,
     knowledge: &(impl LspKnowledge + ?Sized),
     workspace_index: &(impl WorkspaceDefinitionKnowledge + ?Sized),
-    source_resolver: &SourceResolver,
+    library: &LibrarySources,
 ) -> Option<GotoTypeDefinitionResponse> {
     let node = document.reference_node_at_position(position)?;
     let inferred_type = document
@@ -235,9 +257,11 @@ pub fn goto_type_definition_response(
 
     let (package, record) = knowledge.get_record_with_package(&inferred_type)?;
     record.type_info()?;
-    source_resolver
-        .package_location(&package)
-        .map(GotoDefinitionResponse::Scalar)
+    locations_response(
+        library.locations(uri, Some(ObjectName::new(&package)), |sources| {
+            sources.type_definitions(inferred_type.name(), uri)
+        }),
+    )
 }
 
 pub fn goto_implementation_response(
@@ -246,6 +270,7 @@ pub fn goto_implementation_response(
     uri: &Url,
     knowledge: &(impl LspKnowledge + ?Sized),
     workspace_index: &(impl WorkspaceImplementationKnowledge + ?Sized),
+    library: &LibrarySources,
 ) -> Option<GotoImplementationResponse> {
     let (name, _) = document.symbol_occurrence_at(position)?;
     let analysis = document.analysis();
@@ -278,11 +303,15 @@ pub fn goto_implementation_response(
         .filter(|installations| installations.len() == 1)
         .and_then(|installations| installations.first().copied());
     let local_binding = binding.is_some_and(|binding| binding.scope_idx != 0);
-    let indexed_method = binding.is_none()
-        && knowledge
-            .get_record(&ObjectName::new(name))
-            .and_then(|record| record.callable())
-            .is_some_and(|callable| callable.is_method_function());
+    let library_record = knowledge
+        .get_record_with_package(&ObjectName::new(name))
+        .filter(|_| !local_binding);
+    let library_method = library_record
+        .as_ref()
+        .and_then(|(_, record)| record.callable())
+        .is_some_and(|callable| callable.is_method_function());
+    let record_package = library_record.map(|(package, _)| ObjectName::new(package));
+    let indexed_method = binding.is_none() && library_method;
     let workspace_method_declared =
         !local_binding && workspace_index.has_method_declaration(name, uri);
 
@@ -342,8 +371,18 @@ pub fn goto_implementation_response(
                 range,
             })
             .collect::<Vec<_>>();
-        if pinned_installation.is_none() {
+        if pinned_installation.is_none() && !local_binding {
             locations.extend(workspace_method_locations);
+            // Any loaded package may install a library method.
+            let installing_packages = if library_method {
+                record_package
+                    .into_iter()
+                    .chain(knowledge.loaded_packages())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            locations.extend(library.method_installations(uri, installing_packages, name));
         }
         locations
     } else {
@@ -373,6 +412,9 @@ pub fn goto_implementation_response(
                 ImplementationKind::Lambda,
                 uri,
             ));
+            locations.extend(library.locations(uri, record_package, |sources| {
+                sources.implementations(name, ImplementationKind::Lambda, uri)
+            }));
         }
         locations
     };
@@ -679,13 +721,20 @@ pub fn is_valid_m2_identifier(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::document::DocumentSnapshot;
+    use crate::library_index::LibraryIndex;
     use crate::object_registry::ObjectRegistry;
+    use crate::package_index::SourceResolver;
     use crate::workspace_index::WorkspaceIndex;
     use tower_lsp::lsp_types::Range as TextRange;
 
     fn document(text: &str) -> DocumentSnapshot {
         DocumentSnapshot::from_text(text.to_string(), &ObjectRegistry::default())
             .expect("fixture should parse")
+    }
+
+    /// The library of a machine without Macaulay2 sources.
+    fn sourceless_library(registry: &ObjectRegistry) -> LibraryIndex {
+        LibraryIndex::new(SourceResolver::default(), registry.clone())
     }
 
     #[test]
@@ -852,6 +901,7 @@ mod tests {
             crate::object_registry::ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
         let scoped = index.with_source_imports(text);
         let uri = Url::parse("file:///t.m2").expect("uri");
+        let library = sourceless_library(&index);
 
         assert_eq!(
             goto_definition_response(
@@ -859,8 +909,8 @@ mod tests {
                 &uri,
                 pos!(0, 9),
                 &scoped,
-                &SourceResolver::new(Vec::new()),
                 &WorkspaceIndex::default(),
+                &library.sources(),
             ),
             None
         );
@@ -876,14 +926,15 @@ mod tests {
             crate::object_registry::ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
         let scoped = index.with_source_imports(text);
         let uri = Url::parse("file:///t.m2").expect("uri");
+        let library = sourceless_library(&index);
         let declaration = |position| {
             goto_declaration_response(
                 &document,
                 &uri,
                 position,
                 &scoped,
-                &SourceResolver::new(Vec::new()),
                 &WorkspaceIndex::default(),
+                &library.sources(),
             )
         };
 

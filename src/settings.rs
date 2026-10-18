@@ -1,25 +1,52 @@
-use std::collections::HashSet;
-use std::fmt;
-use std::sync::RwLock;
+//! The settings a client configures m2-ls with.
+//!
+//! Each group below is a plain struct whose fields are the settings, under
+//! their camelCase JSON names; its `Default` impl holds the defaults. The
+//! client sends them under the `m2-ls` section (`macaulay2` is accepted too):
+//!
+//! ```json
+//! { "m2-ls": { "formatting": { "indentWidth": 4 }, "sources": { "paths": ["~/M2"] } } }
+//! ```
+//!
+//! Settings are read leniently: a value that does not deserialize, an unknown
+//! key in a group, or an unknown entry in a list is reported as a
+//! [`SettingProblem`] and dropped, and everything else still applies.
 
-use serde::de::DeserializeOwned;
-use serde_json::{Map, Value};
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::RwLock;
+use std::{fmt, mem};
+
+use serde::Deserialize;
+use serde_json::Value;
+use serde_path_to_error::{Path, Segment};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-use crate::capabilities::formatting::{ControlFlowLayout, FormattingConfiguration};
-use crate::capabilities::inlay_hints::InlayHintOptions;
+use crate::capabilities::formatting::ControlFlowLayout;
 use crate::diagnostics::DiagnosticCode;
 
-#[derive(Debug)]
+/// The current value of a setting that requests read while the client
+/// replaces it.
+#[derive(Debug, Default)]
 pub struct SettingsStore<T> {
     current: RwLock<T>,
 }
 
-impl<T: Default> Default for SettingsStore<T> {
-    fn default() -> Self {
+impl<T> SettingsStore<T> {
+    pub fn new(value: T) -> Self {
         Self {
-            current: RwLock::new(T::default()),
+            current: RwLock::new(value),
         }
+    }
+
+    pub fn replace(&self, value: T) -> T {
+        mem::replace(
+            &mut self
+                .current
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            value,
+        )
     }
 }
 
@@ -32,194 +59,76 @@ impl<T: Clone> SettingsStore<T> {
     }
 }
 
-impl<T> SettingsStore<T> {
-    pub fn replace(&self, value: T) -> T {
-        std::mem::replace(
-            &mut self
-                .current
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            value,
-        )
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Every setting m2-ls reads. Other top-level keys of the section belong to
+/// the client (e.g. an extension's `server.path`) and are ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ServerSettings {
-    diagnostics: DiagnosticSettings,
-    formatting: FormattingSettings,
-    inlay_hints: InlayHintSettings,
+    pub diagnostics: DiagnosticSettings,
+    pub formatting: FormattingSettings,
+    pub inlay_hints: InlayHintSettings,
+    pub sources: SourceSettings,
 }
 
-/// Settings read from a client, plus every value that could not be used.
-/// Each setting is read on its own, so one bad value never discards the rest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedSettings {
-    pub settings: ServerSettings,
-    pub problems: Vec<SettingProblem>,
-}
-
-/// One setting the server ignored, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SettingProblem {
-    path: String,
-    reason: String,
-}
-
-impl fmt::Display for SettingProblem {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "`{}`: {}", self.path, self.reason)
-    }
-}
-
-/// The settings groups this server owns. Other top-level keys in the shared
-/// section belong to the client (e.g. an extension's `server.path`).
-const DIAGNOSTICS_GROUP: &str = "diagnostics";
-const FORMATTING_GROUP: &str = "formatting";
-const INLAY_HINTS_GROUP: &str = "inlayHints";
-
-impl ServerSettings {
-    pub fn from_value(value: &Value) -> ParsedSettings {
-        let section = value
-            .get("m2-ls")
-            .or_else(|| value.get("macaulay2"))
-            .unwrap_or(value);
-        let mut problems = Vec::new();
-        let settings = match section {
-            Value::Object(section) => Self {
-                diagnostics: read_group(
-                    section,
-                    DIAGNOSTICS_GROUP,
-                    &mut problems,
-                    DiagnosticSettings::read,
-                ),
-                formatting: read_group(
-                    section,
-                    FORMATTING_GROUP,
-                    &mut problems,
-                    FormattingSettings::read,
-                ),
-                inlay_hints: read_group(
-                    section,
-                    INLAY_HINTS_GROUP,
-                    &mut problems,
-                    InlayHintSettings::read,
-                ),
-            },
-            Value::Null => Self::default(),
-            other => {
-                problems.push(SettingProblem {
-                    path: "settings".to_string(),
-                    reason: format!("expected an object, got {other}"),
-                });
-                Self::default()
-            }
-        };
-        ParsedSettings { settings, problems }
-    }
-
-    pub fn diagnostics(&self) -> &DiagnosticSettings {
-        &self.diagnostics
-    }
-
-    pub fn formatting(&self) -> &FormattingSettings {
-        &self.formatting
-    }
-
-    pub fn inlay_hints(&self) -> &InlayHintSettings {
-        &self.inlay_hints
-    }
-
-    pub fn inlay_hint_options(&self) -> InlayHintOptions {
-        InlayHintOptions {
-            expression_types: self.inlay_hints.expression_types,
-            all_known_types: self.inlay_hints.all_known_types,
-        }
-    }
-}
-
-/// Read the group `name` of `section` with `read`, then report every key in it
-/// that `read` never asked for: an unknown key is most likely a typo.
-fn read_group<Settings>(
-    section: &Map<String, Value>,
-    name: &'static str,
-    problems: &mut Vec<SettingProblem>,
-    read: impl FnOnce(&mut SettingsGroup<'_>) -> Settings,
-) -> Settings {
-    let mut group = SettingsGroup::open(section, name, problems);
-    let settings = read(&mut group);
-    group.report_unknown_keys();
-    settings
-}
-
-/// One settings group (`diagnostics`, `formatting`, …) read key by key: an
-/// invalid or unknown key is recorded as a problem and the rest still apply.
-struct SettingsGroup<'settings> {
-    name: &'static str,
-    fields: Option<&'settings Map<String, Value>>,
-    read_keys: Vec<&'static str>,
-    problems: &'settings mut Vec<SettingProblem>,
-}
-
-impl<'settings> SettingsGroup<'settings> {
-    fn open(
-        section: &'settings Map<String, Value>,
-        name: &'static str,
-        problems: &'settings mut Vec<SettingProblem>,
-    ) -> Self {
-        let fields = match section.get(name) {
-            None | Some(Value::Null) => None,
-            Some(Value::Object(fields)) => Some(fields),
-            Some(other) => {
-                problems.push(SettingProblem {
-                    path: name.to_string(),
-                    reason: format!("expected an object, got {other}"),
-                });
-                None
-            }
-        };
-        Self {
-            name,
-            fields,
-            read_keys: Vec::new(),
-            problems,
-        }
-    }
-
-    /// The value configured for `key`, or `None` when it is absent or invalid.
-    fn read<T: DeserializeOwned>(&mut self, key: &'static str) -> Option<T> {
-        self.read_keys.push(key);
-        let value = self.fields?.get(key)?;
-        T::deserialize(value)
-            .map_err(|error| self.report(key, error.to_string()))
-            .ok()
-    }
-
-    fn report(&mut self, key: &str, reason: String) {
-        self.problems.push(SettingProblem {
-            path: format!("{}.{key}", self.name),
-            reason,
-        });
-    }
-
-    fn report_unknown_keys(&mut self) {
-        let Some(fields) = self.fields else {
-            return;
-        };
-        for key in fields.keys() {
-            if !self.read_keys.contains(&key.as_str()) {
-                self.report(key, "unknown setting".to_string());
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `diagnostics.*`: which diagnostics are published, and how prominently.
+/// Rules are named by code or by name, e.g. `T02` or `unused-binding`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiagnosticSettings {
-    enabled: bool,
-    disabled: HashSet<DiagnosticCode>,
-    warnings_as_hint: HashSet<DiagnosticCode>,
-    warnings_as_info: HashSet<DiagnosticCode>,
+    /// Whether any diagnostic is shown. Default `true`.
+    pub enabled: bool,
+    /// Rules that are never shown.
+    pub disabled: HashSet<DiagnosticCode>,
+    /// Rules whose warnings are shown as hints.
+    pub warnings_as_hint: HashSet<DiagnosticCode>,
+    /// Rules whose warnings are shown as information.
+    pub warnings_as_info: HashSet<DiagnosticCode>,
+}
+
+/// `formatting.*`: how the formatter lays out a document.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct FormattingSettings {
+    /// Spaces per indentation level; the editor's tab size when unset.
+    pub indent_width: Option<u32>,
+    /// Whether to indent with tabs; the editor's choice when unset.
+    pub use_tabs: Option<bool>,
+    /// The width lines are preferably wrapped at. Default `100`; `0` or
+    /// `null` disables it. It never exceeds `hardLineWidth`.
+    pub soft_line_width: Option<u32>,
+    /// The width lines are always wrapped at. Default `100`; `0` or `null`
+    /// disables it.
+    pub hard_line_width: Option<u32>,
+    /// `compact`, `multiline`, or `multilineCompactElse` (the default).
+    pub control_flow_layout: ControlFlowLayout,
+    /// `2*x` instead of `2 * x`. Default `false`.
+    pub compact_factor_operators: bool,
+    /// Whether the next expression after `;` starts on a new line. Default
+    /// `true`.
+    pub break_after_semicolon: bool,
+}
+
+/// `inlayHints.*`: which inferred types are shown inline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct InlayHintSettings {
+    /// Argument, subexpression, and call-result types. Default `false`.
+    pub expression_types: bool,
+    /// Also the types that are obvious from literals. Default `false`.
+    pub all_known_types: bool,
+}
+
+/// `sources.*`: where navigation finds the Macaulay2 library sources.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct SourceSettings {
+    /// Whether navigation enters the library sources at all. Default `true`.
+    pub enabled: bool,
+    /// Searched before the discovered installation: each an `M2` executable
+    /// or an installation prefix (a build tree's `usr-dist` included),
+    /// standing for that installation, or else a directory added to
+    /// Macaulay2's `path`. A leading `~` is the home directory.
+    pub paths: Vec<PathBuf>,
 }
 
 impl Default for DiagnosticSettings {
@@ -233,17 +142,122 @@ impl Default for DiagnosticSettings {
     }
 }
 
-impl DiagnosticSettings {
-    fn read(group: &mut SettingsGroup<'_>) -> Self {
-        let defaults = Self::default();
+impl Default for FormattingSettings {
+    fn default() -> Self {
         Self {
-            enabled: group.read("enabled").unwrap_or(defaults.enabled),
-            disabled: read_diagnostic_codes(group, "disabled"),
-            warnings_as_hint: read_diagnostic_codes(group, "warningsAsHint"),
-            warnings_as_info: read_diagnostic_codes(group, "warningsAsInfo"),
+            indent_width: None,
+            use_tabs: None,
+            soft_line_width: Some(100),
+            hard_line_width: Some(100),
+            control_flow_layout: ControlFlowLayout::MultilineCompactElse,
+            compact_factor_operators: false,
+            break_after_semicolon: true,
+        }
+    }
+}
+
+impl Default for SourceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            paths: Vec::new(),
+        }
+    }
+}
+
+/// Settings read from a client, plus every value that could not be used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSettings {
+    pub settings: ServerSettings,
+    pub problems: Vec<SettingProblem>,
+}
+
+/// One setting the server ignored, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingProblem {
+    /// Where the value sits in the section, e.g. `diagnostics.disabled[1]`.
+    path: String,
+    reason: String,
+}
+
+impl fmt::Display for SettingProblem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "`{}`: {}", self.path, self.reason)
+    }
+}
+
+impl ServerSettings {
+    /// The names the client may send the settings section under.
+    const SECTIONS: [&str; 2] = ["m2-ls", "macaulay2"];
+
+    /// Read the settings in `value`, either the section itself or an object
+    /// holding it. Each value that fails to deserialize is reported, removed,
+    /// and the rest read again, until what remains reads cleanly.
+    pub fn from_value(value: &Value) -> ParsedSettings {
+        let mut section = Self::SECTIONS
+            .iter()
+            .find_map(|name| value.get(name))
+            .unwrap_or(value)
+            .clone();
+        if section.is_null() {
+            section = Value::Object(Default::default());
+        }
+        let mut problems = Vec::new();
+        loop {
+            match serde_path_to_error::deserialize::<_, Self>(&section) {
+                Ok(settings) => return ParsedSettings { settings, problems },
+                Err(error) => {
+                    let removed = Self::remove_value(&mut section, error.path());
+                    problems.push(SettingProblem {
+                        path: if error.path().iter().next().is_some() {
+                            error.path().to_string()
+                        } else {
+                            "settings".to_string()
+                        },
+                        reason: error.into_inner().to_string(),
+                    });
+                    if !removed {
+                        return ParsedSettings {
+                            settings: Self::default(),
+                            problems,
+                        };
+                    }
+                }
+            }
         }
     }
 
+    /// Remove the value at `path` from `section`; `false` when the path does
+    /// not lead to a removable value, such as the section itself.
+    fn remove_value(section: &mut Value, path: &Path) -> bool {
+        let segments = path.iter().collect::<Vec<_>>();
+        let Some((last, parents)) = segments.split_last() else {
+            return false;
+        };
+        let mut parent = section;
+        for segment in parents {
+            let child = match (segment, parent) {
+                (Segment::Map { key }, Value::Object(fields)) => fields.get_mut(key),
+                (Segment::Seq { index }, Value::Array(items)) => items.get_mut(*index),
+                _ => None,
+            };
+            let Some(child) = child else {
+                return false;
+            };
+            parent = child;
+        }
+        match (last, parent) {
+            (Segment::Map { key }, Value::Object(fields)) => fields.remove(key).is_some(),
+            (Segment::Seq { index }, Value::Array(items)) if *index < items.len() => {
+                items.remove(*index);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl DiagnosticSettings {
     /// Whether findings filed under `code` are shown: diagnostics are enabled
     /// and the user has not disabled this one.
     pub fn allows(&self, code: DiagnosticCode) -> bool {
@@ -275,141 +289,16 @@ impl DiagnosticSettings {
     }
 }
 
-/// The diagnostics named in the list setting `key`, by code or name. Unknown
-/// names are reported; the recognized ones still apply.
-fn read_diagnostic_codes(
-    group: &mut SettingsGroup<'_>,
-    key: &'static str,
-) -> HashSet<DiagnosticCode> {
-    group
-        .read::<Vec<String>>(key)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|selector| {
-            let code = DiagnosticCode::from_selector(&selector);
-            if code.is_none() {
-                group.report(key, format!("unknown diagnostic `{selector}`"));
-            }
-            code
-        })
-        .collect()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FormattingSettings {
-    indent_width: Option<u32>,
-    use_tabs: Option<bool>,
-    soft_line_width: Option<u32>,
-    hard_line_width: Option<u32>,
-    max_line_width: LegacyLineWidth,
-    control_flow_layout: ControlFlowLayout,
-    compact_factor_operators: bool,
-    break_after_semicolon: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum LegacyLineWidth {
-    #[default]
-    Unset,
-    Configured(Option<u32>),
-}
-
-impl Default for FormattingSettings {
-    fn default() -> Self {
-        Self {
-            indent_width: None,
-            use_tabs: None,
-            soft_line_width: Some(100),
-            hard_line_width: Some(100),
-            max_line_width: LegacyLineWidth::Unset,
-            control_flow_layout: ControlFlowLayout::MultilineCompactElse,
-            compact_factor_operators: false,
-            break_after_semicolon: true,
-        }
-    }
-}
-
 impl FormattingSettings {
-    fn read(group: &mut SettingsGroup<'_>) -> Self {
-        let defaults = Self::default();
-        Self {
-            indent_width: group.read("indentWidth").unwrap_or(defaults.indent_width),
-            use_tabs: group.read("useTabs").unwrap_or(defaults.use_tabs),
-            soft_line_width: group
-                .read("softLineWidth")
-                .unwrap_or(defaults.soft_line_width),
-            hard_line_width: group
-                .read("hardLineWidth")
-                .unwrap_or(defaults.hard_line_width),
-            max_line_width: group
-                .read("maxLineWidth")
-                .map_or(defaults.max_line_width, LegacyLineWidth::Configured),
-            control_flow_layout: group
-                .read("controlFlowLayout")
-                .unwrap_or(defaults.control_flow_layout),
-            compact_factor_operators: group
-                .read("compactFactorOperators")
-                .unwrap_or(defaults.compact_factor_operators),
-            break_after_semicolon: group
-                .read("breakAfterSemicolon")
-                .unwrap_or(defaults.break_after_semicolon),
-        }
-    }
-}
-
-impl FormattingConfiguration for FormattingSettings {
-    fn indent_width(&self) -> Option<u32> {
-        self.indent_width
-    }
-
-    fn use_tabs(&self) -> Option<bool> {
-        self.use_tabs
-    }
-
-    fn line_widths(&self) -> (Option<u32>, Option<u32>) {
-        if let LegacyLineWidth::Configured(width) = self.max_line_width {
-            let width = width.filter(|width| *width > 0);
-            return (width, width);
-        }
-
+    /// The soft and hard wrapping widths in effect: a zero width is none, and
+    /// the soft width never exceeds the hard one.
+    pub fn line_widths(&self) -> (Option<u32>, Option<u32>) {
         let hard = self.hard_line_width.filter(|width| *width > 0);
         let soft = self
             .soft_line_width
             .filter(|width| *width > 0)
             .map(|width| hard.map_or(width, |hard| width.min(hard)));
         (soft, hard)
-    }
-
-    fn control_flow_layout(&self) -> ControlFlowLayout {
-        self.control_flow_layout
-    }
-
-    fn compact_factor_operators(&self) -> bool {
-        self.compact_factor_operators
-    }
-
-    fn break_after_semicolon(&self) -> bool {
-        self.break_after_semicolon
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct InlayHintSettings {
-    expression_types: bool,
-    all_known_types: bool,
-}
-
-impl InlayHintSettings {
-    fn read(group: &mut SettingsGroup<'_>) -> Self {
-        let defaults = Self::default();
-        Self {
-            expression_types: group
-                .read("expressionTypes")
-                .unwrap_or(defaults.expression_types),
-            all_known_types: group
-                .read("allKnownTypes")
-                .unwrap_or(defaults.all_known_types),
-        }
     }
 }
 
@@ -429,15 +318,16 @@ mod tests {
     fn defaults_enable_diagnostics_and_canonical_factor_spacing() {
         let settings = valid_settings(serde_json::json!({}));
 
-        assert!(settings.diagnostics().allows(catalog::UNUSED_BINDING.code));
-        assert_eq!(settings.formatting().line_widths(), (Some(100), Some(100)));
+        assert!(settings.diagnostics.allows(catalog::UNUSED_BINDING.code));
+        assert_eq!(settings.formatting.line_widths(), (Some(100), Some(100)));
         assert_eq!(
-            settings.formatting().control_flow_layout(),
+            settings.formatting.control_flow_layout,
             ControlFlowLayout::MultilineCompactElse
         );
-        assert!(!settings.formatting().compact_factor_operators());
-        assert!(settings.formatting().break_after_semicolon());
-        assert_eq!(settings.inlay_hint_options(), InlayHintOptions::default());
+        assert!(!settings.formatting.compact_factor_operators);
+        assert!(settings.formatting.break_after_semicolon);
+        assert_eq!(settings.inlay_hints, InlayHintSettings::default());
+        assert_eq!(valid_settings(Value::Null), settings);
     }
 
     #[test]
@@ -450,7 +340,7 @@ mod tests {
                 "formatting": {
                     "indentWidth": 2,
                     "useTabs": false,
-                    "maxLineWidth": 88,
+                    "hardLineWidth": 88,
                     "controlFlowLayout": "multiline",
                     "compactFactorOperators": true,
                     "breakAfterSemicolon": false
@@ -462,23 +352,23 @@ mod tests {
             }
         }));
 
-        assert!(!settings.diagnostics().allows(catalog::UNUSED_BINDING.code));
+        assert!(!settings.diagnostics.allows(catalog::UNUSED_BINDING.code));
         assert!(!settings
-            .diagnostics()
+            .diagnostics
             .allows(catalog::OPTION_KEY_CONVENTION.code));
-        assert!(settings.diagnostics().allows(catalog::SYNTAX_ERROR.code));
-        assert_eq!(settings.formatting().indent_width(), Some(2));
-        assert_eq!(settings.formatting().use_tabs(), Some(false));
-        assert_eq!(settings.formatting().line_widths(), (Some(88), Some(88)));
+        assert!(settings.diagnostics.allows(catalog::SYNTAX_ERROR.code));
+        assert_eq!(settings.formatting.indent_width, Some(2));
+        assert_eq!(settings.formatting.use_tabs, Some(false));
+        assert_eq!(settings.formatting.line_widths(), (Some(88), Some(88)));
         assert_eq!(
-            settings.formatting().control_flow_layout(),
+            settings.formatting.control_flow_layout,
             ControlFlowLayout::Multiline
         );
-        assert!(settings.formatting().compact_factor_operators());
-        assert!(!settings.formatting().break_after_semicolon());
+        assert!(settings.formatting.compact_factor_operators);
+        assert!(!settings.formatting.break_after_semicolon);
         assert_eq!(
-            settings.inlay_hint_options(),
-            InlayHintOptions {
+            settings.inlay_hints,
+            InlayHintSettings {
                 expression_types: true,
                 all_known_types: true,
             }
@@ -503,11 +393,11 @@ mod tests {
         }));
 
         let settings = &parsed.settings;
-        assert!(!settings.diagnostics().allows(catalog::UNUSED_BINDING.code));
-        assert!(settings.diagnostics().allows(catalog::SYNTAX_ERROR.code));
-        assert_eq!(settings.formatting().indent_width(), None);
-        assert_eq!(settings.formatting().use_tabs(), Some(true));
-        assert_eq!(settings.inlay_hint_options(), InlayHintOptions::default());
+        assert!(!settings.diagnostics.allows(catalog::UNUSED_BINDING.code));
+        assert!(settings.diagnostics.allows(catalog::SYNTAX_ERROR.code));
+        assert_eq!(settings.formatting.indent_width, None);
+        assert_eq!(settings.formatting.use_tabs, Some(true));
+        assert_eq!(settings.inlay_hints, InlayHintSettings::default());
 
         let problems = parsed
             .problems
@@ -515,10 +405,31 @@ mod tests {
             .map(SettingProblem::to_string)
             .collect::<Vec<_>>();
         assert_eq!(problems.len(), 4, "{problems:?}");
-        assert!(problems[0].contains("`diagnostics.disabled`: unknown diagnostic `not-a-rule`"));
-        assert!(problems[1].contains("`diagnostics.enabeld`: unknown setting"));
-        assert!(problems[2].starts_with("`formatting.indentWidth`: invalid type"));
-        assert!(problems[3].starts_with("`inlayHints`: expected an object"));
+        assert!(
+            problems[0].starts_with("`diagnostics.disabled[0]`: unknown diagnostic `not-a-rule`"),
+            "{problems:?}"
+        );
+        assert!(
+            problems[1].starts_with("`diagnostics.enabeld`: unknown field"),
+            "{problems:?}"
+        );
+        assert!(
+            problems[2].starts_with("`formatting.indentWidth`: invalid type"),
+            "{problems:?}"
+        );
+        assert!(
+            problems[3].starts_with("`inlayHints`: invalid type"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_section_that_is_not_an_object_keeps_the_defaults() {
+        let parsed = ServerSettings::from_value(&serde_json::json!("on"));
+
+        assert_eq!(parsed.settings, ServerSettings::default());
+        assert_eq!(parsed.problems.len(), 1);
+        assert!(parsed.problems[0].to_string().starts_with("`settings`:"));
     }
 
     #[test]
@@ -529,7 +440,7 @@ mod tests {
                 "warningsAsInfo": ["S01"]
             }
         }));
-        let diagnostics = settings.diagnostics();
+        let diagnostics = &settings.diagnostics;
 
         assert_eq!(
             diagnostics
@@ -558,19 +469,20 @@ mod tests {
             }
         }));
 
-        assert!(DiagnosticCode::registered().all(|code| !settings.diagnostics().allows(code)));
+        assert!(DiagnosticCode::registered().all(|code| !settings.diagnostics.allows(code)));
     }
 
     #[test]
-    fn null_or_zero_line_width_disables_wrapping() {
-        for max_line_width in [serde_json::Value::Null, serde_json::json!(0)] {
+    fn null_or_zero_line_widths_disable_wrapping() {
+        for width in [Value::Null, serde_json::json!(0)] {
             let settings = valid_settings(serde_json::json!({
                 "formatting": {
-                    "maxLineWidth": max_line_width
+                    "softLineWidth": width,
+                    "hardLineWidth": width
                 }
             }));
 
-            assert_eq!(settings.formatting().line_widths(), (None, None));
+            assert_eq!(settings.formatting.line_widths(), (None, None));
         }
     }
 
@@ -582,7 +494,7 @@ mod tests {
                 "hardLineWidth": 110
             }
         }));
-        assert_eq!(settings.formatting().line_widths(), (Some(90), Some(110)));
+        assert_eq!(settings.formatting.line_widths(), (Some(90), Some(110)));
 
         let clamped = valid_settings(serde_json::json!({
             "formatting": {
@@ -590,7 +502,7 @@ mod tests {
                 "hardLineWidth": 120
             }
         }));
-        assert_eq!(clamped.formatting().line_widths(), (Some(120), Some(120)));
+        assert_eq!(clamped.formatting.line_widths(), (Some(120), Some(120)));
     }
 
     #[test]
@@ -609,7 +521,7 @@ mod tests {
                 }
             }));
 
-            assert_eq!(settings.formatting().control_flow_layout(), expected);
+            assert_eq!(settings.formatting.control_flow_layout, expected);
         }
     }
 

@@ -67,9 +67,9 @@ vim.lsp.enable('m2_ls')
 ```
 
 Any other LSP client: run `m2-ls` over stdio for `.m2` files and give it a
-project root, which is the scope of workspace search and cross-file rename. To
-let go-to-definition reach the installed Macaulay2 library source, set
-`M2_LSP_SOURCE_PATH` to its root(s).
+project root, which is the scope of workspace search and cross-file rename.
+Navigation also enters the Macaulay2 library source of the loaded packages when
+it can find them; point `sources.paths` at an installation it does not find.
 
 ## Configuration
 
@@ -98,6 +98,8 @@ Every setting is optional and applies without a restart. Send them under the
 | `formatting.breakAfterSemicolon` | `true` | Starts the next statement on a new line. |
 | `inlayHints.expressionTypes` | `false` | Adds argument, subexpression, and call-result types. |
 | `inlayHints.allKnownTypes` | `false` | Also shows types that are obvious from literals. |
+| `sources.enabled` | `true` | Lets navigation enter the Macaulay2 library source. |
+| `sources.paths` | `[]` | Extra places to find it: an `M2` executable, an installation prefix (a build tree's `usr-dist` included), or a directory to add to Macaulay2's `path`. |
 
 An invalid value only affects its own setting, which keeps its default; the
 server reports what it ignored in a warning message.

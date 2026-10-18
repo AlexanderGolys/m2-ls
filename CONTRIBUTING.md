@@ -19,7 +19,6 @@ src/
   workspace_index.rs      cross-file index of top-level definitions
   diagnostics.rs, diagnostics/  every diagnostic: catalog, checks, rewrites, publication
   documentation.rs        Markdown documentation attached to source items
-  documentation_site.rs   mdBook generation for `m2-ls docs`
   settings.rs             initialization and live workspace configuration
   capabilities/           one module per LSP feature
   data/m2-index.jsonl     generated builtin corpus

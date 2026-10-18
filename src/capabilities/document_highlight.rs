@@ -18,13 +18,13 @@ pub fn document_highlight_provider_capability() -> Option<OneOf<bool, DocumentHi
 
 /// Highlight occurrences related to the cursor. A symbol under the cursor lights
 /// up all its in-file references; a keyword lights up its compound statement's
-/// keyword sequence; a semicolon lights up compact boundary markers for the
-/// expression it terminates.
+/// keyword sequence; a semicolon highlights as the character preceding it.
 pub fn document_highlights(
     document: &DocumentSnapshot,
     position: Position,
     builtins: &(impl TypeKnowledge + ?Sized),
 ) -> Option<Vec<DocumentHighlight>> {
+    let position = position_preceding_semicolon(document, position).unwrap_or(position);
     if document
         .symbol_occurrence_at(position)
         .is_some_and(|(name, _)| matches!(name, "null" | "true" | "false"))
@@ -37,9 +37,6 @@ pub fn document_highlights(
     if let Some(highlights) = unbound_symbol_highlights(document, position, builtins) {
         return Some(highlights);
     }
-    if let Some(highlights) = semicolon_expression_highlight(document, position) {
-        return Some(highlights);
-    }
     if let Some(highlights) = control_transfer_highlights(document, position, builtins) {
         return Some(highlights);
     }
@@ -47,6 +44,20 @@ pub fn document_highlights(
         return Some(highlights);
     }
     keyword_sequence_highlights(document, position)
+}
+
+/// The position of the character before the semicolon under the cursor, so
+/// resting on the `;` of `x := y;` highlights what resting on `y` would.
+fn position_preceding_semicolon(
+    document: &DocumentSnapshot,
+    position: Position,
+) -> Option<Position> {
+    let semicolon = document
+        .node_at_position_minimal(position)
+        .filter(M2Node::is_semicolon)?;
+    let start = document.range_for_node(semicolon).start;
+    let preceding_character = start.character.checked_sub(1)?;
+    Some(Position::new(start.line, preceding_character))
 }
 
 /// Highlight an otherwise unresolved symbol by spelling alone, without
@@ -113,105 +124,6 @@ fn symbol_reference_highlights(
             })
             .collect(),
     )
-}
-
-fn semicolon_expression_highlight(
-    document: &DocumentSnapshot,
-    position: Position,
-) -> Option<Vec<DocumentHighlight>> {
-    let semicolon = document.node_at_position_minimal(position)?;
-    if !semicolon.is_semicolon() {
-        return None;
-    }
-    let muted = semicolon.parent()?;
-    if !muted.is_muted_statement() {
-        return None;
-    }
-    let expression = muted
-        .named_children()
-        .find(|child| !child.is_comment() && child.end_byte() <= semicolon.start_byte())?;
-    let mut markers = expression_boundary_markers(expression)
-        .into_iter()
-        .filter(|marker| marker.start_byte() < marker.end_byte())
-        .collect::<Vec<_>>();
-    markers.push(semicolon);
-
-    Some(
-        markers
-            .into_iter()
-            .map(|marker| DocumentHighlight {
-                range: document.range_for_node(marker),
-                kind: Some(DocumentHighlightKind::TEXT),
-            })
-            .collect(),
-    )
-}
-
-/// Select the small structural boundary that identifies an expression from its
-/// terminating semicolon:
-///
-/// - an ordinary expression contributes its first meaningful token;
-/// - a prefix contributes its operator and the operand's opening marker;
-/// - a bracketed expression additionally contributes its opening and closing
-///   delimiters.
-///
-/// Prefixes and brackets recurse, so `(-x);` lights `(`, `-`, `x`, and `)`.
-/// A prefix applied directly to a bracketed expression is deliberately quieter:
-/// `-(x);` contributes only `-`; the caller adds `;` as the matching endpoint.
-/// Every selected range comes from the CST; this deliberately does not scan the
-/// source to rediscover token boundaries.
-fn expression_boundary_markers(expression: M2Node<'_>) -> Vec<M2Node<'_>> {
-    if expression.is_prefix_expr() {
-        let mut markers = expression
-            .child_by_field_name("operator")
-            .into_iter()
-            .collect::<Vec<_>>();
-        if let Some(operand) = expression.child_by_field_name("operand") {
-            if !is_bracketed_expression(operand) {
-                markers.extend(expression_boundary_markers(operand));
-            }
-        }
-        return markers;
-    }
-
-    let children = expression.children().collect::<Vec<_>>();
-    let opening = children
-        .first()
-        .copied()
-        .filter(M2Node::is_opening_delimiter);
-    let closing = children
-        .last()
-        .copied()
-        .filter(M2Node::is_closing_delimiter);
-    if let Some(opening) = opening {
-        let mut markers = vec![opening];
-        if let Some(first_expression) = expression
-            .named_children()
-            .find(|child| !child.is_comment())
-        {
-            markers.extend(expression_boundary_markers(first_expression));
-        }
-        markers.extend(closing);
-        return markers;
-    }
-
-    if expression.is_symbol_like() || expression.is_literal() {
-        return vec![expression];
-    }
-
-    expression
-        .children()
-        .find(|child| !child.is_comment())
-        .map(expression_boundary_markers)
-        .unwrap_or_else(|| vec![expression])
-}
-
-fn is_bracketed_expression(expression: M2Node<'_>) -> bool {
-    let mut children = expression.children();
-    let opening = children.next();
-    let closing = children.last().or(opening);
-    opening.is_some_and(|node| node.is_opening_delimiter())
-        && closing.is_some_and(|node| node.is_closing_delimiter())
 }
 
 fn control_transfer_highlights(
@@ -609,39 +521,8 @@ mod tests {
     }
 
     #[test]
-    fn semicolon_highlights_only_the_terminated_expression_start() {
-        let text = "x := (a + b; c);\n";
-        assert_eq!(highlighted_words(text, 0, 15), vec!["x", ";"]);
-    }
-
-    #[test]
-    fn semicolon_includes_a_leading_prefix_and_its_operand() {
-        assert_eq!(highlighted_words("-x;\n", 0, 2), vec!["-", "x", ";"]);
-    }
-
-    #[test]
-    fn semicolon_includes_bracket_boundaries_and_the_expression_start() {
-        assert_eq!(
-            highlighted_words("(a + b);\n", 0, 7),
-            vec!["(", "a", ")", ";"]
-        );
-        assert_eq!(
-            highlighted_words("(-x);\n", 0, 4),
-            vec!["(", "-", "x", ")", ";"]
-        );
-        assert_eq!(highlighted_words("();\n", 0, 2), vec!["(", ")", ";"]);
-    }
-
-    #[test]
-    fn prefix_of_a_bracketed_expression_highlights_only_the_endpoints() {
-        assert_eq!(highlighted_words("-(x);\n", 0, 4), vec!["-", ";"]);
-    }
-
-    #[test]
-    fn semicolon_after_a_compound_statement_highlights_only_its_first_keyword() {
-        assert_eq!(
-            highlighted_words("while a do f a;\n", 0, 14),
-            vec!["while", ";"]
-        );
+    fn semicolon_highlights_as_its_preceding_character() {
+        assert_eq!(highlighted_words("x := 1\ny := x;\n", 1, 6), vec!["x", "x"]);
+        assert!(highlighted_words("ownStatement := false;\n", 0, 21).is_empty());
     }
 }

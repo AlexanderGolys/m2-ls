@@ -262,6 +262,19 @@ impl ObjectRegistry {
             .filter_map(|object| self.catalog.index.object(object))
     }
 
+    /// The packages loaded at `position`, most recently loaded first.
+    pub fn loaded_packages_at(&self, position: Position) -> Vec<ObjectName> {
+        let mut seen = HashSet::new();
+        self.packages
+            .iter()
+            .rev()
+            .filter(|registration| registration.is_effective_at(position))
+            .filter(|registration| seen.insert(&registration.package))
+            .filter_map(|registration| self.package_name(&registration.package))
+            .map(ObjectName::new)
+            .collect()
+    }
+
     pub fn option_facts(&self) -> &OptionFacts {
         &self.catalog.option_facts
     }
@@ -304,6 +317,10 @@ impl ObjectRegistryView<'_> {
 
     pub fn package_name(&self, package: &ObjectId) -> Option<&str> {
         self.registry.package_name(package)
+    }
+
+    pub fn loaded_packages(&self) -> Vec<ObjectName> {
+        self.registry.loaded_packages_at(self.position)
     }
 
     pub fn package_names_with_prefix(&self, prefix: &str, limit: usize) -> Vec<String> {

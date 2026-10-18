@@ -6,7 +6,6 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::panic;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -30,7 +29,7 @@ mod client_capabilities;
 mod diagnostics;
 mod document;
 mod documentation;
-mod documentation_site;
+mod library_index;
 mod meta;
 mod node_metadata;
 mod object_registry;
@@ -75,24 +74,23 @@ use client_capabilities::{
 };
 use diagnostics::{publish_diagnostics, visible_diagnostics};
 use document::DocumentSnapshot;
-use documentation_site::{build_documentation_book, generate_documentation_book};
-use package_index::{
-    collect_imported_packages, preloaded_package_additions, Macaulay2Environment, SourceResolver,
-};
+use library_index::{LibraryIndex, LibrarySources};
+use package_index::{InitializationFile, Macaulay2Environment, SourceResolver};
 use session::{ClientInput, ExitNotificationService, SessionEnd};
 
-use crate::object_registry::{ObjectName, ObjectRegistry};
+use crate::object_registry::ObjectRegistry;
 use crate::semantic_token::{LEGEND_MODIFIERS, LEGEND_TYPES};
-use crate::settings::{ServerSettings, SettingProblem, SettingsStore};
+use crate::settings::{ServerSettings, SettingProblem, SettingsStore, SourceSettings};
 use crate::workspace_index::WorkspaceIndex;
 
 #[derive(Debug)]
 struct Backend {
     client: Client,
     registry: ObjectRegistry,
-    source_resolver: SourceResolver,
+    environment: Macaulay2Environment,
     documents: DashMap<Url, DocumentSnapshot>,
     workspace_index: Arc<WorkspaceIndex>,
+    library: SettingsStore<Arc<LibraryIndex>>,
     settings: SettingsStore<ServerSettings>,
     semantic_tokens_augment_syntax: ClientSupport<SemanticTokensAugmentSyntax>,
     type_hierarchy_dynamic_registration: ClientSupport<TypeHierarchyDynamicRegistration>,
@@ -101,49 +99,17 @@ struct Backend {
     initialization_file: Option<InitializationFile>,
 }
 
-/// The user's `init.m2`. It runs before any document, so the packages it loads
-/// are loaded at startup and its global definitions are known in every file.
-#[derive(Debug)]
-struct InitializationFile {
-    uri: Url,
-    text: String,
-    /// Packages it loads that the builtin index knows, loaded into every
-    /// document's registry.
-    loaded_packages: Vec<ObjectName>,
-    /// Packages it loads that the builtin index does not know.
-    unknown_packages: Vec<ObjectName>,
-}
-
-impl InitializationFile {
-    /// The initialization file of `environment`, with the packages it loads
-    /// registered in `registry` as loaded at startup.
-    fn load(environment: &Macaulay2Environment, registry: &mut ObjectRegistry) -> Option<Self> {
-        let path = environment.initialization_file()?;
-        let text = fs::read_to_string(&path).ok()?;
-        let uri = Url::from_file_path(&path).ok()?;
-        let (loaded_packages, unknown_packages) = collect_imported_packages(&text)
-            .into_iter()
-            .map(|import| import.package)
-            .chain(preloaded_package_additions(&text))
-            .partition(|package| registry.load_package(package));
-        Some(Self {
-            uri,
-            text,
-            loaded_packages,
-            unknown_packages,
-        })
-    }
-}
-
 impl Backend {
     fn new(client: Client) -> Self {
         let environment = Macaulay2Environment::current();
         let mut registry = ObjectRegistry::load(include_str!("./data/m2-index.jsonl"));
         let initialization_file = InitializationFile::load(&environment, &mut registry);
+        let library = configured_library(&environment, &registry, &SourceSettings::default());
         Backend {
             client,
+            library: SettingsStore::new(library),
             registry,
-            source_resolver: SourceResolver::discover(&environment),
+            environment,
             documents: DashMap::new(),
             workspace_index: Arc::new(WorkspaceIndex::default()),
             settings: SettingsStore::default(),
@@ -188,6 +154,28 @@ impl Backend {
         Some(request(document.value(), scoped))
     }
 
+    /// Run a navigation request against the library sources indexed so far;
+    /// while it wanted packages that were not indexed yet, index them off the
+    /// session task and run it again.
+    async fn navigate<R>(
+        &self,
+        uri: &Url,
+        request: impl Fn(&DocumentSnapshot, &ObjectRegistry, &LibrarySources) -> R,
+    ) -> Option<R> {
+        loop {
+            let library_index = self.library.snapshot();
+            let library = library_index.sources();
+            let response = self.with_scoped_document(uri, |document, knowledge| {
+                request(document, knowledge, &library)
+            });
+            let wanted_packages = library.into_wanted_packages();
+            if wanted_packages.is_empty() {
+                return response;
+            }
+            library_index.index_packages(wanted_packages).await;
+        }
+    }
+
     /// Collect occurrences of a global symbol across every indexed file
     /// other than `exclude`. Prefers a live open buffer (so unsaved edits are
     /// reflected) and falls back to parsing the on-disk file. Used by both
@@ -219,13 +207,25 @@ impl Backend {
             })
     }
 
-    fn type_hierarchy_context(&self) -> TypeHierarchyContext<'_, ObjectRegistry> {
-        TypeHierarchyContext::new(&self.registry, &self.source_resolver)
+    fn type_hierarchy_context<'a>(
+        &'a self,
+        library: &'a LibraryIndex,
+    ) -> TypeHierarchyContext<'a, ObjectRegistry> {
+        TypeHierarchyContext::new(&self.registry, library.source_resolver())
+    }
+
+    /// Point library navigation at the sources `sources` configures.
+    fn configure_library(&self, sources: &SourceSettings) {
+        self.library.replace(configured_library(
+            &self.environment,
+            &self.registry,
+            sources,
+        ));
     }
 
     async fn publish_document_diagnostics(&self, uri: Url, document: &DocumentSnapshot) {
         let settings = self.settings.snapshot();
-        publish_diagnostics(&self.client, uri, document, settings.diagnostics()).await;
+        publish_diagnostics(&self.client, uri, document, &settings.diagnostics).await;
     }
 
     /// Tell the user, not just the log, which settings were ignored and why.
@@ -252,8 +252,11 @@ impl Backend {
         refresh_client: &(impl WorkspaceRefresh<InlayHintRefresh> + ?Sized),
     ) -> Result<()> {
         let previous = self.settings.replace(settings.clone());
+        if previous.sources != settings.sources {
+            self.configure_library(&settings.sources);
+        }
 
-        if previous.diagnostics() != settings.diagnostics() {
+        if previous.diagnostics != settings.diagnostics {
             let diagnostics = self
                 .documents
                 .iter()
@@ -263,7 +266,7 @@ impl Backend {
                         visible_diagnostics(
                             document.value(),
                             document.key(),
-                            settings.diagnostics(),
+                            &settings.diagnostics,
                         ),
                     )
                 })
@@ -278,7 +281,7 @@ impl Backend {
         refresh_if_changed(
             &self.inlay_hint_refresh,
             refresh_client,
-            previous.inlay_hints() != settings.inlay_hints(),
+            previous.inlay_hints != settings.inlay_hints,
         )
         .await
     }
@@ -354,14 +357,8 @@ fn install_panic_logging() {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        // `init.m2` runs before every file, so its global definitions are
-        // known everywhere, like those of a workspace file.
         if let Some(initialization_file) = &self.initialization_file {
-            self.workspace_index.index_file(
-                &initialization_file.uri,
-                &initialization_file.text,
-                &self.registry,
-            );
+            initialization_file.index_into(&self.workspace_index, &self.registry);
         }
         self.semantic_tokens_augment_syntax
             .negotiate(&params.capabilities);
@@ -371,6 +368,7 @@ impl LanguageServer for Backend {
 
         if let Some(options) = params.initialization_options.as_ref() {
             let parsed = ServerSettings::from_value(options);
+            self.configure_library(&parsed.settings.sources);
             self.settings.replace(parsed.settings);
             self.report_setting_problems(&parsed.problems).await;
         }
@@ -469,30 +467,6 @@ impl LanguageServer for Backend {
                 ),
             )
             .await;
-        if let Some(initialization_file) = &self.initialization_file {
-            if !initialization_file.loaded_packages.is_empty() {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!(
-                            "Packages loaded by init.m2: {}",
-                            package_list(&initialization_file.loaded_packages)
-                        ),
-                    )
-                    .await;
-            }
-            if !initialization_file.unknown_packages.is_empty() {
-                self.client
-                    .log_message(
-                        MessageType::WARNING,
-                        format!(
-                            "Packages loaded by init.m2 but missing from the builtin index: {}",
-                            package_list(&initialization_file.unknown_packages)
-                        ),
-                    )
-                    .await;
-            }
-        }
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -620,15 +594,13 @@ impl LanguageServer for Backend {
         Ok(self
             .with_document(uri, |document| {
                 let diagnostics = if params.context.diagnostics.is_empty() {
-                    visible_diagnostics(document, uri, settings.diagnostics())
+                    visible_diagnostics(document, uri, &settings.diagnostics)
                 } else {
                     params
                         .context
                         .diagnostics
                         .into_iter()
-                        .filter(|diagnostic| {
-                            settings.diagnostics().allows_lsp_diagnostic(diagnostic)
-                        })
+                        .filter(|diagnostic| settings.diagnostics.allows_lsp_diagnostic(diagnostic))
                         .collect()
                 };
                 available_code_actions(document, uri, params.range.start, &diagnostics)
@@ -638,7 +610,7 @@ impl LanguageServer for Backend {
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = &params.text_document.uri;
-        let options = self.settings.snapshot().inlay_hint_options();
+        let options = self.settings.snapshot().inlay_hints;
         Ok(self.with_scoped_document(uri, |document, knowledge| {
             inlay_hints_response(document, params.range, options, knowledge)
         }))
@@ -777,12 +749,8 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params.position;
         Ok(self
             .with_scoped_document(&uri, |document, knowledge| {
-                self.type_hierarchy_context().prepare(
-                    document,
-                    &knowledge.at(position),
-                    &uri,
-                    position,
-                )
+                self.type_hierarchy_context(&self.library.snapshot())
+                    .prepare(document, &knowledge.at(position), &uri, position)
             })
             .flatten())
     }
@@ -791,14 +759,18 @@ impl LanguageServer for Backend {
         &self,
         params: TypeHierarchySupertypesParams,
     ) -> Result<Option<Vec<TypeHierarchyItem>>> {
-        Ok(self.type_hierarchy_context().supertypes(&params.item))
+        Ok(self
+            .type_hierarchy_context(&self.library.snapshot())
+            .supertypes(&params.item))
     }
 
     async fn subtypes(
         &self,
         params: TypeHierarchySubtypesParams,
     ) -> Result<Option<Vec<TypeHierarchyItem>>> {
-        Ok(self.type_hierarchy_context().subtypes(&params.item))
+        Ok(self
+            .type_hierarchy_context(&self.library.snapshot())
+            .subtypes(&params.item))
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
@@ -809,7 +781,7 @@ impl LanguageServer for Backend {
                 document,
                 params.options.tab_size,
                 params.options.insert_spaces,
-                settings.formatting(),
+                &settings.formatting,
             )
         }))
     }
@@ -838,16 +810,17 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .with_scoped_document(uri, |document, knowledge| {
+            .navigate(uri, |document, knowledge, library| {
                 goto_definition_response(
                     document,
                     uri,
                     position,
                     &knowledge.at(position),
-                    &self.source_resolver,
                     &self.workspace_index,
+                    library,
                 )
             })
+            .await
             .flatten())
     }
 
@@ -858,16 +831,17 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .with_scoped_document(uri, |document, knowledge| {
+            .navigate(uri, |document, knowledge, library| {
                 goto_declaration_response(
                     document,
                     uri,
                     position,
                     &knowledge.at(position),
-                    &self.source_resolver,
                     &self.workspace_index,
+                    library,
                 )
             })
+            .await
             .flatten())
     }
 
@@ -878,16 +852,17 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .with_scoped_document(uri, |document, knowledge| {
+            .navigate(uri, |document, knowledge, library| {
                 goto_type_definition_response(
                     document,
                     uri,
                     position,
                     &knowledge.at(position),
                     &self.workspace_index,
-                    &self.source_resolver,
+                    library,
                 )
             })
+            .await
             .flatten())
     }
 
@@ -898,15 +873,17 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .with_scoped_document(uri, |document, knowledge| {
+            .navigate(uri, |document, knowledge, library| {
                 goto_implementation_response(
                     document,
                     position,
                     uri,
                     &knowledge.at(position),
                     &self.workspace_index,
+                    library,
                 )
             })
+            .await
             .flatten())
     }
 
@@ -922,21 +899,37 @@ impl LanguageServer for Backend {
         let uri = request.text_document.uri;
         let position = request.position;
         let response = self
-            .with_scoped_document(&uri, |document, knowledge| {
+            .navigate(&uri, |document, knowledge, library| {
                 goto_definition_response(
                     document,
                     &uri,
                     position,
                     &knowledge.at(position),
-                    &self.source_resolver,
                     &self.workspace_index,
+                    library,
                 )
             })
+            .await
             .flatten();
         Ok(response.map_or(link.clone(), |response| {
             resolve_document_link(link, response)
         }))
     }
+}
+
+/// The library of the Macaulay2 sources `sources` configures; with library
+/// navigation disabled, a library without sources.
+fn configured_library(
+    environment: &Macaulay2Environment,
+    registry: &ObjectRegistry,
+    sources: &SourceSettings,
+) -> Arc<LibraryIndex> {
+    let source_resolver = if sources.enabled {
+        SourceResolver::discover(environment, &sources.paths)
+    } else {
+        SourceResolver::default()
+    };
+    Arc::new(LibraryIndex::new(source_resolver, registry.clone()))
 }
 
 fn server_info() -> ServerInfo {
@@ -946,62 +939,11 @@ fn server_info() -> ServerInfo {
     }
 }
 
-fn run_documentation_command() -> Option<std::result::Result<(), String>> {
-    let mut arguments = env::args_os().skip(1);
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("docs")) {
-        return None;
-    }
-    let result = (|| {
-        let input = arguments.next().map(PathBuf::from).ok_or_else(|| {
-            "usage: m2-ls docs <source-or-directory> [--output PATH] [--no-build]".to_string()
-        })?;
-        let mut output = PathBuf::from("target/m2-doc");
-        let mut build = true;
-        while let Some(argument) = arguments.next() {
-            if argument == "--output" {
-                output = arguments
-                    .next()
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--output requires a path".to_string())?;
-            } else if argument == "--no-build" {
-                build = false;
-            } else {
-                return Err(format!(
-                    "unrecognized documentation option: {}",
-                    argument.to_string_lossy()
-                ));
-            }
-        }
-        let registry = ObjectRegistry::load(include_str!("./data/m2-index.jsonl"));
-        let generated = generate_documentation_book(&input, &output, &registry)
-            .map_err(|error| error.to_string())?;
-        if build {
-            build_documentation_book(&output).map_err(|error| error.to_string())?;
-        }
-        println!(
-            "generated {} documentation pages in {}",
-            generated.pages,
-            output.display()
-        );
-        Ok(())
-    })();
-    Some(result)
-}
-
-/// Package names as a comma-separated list for log messages.
-fn package_list(packages: &[ObjectName]) -> String {
-    packages
-        .iter()
-        .map(ObjectName::name)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// Stack reserved for every runtime thread. Lowering and analysis recurse once
 /// per nesting level, and generated sources (e.g. polynomials with thousands of
 /// terms in one left-associated chain) nest far beyond the default 2 MiB worker
 /// stack. The reservation is virtual; pages are committed only when touched.
-const RUNTIME_THREAD_STACK_BYTES: usize = 1 << 30;
+pub const RUNTIME_THREAD_STACK_BYTES: usize = 1 << 30;
 
 fn main() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1016,13 +958,6 @@ fn main() {
 }
 
 async fn serve() {
-    if let Some(result) = run_documentation_command() {
-        if let Err(error) = result {
-            eprintln!("m2-ls docs: {error}");
-            std::process::exit(2);
-        }
-        return;
-    }
     install_panic_logging();
     let session_end = SessionEnd::default();
     let stdin = ClientInput::new(io::stdin(), session_end.clone());

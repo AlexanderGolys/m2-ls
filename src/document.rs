@@ -166,6 +166,7 @@ impl DocumentSnapshot {
         self.documentation.snippets()
     }
 
+    #[cfg(test)]
     pub fn documentation_blocks(&self) -> &[DocumentationBlock] {
         self.documentation.blocks()
     }

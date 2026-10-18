@@ -12,16 +12,8 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::node_metadata::{matches_token, M2Node, M2Parser};
+use crate::settings::FormattingSettings;
 use crate::source::SourceNavigation;
-
-pub trait FormattingConfiguration {
-    fn indent_width(&self) -> Option<u32>;
-    fn use_tabs(&self) -> Option<bool>;
-    fn line_widths(&self) -> (Option<u32>, Option<u32>);
-    fn control_flow_layout(&self) -> ControlFlowLayout;
-    fn compact_factor_operators(&self) -> bool;
-    fn break_after_semicolon(&self) -> bool;
-}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,20 +65,22 @@ impl FormatOptions {
         }
     }
 
-    pub fn from_configuration(
+    /// The options for `settings`, with the editor's `tab_size` and
+    /// `insert_spaces` where the settings leave indentation to the editor.
+    pub fn from_settings(
         tab_size: u32,
         insert_spaces: bool,
-        configuration: &(impl FormattingConfiguration + ?Sized),
+        settings: &FormattingSettings,
     ) -> Self {
-        let tab_size = configuration.indent_width().unwrap_or(tab_size);
-        let use_tabs = configuration.use_tabs().unwrap_or(!insert_spaces);
+        let tab_size = settings.indent_width.unwrap_or(tab_size);
+        let use_tabs = settings.use_tabs.unwrap_or(!insert_spaces);
         let mut options = Self::new(tab_size, !use_tabs);
-        let (soft_line_width, hard_line_width) = configuration.line_widths();
+        let (soft_line_width, hard_line_width) = settings.line_widths();
         options.soft_line_width = soft_line_width.map(|width| width as usize);
         options.max_line_width = hard_line_width.map(|width| width as usize);
-        options.control_flow_layout = configuration.control_flow_layout();
-        options.compact_factor_operators = configuration.compact_factor_operators();
-        options.break_after_semicolon = configuration.break_after_semicolon();
+        options.control_flow_layout = settings.control_flow_layout;
+        options.compact_factor_operators = settings.compact_factor_operators;
+        options.break_after_semicolon = settings.break_after_semicolon;
         options
     }
 }
@@ -103,10 +97,10 @@ pub fn document_formatting_text_edits(
     source: &(impl SourceNavigation + ?Sized),
     tab_size: u32,
     insert_spaces: bool,
-    configuration: &(impl FormattingConfiguration + ?Sized),
+    settings: &FormattingSettings,
 ) -> Vec<TextEdit> {
     let text = source.text();
-    let options = FormatOptions::from_configuration(tab_size, insert_spaces, configuration);
+    let options = FormatOptions::from_settings(tab_size, insert_spaces, settings);
     let formatted = format_document_text_with_options(text, &options);
     if formatted == text {
         return Vec::new();
@@ -2346,7 +2340,7 @@ mod tests {
             }
         }))
         .settings;
-        let options = FormatOptions::from_configuration(8, false, settings.formatting());
+        let options = FormatOptions::from_settings(8, false, &settings.formatting);
 
         assert_eq!(
             format_document_text_with_options("f := (\na * b;c\n)\n", &options),

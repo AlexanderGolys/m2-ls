@@ -34,14 +34,6 @@ pub enum DocumentationTarget {
 }
 
 impl DocumentationTarget {
-    pub fn name(&self) -> Option<&str> {
-        match self {
-            Self::Package => None,
-            Self::Binding { name, .. } | Self::Installation { name, .. } => Some(name.name()),
-            Self::Assignment { label, .. } => Some(label),
-        }
-    }
-
     pub fn owns_binding(&self, binding: BindingView<'_>) -> bool {
         matches!(
             self,
@@ -67,32 +59,18 @@ impl DocumentationTarget {
 /// One Markdown block whose placement resolves to at least one meaningful owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentationBlock {
-    source: DocumentSpan,
-    markdown: String,
     hover_markdown: String,
-    wiki_links: Vec<(ByteRange, ByteRange)>,
     targets: Vec<DocumentationTarget>,
 }
 
 impl DocumentationBlock {
-    pub fn source_span(&self) -> &DocumentSpan {
-        &self.source
-    }
-
     pub fn hover_markdown(&self) -> &str {
         &self.hover_markdown
     }
 
+    #[cfg(test)]
     pub fn targets(&self) -> &[DocumentationTarget] {
         &self.targets
-    }
-
-    pub fn render_markdown(&self, mut resolve: impl FnMut(&str) -> Option<String>) -> String {
-        render_wiki_links(&self.markdown, &self.wiki_links, |target| {
-            resolve(target)
-                .map(|destination| format!("[{target}]({destination})"))
-                .unwrap_or_else(|| format!("`{target}`"))
-        })
     }
 }
 
@@ -143,6 +121,7 @@ pub struct DocumentationIndex {
 }
 
 impl DocumentationIndex {
+    #[cfg(test)]
     pub fn blocks(&self) -> &[DocumentationBlock] {
         &self.blocks
     }
@@ -411,17 +390,8 @@ fn collect_line_documentation(
         if targets.is_empty() {
             continue;
         }
-        let text = DocumentationText::from_line_comments(block_comments);
-        let source_span = source.span_for_bytes(
-            block_comments[0].start_byte()
-                ..block_comments
-                    .last()
-                    .expect("nonempty comment block")
-                    .end_byte(),
-        );
         collect_markdown_block(
-            text,
-            source_span,
+            DocumentationText::from_line_comments(block_comments),
             targets,
             source,
             m2_parser.as_deref_mut(),
@@ -460,7 +430,6 @@ fn collect_inner_documentation(
         };
         collect_markdown_block(
             DocumentationText::from_block_comment(comment),
-            source.span_for_node(comment),
             vec![target],
             source,
             m2_parser.as_deref_mut(),
@@ -472,7 +441,6 @@ fn collect_inner_documentation(
 
 fn collect_markdown_block(
     text: DocumentationText,
-    source_span: DocumentSpan,
     targets: Vec<DocumentationTarget>,
     source: &(impl SourceNavigation + ?Sized),
     m2_parser: Option<&mut M2Parser>,
@@ -512,27 +480,17 @@ fn collect_markdown_block(
         }
     }
 
-    let hover_markdown =
-        render_wiki_links(&text.markdown, &wiki_links, |target| format!("`{target}`"));
+    let mut hover_markdown = text.markdown.clone();
+    for (whole, target) in wiki_links.iter().rev() {
+        hover_markdown.replace_range(
+            whole.clone(),
+            &format!("`{}`", &text.markdown[target.clone()]),
+        );
+    }
     index.blocks.push(DocumentationBlock {
-        source: source_span,
-        markdown: text.markdown,
         hover_markdown,
-        wiki_links,
         targets,
     });
-}
-
-fn render_wiki_links(
-    markdown: &str,
-    wiki_links: &[(ByteRange, ByteRange)],
-    mut render: impl FnMut(&str) -> String,
-) -> String {
-    let mut rendered = markdown.to_string();
-    for (whole, target) in wiki_links.iter().rev() {
-        rendered.replace_range(whole.clone(), &render(&markdown[target.clone()]));
-    }
-    rendered
 }
 
 fn collect_mapped_m2_references(
@@ -778,8 +736,8 @@ mod tests {
 
         assert_eq!(document.documentation_blocks().len(), 1);
         assert_eq!(
-            document.documentation_blocks()[0].markdown.as_str(),
-            "docs for x and [[ideal]]"
+            document.documentation_blocks()[0].hover_markdown(),
+            "docs for x and `ideal`"
         );
         assert_eq!(
             document
@@ -797,28 +755,22 @@ mod tests {
         // `-*` that a plain comment opens with would leave a stray `-` or `*` at
         // the start of the Markdown, which renders as a list bullet.
         assert_eq!(
-            document("--- Triple dash docs.\nx = 1\n").documentation_blocks()[0]
-                .markdown
-                .as_str(),
+            document("--- Triple dash docs.\nx = 1\n").documentation_blocks()[0].hover_markdown(),
             "Triple dash docs."
         );
         assert_eq!(
-            document("-- Plain docs.\nx = 1\n").documentation_blocks()[0]
-                .markdown
-                .as_str(),
+            document("-- Plain docs.\nx = 1\n").documentation_blocks()[0].hover_markdown(),
             "Plain docs."
         );
         assert_eq!(
             document("-** Doc block. **-\nnewPackage(\"P\")\n").documentation_blocks()[0]
-                .markdown
-                .as_str(),
+                .hover_markdown(),
             "Doc block."
         );
         // The mirrored width leaves a `*` that belongs to the prose alone.
         assert_eq!(
             document("-* Emphasis **here**. *-\nnewPackage(\"P\")\n").documentation_blocks()[0]
-                .markdown
-                .as_str(),
+                .hover_markdown(),
             "Emphasis **here**."
         );
     }
@@ -845,8 +797,7 @@ mod tests {
             function
                 .documentation_for_binding(binding)
                 .expect("inner docs should attach to the function")
-                .markdown
-                .as_str(),
+                .hover_markdown(),
             "Function docs."
         );
 

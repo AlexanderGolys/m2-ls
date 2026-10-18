@@ -262,7 +262,7 @@ mod tests {
         let scoped = knowledge.with_source_imports("");
         let document = DocumentSnapshot::from_text("ZZ\n".to_string(), &knowledge)
             .expect("source should parse");
-        let resolver = SourceResolver::new(Vec::new());
+        let resolver = SourceResolver::default();
         let context = TypeHierarchyContext::new(&knowledge, &resolver);
         let uri = Url::parse("file:///type-hierarchy-test.m2").expect("valid test URI");
 

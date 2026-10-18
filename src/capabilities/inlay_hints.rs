@@ -12,6 +12,7 @@ use tower_lsp::lsp_types::{
 use crate::document::DocumentSnapshot;
 use crate::node_metadata::{M2Node, SyntaxNodeId};
 use crate::object_registry::ObjectRegistry;
+use crate::settings::InlayHintSettings;
 use crate::source::SourceNavigation;
 use crate::typesystem::InferredType;
 use crate::util::TextRangeExt;
@@ -20,16 +21,10 @@ pub fn inlay_hint_provider_capability() -> Option<OneOf<bool, InlayHintServerCap
     Some(OneOf::Left(true))
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct InlayHintOptions {
-    pub expression_types: bool,
-    pub all_known_types: bool,
-}
-
 pub fn inlay_hints_response(
     document: &DocumentSnapshot,
     range: TextRange,
-    options: InlayHintOptions,
+    options: InlayHintSettings,
     knowledge: &ObjectRegistry,
 ) -> Vec<InlayHint> {
     let inferred_types = inferred_expression_types(document, knowledge);
@@ -514,7 +509,7 @@ mod tests {
         inlay_hints_response(
             &document,
             range,
-            InlayHintOptions {
+            InlayHintSettings {
                 expression_types,
                 all_known_types: false,
             },

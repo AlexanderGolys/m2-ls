@@ -8,7 +8,8 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use dashmap::DashMap;
 use tower_lsp::lsp_types::{Location, Range as TextRange, Url};
@@ -122,18 +123,48 @@ impl WorkspaceIndex {
     /// disk. Files already indexed keep their facts, so an open document's live
     /// text is never clobbered by its saved copy.
     pub fn index_file(&self, uri: &Url, text: &str, knowledge_provider: &ObjectRegistry) {
-        let mut pending = self.index_source(uri, text, knowledge_provider);
-        while let Some(loaded) = pending.pop() {
-            if self.is_indexed(&loaded) {
-                continue;
-            }
-            let Ok(path) = loaded.to_file_path() else {
-                continue;
-            };
-            let Ok(text) = fs::read_to_string(&path) else {
-                continue;
-            };
-            pending.extend(self.index_source(&loaded, &text, knowledge_provider));
+        let loaded = self.index_source(uri, text, knowledge_provider);
+        self.index_files_from_disk(loaded, knowledge_provider);
+    }
+
+    /// Index `files` from disk, then every file they load, transitively. Each
+    /// wave of newly discovered files is parsed in parallel; files already
+    /// indexed keep their facts.
+    pub fn index_files_from_disk(&self, files: Vec<Url>, knowledge_provider: &ObjectRegistry) {
+        let mut pending = files;
+        while !pending.is_empty() {
+            pending.sort();
+            pending.dedup();
+            pending.retain(|file| !self.is_indexed(file));
+            let workers = thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(pending.len());
+            let wave = Mutex::new(pending.into_iter());
+            let loaded = Mutex::new(Vec::new());
+            thread::scope(|scope| {
+                for _ in 0..workers {
+                    thread::Builder::new()
+                        .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
+                        .spawn_scoped(scope, || loop {
+                            // Taken in its own statement, so the lock is
+                            // released before the file is parsed.
+                            let next_file = wave.lock().expect("wave lock").next();
+                            let Some(file) = next_file else {
+                                break;
+                            };
+                            let Ok(text) = file
+                                .to_file_path()
+                                .and_then(|path| fs::read_to_string(path).map_err(drop))
+                            else {
+                                continue;
+                            };
+                            let file_loads = self.index_source(&file, &text, knowledge_provider);
+                            loaded.lock().expect("loaded lock").extend(file_loads);
+                        })
+                        .expect("indexing worker starts");
+                }
+            });
+            pending = loaded.into_inner().expect("loaded lock");
         }
     }
 
@@ -353,6 +384,25 @@ impl WorkspaceDefinitionKnowledge for WorkspaceIndex {
 }
 
 impl WorkspaceIndex {
+    /// Every indexed installation of a method named `name`, whether or not its
+    /// own file declares the method: for the library sources, the corpus
+    /// already knows the name is a method function.
+    pub fn method_installations(&self, name: &str) -> Vec<Location> {
+        self.implementations_by_name
+            .get(name)
+            .map(|locations| {
+                locations
+                    .iter()
+                    .filter(|location| location.kind == ImplementationKind::Method)
+                    .map(|location| Location {
+                        uri: location.uri.clone(),
+                        range: location.range,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn locations(
         &self,
         name: &str,

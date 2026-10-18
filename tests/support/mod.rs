@@ -57,6 +57,22 @@ impl LspProcess {
     }
 
     pub(crate) async fn initialize(&mut self, root_uri: &str) -> Value {
+        self.initialize_with_options(
+            root_uri,
+            json!({
+                "inlayHints": {
+                    "expressionTypes": true
+                }
+            }),
+        )
+        .await
+    }
+
+    pub(crate) async fn initialize_with_options(
+        &mut self,
+        root_uri: &str,
+        initialization_options: Value,
+    ) -> Value {
         self.request(
             "initialize",
             json!({
@@ -83,11 +99,7 @@ impl LspProcess {
                         }
                     }
                 },
-                "initializationOptions": {
-                    "inlayHints": {
-                        "expressionTypes": true
-                    }
-                }
+                "initializationOptions": initialization_options
             }),
         )
         .await
