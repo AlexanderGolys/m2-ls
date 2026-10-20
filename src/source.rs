@@ -5,6 +5,7 @@ use tower_lsp::lsp_types::Range as TextRange;
 use tree_sitter::Point;
 
 use crate::node_metadata::M2Node;
+use crate::util::TextRangeExt;
 
 /// A half-open range of byte offsets into source text.
 pub type ByteRange = std::ops::Range<usize>;
@@ -29,6 +30,40 @@ impl DocumentSpan {
     /// The protocol-oriented UTF-16 range of this span.
     pub fn range(&self) -> TextRange {
         self.range
+    }
+}
+
+/// A symbol named inside text that is not code: a link of a documentation
+/// comment, or a name string listed by `export`. It refers to the same object
+/// the name would refer to were it written as code at that position, so
+/// navigation, highlights, references, and renames treat it as a use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolMention {
+    span: DocumentSpan,
+}
+
+impl SymbolMention {
+    /// The mention covering exactly the name at `span`.
+    pub fn new(span: DocumentSpan) -> Self {
+        Self { span }
+    }
+
+    /// The mentioned name, out of `text`, the file the mention is in.
+    pub fn name<'a>(&self, text: &'a str) -> &'a str {
+        &text[self.span.bytes()]
+    }
+
+    pub fn range(&self) -> TextRange {
+        self.span.range()
+    }
+
+    pub fn byte_span(&self) -> (usize, usize) {
+        let bytes = self.span.bytes();
+        (bytes.start, bytes.end)
+    }
+
+    pub fn contains(&self, position: Position) -> bool {
+        self.span.range().contains_position(position)
     }
 }
 /// Cached byte ranges for every line's visible content.

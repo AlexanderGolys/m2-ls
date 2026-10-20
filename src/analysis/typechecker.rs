@@ -195,7 +195,7 @@ impl Analysis {
 
     fn enrich_lambda_node(&mut self, node: M2Node, source: &(impl SourceNavigation + ?Sized)) {
         if let Some(parameters) = node.child_by_field_name("parameters") {
-            let parameter_types = method_installation_parameter_types_for_function(node);
+            let parameter_types = self.argument_lambda_domain(node, source).cloned();
             self.enrich_parameters(parameters, source, parameter_types.as_deref());
         }
     }
@@ -215,8 +215,8 @@ impl Analysis {
         let knowledge = knowledge_provider.at_position(source.position_for_node(node));
         let installation_id = self.record_method_installation(node, source, &knowledge);
         let inferred_type = right.map(|right| {
-            if method_declaration_typical_value(right).is_some() || is_method_call(right) {
-                InferredType::exact_from_id(TypeRole::MethodFunction.object_name())
+            if let Some(declaration) = MethodDeclaration::of(right) {
+                InferredType::exact_from_id(declaration.runtime_class().object_name())
             } else {
                 TypeChecker::new(self, knowledge_provider).type_of(right, source, scope_idx)
             }
@@ -231,9 +231,7 @@ impl Analysis {
             )
         });
         let presentation_kind = if right.is_some_and(|right| {
-            right.is::<LambdaExpression>()
-                || method_declaration_typical_value(right).is_some()
-                || is_method_call(right)
+            right.is::<LambdaExpression>() || MethodDeclaration::of(right).is_some()
         }) || type_name
             .is_some_and(|type_name| knowledge.has_type_role(type_name, TypeRole::Function))
         {
@@ -578,12 +576,12 @@ fn type_substitution(node: M2Node<'_>) -> TypeSubstitution<'_> {
     use TypeSubstitution::{Dispatch, Exact, Follow, Symbol, Union, Unknown};
 
     let exact = |name| Exact(ObjectName::new(name));
+    if let Some(declaration) = MethodDeclaration::of(node) {
+        return Exact(declaration.runtime_class().object_name());
+    }
 
     match node {
         node if node.is::<LambdaExpression>() => exact("FunctionClosure"),
-        node if method_declaration_typical_value(node).is_some() || is_method_call(node) => {
-            Exact(TypeRole::MethodFunction.object_name())
-        }
         node if node.is::<List>() => exact("List"),
         node if node.is::<Array>() => exact("Array"),
         node if node.is::<AngleBarList>() => exact("AngleBarList"),

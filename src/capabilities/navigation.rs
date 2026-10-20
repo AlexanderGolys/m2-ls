@@ -133,7 +133,7 @@ fn goto_symbol_response(
     target: NavigationTarget,
 ) -> Option<GotoDefinitionResponse> {
     let node = document.node_at_position_minimal(position)?;
-    let documentation_reference = document.documentation_reference_at(position);
+    let mention = document.symbol_mention_at(position);
 
     if let NavigationTarget::Definition = target {
         if let Some(string_node) = node.enclosing_node(M2Node::is_string_literal) {
@@ -150,8 +150,8 @@ fn goto_symbol_response(
         }
     }
 
-    let node_text = if let Some(reference) = documentation_reference.as_ref() {
-        reference.name(document.text())
+    let node_text = if let Some(mention) = mention.as_ref() {
+        mention.name(document.text())
     } else {
         if !node.is::<Symbol>() {
             return None;
@@ -431,13 +431,13 @@ pub fn goto_implementation_response(
 
 pub fn document_links_response(document: &DocumentSnapshot, uri: &Url) -> Vec<DocumentLink> {
     let mut links = document
-        .documentation_references()
+        .symbol_mentions()
         .iter()
-        .map(|reference| {
+        .map(|mention| {
             document_link(
-                reference.range(),
+                mention.range(),
                 uri,
-                format!("Open `{}`", reference.name(document.text())),
+                format!("Open `{}`", mention.name(document.text())),
             )
         })
         .collect::<Vec<_>>();
@@ -551,12 +551,12 @@ pub fn reference_ranges_resolved(
             }
         }
     }
-    for reference in document.documentation_references() {
-        if reference.name(document.text()) != target_name {
+    for mention in document.symbol_mentions() {
+        if mention.name(document.text()) != target_name {
             continue;
         }
-        let range = reference.range();
-        if let Some(symbol) = document.documentation_symbol(reference) {
+        let range = mention.range();
+        if let Some(symbol) = document.mention_symbol(mention) {
             if symbol.range == target_range && (include_declaration || range != target_range) {
                 references.push(range);
             }
@@ -654,27 +654,27 @@ pub fn global_reference_ranges(document: &DocumentSnapshot, name: &str) -> Vec<T
             }
         }
     }
-    for reference in document.documentation_references() {
-        if reference.name(document.text()) != name {
+    for mention in document.symbol_mentions() {
+        if mention.name(document.text()) != name {
             continue;
         }
-        let range = reference.range();
+        let range = mention.range();
         let shadowed = document
-            .documentation_symbol(reference)
+            .mention_symbol(mention)
             .is_some_and(|binding| binding.scope_idx != 0);
         if !shadowed {
             references.push(range);
         }
     }
-    // A TEST block sees the document's globals only through its package's
-    // exports, so it shares only the exported ones.
-    for test in document.package_tests() {
-        let package_exports_name =
-            document.packages().declarations().iter().any(|package| {
-                package.name == test.package && package.export_named(name).is_some()
-            });
+    // Package-session code sees the document's globals only through its
+    // package's exports, so it shares only the exported ones.
+    for session in document.package_sessions() {
+        let package_exports_name = document.packages().declarations().iter().any(|package| {
+            session.code.package.as_ref() == Some(&package.name)
+                && package.export_named(name).is_some()
+        });
         if package_exports_name {
-            references.extend(global_reference_ranges(&test.snapshot, name));
+            references.extend(global_reference_ranges(&session.snapshot, name));
         }
     }
     references.sort_by_key(|range| (range.start, range.end));
@@ -702,15 +702,12 @@ pub fn unbound_reference_ranges(document: &DocumentSnapshot, name: &str) -> Vec<
 
     references.extend(
         document
-            .documentation_references()
+            .symbol_mentions()
             .iter()
-            .filter(|reference| reference.name(document.text()) == name)
-            .filter_map(|reference| {
-                let range = reference.range();
-                document
-                    .documentation_symbol(reference)
-                    .is_none()
-                    .then_some(range)
+            .filter(|mention| mention.name(document.text()) == name)
+            .filter_map(|mention| {
+                let range = mention.range();
+                document.mention_symbol(mention).is_none().then_some(range)
             }),
     );
     references.sort_by_key(|range| (range.start, range.end));

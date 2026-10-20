@@ -6,6 +6,7 @@
 //! finds into the [`DiagnosticSink`], under whichever rules apply.
 
 mod document;
+mod documentation;
 mod installation;
 mod node;
 
@@ -16,6 +17,7 @@ use super::{DiagnosticRule, Finding, M2Diagnostic};
 use crate::analysis::{Analysis, MethodInstallation};
 use crate::node_metadata::{visit_source_nodes, M2Node};
 use crate::object_registry::{ObjectRegistry, ObjectRegistryView};
+use crate::package_documentation::PackageDocumentation;
 use crate::source::{DocumentSource, SourceNavigation};
 use crate::source_package::SourcePackages;
 
@@ -36,13 +38,24 @@ struct InstallationContext<'context> {
     knowledge: &'context ObjectRegistryView<'context>,
 }
 
-/// What the document occasion provides: the analysis, the syntax root, the
-/// source of the document, and the packages it declares.
+/// What the document occasion provides: the analysis, the syntax root, and the
+/// source of the document.
 struct DocumentContext<'context, 'tree> {
     analysis: &'context Analysis,
     root: M2Node<'tree>,
     source: &'context DocumentSource,
+}
+
+/// What the documentation occasion provides: the package documentation the
+/// document writes, the packages it declares, the syntax and source it is
+/// written in, and the knowledge of the packages the document loads.
+struct DocumentationContext<'context, 'tree> {
+    documentation: &'context PackageDocumentation,
     packages: &'context SourcePackages,
+    root: M2Node<'tree>,
+    syntax: Option<&'context SourceFile>,
+    source: &'context DocumentSource,
+    knowledge: &'context ObjectRegistry,
 }
 
 /// The diagnostics spawned for one document, in the order they were found.
@@ -59,7 +72,8 @@ impl DiagnosticSink {
 }
 
 /// Every diagnostic spawned for one analyzed document: on each syntax node in
-/// source order, then on each method installation, then on the whole document.
+/// source order, then on each method installation, then on the whole
+/// document, then on the package documentation it writes.
 pub fn collect(
     analysis: &Analysis,
     root: M2Node,
@@ -67,6 +81,7 @@ pub fn collect(
     source: &DocumentSource,
     knowledge: &ObjectRegistry,
     packages: &SourcePackages,
+    documentation: &PackageDocumentation,
 ) -> Vec<M2Diagnostic> {
     let mut sink = DiagnosticSink::default();
     visit_source_nodes(root, syntax, |node| {
@@ -92,9 +107,17 @@ pub fn collect(
         analysis,
         root,
         source,
-        packages,
     };
     document::spawn(&context, &mut sink);
+    let context = DocumentationContext {
+        documentation,
+        packages,
+        root,
+        syntax,
+        source,
+        knowledge,
+    };
+    documentation::spawn(&context, &mut sink);
     sink.diagnostics
 }
 

@@ -1,21 +1,22 @@
 //! Packages declared in Macaulay2 source: each `newPackage` section with the
 //! symbols it exports, the packages it exports along with them, and the TEST
-//! blocks it registers.
+//! blocks it registers, along with the code Macaulay2 runs in separate
+//! sessions that load a package.
 //!
 //! A section runs from `newPackage "P"` to the `endPackage "P"` closing it.
 //! Inside it, global assignments land in the package's private dictionary, so
 //! only the names its `export`/`exportMutable` calls list are visible to the
 //! sessions that load the package; after `endPackage` the file is back in the
-//! `User` package and its globals are public again. Macaulay2 1.26 closes a
-//! package still open at the end of its file from a file-exit hook, but a
-//! package is expected to close itself, and the server requires it to.
+//! `User` package and its globals are public again. A package still open at
+//! the end of its file is closed by Macaulay2 from a file-exit hook, so its
+//! section then runs to the end of the file.
 
 use tower_lsp::lsp_types::{Position, Range as TextRange};
 
 use crate::node_metadata::M2Node;
 use crate::object_registry::ObjectName;
-use crate::package_index::{declared_package_name, first_call_argument};
-use crate::source::{ByteRange, SourceNavigation};
+use crate::package_index::{declared_package_name, first_call_argument, PackageLoadingOption};
+use crate::source::{ByteRange, SourceNavigation, SymbolMention};
 
 /// The function that closes the package a `newPackage` section declares.
 const PACKAGE_CLOSER: &str = "endPackage";
@@ -24,16 +25,12 @@ const PACKAGE_CLOSER: &str = "endPackage";
 /// `exportMutable` exports them as assignable by the importing session.
 const EXPORTERS: [&str; 2] = ["export", "exportMutable"];
 
-/// The `newPackage` option listing the packages loaded along with the package
-/// into every session that loads it.
-const PACKAGE_EXPORTS_OPTION: &str = "PackageExports";
-
 /// The packages one source file declares, in source order, and the TEST blocks
 /// they register.
 #[derive(Debug, Default)]
 pub struct SourcePackages {
     declarations: Vec<PackageDeclaration>,
-    tests: Vec<PackageTestBlock>,
+    tests: Vec<PackageSessionCode>,
 }
 
 /// One `newPackage` section of a source file.
@@ -41,13 +38,9 @@ pub struct SourcePackages {
 pub struct PackageDeclaration {
     /// The package name, which `newPackage` also binds as a global symbol.
     pub name: ObjectName,
-    /// The name string of the `newPackage` call.
-    pub name_range: TextRange,
     /// From the `newPackage` call through its closing `endPackage` call, or
     /// up to the next section or the end of the file when it is never closed.
     pub section: TextRange,
-    /// The `endPackage` call closing the section.
-    pub closing: Option<TextRange>,
     /// The symbols the section exports, in source order.
     pub exports: Vec<PackageExport>,
     /// The packages its `PackageExports` option loads along with it.
@@ -64,36 +57,88 @@ pub struct PackageExport {
     pub definition: ObjectName,
     /// The string that exports the name.
     pub range: TextRange,
+    /// The name of [`Self::definition`] inside its string, a use of the
+    /// package global.
+    pub definition_mention: SymbolMention,
 }
 
-/// A `TEST ///…///` block inside a package section. `check` runs its body as
-/// a separate Macaulay2 session that has loaded the package, so the body sees
-/// the package only through its exports.
-#[derive(Debug, Clone)]
-pub struct PackageTestBlock {
-    /// The package registering the test.
-    pub package: ObjectName,
-    /// The code between the `///` delimiters.
-    pub body: ByteRange,
-    /// The span of [`Self::body`].
-    pub body_range: TextRange,
+/// Code Macaulay2 runs in a separate session that has loaded a package, so
+/// the code sees the package only through its exports: the body of a
+/// `TEST ///…///` block, which `check` runs, or the examples of one
+/// documentation node, which `installPackage` runs one after another in a
+/// single session.
+///
+/// The code is a sequence of fragments of the file, such as the lines of every
+/// `Example` section of a SimpleDoc node. Analyzed alone, in
+/// [`Self::isolated_source`], it is that session, and whatever answers for it
+/// there answers for the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageSessionCode {
+    /// The package the session loads; `None` for code in a file declaring no
+    /// package, such as documentation or tests a package loads from its own
+    /// directory.
+    pub package: Option<ObjectName>,
+    /// The fragments of the file the session runs, in source order.
+    pub fragments: Vec<CodeFragment>,
 }
 
-impl PackageTestBlock {
-    /// The body of the block, out of `text`, the file the block is in, placed
-    /// at the same LSP positions as in the file: after as many empty lines
-    /// as precede it there and as many spaces as UTF-16 units precede it on
-    /// its first line. Analyzed alone, it is the session `check` runs the
-    /// block in, and whatever answers for it there answers for the file.
+/// One contiguous piece of code inside a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeFragment {
+    /// The bytes of the fragment.
+    pub bytes: ByteRange,
+    /// The span of [`Self::bytes`].
+    pub range: TextRange,
+}
+
+impl CodeFragment {
+    /// The fragment covering `bytes` of `source`.
+    pub fn new(bytes: ByteRange, source: &(impl SourceNavigation + ?Sized)) -> Self {
+        Self {
+            range: source.range_for_bytes(bytes.clone()),
+            bytes,
+        }
+    }
+
+    /// Whether `position` lies in the fragment, its end included.
+    pub fn contains(&self, position: Position) -> bool {
+        self.range.start <= position && position <= self.range.end
+    }
+}
+
+impl PackageSessionCode {
+    /// The fragments, out of `text`, the file they are in, placed at the same
+    /// LSP positions as in the file: everything between them is blank, kept
+    /// only as the line breaks and as many spaces as UTF-16 units lead up to
+    /// each fragment on its first line.
     pub fn isolated_source(&self, text: &str) -> String {
-        let start = self.body_range.start;
-        let body = &text[self.body.clone()];
-        let mut isolated =
-            String::with_capacity((start.line + start.character) as usize + body.len());
-        isolated.extend(std::iter::repeat_n('\n', start.line as usize));
-        isolated.extend(std::iter::repeat_n(' ', start.character as usize));
-        isolated.push_str(body);
+        let mut isolated = String::new();
+        let mut end = Position::new(0, 0);
+        for fragment in &self.fragments {
+            let start = fragment.range.start;
+            assert!(
+                end <= start,
+                "the fragments of session code are ordered and disjoint"
+            );
+            if start.line > end.line {
+                isolated.extend(std::iter::repeat_n('\n', (start.line - end.line) as usize));
+                end.character = 0;
+            }
+            isolated.extend(std::iter::repeat_n(
+                ' ',
+                (start.character - end.character) as usize,
+            ));
+            isolated.push_str(&text[fragment.bytes.clone()]);
+            end = fragment.range.end;
+        }
         isolated
+    }
+
+    /// Whether `position` lies in one of the fragments.
+    pub fn contains(&self, position: Position) -> bool {
+        self.fragments
+            .iter()
+            .any(|fragment| fragment.contains(position))
     }
 }
 
@@ -147,13 +192,10 @@ impl SourcePackages {
             let section_end = closing.map_or(next_section_start, |closing| closing.end_byte());
             declarations.push(PackageDeclaration {
                 name: ObjectName::new(package_name),
-                name_range: source.range_for_node(name),
                 section: source.range_for_bytes(call.start_byte()..section_end),
-                closing: closing.map(|closing| source.range_for_node(closing)),
                 exports: Vec::new(),
-                exported_packages: package_exports_option(call)
-                    .map(string_list)
-                    .unwrap_or_default()
+                exported_packages: PackageLoadingOption::Exports
+                    .package_names(call)
                     .into_iter()
                     .filter_map(|package| package.string_literal_inner_text())
                     .map(ObjectName::new)
@@ -175,17 +217,17 @@ impl SourcePackages {
                     }
                 }
                 PackageCall::Test(clause, body) => {
-                    let Some(package) = packages.declaration_at(source.position_for_node(*clause))
+                    let Some(package) =
+                        packages.session_package_at(source.position_for_node(*clause))
                     else {
                         continue;
                     };
                     let Some(body) = body.string_literal_inner_bytes() else {
                         continue;
                     };
-                    packages.tests.push(PackageTestBlock {
-                        package: package.name.clone(),
-                        body_range: source.range_for_bytes(body.clone()),
-                        body,
+                    packages.tests.push(PackageSessionCode {
+                        package,
+                        fragments: vec![CodeFragment::new(body, source)],
                     });
                 }
                 PackageCall::Declaration(..) | PackageCall::Closing(..) => {}
@@ -200,8 +242,21 @@ impl SourcePackages {
     }
 
     /// The TEST blocks the file's packages register, in source order.
-    pub fn tests(&self) -> &[PackageTestBlock] {
+    pub fn tests(&self) -> &[PackageSessionCode] {
         &self.tests
+    }
+
+    /// The package whose session runs code written at `position`, such as a
+    /// TEST block or a documentation example: the package whose section
+    /// contains it, or no package in a file that declares none. `None` when
+    /// the file declares packages but `position` lies outside of them, where
+    /// Macaulay2 has no package open to register the code with.
+    pub fn session_package_at(&self, position: Position) -> Option<Option<ObjectName>> {
+        if self.declarations.is_empty() {
+            return Some(None);
+        }
+        self.declaration_at(position)
+            .map(|declaration| Some(declaration.name.clone()))
     }
 
     /// The package whose section contains `position`: the one global
@@ -223,6 +278,11 @@ impl PackageDeclaration {
     /// Whether `position` lies in the section.
     pub fn contains(&self, position: Position) -> bool {
         self.section.start <= position && position <= self.section.end
+    }
+
+    /// The uses of package globals its exports make by naming them.
+    pub fn export_mentions(&self) -> impl Iterator<Item = &SymbolMention> {
+        self.exports.iter().map(|export| &export.definition_mention)
     }
 
     /// The export of `name`, when the package exports it.
@@ -264,17 +324,6 @@ fn test_body(clause: M2Node<'_>) -> Option<M2Node<'_>> {
         .find(|child| child.is::<m2_syn::nodes::RawStringLiteral>())
 }
 
-/// The value of the `PackageExports => …` option of a `newPackage` call.
-fn package_exports_option(call: M2Node<'_>) -> Option<M2Node<'_>> {
-    let arguments = call.child_by_field_name("right")?;
-    let options = arguments.collection_elements().collect::<Vec<_>>();
-    options.into_iter().find_map(|option| {
-        let key = option.child_by_field_name("left")?;
-        (option.is_option_assignment() && key.text() == PACKAGE_EXPORTS_OPTION)
-            .then(|| option.child_by_field_name("right"))?
-    })
-}
-
 /// The elements of a list argument, or the argument itself when it is a
 /// single element.
 fn string_list(argument: M2Node<'_>) -> Vec<M2Node<'_>> {
@@ -292,6 +341,11 @@ fn exported_symbols(
     argument: M2Node<'_>,
     source: &(impl SourceNavigation + ?Sized),
 ) -> Vec<PackageExport> {
+    let mention = |name: M2Node<'_>| {
+        Some(SymbolMention::new(
+            source.span_for_bytes(name.string_literal_inner_bytes()?),
+        ))
+    };
     string_list(argument)
         .into_iter()
         .filter_map(|element| {
@@ -300,6 +354,7 @@ fn exported_symbols(
                     name: ObjectName::new(name),
                     definition: ObjectName::new(name),
                     range: source.range_for_node(element),
+                    definition_mention: mention(element)?,
                 });
             }
             if !element.is_option_assignment() {
@@ -311,6 +366,7 @@ fn exported_symbols(
                 name: ObjectName::new(synonym.string_literal_inner_text()?),
                 definition: ObjectName::new(definition.string_literal_inner_text()?),
                 range: source.range_for_node(synonym),
+                definition_mention: mention(definition)?,
             })
         })
         .collect()
@@ -344,7 +400,10 @@ mod tests {
             panic!("one package expected");
         };
         assert_eq!(package.name.name(), "Pkg");
-        assert!(package.closing.is_some());
+        assert_eq!(
+            package.section.end.line, 7,
+            "the section ends at endPackage"
+        );
         assert_eq!(
             package
                 .exports
@@ -357,7 +416,7 @@ mod tests {
         let [test] = packages.tests() else {
             panic!("only the TEST inside the section is registered");
         };
-        assert_eq!(test.body_range.start.line, 4);
+        assert_eq!(test.fragments[0].range.start.line, 4);
     }
 
     #[test]
@@ -366,8 +425,10 @@ mod tests {
         let [first, second] = packages.declarations() else {
             panic!("two packages expected");
         };
-        assert!(first.closing.is_none());
-        assert!(second.closing.is_none());
         assert_eq!(first.section.end, second.section.start);
+        assert_eq!(
+            second.section.end.line, 3,
+            "the last section runs to the end"
+        );
     }
 }

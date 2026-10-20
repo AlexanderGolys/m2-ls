@@ -3,15 +3,17 @@
 use tower_lsp::lsp_types::*;
 
 use crate::analysis::BindingView;
-use crate::document::{DocumentSnapshot, PackageTest};
+use crate::document::{DocumentSnapshot, PackageSession};
 use crate::documentation::DocumentationSnippet;
 use crate::object_registry::ObjectRegistry;
+use crate::package_documentation::DocumentationMarkupKind;
 use crate::semantic_token::{
     classify_source_semantic_token, M2SemanticToken, M2SemanticTokenType, SourceSemanticToken,
     SourceSemanticTokenContext,
 };
 use crate::settings::SemanticTokenSettings;
-use crate::source::{DocumentSpan, SourceNavigation};
+use crate::source::{ByteRange, DocumentSpan, SourceNavigation};
+use crate::source_package::CodeFragment;
 use crate::workspace_index::{WorkspaceDefinitionKnowledge, WorkspaceIndex, WorkspaceView};
 use tower_lsp::lsp_types::Range as TextRange;
 
@@ -29,29 +31,25 @@ pub fn collect_semantic_tokens(
         workspace_index: &WorkspaceView::Document(workspace_index),
         uri,
     };
-    let test_workspace = WorkspaceView::PackageTest(workspace_index);
+    let session_workspace = WorkspaceView::PackageSession(workspace_index);
+    let session_classifiers = document
+        .package_sessions()
+        .iter()
+        .map(|session| SessionTokenClassifier {
+            session,
+            classifier: SemanticTokenClassifier {
+                document: &session.snapshot,
+                builtins: session.snapshot.object_registry(),
+                workspace_index: &session_workspace,
+                uri,
+            },
+        })
+        .collect::<Vec<_>>();
     let mut emitter = SemanticTokenEmitter::new(document, settings);
 
     for source_token in document.analysis().source_semantic_tokens() {
-        if let Some(test) = document.package_tests().iter().find(|test| {
-            let token_range = source_token.span.range();
-            token_range.start <= test.body_range.start && test.body_range.end <= token_range.end
-        }) {
-            let test_classifier = SemanticTokenClassifier {
-                document: &test.snapshot,
-                builtins: test.snapshot.object_registry(),
-                workspace_index: &test_workspace,
-                uri,
-            };
-            emitter.emit_package_test_tokens(
-                source_token,
-                test,
-                &test_classifier,
-                augments_syntax_tokens,
-            );
-            continue;
-        }
-        if emitter.emit_documentation_container_tokens(source_token, augments_syntax_tokens) {
+        if emitter.emit_embedded_tokens(source_token, &session_classifiers, augments_syntax_tokens)
+        {
             continue;
         }
         if let Some(span) = classifier.semantic_span(source_token, augments_syntax_tokens) {
@@ -60,6 +58,47 @@ pub fn collect_semantic_tokens(
     }
 
     emitter.finish()
+}
+
+/// The classifier of one package session's code, whose own analysis decides
+/// the tokens of the code embedded in the document's strings.
+struct SessionTokenClassifier<'a> {
+    session: &'a PackageSession,
+    classifier: SemanticTokenClassifier<'a, WorkspaceView<'a>>,
+}
+
+impl SessionTokenClassifier<'_> {
+    /// The tokens of the session's code lying inside `container`, a byte
+    /// range of the document, placed in the document.
+    fn spans_inside(
+        &self,
+        document: &DocumentSnapshot,
+        container: &ByteRange,
+        augments_syntax_tokens: bool,
+    ) -> Vec<SemanticSpan> {
+        let inside = |fragment: &CodeFragment| {
+            container.start <= fragment.bytes.start && fragment.bytes.end <= container.end
+        };
+        if !self.session.code.fragments.iter().any(inside) {
+            return Vec::new();
+        }
+        self.session
+            .snapshot
+            .analysis()
+            .source_semantic_tokens()
+            .iter()
+            .filter_map(|token| self.classifier.semantic_span(token, augments_syntax_tokens))
+            .filter_map(|span| {
+                let bytes = document.bytes_for_range(span.source.range())?;
+                (container.start <= bytes.start && bytes.end <= container.end).then(|| {
+                    SemanticSpan {
+                        source: document.span_for_bytes(bytes),
+                        token: span.token,
+                    }
+                })
+            })
+            .collect()
+    }
 }
 
 struct SemanticTokenEmitter<'a> {
@@ -79,9 +118,17 @@ impl<'a> SemanticTokenEmitter<'a> {
         }
     }
 
-    fn emit_documentation_container_tokens(
+    /// Emit a string or comment `source_token` that embeds code or markup:
+    /// the code of package sessions (TEST blocks, documentation examples) as
+    /// their own analysis classifies it, documentation snippets and the
+    /// expressions documentation evaluates as code, SimpleDoc section
+    /// keywords as keywords, and the rest of the container as the string or
+    /// comment it is. Returns `false`, emitting nothing, when the container
+    /// embeds nothing.
+    fn emit_embedded_tokens(
         &mut self,
         source_token: &SourceSemanticToken,
+        sessions: &[SessionTokenClassifier<'_>],
         augments_syntax_tokens: bool,
     ) -> bool {
         let Some(base_type) = source_token.syntax_token_type.filter(|token_type| {
@@ -92,18 +139,37 @@ impl<'a> SemanticTokenEmitter<'a> {
         }) else {
             return false;
         };
+        let source_bytes = source_token.span.bytes();
+        let inside =
+            |(start, end): (usize, usize)| source_bytes.start <= start && end <= source_bytes.end;
 
-        let mut spans = self
-            .document
-            .documentation_snippets()
+        let mut spans = sessions
             .iter()
-            .filter(|snippet| {
-                let (start, end) = snippet.byte_span();
-                let source_bytes = source_token.span.bytes();
-                source_bytes.start <= start && end <= source_bytes.end
+            .flat_map(|session| {
+                session.spans_inside(self.document, &source_bytes, augments_syntax_tokens)
             })
-            .map(|snippet| documentation_snippet_semantic_span(self.document, snippet))
             .collect::<Vec<_>>();
+        spans.extend(
+            self.document
+                .documentation_snippets()
+                .iter()
+                .filter(|snippet| inside(snippet.byte_span()))
+                .map(|snippet| documentation_snippet_semantic_span(self.document, snippet)),
+        );
+        spans.extend(
+            self.document
+                .package_documentation()
+                .markup()
+                .iter()
+                .filter(|markup| inside((markup.bytes.start, markup.bytes.end)))
+                .map(|markup| SemanticSpan {
+                    source: self.document.span_for_bytes(markup.bytes.clone()),
+                    token: M2SemanticToken::new(match markup.kind {
+                        DocumentationMarkupKind::SectionKeyword => M2SemanticTokenType::Keyword,
+                        DocumentationMarkupKind::Expression => M2SemanticTokenType::Property,
+                    }),
+                }),
+        );
         if spans.is_empty() {
             return false;
         }
@@ -113,7 +179,6 @@ impl<'a> SemanticTokenEmitter<'a> {
         });
 
         let emit_base = !augments_syntax_tokens || base_type.emit_with_syntax_highlighting();
-        let source_bytes = source_token.span.bytes();
         let mut cursor = source_bytes.start;
         let mut emitted = false;
 
@@ -132,7 +197,7 @@ impl<'a> SemanticTokenEmitter<'a> {
             emitted |= self.push(span);
         }
 
-        if emitted && emit_base && cursor < source_bytes.end {
+        if emit_base && cursor < source_bytes.end {
             emitted |= self.push(SemanticSpan {
                 source: self.document.span_for_bytes(cursor..source_bytes.end),
                 token: M2SemanticToken::new(base_type),
@@ -140,47 +205,6 @@ impl<'a> SemanticTokenEmitter<'a> {
         }
 
         emitted
-    }
-
-    /// Emit the raw string `source_token` holding the code of `test`: its
-    /// `///` delimiters as a string, and the code as `classifier`, which
-    /// classifies the block's own analysis, classifies it.
-    fn emit_package_test_tokens<W>(
-        &mut self,
-        source_token: &SourceSemanticToken,
-        test: &PackageTest,
-        classifier: &SemanticTokenClassifier<'_, W>,
-        augments_syntax_tokens: bool,
-    ) where
-        W: WorkspaceDefinitionKnowledge + ?Sized,
-    {
-        let token_range = source_token.span.range();
-        let delimiter = M2SemanticToken::new(M2SemanticTokenType::String);
-        let emit_delimiters =
-            !augments_syntax_tokens || M2SemanticTokenType::String.emit_with_syntax_highlighting();
-        let delimiter_span = |range: TextRange| {
-            let bytes = self
-                .document
-                .bytes_for_range(range)
-                .expect("a TEST block's delimiters lie in its document");
-            SemanticSpan {
-                source: self.document.span_for_bytes(bytes),
-                token: delimiter,
-            }
-        };
-        let opening = delimiter_span(TextRange::new(token_range.start, test.body_range.start));
-        let closing = delimiter_span(TextRange::new(test.body_range.end, token_range.end));
-        if emit_delimiters {
-            self.push(opening);
-        }
-        for test_token in test.snapshot.analysis().source_semantic_tokens() {
-            if let Some(span) = classifier.semantic_span(test_token, augments_syntax_tokens) {
-                self.push_ranges(test.snapshot.visible_ranges(&span.source), span.token);
-            }
-        }
-        if emit_delimiters {
-            self.push(closing);
-        }
     }
 
     fn push(&mut self, span: SemanticSpan) -> bool {

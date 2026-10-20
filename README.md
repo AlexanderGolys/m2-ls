@@ -56,27 +56,26 @@ Installation also provides `m2-lint` and `m2-fmt`, using the same diagnostics
 and formatter as the server:
 
 ```sh
-m2-lint .                      # Recursively lint .m2 files
+m2-lint file.m2                 # Lint one file
 m2-lint --deny-warnings file.m2 # Fail on warnings as well as errors
-m2-fmt .                       # Format .m2 files in place
-m2-fmt --check .                # Check formatting without writing (CI)
-m2-fmt --stdout file.m2         # Print one formatted file
+m2-fmt file.m2                  # Format one file in place
+m2-fmt --check file.m2          # Check formatting without writing (CI)
+m2-fmt --stdout file.m2         # Print the formatted file
 cat file.m2 | m2-fmt -          # Format stdin to stdout
 ```
 
-Both commands accept multiple files or directories and default to the current
-directory. Directory scans skip hidden entries, `target`, and symlinks. Use `-`
-alone to read stdin. `--config settings.json` reads the same JSON settings as
-the server, including `diagnostics` and `formatting`; invalid values fail the
-command. No configuration file is loaded automatically.
+Each command takes exactly one file, or `-` alone to read stdin. The
+`--config settings.json` option reads the same JSON settings as the server,
+including `diagnostics` and `formatting`; invalid values fail the command. No
+configuration file is loaded automatically.
 
 Exit status is `0` on success, `1` for lint errors (also warnings with
 `--deny-warnings`) or formatting differences with `--check`, and `2` for usage,
 configuration, or I/O errors. Lint hints and information are printed but do not
 fail the command. Diagnostic columns use one-based UTF-16 positions.
 
-For a local build, use `cargo run --bin m2-lint -- .` or
-`cargo run --bin m2-fmt -- --check .`; `cargo run` still starts the server.
+For a local build, use `cargo run --bin m2-lint -- file.m2` or
+`cargo run --bin m2-fmt -- --check file.m2`; `cargo run` still starts the server.
 
 ## Connect your editor
 

@@ -19,6 +19,7 @@
 //! | `S` | style and simplification hints |
 //! | `E` | code Macaulay2 rejects or silently ignores when it runs |
 //! | `T` | type errors found by inference |
+//! | `D` | package documentation Macaulay2 rejects or warns about |
 //!
 //! Users write codes and names in their settings, so neither ever changes, and
 //! a removed diagnostic's code is never reused: `E07` belonged to the
@@ -244,7 +245,7 @@ mod tests {
             assert!(
                 matches!(
                     code.as_bytes(),
-                    [b'X' | b'S' | b'E' | b'T', b'0'..=b'9', b'0'..=b'9']
+                    [b'X' | b'S' | b'E' | b'T' | b'D', b'0'..=b'9', b'0'..=b'9']
                 ),
                 "invalid diagnostic code `{code}`"
             );

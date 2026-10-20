@@ -22,9 +22,9 @@ pub fn hover_response(
     let text = document.text();
     let analysis = document.analysis();
 
-    if let Some(reference) = document.documentation_reference_at(position) {
-        let name = reference.name(text);
-        let mut hover = if let Some(symbol) = document.documentation_symbol(&reference) {
+    if let Some(mention) = document.symbol_mention_at(position) {
+        let name = mention.name(text);
+        let mut hover = if let Some(symbol) = document.mention_symbol(&mention) {
             local_symbol_hover(
                 name,
                 &symbol,
@@ -40,7 +40,7 @@ pub fn hover_response(
                 knowledge.get_record_with_package(&ObjectName(name.to_string()))?;
             record_hover_with_package_and_usage(record, Some(&package), knowledge, None)
         };
-        hover.range = Some(reference.range());
+        hover.range = Some(mention.range());
         return Some(hover);
     }
 
@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_resolves_local_wikilink_documentation_references() {
+    fn hover_resolves_local_wikilink_mentions() {
         let text = "-- use [[x]]\nx := 1\n";
         let document = DocumentSnapshot::from_text(text.to_string(), &ObjectRegistry::default())
             .expect("fixture should parse");
@@ -447,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_resolves_indexed_wikilink_documentation_references() {
+    fn hover_resolves_indexed_wikilink_mentions() {
         let text = "-- use [[ideal]]\nx := 1\n";
         let document = DocumentSnapshot::from_text(text.to_string(), &ObjectRegistry::default())
             .expect("fixture should parse");

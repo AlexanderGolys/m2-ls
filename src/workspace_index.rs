@@ -81,10 +81,11 @@ enum WorkspaceViewer<'a> {
     /// A document, whose own definitions its analysis answers for. It sees
     /// the private globals of the package it belongs to.
     Document(&'a Url),
-    /// A TEST block. Analyzed on its own, it knows none of the definitions
-    /// of the document holding it, and sees every package, its own
-    /// included, only through the exports.
-    PackageTest,
+    /// Code run in a package session, such as a TEST block or a
+    /// documentation example. Analyzed on its own, it knows none of the
+    /// definitions of the document holding it, and sees every package, its
+    /// own included, only through the exports.
+    PackageSession,
 }
 
 pub trait WorkspaceSymbolKnowledge {
@@ -178,8 +179,9 @@ pub struct WorkspaceIndex {
 pub enum WorkspaceView<'index> {
     /// A document of the workspace.
     Document(&'index WorkspaceIndex),
-    /// A TEST block, analyzed as the session `check` runs it in.
-    PackageTest(&'index WorkspaceIndex),
+    /// Code run in a package session, such as a TEST block as `check` runs
+    /// it or a documentation example as `installPackage` runs it.
+    PackageSession(&'index WorkspaceIndex),
 }
 
 impl WorkspaceIndex {
@@ -468,7 +470,7 @@ impl WorkspaceIndex {
         }
         let is_member = match viewer {
             WorkspaceViewer::Document(requester) => self.belongs_to_package(requester, &owner),
-            WorkspaceViewer::PackageTest => false,
+            WorkspaceViewer::PackageSession => false,
         };
         is_member
             || self
@@ -683,14 +685,14 @@ impl WorkspaceView<'_> {
     fn viewer<'a>(&'a self, exclude: &'a Url) -> (&'a WorkspaceIndex, WorkspaceViewer<'a>) {
         match self {
             Self::Document(index) => (index, WorkspaceViewer::Document(exclude)),
-            Self::PackageTest(index) => (index, WorkspaceViewer::PackageTest),
+            Self::PackageSession(index) => (index, WorkspaceViewer::PackageSession),
         }
     }
 }
 
-/// For a TEST block, `exclude` is the document holding it, whose analysis does
-/// not answer for the block's session; the block sees that document like any
-/// other file of its package, through the exports.
+/// For package-session code, `exclude` is the document holding it, whose
+/// analysis does not answer for the session; the code sees that document like
+/// any other file of its package, through the exports.
 impl WorkspaceDefinitionKnowledge for WorkspaceView<'_> {
     fn declarations(&self, name: &str, exclude: &Url) -> Vec<Location> {
         let (index, viewer) = self.viewer(exclude);
@@ -992,7 +994,7 @@ mod tests {
         );
         assert_eq!(index.definitions("after", &script).len(), 1);
 
-        let test_view = WorkspaceView::PackageTest(&index);
+        let test_view = WorkspaceView::PackageSession(&index);
         assert_eq!(test_view.definitions("pub", &package).len(), 1);
         assert!(test_view.definitions("priv", &package).is_empty());
     }

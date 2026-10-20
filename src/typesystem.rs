@@ -20,7 +20,12 @@ pub type InferredType = TypeRange;
 pub enum TypeRole {
     Boolean,
     Function,
+    /// The runtime classes of `method(...)` results. They are unrelated
+    /// siblings below `Function`, not subtypes of `MethodFunction`.
     MethodFunction,
+    MethodFunctionBinary,
+    MethodFunctionSingle,
+    MethodFunctionWithOptions,
     Package,
     Ring,
     String,
@@ -44,6 +49,9 @@ impl TypeRole {
             Self::Boolean => "Boolean",
             Self::Function => "Function",
             Self::MethodFunction => "MethodFunction",
+            Self::MethodFunctionBinary => "MethodFunctionBinary",
+            Self::MethodFunctionSingle => "MethodFunctionSingle",
+            Self::MethodFunctionWithOptions => "MethodFunctionWithOptions",
             Self::Package => "Package",
             Self::Ring => "Ring",
             Self::String => "String",

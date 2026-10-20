@@ -34,6 +34,7 @@ mod library_index;
 mod meta;
 mod node_metadata;
 mod object_registry;
+mod package_documentation;
 mod package_index;
 mod record_lsp;
 mod semantic_token;
@@ -159,26 +160,27 @@ impl Backend {
     }
 
     /// The source analyzed at `position` of `document`, with the workspace as
-    /// it sees it: the TEST block containing the position, analyzed as the
-    /// session `check` runs it in, or else the document itself.
+    /// it sees it: the package-session code containing the position — a TEST
+    /// block or a documentation example — analyzed as the session that runs
+    /// it, or else the document itself.
     fn source_at<'a>(
         &'a self,
         document: &'a DocumentSnapshot,
         position: Position,
     ) -> (&'a DocumentSnapshot, WorkspaceView<'a>) {
-        match document.package_test_at(position) {
-            Some(test) => (
-                &test.snapshot,
-                WorkspaceView::PackageTest(&self.workspace_index),
+        match document.package_session_at(position) {
+            Some(session) => (
+                &session.snapshot,
+                WorkspaceView::PackageSession(&self.workspace_index),
             ),
             None => (document, WorkspaceView::Document(&self.workspace_index)),
         }
     }
 
-    /// What the symbol at `position` of `document` refers to. In a TEST block,
-    /// a name the block binds itself lives in the block's own session, so it
-    /// is local to the block; only the names it gets from the workspace are
-    /// shared with other sources.
+    /// What the symbol at `position` of `document` refers to. In package-
+    /// session code, a name the code binds itself lives in the code's own
+    /// session, so it is local to the code; only the names it gets from the
+    /// workspace are shared with other sources.
     fn reference_target_at(
         &self,
         document: &DocumentSnapshot,
@@ -187,9 +189,9 @@ impl Backend {
     ) -> Option<ReferenceTarget> {
         let (source, workspace) = self.source_at(document, position);
         let target = reference_target(source, uri, position, &workspace)?;
-        let bound_by_test =
+        let bound_by_session =
             !std::ptr::eq(source, document) && source.binding_at_position(position).is_some();
-        Some(if bound_by_test {
+        Some(if bound_by_session {
             ReferenceTarget::Local
         } else {
             target
@@ -679,12 +681,12 @@ impl LanguageServer for Backend {
         let options = self.settings.snapshot().inlay_hints;
         Ok(self.with_scoped_document(uri, |document, knowledge| {
             let mut hints = inlay_hints_response(document, params.range, options, knowledge);
-            for test in document.package_tests() {
+            for session in document.package_sessions() {
                 hints.extend(inlay_hints_response(
-                    &test.snapshot,
+                    &session.snapshot,
                     params.range,
                     options,
-                    test.snapshot.object_registry(),
+                    session.snapshot.object_registry(),
                 ));
             }
             hints

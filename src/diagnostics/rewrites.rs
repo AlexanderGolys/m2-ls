@@ -315,7 +315,7 @@ fn null_test(if_statement: M2Node<'_>, subject_errors: SubjectErrors) -> Option<
     let operator = condition.binary_operator()?;
     let left = condition.child_by_field_name("left")?;
     let right = condition.child_by_field_name("right")?;
-    let tested = match (is_null_value(left), is_null_value(right)) {
+    let tested = match (left.is_null_symbol(), right.is_null_symbol()) {
         (true, false) => right,
         (false, true) => left,
         _ => return None,
@@ -371,16 +371,12 @@ fn coalescence_parts(
     same_expression(repeated_subject, subject).then_some((subject, fallback))
 }
 
-fn is_null_value(node: M2Node<'_>) -> bool {
-    node.is::<Symbol>() && node.text() == "null"
-}
-
 pub fn if_null_branch_rewrite(if_node: M2Node<'_>) -> Option<String> {
     let condition = if_node.child_by_field_name("condition")?;
     let then_branch = clause_of::<ThenClause>(if_node).and_then(clause_value)?;
     let else_branch = clause_of::<ElseClause>(if_node).and_then(clause_value)?;
 
-    if is_null_value(else_branch) {
+    if else_branch.is_null_symbol() {
         return Some(format!(
             "if {} then {}",
             condition.text().trim_end(),
@@ -388,7 +384,7 @@ pub fn if_null_branch_rewrite(if_node: M2Node<'_>) -> Option<String> {
         ));
     }
 
-    if is_null_value(then_branch) && !is_null_value(else_branch) {
+    if then_branch.is_null_symbol() && !else_branch.is_null_symbol() {
         return Some(format!(
             "if {} then {}",
             negated_condition_text(condition),
@@ -411,7 +407,7 @@ pub fn try_statement_rewrite(try_node: M2Node<'_>) -> Option<String> {
     }
 
     if let Some(alternative) = else_clause.and_then(clause_value) {
-        if is_null_value(alternative) {
+        if alternative.is_null_symbol() {
             let mut simplified = format!("try {condition_text}");
             if let Some(consequence_text) = consequence_text {
                 simplified.push_str(" then ");

@@ -18,14 +18,14 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 use tower_lsp::lsp_types::{Position, Range as TextRange, SymbolKind};
 
-use crate::builtin_index::{CallableKind, MethodSignature};
+use crate::builtin_index::{CallableKind, MethodSignature, Record};
 use crate::meta::{BindingRole, Meta, Metadata};
 use crate::node_metadata::{
     matches_token, token_spelling, visit_source_nodes, M2Node, M2SyntaxKind,
 };
 use crate::object_registry::ObjectName;
 use crate::object_registry::{ObjectId, OperatorForm, TypeData, TypeId};
-use crate::package_index::declared_package_name;
+use crate::package_index::{declared_package_name, PackageLoadingOption};
 use crate::semantic_token::{syntax_semantic_token_type, SourceSemanticRole, SourceSemanticToken};
 use crate::source::SourceNavigation;
 use crate::typesystem::{
@@ -160,11 +160,182 @@ pub struct MethodInstallation {
     pub id: MethodInstallationId,
     pub method: Method,
     pub span: TextRange,
-    expected_rhs_arity: usize,
-    pub rhs_lambda_dispatch: Option<Dispatch>,
+    expected_argument_arity: usize,
+    /// How the head passes options, which decides the form the installed
+    /// function must have and which of its lambdas receives the arguments.
+    pub options: MethodOptions,
+    /// The form of the installed function.
+    pub installed: InstalledValue,
+    /// The shape of the installed function when it is a lambda, which
+    /// receives the option table for [`MethodOptions::Table`].
+    pub installed_lambda_dispatch: Option<Dispatch>,
+    /// The shape of the lambda receiving the method's arguments, when the
+    /// installed function has the form [`Self::options`] expect.
+    pub argument_lambda_dispatch: Option<Dispatch>,
     pub(crate) syntax: MethodInstallationSyntax,
-    has_option_handler: bool,
     effect: MethodInstallationEffect,
+}
+
+/// How a method function passes options to the functions installed on it,
+/// decided by the `Options` it was created with, independently of its runtime
+/// class.
+///
+/// For `f ZZ := …`, a call `f 1` evaluates as follows:
+///
+/// | `method(…)` | installed value | `f 1` |
+/// | --- | --- | --- |
+/// | no `Options`, `Options => null` | `x -> body` | `body` |
+/// | `Options => {…}`, `Options => false` | `o -> x -> body` | `body`, `o` the option table |
+/// | `Options => true` | `{…} >> o -> x -> body` | `body`, `o` the declared options |
+///
+/// Any other form either fails at the call or yields something else, for
+/// example `o -> x -> body` without options makes `f 1` a `FunctionClosure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodOptions {
+    /// No options: installed functions receive the arguments.
+    Absent,
+    /// `Options => {…}`: installed functions receive the option table, merged
+    /// from the declared defaults and the call, and return the function of the
+    /// arguments.
+    Table,
+    /// `Options => true`: the call's options are forwarded with the arguments,
+    /// so installed functions declare their own with `{…} >> o -> …`.
+    Forwarded,
+    /// A library `MethodFunctionWithOptions`: [`Self::Table`] or
+    /// [`Self::Forwarded`], which the catalog does not record.
+    TableOrForwarded,
+    /// Neither the source nor the catalog tells whether the method has options.
+    Unrecorded,
+}
+
+impl MethodOptions {
+    /// The options implied by a method function's runtime class, or `None`
+    /// when `class` is not a method function class. `MethodFunctionSingle` and
+    /// `MethodFunctionBinary` exist with and without options.
+    pub fn of_runtime_class(
+        class: &ObjectName,
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Option<Self> {
+        if knowledge.has_type_role(class, TypeRole::MethodFunctionWithOptions) {
+            Some(Self::TableOrForwarded)
+        } else if knowledge.has_type_role(class, TypeRole::MethodFunction) {
+            Some(Self::Absent)
+        } else if knowledge.has_type_role(class, TypeRole::MethodFunctionSingle)
+            || knowledge.has_type_role(class, TypeRole::MethodFunctionBinary)
+        {
+            Some(Self::Unrecorded)
+        } else {
+            None
+        }
+    }
+
+    /// The lambda that receives the method's arguments in an installed
+    /// function of the form these options expect, or `None` when the form
+    /// does not fit. With unrecorded options a lambda returning another lambda
+    /// could be either form, so only one that does not is taken.
+    fn argument_lambda(self, installed: InstalledFunction<'_>) -> Option<M2Node<'_>> {
+        match (self, installed) {
+            (Self::Absent, InstalledFunction::Lambda(lambda)) => Some(lambda),
+            (Self::Unrecorded, InstalledFunction::Lambda(lambda)) => {
+                returned_lambda(lambda).is_none().then_some(lambda)
+            }
+            (Self::Table | Self::TableOrForwarded, InstalledFunction::Lambda(handler))
+            | (
+                Self::Absent | Self::Forwarded | Self::TableOrForwarded | Self::Unrecorded,
+                InstalledFunction::OptionDeclaring { handler, .. },
+            ) => returned_lambda(handler),
+            _ => None,
+        }
+    }
+}
+
+/// The lambda a lambda returns directly, as `x -> …` in `o -> x -> …`.
+fn returned_lambda(lambda: M2Node<'_>) -> Option<M2Node<'_>> {
+    lambda
+        .child_by_field_name("body")
+        .and_then(parenthesized_value)
+        .filter(|body| body.is::<LambdaExpression>())
+}
+
+/// The function an installation stores, read from its syntax once grouping
+/// parentheses and a `Codomain =>` annotation are removed.
+#[derive(Debug, Clone, Copy)]
+enum InstalledFunction<'tree> {
+    /// `x -> …`, or `o -> x -> …` receiving an option table.
+    Lambda(M2Node<'tree>),
+    /// `{…} >> o -> …`: a function declaring its own options, whose handler
+    /// `o -> …` receives them.
+    OptionDeclaring {
+        declaration: M2Node<'tree>,
+        handler: M2Node<'tree>,
+    },
+    /// Any other value, such as a named function.
+    Other(M2Node<'tree>),
+}
+
+impl<'tree> InstalledFunction<'tree> {
+    fn of(value: M2Node<'tree>) -> Option<Self> {
+        let value = parenthesized_value(value)?;
+        if value.is::<LambdaExpression>() {
+            return Some(Self::Lambda(value));
+        }
+        if value.is_option_assignment() {
+            return Self::of(value.child_by_field_name("right")?);
+        }
+        let handler = value
+            .has_binary_operator::<Token![>>]>()
+            .then(|| {
+                value
+                    .child_by_field_name("right")
+                    .and_then(parenthesized_value)
+            })
+            .flatten()
+            .filter(|handler| handler.is::<LambdaExpression>());
+        Some(match handler {
+            Some(handler) => Self::OptionDeclaring {
+                declaration: value,
+                handler,
+            },
+            None => Self::Other(value),
+        })
+    }
+
+    /// The whole installed function, before which a codomain annotation goes.
+    fn node(self) -> M2Node<'tree> {
+        match self {
+            Self::Lambda(node)
+            | Self::OptionDeclaring {
+                declaration: node, ..
+            }
+            | Self::Other(node) => node,
+        }
+    }
+}
+
+/// The form of an installation's stored function that decides whether it
+/// fits the head's [`MethodOptions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstalledValue {
+    /// A lambda: `x -> …`, or `o -> x -> …` receiving an option table.
+    Lambda,
+    /// `{…} >> o -> …`, a function declaring its own options.
+    OptionDeclaring,
+    /// A library function, which neither receives an option table first nor
+    /// returns a function of the arguments.
+    LibraryFunction {
+        /// Whether it accepts options; assumed for every method function
+        /// class that may have them, and for records listing options.
+        declares_options: bool,
+    },
+    /// A value the analysis does not characterize, such as a local name.
+    Unknown,
+}
+
+/// An installation read from its syntax, before its head is resolved.
+struct ClassifiedInstallation<'tree> {
+    installation: MethodInstallation,
+    method_type_spans: Vec<(TextRange, SourceSemanticRole)>,
+    installed: Option<InstalledFunction<'tree>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,9 +385,9 @@ pub struct AssignmentFact {
 }
 
 impl MethodInstallation {
-    /// The argument count the right-hand-side function must take.
-    pub fn expected_rhs_arity(&self) -> usize {
-        self.expected_rhs_arity
+    /// The argument count the lambda receiving the method's arguments must take.
+    pub fn expected_argument_arity(&self) -> usize {
+        self.expected_argument_arity
     }
 
     pub fn takes_effect(&self) -> bool {
@@ -233,13 +404,13 @@ impl MethodInstallation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalFunctionKind {
     Plain,
-    Method,
+    Method(MethodOptions),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CallableHeadKind {
     PlainFunction,
-    MethodFunction,
+    MethodFunction(MethodOptions),
     Unknown,
 }
 
@@ -254,12 +425,11 @@ pub struct FunctionInfo {
     pub installations: Vec<MethodInstallationId>,
     pub dispatch: Option<Dispatch>,
     kind: LocalFunctionKind,
-    accepts_options: bool,
 }
 
 impl FunctionInfo {
     pub fn is_method_function(&self) -> bool {
-        self.kind == LocalFunctionKind::Method
+        matches!(self.kind, LocalFunctionKind::Method(_))
     }
 }
 
@@ -385,6 +555,9 @@ struct SemanticRegistry {
     indexed_callable_objects: HashMap<ObjectId, CallableObjectId>,
     operator_functions: HashMap<Operator, FunctionInfo>,
     installations: Vec<MethodInstallation>,
+    /// Function-head installations by the lambda receiving their arguments,
+    /// whose parameters take the installation's domain types.
+    installations_by_argument_lambda: HashMap<SourceRangeKey, MethodInstallationId>,
     assignment_facts: Vec<AssignmentFact>,
     pending_source_semantic_roles: Vec<(TextRange, SourceSemanticRole)>,
     source_semantic_tokens: Vec<SourceSemanticToken>,
@@ -501,7 +674,7 @@ pub struct Analysis {
 }
 
 impl Analysis {
-    pub fn documentation_symbol_at(&self, name: &str, pos: Position) -> Option<BindingView<'_>> {
+    pub fn mention_symbol_at(&self, name: &str, pos: Position) -> Option<BindingView<'_>> {
         self.get_binding_at(name, pos).or_else(|| {
             let mut fallback = None;
             for binding_id in self.registry.bindings_by_name.get(name)? {
@@ -1056,7 +1229,8 @@ impl Analysis {
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) {
         if (node.is::<StringLiteral>() || node.is::<RawStringLiteral>())
-            && indexed_string_names_package(node, knowledge)
+            && (indexed_string_names_package(node, knowledge)
+                || PackageLoadingOption::lists_package(node))
         {
             self.register_source_semantic_role(
                 source.range_for_node(node),
@@ -1179,6 +1353,19 @@ impl Analysis {
     }
 
     /// The installation characterized for the assignment spanning `node`, if any.
+    /// The domain of the installation whose arguments `lambda` receives.
+    fn argument_lambda_domain(
+        &self,
+        lambda: M2Node,
+        source: &(impl SourceNavigation + ?Sized),
+    ) -> Option<&Vec<ObjectName>> {
+        let id = self
+            .registry
+            .installations_by_argument_lambda
+            .get(&source_range_key(source.range_for_node(lambda)))?;
+        Some(&self.registry.installations[id.0].method.domain)
+    }
+
     pub fn installation_for(
         &self,
         node: M2Node,
@@ -1201,13 +1388,13 @@ impl Analysis {
     /// - `=` installs ONLY the assignment-operator form `T1 op T2 = f`, and only
     ///   when both operands are types — otherwise the identical syntax assigns
     ///   `f` to the lvalue `T1 op T2`, which is a call.
-    fn classify_installation(
+    fn classify_installation<'tree>(
         &self,
         id: MethodInstallationId,
-        node: M2Node,
+        node: M2Node<'tree>,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> Option<(MethodInstallation, Vec<(TextRange, SourceSemanticRole)>)> {
+    ) -> Option<ClassifiedInstallation<'tree>> {
         let (left, operator_node, right) = assignment_parts(node)?;
         let operator = operator_node.text();
         let position = source.position_for_node(left);
@@ -1222,7 +1409,6 @@ impl Analysis {
             .collect::<Vec<_>>();
         let operand_arity = domain.len();
         let span = source.range_for_node(node);
-        let rhs_lambda = assigned_lambda(right);
         let codomain_node = method_codomain_annotation(right);
         let codomain = codomain_node
             .and_then(symbol_node_text)
@@ -1234,26 +1420,24 @@ impl Analysis {
             .chain(codomain_span)
             .map(|range| (range, SourceSemanticRole::MethodTypeParameter))
             .collect::<Vec<_>>();
-        // The RHS function shape, read once here so the arity diagnostic need not
-        // re-walk the tree. Only a plain lambda RHS carries a checkable arity.
-        let rhs_lambda_dispatch =
-            rhs_lambda.and_then(|lambda| self.registry.scopes.function_dispatch(lambda, source));
-
         if matches_token::<Token![:=]>(operator) {
             // `:=` installs by shape alone — no type check on the operands.
-            Some((
-                MethodInstallation {
+            Some(ClassifiedInstallation {
+                installation: MethodInstallation {
                     id,
                     method: Method::new(head, domain, codomain),
                     span,
-                    expected_rhs_arity: operand_arity,
-                    rhs_lambda_dispatch,
+                    expected_argument_arity: operand_arity,
+                    options: MethodOptions::Absent,
+                    installed: InstalledValue::Unknown,
+                    installed_lambda_dispatch: None,
+                    argument_lambda_dispatch: None,
                     syntax: MethodInstallationSyntax::Classical,
-                    has_option_handler: false,
                     effect: MethodInstallationEffect::Rejected,
                 },
-                method_semantic_spans.clone(),
-            ))
+                method_type_spans: method_semantic_spans,
+                installed: InstalledFunction::of(right),
+            })
         } else if matches_token::<Token![=]>(operator) {
             // `=` installs only the assignment form of a BINARY operator (incl.
             // SPACE), and only when every operand is a type; otherwise the same
@@ -1265,19 +1449,22 @@ impl Analysis {
                             self.operand_is_type(operand.name(), position, knowledge)
                         }) =>
                 {
-                    Some((
-                        MethodInstallation {
+                    Some(ClassifiedInstallation {
+                        installation: MethodInstallation {
                             id,
                             method: Method::new(MethodHead::Operator(op), domain, codomain),
                             span,
-                            expected_rhs_arity: operand_arity + 1,
-                            rhs_lambda_dispatch,
+                            expected_argument_arity: operand_arity + 1,
+                            options: MethodOptions::Absent,
+                            installed: InstalledValue::Unknown,
+                            installed_lambda_dispatch: None,
+                            argument_lambda_dispatch: None,
                             syntax: MethodInstallationSyntax::Classical,
-                            has_option_handler: false,
                             effect: MethodInstallationEffect::Rejected,
                         },
-                        method_semantic_spans,
-                    ))
+                        method_type_spans: method_semantic_spans,
+                        installed: InstalledFunction::of(right),
+                    })
                 }
                 _ => None,
             }
@@ -1289,13 +1476,13 @@ impl Analysis {
     /// Classify the left side of an assignment into a `(MethodHead, domain)`
     /// pair (the bare, non-assignment head), or `None` if it is not an
     /// installation target at all. The `=`/`:=` rule is applied by the caller.
-    fn classify_install_method(
+    fn classify_install_method<'tree>(
         &self,
         id: MethodInstallationId,
-        node: M2Node,
+        node: M2Node<'tree>,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> Option<(MethodInstallation, Vec<(TextRange, SourceSemanticRole)>)> {
+    ) -> Option<ClassifiedInstallation<'tree>> {
         if !node.is_space_application()
             || node.child_by_field_name("left").and_then(symbol_node_text) != Some("installMethod")
         {
@@ -1314,7 +1501,7 @@ impl Analysis {
             .map(|node| symbol_node_text(*node).map(ObjectName::new))
             .collect::<Option<Vec<_>>>()?;
         let head = self.install_method_head(head_node, domain.len(), knowledge)?;
-        let expected_rhs_arity = match &head {
+        let expected_argument_arity = match &head {
             // `<-` methods are installed like `(op, =)` assignment methods: the
             // assigned value is one extra parameter after the domain.
             MethodHead::Operator(operator)
@@ -1335,20 +1522,22 @@ impl Analysis {
             })
             .collect();
 
-        Some((
-            MethodInstallation {
+        Some(ClassifiedInstallation {
+            installation: MethodInstallation {
                 id,
                 method: Method::new(head, domain, None),
                 span: source.range_for_node(node),
-                expected_rhs_arity,
-                rhs_lambda_dispatch: assigned_lambda(value)
-                    .and_then(|lambda| self.registry.scopes.function_dispatch(lambda, source)),
+                expected_argument_arity,
+                options: MethodOptions::Absent,
+                installed: InstalledValue::Unknown,
+                installed_lambda_dispatch: None,
+                argument_lambda_dispatch: None,
                 syntax: MethodInstallationSyntax::InstallMethod,
-                has_option_handler: false,
                 effect: MethodInstallationEffect::Rejected,
             },
-            method_semantic_spans,
-        ))
+            method_type_spans: method_semantic_spans,
+            installed: InstalledFunction::of(value),
+        })
     }
 
     fn install_method_head(
@@ -1504,7 +1693,7 @@ impl Analysis {
             if let Some(function) = self.function_for_binding(binding) {
                 return match function.kind {
                     LocalFunctionKind::Plain => CallableHeadKind::PlainFunction,
-                    LocalFunctionKind::Method => CallableHeadKind::MethodFunction,
+                    LocalFunctionKind::Method(options) => CallableHeadKind::MethodFunction(options),
                 };
             }
             return binding
@@ -1512,27 +1701,39 @@ impl Analysis {
                 .inferred_type
                 .as_ref()
                 .and_then(InferredType::single)
-                .map(|type_name| {
-                    if knowledge.has_type_role(type_name, TypeRole::MethodFunction) {
-                        CallableHeadKind::MethodFunction
-                    } else if knowledge.has_type_role(type_name, TypeRole::Function) {
-                        CallableHeadKind::PlainFunction
-                    } else {
-                        CallableHeadKind::Unknown
-                    }
-                })
-                .unwrap_or(CallableHeadKind::Unknown);
+                .map_or(
+                    CallableHeadKind::Unknown,
+                    |type_name| match MethodOptions::of_runtime_class(type_name, knowledge) {
+                        Some(options) => CallableHeadKind::MethodFunction(options),
+                        None if knowledge.has_type_role(type_name, TypeRole::Function) => {
+                            CallableHeadKind::PlainFunction
+                        }
+                        None => CallableHeadKind::Unknown,
+                    },
+                );
         }
         knowledge
             .get_record(&ObjectName::new(name))
-            .and_then(|record| record.callable())
-            .map_or(CallableHeadKind::Unknown, |callable| {
+            .and_then(|record| Some((record, record.callable()?)))
+            .map_or(CallableHeadKind::Unknown, |(record, callable)| {
                 if callable.is_method_function() {
-                    CallableHeadKind::MethodFunction
+                    CallableHeadKind::MethodFunction(Self::catalog_method_options(
+                        record, knowledge,
+                    ))
                 } else {
                     CallableHeadKind::PlainFunction
                 }
             })
+    }
+
+    /// The options of a catalog method function, read from its runtime class.
+    /// A record without a method function class leaves them unrecorded.
+    fn catalog_method_options(
+        record: &Record,
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> MethodOptions {
+        MethodOptions::of_runtime_class(&record.class, knowledge)
+            .unwrap_or(MethodOptions::Unrecorded)
     }
 
     fn enrich_parameters(
@@ -1879,8 +2080,13 @@ impl Analysis {
     ) -> Option<MethodCodomainDeduction> {
         let installation = self.installation_for(assignment, source)?;
         let (left, _, right) = assignment_parts(assignment)?;
-        let lambda = assigned_lambda(right)?;
-        let body = lambda.child_by_field_name("body")?;
+        // The annotation precedes the installed lambda, while the codomain is
+        // the value of the lambda receiving the arguments.
+        let installed = InstalledFunction::of(right)?;
+        let body = installation
+            .options
+            .argument_lambda(installed)?
+            .child_by_field_name("body")?;
         let codomain = self.infer_expression_static_type(body, source, knowledge)?;
         if codomain == TypeRole::Thing.object_name() {
             return None;
@@ -1918,7 +2124,7 @@ impl Analysis {
         let edit = annotation.map_or_else(
             || {
                 MethodCodomainEdit::Add({
-                    let start = source.position_for_node(lambda);
+                    let start = source.position_for_node(installed.node());
                     TextRange::new(start, start)
                 })
             },
@@ -1982,10 +2188,11 @@ impl Analysis {
                 installations: Vec::new(),
                 dispatch: None,
                 kind: match callable.kind {
-                    CallableKind::MethodFunction => LocalFunctionKind::Method,
+                    CallableKind::MethodFunction => LocalFunctionKind::Method(
+                        Self::catalog_method_options(knowledge.object(&indexed_id)?, knowledge),
+                    ),
                     CallableKind::Function | CallableKind::Operator(_) => LocalFunctionKind::Plain,
                 },
-                accepts_options: !callable.options.is_empty(),
             };
             let object_id = CallableObjectId(self.registry.callable_objects.len());
             self.registry.callable_objects.push(function);
@@ -1995,13 +2202,12 @@ impl Analysis {
             return Some(object_id);
         }
 
-        let function = if let Some(typical_value) = method_declaration_typical_value(value) {
+        let function = if let Some(declaration) = MethodDeclaration::of(value) {
             Some(FunctionInfo {
-                typical_value,
+                typical_value: declaration.typical_value(),
                 installations: Vec::new(),
                 dispatch: None,
-                kind: LocalFunctionKind::Method,
-                accepts_options: method_declaration_accepts_options(value),
+                kind: LocalFunctionKind::Method(declaration.options()),
             })
         } else if value.is::<LambdaExpression>() {
             Some(FunctionInfo {
@@ -2009,7 +2215,6 @@ impl Analysis {
                 installations: Vec::new(),
                 dispatch: self.registry.scopes.function_dispatch(value, source),
                 kind: LocalFunctionKind::Plain,
-                accepts_options: false,
             })
         } else {
             None
@@ -2029,17 +2234,16 @@ impl Analysis {
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<MethodInstallationId> {
         let id = MethodInstallationId(self.registry.installations.len());
-        let (installation, method_type_spans) =
-            self.classify_installation(id, assignment, source, knowledge)?;
+        let classified = self.classify_installation(id, assignment, source, knowledge)?;
 
         // Preserve M2's distinct assignment-method form: only `:=` contributes
         // a callable signature here. `=` installations are retained for
         // diagnostics/document symbols but are not ordinary call methods.
         self.retain_method_installation(
-            installation,
-            method_type_spans,
+            classified,
             assignment_parts(assignment)
                 .is_some_and(|(_, operator, _)| matches_token::<Token![:=]>(operator.text())),
+            source,
             knowledge,
         )
     }
@@ -2051,20 +2255,47 @@ impl Analysis {
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<MethodInstallationId> {
         let id = MethodInstallationId(self.registry.installations.len());
-        let (installation, method_type_spans) =
-            self.classify_install_method(id, call, source, knowledge)?;
-        self.retain_method_installation(installation, method_type_spans, true, knowledge)
+        let classified = self.classify_install_method(id, call, source, knowledge)?;
+        self.retain_method_installation(classified, true, source, knowledge)
     }
 
     fn retain_method_installation(
         &mut self,
-        mut installation: MethodInstallation,
-        method_type_spans: Vec<(TextRange, SourceSemanticRole)>,
+        classified: ClassifiedInstallation,
         attach: bool,
+        source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<MethodInstallationId> {
+        let ClassifiedInstallation {
+            mut installation,
+            method_type_spans,
+            installed,
+        } = classified;
         if attach {
             installation.effect = self.attach_method_installation(&mut installation, knowledge);
+        }
+        installation.installed = installed.map_or(InstalledValue::Unknown, |installed| {
+            self.installed_value(installed, installation.span.start, knowledge)
+        });
+        // Read once here so the arity check and parameter typing need not
+        // re-walk the tree. Only a lambda carries a checkable arity.
+        installation.installed_lambda_dispatch = match installed {
+            Some(InstalledFunction::Lambda(lambda)) => {
+                self.registry.scopes.function_dispatch(lambda, source)
+            }
+            _ => None,
+        };
+        let argument_lambda =
+            installed.and_then(|installed| installation.options.argument_lambda(installed));
+        installation.argument_lambda_dispatch = argument_lambda
+            .and_then(|lambda| self.registry.scopes.function_dispatch(lambda, source));
+        if let (MethodHead::Function(_), Some(lambda)) =
+            (&installation.method.head, argument_lambda)
+        {
+            self.registry.installations_by_argument_lambda.insert(
+                source_range_key(source.range_for_node(lambda)),
+                installation.id,
+            );
         }
 
         for (range, role) in method_type_spans {
@@ -2074,6 +2305,32 @@ impl Analysis {
         debug_assert_eq!(installation.id.0, self.registry.installations.len());
         self.registry.installations.push(installation);
         Some(id)
+    }
+
+    fn installed_value(
+        &self,
+        installed: InstalledFunction,
+        position: Position,
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> InstalledValue {
+        match installed {
+            InstalledFunction::Lambda(_) => InstalledValue::Lambda,
+            InstalledFunction::OptionDeclaring { .. } => InstalledValue::OptionDeclaring,
+            InstalledFunction::Other(value) => {
+                let library_record = symbol_node_text(value)
+                    .filter(|name| self.get_binding_at(name, position).is_none())
+                    .and_then(|name| knowledge.get_record(&ObjectName::new(name)))
+                    .and_then(|record| Some((record, record.callable()?)));
+                match library_record {
+                    Some((record, callable)) => InstalledValue::LibraryFunction {
+                        declares_options: !callable.options.is_empty()
+                            || MethodOptions::of_runtime_class(&record.class, knowledge)
+                                .is_some_and(|options| options != MethodOptions::Absent),
+                    },
+                    None => InstalledValue::Unknown,
+                }
+            }
+        }
     }
 
     fn attach_method_installation(
@@ -2088,9 +2345,10 @@ impl Analysis {
                         return MethodInstallationEffect::Rejected;
                     }
                     CallableHeadKind::Unknown => {
+                        installation.options = MethodOptions::Unrecorded;
                         return MethodInstallationEffect::Unresolved;
                     }
-                    CallableHeadKind::MethodFunction => {}
+                    CallableHeadKind::MethodFunction(options) => installation.options = options,
                 }
                 let Some(object_id) = self
                     .get_binding_at(name.name(), installation.span.start)
@@ -2131,7 +2389,6 @@ impl Analysis {
                         installations: Vec::new(),
                         dispatch: None,
                         kind: LocalFunctionKind::Plain,
-                        accepts_options: false,
                     });
                 function.installations.push(installation.id);
                 MethodInstallationEffect::Effective
@@ -2319,64 +2576,98 @@ fn is_condition_value(node: M2Node<'_>) -> bool {
     false
 }
 
-fn method_declaration_typical_value(node: M2Node) -> Option<Option<ObjectName>> {
-    if !node.is_space_application() {
-        return None;
-    }
-
-    let left = node.child_by_field_name("left")?;
-    if symbol_node_text(left) != Some("method") {
-        return None;
-    }
-
-    Some(find_option_value(node, "TypicalValue"))
+/// The options of Macaulay2's `method` that shape the method function it creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MethodDeclarationOption {
+    Binary,
+    Dispatch,
+    Options,
+    TypicalValue,
 }
 
-/// Check if a binary expression is a call to the `method` function, catching
-/// cases where the tree structure doesn't perfectly match a space_application.
-fn is_method_call(node: M2Node) -> bool {
-    if !node.is_adjacent_expr() && !node.is_binary_expr() {
-        return false;
+impl MethodDeclarationOption {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Binary => "Binary",
+            Self::Dispatch => "Dispatch",
+            Self::Options => "Options",
+            Self::TypicalValue => "TypicalValue",
+        }
     }
-    node.child_by_field_name("left")
-        .and_then(|left| symbol_node_text(left))
-        == Some("method")
 }
 
-fn find_option_value(node: M2Node, option_name: &str) -> Option<ObjectName> {
-    find_option_value_node(node, option_name)
-        .and_then(symbol_node_text)
-        .map(ObjectName::new)
+/// A `method(...)` call, which creates a method function.
+///
+/// Its options are read from the call's own arguments only, so an option list
+/// such as `Options => {Binary => true}` does not configure the method itself.
+#[derive(Debug, Clone, Copy)]
+struct MethodDeclaration<'tree> {
+    call: M2Node<'tree>,
 }
 
-fn find_option_value_node<'tree>(node: M2Node<'tree>, option_name: &str) -> Option<M2Node<'tree>> {
-    if node.is_option_assignment() {
-        let left = node.child_by_field_name("left")?;
-        let right = node.child_by_field_name("right")?;
-        if symbol_node_text(left) == Some(option_name) {
-            return Some(right);
+impl<'tree> MethodDeclaration<'tree> {
+    fn of(node: M2Node<'tree>) -> Option<Self> {
+        (node.is_space_application()
+            && node.child_by_field_name("left").and_then(symbol_node_text) == Some("method"))
+        .then_some(Self { call: node })
+    }
+
+    fn option(self, option: MethodDeclarationOption) -> Option<M2Node<'tree>> {
+        let arguments = parenthesized_value(self.call.child_by_field_name("right")?)?;
+        let mut arguments = if arguments.is_sequence() {
+            arguments.collection_elements().collect::<Vec<_>>()
+        } else {
+            vec![arguments]
+        };
+        arguments.retain(|argument| {
+            argument.is_option_assignment()
+                && argument
+                    .child_by_field_name("left")
+                    .and_then(symbol_node_text)
+                    == Some(option.name())
+        });
+        arguments.pop()?.child_by_field_name("right")
+    }
+
+    fn typical_value(self) -> Option<ObjectName> {
+        self.option(MethodDeclarationOption::TypicalValue)
+            .and_then(symbol_node_text)
+            .map(ObjectName::new)
+    }
+
+    /// `method` takes options exactly when `Options` is given and not `null`;
+    /// `true` forwards them, any other value (an empty list and `false`
+    /// included) passes them as a table.
+    fn options(self) -> MethodOptions {
+        match self.option(MethodDeclarationOption::Options) {
+            None => MethodOptions::Absent,
+            Some(options) if options.is_null_symbol() => MethodOptions::Absent,
+            Some(options) if symbol_node_text(options) == Some("true") => MethodOptions::Forwarded,
+            Some(_) => MethodOptions::Table,
         }
     }
 
-    for child in node.named_children() {
-        if let Some(value) = find_option_value_node(child, option_name) {
-            return Some(value);
+    /// The runtime class `method` picks: `Binary => true` first, then a single
+    /// `Dispatch` of `Thing` or `Type`, then whether there are options.
+    fn runtime_class(self) -> TypeRole {
+        let is_symbol = |option, role: TypeRole| {
+            self.option(option).and_then(symbol_node_text) == Some(role.object_name().name())
+        };
+        if self
+            .option(MethodDeclarationOption::Binary)
+            .and_then(symbol_node_text)
+            == Some("true")
+        {
+            TypeRole::MethodFunctionBinary
+        } else if is_symbol(MethodDeclarationOption::Dispatch, TypeRole::Thing)
+            || is_symbol(MethodDeclarationOption::Dispatch, TypeRole::Type)
+        {
+            TypeRole::MethodFunctionSingle
+        } else if self.options() != MethodOptions::Absent {
+            TypeRole::MethodFunctionWithOptions
+        } else {
+            TypeRole::MethodFunction
         }
-    }
-    None
-}
-
-fn method_declaration_accepts_options(node: M2Node<'_>) -> bool {
-    let Some(options) = find_option_value_node(node, "Options") else {
-        return false;
-    };
-    match symbol_node_text(options) {
-        Some("false") => false,
-        Some(_) => true,
-        None if options.is_collection_expression() => {
-            options.collection_elements().next().is_some()
-        }
-        None => true,
     }
 }
 
@@ -2406,46 +2697,6 @@ fn literal_option_value(node: M2Node<'_>) -> Option<&str> {
     } else {
         None
     }
-}
-
-pub fn method_installation_signature(node: M2Node) -> Option<(String, Vec<ObjectName>)> {
-    if !node.is_space_application() {
-        return None;
-    }
-
-    let callable = node.child_by_field_name("left")?;
-    let arguments = node.child_by_field_name("right")?;
-    let callable = symbol_node_text(callable)?;
-    let domain = method_installation_domain(arguments)?;
-    Some((callable.to_string(), domain))
-}
-
-fn method_installation_parameter_types_for_function(
-    function_node: M2Node,
-) -> Option<Vec<ObjectName>> {
-    let mut current = function_node;
-    while let Some(parent) = current.parent() {
-        if parent.is::<LambdaExpression>() {
-            return None;
-        }
-
-        if parent.is_assignment() {
-            let left = parent.child_by_field_name("left")?;
-            let right = parent.child_by_field_name("right")?;
-            let operator = parent.child_by_field_name("operator")?;
-            if !matches_token::<Token![:=]>(operator.text()) {
-                return None;
-            }
-            if !right.contains(function_node) {
-                return None;
-            }
-            return method_installation_signature(left).map(|(_, domain)| domain);
-        }
-
-        current = parent;
-    }
-
-    None
 }
 
 fn method_installation_assignment_for_callable_node<'tree>(
@@ -2575,15 +2826,6 @@ fn method_installation_domain_nodes(node: M2Node) -> Option<Vec<M2Node>> {
     }
 
     symbol_node_text(node).map(|_| vec![node])
-}
-
-pub fn method_installation_domain(node: M2Node) -> Option<Vec<ObjectName>> {
-    method_installation_domain_nodes(node).map(|nodes| {
-        nodes
-            .into_iter()
-            .map(|node| ObjectName::new(symbol_node_text(node).unwrap_or_else(|| node.text())))
-            .collect()
-    })
 }
 
 fn call_like_left_symbol_for_argument<'tree>(

@@ -29,6 +29,26 @@ pub struct PackageImport {
 pub struct Macaulay2Conventions;
 
 impl Macaulay2Conventions {
+    /// The headline length past which `document` warns that headlines must be
+    /// shorter than 100 characters.
+    pub const HEADLINE_WARNING_LENGTH: usize = 100;
+
+    /// The headline length past which `document` rejects the headline.
+    pub const HEADLINE_MAXIMUM_LENGTH: usize = 200;
+
+    /// The function after whose call a package's documentation starts: what
+    /// follows it is skipped when the package loads without documentation.
+    pub const BEGIN_DOCUMENTATION: &str = "beginDocumentation";
+
+    /// The packages a `beginDocumentation()` call loads with `needsPackage`
+    /// for the documentation after it: the hypertext of `Text` (`TO`, `PARA`,
+    /// …) and the `doc` function of `SimpleDoc`.
+    pub const DOCUMENTATION_PACKAGES: [&str; 2] = ["Text", "SimpleDoc"];
+
+    /// The columns a tab advances SimpleDoc indentation to the next multiple
+    /// of.
+    pub const SIMPLE_DOC_TAB_WIDTH: usize = 8;
+
     /// The command Macaulay2 is run by.
     pub const EXECUTABLE: &str = "M2";
 
@@ -596,12 +616,10 @@ pub fn package_source_string(node: M2Node<'_>) -> Option<&str> {
 }
 
 pub fn is_package_import_string(node: M2Node<'_>) -> bool {
-    node.ancestors()
-        .find_map(|application| {
-            let argument = package_import_argument(application)?;
-            (argument.id() == node.id()).then_some(())
+    PackageLoadingOption::lists_package(node)
+        || node.ancestors().any(|application| {
+            package_import_argument(application).is_some_and(|argument| argument.id() == node.id())
         })
-        .is_some()
 }
 
 fn package_import<'tree>(application: M2Node<'tree>) -> Option<(M2Node<'tree>, &'tree str)> {
@@ -657,6 +675,68 @@ pub fn declared_package_name(application: M2Node<'_>) -> Option<M2Node<'_>> {
     })
 }
 
+/// A `newPackage` option listing packages the new package loads: right after
+/// the call makes the package current, Macaulay2 runs `needsPackage` on each
+/// of them, imports first, so the package's own code sees their exports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageLoadingOption {
+    /// `PackageImports`: loaded for the package's own code.
+    Imports,
+    /// `PackageExports`: loaded for the package's own code and, along with
+    /// the package, into every session that loads it.
+    Exports,
+}
+
+impl PackageLoadingOption {
+    /// Every option, in the order Macaulay2 loads their packages.
+    pub const ALL: [Self; 2] = [Self::Imports, Self::Exports];
+
+    /// The option key as written in the `newPackage` call.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Imports => "PackageImports",
+            Self::Exports => "PackageExports",
+        }
+    }
+
+    /// The package-name strings `call` lists under the option, when `call` is
+    /// a `newPackage` call. Macaulay2 accepts only a list as its value.
+    pub fn package_names(self, call: M2Node<'_>) -> Vec<M2Node<'_>> {
+        if first_call_argument(call, |name| name == PACKAGE_CONSTRUCTOR).is_none() {
+            return Vec::new();
+        }
+        let Some(arguments) = call.child_by_field_name("right") else {
+            return Vec::new();
+        };
+        arguments
+            .collection_elements()
+            .filter(|option| option.is_option_assignment())
+            .filter(|option| {
+                option
+                    .child_by_field_name("left")
+                    .is_some_and(|key| key.text() == self.key())
+            })
+            .filter_map(|option| option.child_by_field_name("right"))
+            .filter(|packages| packages.is_collection_expression())
+            .flat_map(|packages| packages.collection_elements().collect::<Vec<_>>())
+            .filter(|package| package.string_literal_inner_text().is_some())
+            .collect()
+    }
+
+    /// Whether the string `node` names a package some option of an enclosing
+    /// `newPackage` call lists.
+    pub fn lists_package(node: M2Node<'_>) -> bool {
+        node.ancestors().any(|call| {
+            Self::ALL.into_iter().any(|option| {
+                option
+                    .package_names(call)
+                    .iter()
+                    .any(|package| package.id() == node.id())
+            })
+        })
+    }
+}
+
 /// The first argument of `callee ARG` / `callee(ARG, …)` when `callee` is
 /// accepted by `is_trigger`.
 pub fn first_call_argument(
@@ -698,12 +778,33 @@ pub fn collect_imported_packages_in_tree(
 ) -> Vec<PackageImport> {
     let mut packages = Vec::new();
     visit_source_nodes(root, syntax, |application| {
+        let effective_from = source.range_for_node(application).end;
         if let Some((_, package_name)) = package_import(application) {
             packages.push(PackageImport {
                 package: ObjectName::new(package_name),
-                effective_from: source.range_for_node(application).end,
+                effective_from,
             });
         }
+        if application.applied_symbol_name() == Some(Macaulay2Conventions::BEGIN_DOCUMENTATION) {
+            packages.extend(
+                Macaulay2Conventions::DOCUMENTATION_PACKAGES
+                    .into_iter()
+                    .map(|package| PackageImport {
+                        package: ObjectName::new(package),
+                        effective_from,
+                    }),
+            );
+        }
+        packages.extend(
+            PackageLoadingOption::ALL
+                .into_iter()
+                .flat_map(|option| option.package_names(application))
+                .filter_map(|package| package.string_literal_inner_text())
+                .map(|package| PackageImport {
+                    package: ObjectName::new(package),
+                    effective_from,
+                }),
+        );
     });
 
     packages
@@ -713,16 +814,7 @@ pub fn collect_imported_packages_in_tree(
 /// callee name, when `node` is a `SPACE` application whose left operand is a
 /// bare symbol.
 fn binary_expression_left_symbol(node: M2Node<'_>) -> Option<&str> {
-    if !node.is_space_application() {
-        return None;
-    }
-
-    let left = node.child_by_field_name("left")?;
-    if !left.is::<Symbol>() {
-        return None;
-    }
-
-    Some(left.text())
+    node.applied_symbol_name()
 }
 
 #[cfg(test)]

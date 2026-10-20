@@ -237,6 +237,37 @@ INSTALL_ARITY {
         severity: ERROR,
     }
 
+    /// An installed function whose form does not fit how the method passes
+    /// options: a method with an option table (`Options => {…}`) installs
+    /// `o -> x -> …`, and one forwarding its options (`Options => true`)
+    /// installs a function declaring them, `{…} >> o -> x -> …`.
+    ///
+    /// ```m2
+    /// f = method(Options => {Limit => 1})
+    /// f ZZ := print
+    /// f QQ := {} >> o -> x -> x
+    /// g = method(Options => true)
+    /// g ZZ := o -> x -> x
+    /// ```
+INSTALL_OPTION_FORM {
+        code: "E11",
+        name: "install-option-form",
+        severity: ERROR,
+    }
+
+    /// A function declaring options with `>>` installed on a method without
+    /// options, which cannot pass any, so the declared defaults always apply.
+    ///
+    /// ```m2
+    /// f = method()
+    /// f ZZ := {Limit => 1} >> o -> x -> x
+    /// ```
+INSTALL_UNREACHABLE_OPTIONS {
+        code: "E12",
+        name: "install-unreachable-options",
+        severity: WARNING,
+    }
+
     /// A method installed with `=`, which Macaulay2 rejects; installations use
     /// `:=`.
     ///
@@ -288,22 +319,6 @@ EXPLICIT_INSTALL_REQUIRED {
         severity: ERROR,
     }
 
-    /// A `newPackage` section that no matching `endPackage` closes. Macaulay2
-    /// closes a package left open when its file ends, but everything after
-    /// the declaration then stays private to the package, so every package
-    /// has to close itself.
-    ///
-    /// ```m2
-    /// newPackage "Example"
-    /// export {"double"}
-    /// double = x -> 2 * x
-    /// ```
-MISSING_END_PACKAGE {
-        code: "E10",
-        name: "missing-end-package",
-        severity: ERROR,
-    }
-
     /// A parallel assignment whose right side has a type that cannot supply
     /// several values.
     ///
@@ -351,5 +366,161 @@ INSTALL_CODOMAIN_MISMATCH {
         code: "T04",
         name: "install-codomain-mismatch",
         severity: WARNING,
+    }
+
+    /// A SimpleDoc keyword or `document` option that does not exist where it
+    /// is written. In SimpleDoc, a content line indented no deeper than the
+    /// keyword above it reads as a keyword too; `document` has no
+    /// `Description` option, its description being the list's other elements.
+    ///
+    /// ```m2
+    /// doc ///
+    /// Key
+    ///   f
+    /// Headlines
+    ///   a function
+    /// ///
+    /// ```
+UNKNOWN_DOCUMENTATION_SECTION {
+        code: "D01",
+        name: "unknown-documentation-section",
+        severity: ERROR,
+    }
+
+    /// Documentation `document` or SimpleDoc rejects: a section given twice,
+    /// a section missing its content, a headline over several lines or over
+    /// 200 characters, an `Inputs` item without `:` or `=>`, `Inputs` without
+    /// `Usage`, an unmatched `@`, an expression that does not parse, or
+    /// options passed outside the `document` list.
+    ///
+    /// ```m2
+    /// doc ///
+    /// Key
+    ///   f
+    /// Inputs
+    ///   n ZZ
+    /// ///
+    /// ```
+MALFORMED_DOCUMENTATION {
+        code: "D02",
+        name: "malformed-documentation",
+        severity: ERROR,
+    }
+
+    /// A documentation page without a `Key`.
+    ///
+    /// ```m2
+    /// doc ///
+    /// Headline
+    ///   a function
+    /// ///
+    /// ```
+MISSING_DOCUMENTATION_KEY {
+        code: "D03",
+        name: "missing-documentation-key",
+        severity: ERROR,
+    }
+
+    /// A headline longer than the 100 characters `document` allows without a
+    /// warning.
+    ///
+    /// ```m2
+    /// document {Key => f, Headline => "a headline that goes on and on, well past the hundred characters Macaulay2 accepts quietly"}
+    /// ```
+LONG_HEADLINE {
+        code: "D04",
+        name: "long-headline",
+        severity: WARNING,
+    }
+
+    /// A name documentation evaluates — a key, an `@TO …@` link, a `SeeAlso`
+    /// entry — that neither the package nor a package it loads defines.
+    /// Macaulay2 creates it as a new symbol, which `endPackage` rejects as a
+    /// "mutable unexported unset symbol".
+    ///
+    /// ```m2
+    /// newPackage "P"
+    /// export {"foo"}
+    /// foo = x -> x
+    /// beginDocumentation()
+    /// doc ///
+    /// Key
+    ///   foo
+    /// SeeAlso
+    ///   bar
+    /// ///
+    /// ```
+UNDEFINED_DOCUMENTATION_KEY {
+        code: "D05",
+        name: "undefined-documentation-key",
+        severity: ERROR,
+    }
+
+    /// A key documented twice, or both documented and listed in
+    /// `undocumented`.
+    ///
+    /// ```m2
+    /// doc ///
+    /// Key
+    ///   foo
+    /// ///
+    /// document {Key => foo}
+    /// ```
+DUPLICATE_DOCUMENTATION {
+        code: "D06",
+        name: "duplicate-documentation",
+        severity: ERROR,
+    }
+
+    /// An exported symbol without documentation in a package whose
+    /// documentation is in the same file; `installPackage` warns about each.
+    /// List deliberately undocumented symbols in `undocumented {…}`.
+    ///
+    /// ```m2
+    /// newPackage "P"
+    /// export {"foo", "bar"}
+    /// foo = x -> x
+    /// bar = x -> x
+    /// beginDocumentation()
+    /// doc ///
+    /// Key
+    ///   foo
+    /// ///
+    /// ```
+UNDOCUMENTED_EXPORT {
+        code: "D07",
+        name: "undocumented-export",
+        severity: WARNING,
+    }
+
+    /// Documentation outside every package section of a file that declares
+    /// packages, where no package is open to hold it.
+    ///
+    /// ```m2
+    /// newPackage "P"
+    /// endPackage "P"
+    /// document {Key => "P"}
+    /// ```
+DOCUMENTATION_OUTSIDE_PACKAGE {
+        code: "D08",
+        name: "documentation-outside-package",
+        severity: ERROR,
+    }
+
+    /// `doc` called in a package before `beginDocumentation()`, which loads
+    /// the SimpleDoc package defining it; until then `doc` is an unset
+    /// symbol.
+    ///
+    /// ```m2
+    /// newPackage "P"
+    /// doc ///
+    /// Key
+    ///   P
+    /// ///
+    /// ```
+DOCUMENTATION_BEFORE_BEGIN {
+        code: "D09",
+        name: "documentation-before-begin",
+        severity: ERROR,
     }
 }

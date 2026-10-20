@@ -3,15 +3,14 @@
 use std::ops::Range;
 
 use m2_syn::nodes::{RawStringLiteral, Symbol};
-use tower_lsp::lsp_types::{Position, Range as TextRange};
+use tower_lsp::lsp_types::Range as TextRange;
 
 use crate::analysis::{Analysis, AssignmentFactKind, BindingId, BindingView, MethodInstallationId};
 use crate::meta::BindingRole;
 use crate::node_metadata::markdown::MarkdownSyntaxParser;
 use crate::node_metadata::{M2Node, M2Parser};
 use crate::object_registry::ObjectName;
-use crate::source::{ByteRange, DocumentSpan, SourceNavigation};
-use crate::util::TextRangeExt;
+use crate::source::{ByteRange, SourceNavigation, SymbolMention};
 
 /// The semantic owner of one accepted documentation block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +63,14 @@ pub struct DocumentationBlock {
 }
 
 impl DocumentationBlock {
+    /// A block showing `hover_markdown` for each of `targets`.
+    pub fn new(hover_markdown: String, targets: Vec<DocumentationTarget>) -> Self {
+        Self {
+            hover_markdown,
+            targets,
+        }
+    }
+
     pub fn hover_markdown(&self) -> &str {
         &self.hover_markdown
     }
@@ -87,37 +94,12 @@ impl DocumentationSnippet {
     }
 }
 
-/// One symbol mention extracted from an otherwise opaque documentation region.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DocumentationReference {
-    span: DocumentSpan,
-}
-
-impl DocumentationReference {
-    pub fn name<'a>(&self, text: &'a str) -> &'a str {
-        &text[self.span.bytes()]
-    }
-
-    pub fn range(&self) -> TextRange {
-        self.span.range()
-    }
-
-    pub fn byte_span(&self) -> (usize, usize) {
-        let bytes = self.span.bytes();
-        (bytes.start, bytes.end)
-    }
-
-    pub fn contains(&self, position: Position) -> bool {
-        self.span.range().contains_position(position)
-    }
-}
-
 /// All documentation projections computed for one source snapshot.
 #[derive(Debug, Default)]
 pub struct DocumentationIndex {
     blocks: Vec<DocumentationBlock>,
     snippets: Vec<DocumentationSnippet>,
-    references: Vec<DocumentationReference>,
+    references: Vec<SymbolMention>,
 }
 
 impl DocumentationIndex {
@@ -130,7 +112,13 @@ impl DocumentationIndex {
         &self.snippets
     }
 
-    pub fn references(&self) -> &[DocumentationReference] {
+    /// Add `blocks` documented elsewhere, such as package documentation
+    /// pages, after the comment documentation, which answers first.
+    pub fn extend_blocks(&mut self, blocks: impl IntoIterator<Item = DocumentationBlock>) {
+        self.blocks.extend(blocks);
+    }
+
+    pub fn references(&self) -> &[SymbolMention] {
         &self.references
     }
 
@@ -198,9 +186,7 @@ pub fn collect_documentation(
         }
     }
 
-    index
-        .references
-        .sort_by_key(DocumentationReference::byte_span);
+    index.references.sort_by_key(SymbolMention::byte_span);
     index
         .references
         .dedup_by_key(|reference| reference.byte_span());
@@ -507,9 +493,9 @@ fn collect_mapped_m2_references(
     for symbol in root.binding_references() {
         let markdown_range = target.start + symbol.start_byte()..target.start + symbol.end_byte();
         if let Some(bytes) = text.source_range(markdown_range) {
-            index.references.push(DocumentationReference {
-                span: source.span_for_bytes(bytes),
-            });
+            index
+                .references
+                .push(SymbolMention::new(source.span_for_bytes(bytes)));
         }
     }
 }
@@ -549,14 +535,13 @@ fn collect_legacy_backtick_snippets(
         let Some(root) = parser.parse(candidate) else {
             continue;
         };
-        index.references.extend(
-            root.binding_references()
-                .map(|symbol| DocumentationReference {
-                    span: source.span_for_bytes(
-                        source_start + symbol.start_byte()..source_start + symbol.end_byte(),
-                    ),
-                }),
-        );
+        index
+            .references
+            .extend(root.binding_references().map(|symbol| {
+                SymbolMention::new(source.span_for_bytes(
+                    source_start + symbol.start_byte()..source_start + symbol.end_byte(),
+                ))
+            }));
         index.snippets.push(DocumentationSnippet {
             bytes: source_start..node.start_byte() + close,
         });
@@ -741,7 +726,7 @@ mod tests {
         );
         assert_eq!(
             document
-                .documentation_references()
+                .symbol_mentions()
                 .iter()
                 .map(|reference| reference.name(text))
                 .collect::<Vec<_>>(),
@@ -822,7 +807,7 @@ mod tests {
             block.hover_markdown(),
             "Use `ideal` and `x + 1`.\n\n```m2\nx = ideal 1\n```"
         );
-        assert_eq!(document.documentation_references()[0].name(text), "ideal");
+        assert_eq!(document.symbol_mentions()[0].name(text), "ideal");
         assert!(!document.documentation_snippets().is_empty());
     }
 
@@ -833,7 +818,7 @@ mod tests {
 
         assert_eq!(
             document
-                .documentation_references()
+                .symbol_mentions()
                 .iter()
                 .map(|reference| reference.name(text))
                 .collect::<Vec<_>>(),

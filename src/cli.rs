@@ -1,9 +1,8 @@
 //! Standalone commands sharing the server's formatter and diagnostics.
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString, Url};
@@ -19,15 +18,54 @@ use crate::settings::ServerSettings;
 /// The standalone tool to execute.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
-    /// Format files in place, or print formatted stdin.
+    /// Format a file in place, or print formatted stdin.
     Formatter,
     /// Report static diagnostics without executing Macaulay2.
     Linter,
 }
 
-#[derive(Default)]
+/// The one source a tool reads.
+enum Input {
+    Stdin,
+    File(PathBuf),
+}
+
+impl Input {
+    /// How diagnostics and messages name the input: the path as given.
+    fn label(&self) -> String {
+        match self {
+            Self::Stdin => "-".into(),
+            Self::File(path) => path.display().to_string(),
+        }
+    }
+
+    fn read(&self) -> Result<String, String> {
+        match self {
+            Self::Stdin => {
+                let mut text = String::new();
+                io::stdin()
+                    .read_to_string(&mut text)
+                    .map_err(|error| error.to_string())?;
+                Ok(text)
+            }
+            Self::File(path) => fs::read_to_string(path).map_err(|error| error.to_string()),
+        }
+    }
+
+    /// The document URI diagnostics are reported against.
+    fn uri(&self) -> Result<Url, String> {
+        let path = match self {
+            Self::Stdin => std::env::current_dir()
+                .map_err(|error| error.to_string())?
+                .join("stdin.m2"),
+            Self::File(path) => fs::canonicalize(path).map_err(|error| error.to_string())?,
+        };
+        Url::from_file_path(path).map_err(|()| "invalid file path".into())
+    }
+}
+
 struct Options {
-    paths: Vec<PathBuf>,
+    input: Input,
     check: bool,
     stdout: bool,
     deny_warnings: bool,
@@ -67,17 +105,21 @@ impl Tool {
 
     fn help(self) -> String {
         let specific = match self {
-            Self::Formatter => "    --check          Report files needing formatting; do not write\n    --stdout         Print one formatted file instead of writing it\n",
+            Self::Formatter => "    --check          Exit 1 if the file needs formatting; do not write\n    --stdout         Print the formatted file instead of writing it\n",
             Self::Linter => "    --deny-warnings  Exit 1 for warnings as well as errors\n",
         };
         format!(
-            "Usage: {} [OPTIONS] [FILE | DIRECTORY | -]...\n\nDefaults to .; directories recursively select .m2 files, skipping hidden\nentries, target, and directory symlinks. Use - alone to read stdin.\n\n{specific}    --config FILE    Read JSON settings (same format as m2-ls)\n    -h, --help       Show help\n    -V, --version    Show version\n    --               Treat remaining arguments as paths\n\nExit codes: 0 success, 1 findings/check failure, 2 usage or I/O error.\n",
+            "Usage: {} [OPTIONS] <FILE | ->\n\nReads one .m2 file, or stdin for -.\n\n{specific}    --config FILE    Read JSON settings (same format as m2-ls)\n    -h, --help       Show help\n    -V, --version    Show version\n    --               Treat the next argument as the file\n\nExit codes: 0 success, 1 findings/check failure, 2 usage or I/O error.\n",
             self.name()
         )
     }
 
     fn parse(self) -> Result<Option<Options>, String> {
-        let mut options = Options::default();
+        let mut paths = Vec::new();
+        let mut check = false;
+        let mut stdout = false;
+        let mut deny_warnings = false;
+        let mut config = None;
         let mut args = std::env::args_os().skip(1);
         while let Some(arg) = args.next() {
             match arg.to_str() {
@@ -89,33 +131,39 @@ impl Tool {
                     println!("{} {}", self.name(), env!("CARGO_PKG_VERSION"));
                     return Ok(None);
                 }
-                Some("--check") if self == Self::Formatter => options.check = true,
-                Some("--stdout") if self == Self::Formatter => options.stdout = true,
-                Some("--deny-warnings") if self == Self::Linter => options.deny_warnings = true,
+                Some("--check") if self == Self::Formatter => check = true,
+                Some("--stdout") if self == Self::Formatter => stdout = true,
+                Some("--deny-warnings") if self == Self::Linter => deny_warnings = true,
                 Some("--config") => {
-                    options.config =
-                        Some(PathBuf::from(args.next().ok_or("--config needs a file")?));
+                    config = Some(PathBuf::from(args.next().ok_or("--config needs a file")?));
                 }
                 Some("--") => {
-                    options.paths.extend(args.map(PathBuf::from));
+                    paths.extend(args.map(PathBuf::from));
                     break;
                 }
                 Some(flag) if flag.starts_with('-') && flag != "-" => {
                     return Err(format!("unknown option {flag}; see --help"));
                 }
-                _ => options.paths.push(PathBuf::from(arg)),
+                _ => paths.push(PathBuf::from(arg)),
             }
         }
-        if options.check && options.stdout {
+        if check && stdout {
             return Err("--check and --stdout cannot be combined".into());
         }
-        if options.paths.is_empty() {
-            options.paths.push(PathBuf::from("."));
-        }
-        if options.paths.iter().any(|path| path == Path::new("-")) && options.paths.len() != 1 {
-            return Err("stdin (-) must be the only input".into());
-        }
-        Ok(Some(options))
+        let [path] = <[PathBuf; 1]>::try_from(paths)
+            .map_err(|_| "expected exactly one file, or - for stdin; see --help")?;
+        let input = if path.as_os_str() == "-" {
+            Input::Stdin
+        } else {
+            Input::File(path)
+        };
+        Ok(Some(Options {
+            input,
+            check,
+            stdout,
+            deny_warnings,
+            config,
+        }))
     }
 
     fn execute(self) -> Result<u8, String> {
@@ -123,130 +171,87 @@ impl Tool {
             return Ok(0);
         };
         let settings = options.settings()?;
-        let stdin = options.paths == [PathBuf::from("-")];
-        let files = if stdin {
-            BTreeSet::new()
-        } else {
-            options.files()?
-        };
-        if options.stdout && !stdin && files.len() != 1 {
-            return Err("--stdout requires exactly one file".into());
+        let label = options.input.label();
+        let text = options
+            .input
+            .read()
+            .map_err(|error| format!("{label}: {error}"))?;
+        match self {
+            Self::Formatter => Self::format(&options, &settings, text),
+            Self::Linter => Self::lint(&options, &settings, text),
         }
-        let mut registry = None;
-        if self == Self::Linter {
-            let mut knowledge = ObjectRegistry::load(include_str!("data/m2-index.jsonl"));
-            InitializationFile::load(&Macaulay2Environment::current(), &mut knowledge);
-            registry = Some(knowledge);
+        .map_err(|error| format!("{label}: {error}"))
+    }
+
+    fn format(options: &Options, settings: &ServerSettings, text: String) -> Result<u8, String> {
+        let mut parser = M2Parser::new().ok_or("could not initialize parser")?;
+        let tree = parser
+            .parse_tree(&text, None)
+            .ok_or("could not parse source")?;
+        let root = tree.root(&text);
+        if root.has_error() {
+            return Err("cannot format source with syntax errors".into());
         }
-        let mut status = 0;
-        let inputs: Vec<_> = if stdin {
-            vec![PathBuf::from("-")]
-        } else {
-            files.into_iter().collect()
-        };
-        for path in inputs {
-            let result: Result<u8, String> = (|| {
-                let text = if stdin {
-                    let mut text = String::new();
-                    io::stdin()
-                        .read_to_string(&mut text)
-                        .map_err(|error| error.to_string())?;
-                    text
-                } else {
-                    fs::read_to_string(&path).map_err(|error| error.to_string())?
-                };
-                match self {
-                    Self::Formatter => {
-                        let mut parser = M2Parser::new().ok_or("could not initialize parser")?;
-                        let tree = parser
-                            .parse_tree(&text, None)
-                            .ok_or("could not parse source")?;
-                        let root = tree.root(&text);
-                        if root.has_error() {
-                            return Err("cannot format source with syntax errors".into());
-                        }
-                        let formatted = format_document_with_options(
-                            root,
-                            &FormatOptions::from(&settings.formatting),
-                        );
-                        if options.check {
-                            if formatted != text {
-                                println!("{}: needs formatting", path.display());
-                                return Ok(1);
-                            }
-                        } else if stdin || options.stdout {
-                            io::stdout()
-                                .write_all(formatted.as_bytes())
-                                .map_err(|error| error.to_string())?;
-                        } else if formatted != text {
-                            fs::write(&path, formatted).map_err(|error| error.to_string())?;
-                        }
-                        Ok(0)
-                    }
-                    Self::Linter => {
-                        let document = DocumentSnapshot::from_text(
-                            text,
-                            registry.as_ref().expect("linter registry"),
-                        )
-                        .ok_or("could not parse source")?;
-                        let uri_path = if stdin {
-                            std::env::current_dir()
-                                .map_err(|error| error.to_string())?
-                                .join("stdin.m2")
-                        } else {
-                            path.clone()
-                        };
-                        let uri =
-                            Url::from_file_path(uri_path).map_err(|()| "invalid file path")?;
-                        let mut failed = false;
-                        for diagnostic in
-                            visible_diagnostics(&document, &uri, &settings.diagnostics)
-                        {
-                            let severity =
-                                diagnostic.severity.unwrap_or(DiagnosticSeverity::WARNING);
-                            failed |= severity == DiagnosticSeverity::ERROR
-                                || (options.deny_warnings
-                                    && severity == DiagnosticSeverity::WARNING);
-                            let label = match severity {
-                                DiagnosticSeverity::ERROR => "error",
-                                DiagnosticSeverity::WARNING => "warning",
-                                DiagnosticSeverity::INFORMATION => "info",
-                                _ => "hint",
-                            };
-                            let code = match diagnostic.code {
-                                Some(NumberOrString::String(code)) => code,
-                                _ => String::new(),
-                            };
-                            println!(
-                                "{}:{}:{}: {label}[{code}]: {}",
-                                path.display(),
-                                diagnostic.range.start.line + 1,
-                                diagnostic.range.start.character + 1,
-                                diagnostic.message
-                            );
-                            for note in diagnostic.related_information.unwrap_or_default() {
-                                println!(
-                                    "{}:{}:{}: note: {}",
-                                    path.display(),
-                                    note.location.range.start.line + 1,
-                                    note.location.range.start.character + 1,
-                                    note.message
-                                );
-                            }
-                        }
-                        Ok(u8::from(failed))
-                    }
-                }
-            })();
-            match result {
-                Ok(code) => status = status.max(code),
-                Err(error) => {
-                    eprintln!("{}: {}: {error}", self.name(), path.display());
-                    status = 2;
+        let formatted =
+            format_document_with_options(root, &FormatOptions::from(&settings.formatting));
+        match &options.input {
+            _ if options.check => {
+                if formatted != text {
+                    println!("{}: needs formatting", options.input.label());
+                    return Ok(1);
                 }
             }
+            Input::File(path) if !options.stdout => {
+                if formatted != text {
+                    fs::write(path, formatted).map_err(|error| error.to_string())?;
+                }
+            }
+            Input::Stdin | Input::File(_) => io::stdout()
+                .write_all(formatted.as_bytes())
+                .map_err(|error| error.to_string())?,
         }
-        Ok(status)
+        Ok(0)
+    }
+
+    fn lint(options: &Options, settings: &ServerSettings, text: String) -> Result<u8, String> {
+        let mut registry = ObjectRegistry::load(include_str!("data/m2-index.jsonl"));
+        InitializationFile::load(&Macaulay2Environment::current(), &mut registry);
+        let document =
+            DocumentSnapshot::from_text(text, &registry).ok_or("could not parse source")?;
+        let label = options.input.label();
+        let mut failed = false;
+        for diagnostic in
+            visible_diagnostics(&document, &options.input.uri()?, &settings.diagnostics)
+        {
+            let severity = diagnostic.severity.unwrap_or(DiagnosticSeverity::WARNING);
+            failed |= severity == DiagnosticSeverity::ERROR
+                || (options.deny_warnings && severity == DiagnosticSeverity::WARNING);
+            let severity_label = match severity {
+                DiagnosticSeverity::ERROR => "error",
+                DiagnosticSeverity::WARNING => "warning",
+                DiagnosticSeverity::INFORMATION => "info",
+                _ => "hint",
+            };
+            let code = match diagnostic.code {
+                Some(NumberOrString::String(code)) => code,
+                _ => String::new(),
+            };
+            println!(
+                "{label}:{}:{}: {severity_label}[{code}]: {}",
+                diagnostic.range.start.line + 1,
+                diagnostic.range.start.character + 1,
+                diagnostic.message
+            );
+            for note in diagnostic.related_information.unwrap_or_default() {
+                println!(
+                    "{label}:{}:{}: note: {}",
+                    note.location.range.start.line + 1,
+                    note.location.range.start.character + 1,
+                    note.message
+                );
+            }
+        }
+        Ok(u8::from(failed))
     }
 }
 
@@ -269,44 +274,5 @@ impl Options {
                 .join("; "));
         }
         Ok(parsed.settings)
-    }
-
-    fn files(&self) -> Result<BTreeSet<PathBuf>, String> {
-        let mut files = BTreeSet::new();
-        for path in &self.paths {
-            Self::collect(path, &mut files)?;
-        }
-        if files.is_empty() {
-            return Err("no .m2 files found".into());
-        }
-        Ok(files)
-    }
-
-    fn collect(path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<(), String> {
-        let metadata =
-            fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
-        if metadata.is_dir() {
-            for entry in
-                fs::read_dir(path).map_err(|error| format!("{}: {error}", path.display()))?
-            {
-                let entry = entry.map_err(|error| error.to_string())?;
-                let name = entry.file_name();
-                let kind = entry.file_type().map_err(|error| error.to_string())?;
-                if name.to_string_lossy().starts_with('.') || name == "target" || kind.is_symlink()
-                {
-                    continue;
-                }
-                if kind.is_dir() || entry.path().extension().is_some_and(|ext| ext == "m2") {
-                    Self::collect(&entry.path(), files)?;
-                }
-            }
-        } else if metadata.is_file() {
-            files.insert(
-                fs::canonicalize(path).map_err(|error| format!("{}: {error}", path.display()))?,
-            );
-        } else {
-            return Err(format!("{}: expected a file or directory", path.display()));
-        }
-        Ok(())
     }
 }

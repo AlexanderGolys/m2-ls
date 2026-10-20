@@ -298,6 +298,11 @@ impl<'tree> M2Node<'tree> {
         self.raw_kind() == "naked_sequence"
     }
 
+    /// Whether this node is the symbol `null`.
+    pub fn is_null_symbol(&self) -> bool {
+        self.is::<Symbol>() && self.text() == "null"
+    }
+
     pub fn is_nothing_value(&self) -> bool {
         self.is_muted_statement() || self.is_empty_component()
     }
@@ -543,6 +548,16 @@ impl<'tree> M2Node<'tree> {
     /// is the inserted `SPACE` token.
     pub fn is_space_application(&self) -> bool {
         self.is_adjacent_expr()
+    }
+
+    /// The function name of a space application `f x` or `f(x)` whose
+    /// function is a plain symbol.
+    pub fn applied_symbol_name(&self) -> Option<&'tree str> {
+        if !self.is_space_application() {
+            return None;
+        }
+        let function = self.child_by_field_name("left")?;
+        function.is::<Symbol>().then(|| function.text())
     }
 }
 

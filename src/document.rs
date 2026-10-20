@@ -12,13 +12,13 @@ use tree_sitter::{InputEdit, Point};
 use crate::analysis::{Analysis, BindingView, FunctionInfo};
 use crate::diagnostics::{self, M2Diagnostic};
 use crate::documentation::{
-    collect_documentation, DocumentationBlock, DocumentationIndex, DocumentationReference,
-    DocumentationSnippet,
+    collect_documentation, DocumentationBlock, DocumentationIndex, DocumentationSnippet,
 };
 use crate::object_registry::{ObjectName, ObjectRegistry};
+use crate::package_documentation::PackageDocumentation;
 use crate::package_index::{collect_imported_packages_in_tree, PackageImport};
-use crate::source::{DocumentSource, SourceNavigation};
-use crate::source_package::{PackageTestBlock, SourcePackages};
+use crate::source::{DocumentSource, SourceNavigation, SymbolMention};
+use crate::source_package::{PackageSessionCode, SourcePackages};
 
 /// One immutable source, syntax, and semantic-analysis snapshot served to LSP
 /// requests.
@@ -31,24 +31,26 @@ pub struct DocumentSnapshot {
     diagnostics: Vec<M2Diagnostic>,
     object_registry: ObjectRegistry,
     documentation: DocumentationIndex,
+    symbol_mentions: Vec<SymbolMention>,
     imported_packages: Vec<PackageImport>,
     packages: SourcePackages,
-    package_tests: Vec<PackageTest>,
+    package_documentation: PackageDocumentation,
+    package_sessions: Vec<PackageSession>,
 }
 
-/// A TEST block analyzed as the session `check` runs it in: the block's code
-/// alone, in a session that loaded its package. Its snapshot shares the
-/// document's LSP positions, so whatever it answers for the block holds in
-/// the document as is.
+/// Code run in a separate session that loaded its package — a TEST block,
+/// as `check` runs it, or the examples of a documentation node, as
+/// `installPackage` runs them — analyzed as that session: the code alone,
+/// seeing the package only through its exports. Its snapshot shares the
+/// document's LSP positions, so whatever it answers for the code holds in the
+/// document as is.
 #[derive(Debug)]
-pub struct PackageTest {
-    /// The package whose exports the block sees.
-    pub package: ObjectName,
-    /// The packages the block's session loads along with the package.
+pub struct PackageSession {
+    /// The code and the package whose exports it sees.
+    pub code: PackageSessionCode,
+    /// The packages the session loads along with the package.
     pub exported_packages: Vec<ObjectName>,
-    /// The block's code between its `///` delimiters.
-    pub body_range: TextRange,
-    /// The block's code analyzed on its own.
+    /// The code analyzed on its own.
     pub snapshot: DocumentSnapshot,
 }
 
@@ -60,7 +62,7 @@ impl SourceNavigation for DocumentSnapshot {
 
 /// The common first step of every reference / highlight / rename request: the
 /// source occurrence under the cursor together with its scope-aware binding.
-/// The occurrence may be a CST symbol or an indexed documentation link.
+/// The occurrence may be a CST symbol or a [`SymbolMention`].
 /// Resolved once per request and threaded through downstream collection.
 #[derive(Debug, Clone, Copy)]
 pub struct TargetSymbol<'a> {
@@ -78,13 +80,14 @@ impl DocumentSnapshot {
 
     /// Analyze `source`, parsed as `tree`, against the packages
     /// `knowledge_provider` has loaded plus those the source imports, then
-    /// each of its TEST blocks against the same packages plus the block's,
-    /// reusing the analysis of the unchanged `previous_tests`.
+    /// the code of each of its package sessions against the same packages
+    /// plus the session's, reusing the analysis of the unchanged
+    /// `previous_sessions`.
     fn analyze(
         source: DocumentSource,
         tree: M2Tree,
         knowledge_provider: &ObjectRegistry,
-        previous_tests: Vec<PackageTest>,
+        previous_sessions: Vec<PackageSession>,
     ) -> Self {
         let typed_ast = tree.typed_source_file(source.text());
         let root = tree.root(source.text());
@@ -93,6 +96,7 @@ impl DocumentSnapshot {
         let knowledge = knowledge_provider.with_imports(&imported_packages);
         let analysis = Analysis::new_with_knowledge(root, typed_ast.as_ref(), &source, &knowledge);
         let packages = SourcePackages::collect(root, &source);
+        let package_documentation = PackageDocumentation::collect(root, &source, &packages);
         let mut diagnostics = diagnostics::collect(
             &analysis,
             root,
@@ -100,14 +104,40 @@ impl DocumentSnapshot {
             &source,
             &knowledge,
             &packages,
+            &package_documentation,
         );
-        let documentation = collect_documentation(&source, root, &analysis);
-        let package_tests =
-            PackageTest::analyze_all(&packages, &source, knowledge_provider, previous_tests);
+        let mut documentation = collect_documentation(&source, root, &analysis);
+        documentation.extend_blocks(package_documentation.documentation_blocks(&analysis));
+        let mut symbol_mentions = documentation
+            .references()
+            .iter()
+            .chain(
+                packages
+                    .declarations()
+                    .iter()
+                    .flat_map(|declaration| declaration.export_mentions()),
+            )
+            .cloned()
+            .chain(package_documentation.mentions())
+            .collect::<Vec<_>>();
+        symbol_mentions.sort_by_key(SymbolMention::byte_span);
+        symbol_mentions.dedup_by_key(|mention| mention.byte_span());
+        let session_code = packages
+            .tests()
+            .iter()
+            .chain(package_documentation.example_sessions())
+            .collect::<Vec<_>>();
+        let package_sessions = PackageSession::analyze_all(
+            &session_code,
+            &packages,
+            &source,
+            knowledge_provider,
+            previous_sessions,
+        );
         diagnostics.extend(
-            package_tests
+            package_sessions
                 .iter()
-                .flat_map(|test| test.snapshot.diagnostics.iter().cloned()),
+                .flat_map(|session| session.snapshot.diagnostics.iter().cloned()),
         );
         Self {
             source,
@@ -117,9 +147,11 @@ impl DocumentSnapshot {
             diagnostics,
             object_registry: knowledge,
             documentation,
+            symbol_mentions,
             imported_packages,
             packages,
-            package_tests,
+            package_documentation,
+            package_sessions,
         }
     }
 
@@ -171,22 +203,28 @@ impl DocumentSnapshot {
         &self.packages
     }
 
-    /// The document's TEST blocks, each analyzed on its own.
-    pub fn package_tests(&self) -> &[PackageTest] {
-        &self.package_tests
+    /// The package documentation the document writes.
+    pub fn package_documentation(&self) -> &PackageDocumentation {
+        &self.package_documentation
     }
 
-    /// The TEST block whose code contains `position`, which answers for it in
-    /// place of the document.
-    pub fn package_test_at(&self, position: Position) -> Option<&PackageTest> {
-        self.package_tests
+    /// The code the document runs in package sessions — its TEST blocks and
+    /// its documentation examples — each analyzed on its own.
+    pub fn package_sessions(&self) -> &[PackageSession] {
+        &self.package_sessions
+    }
+
+    /// The package session whose code contains `position`, which answers for
+    /// it in place of the document.
+    pub fn package_session_at(&self, position: Position) -> Option<&PackageSession> {
+        self.package_sessions
             .iter()
-            .find(|test| test.body_range.start <= position && position <= test.body_range.end)
+            .find(|session| session.code.contains(position))
     }
 
     pub fn binding_at_position(&self, position: Position) -> Option<BindingView<'_>> {
-        if let Some(reference) = self.documentation_reference_at(position) {
-            return self.documentation_symbol(&reference);
+        if let Some(mention) = self.symbol_mention_at(position) {
+            return self.mention_symbol(&mention);
         }
         let node = self.reference_node_at_position(position)?;
         self.source_binding_at(node.text(), position)
@@ -214,15 +252,15 @@ impl DocumentSnapshot {
     }
 
     pub fn target_symbol_at(&self, position: Position) -> Option<TargetSymbol<'_>> {
-        let documentation_reference = self.documentation_reference_at(position);
-        let (name, range) = if let Some(reference) = documentation_reference.as_ref() {
-            (reference.name(self.text()), reference.range())
+        let mention = self.symbol_mention_at(position);
+        let (name, range) = if let Some(mention) = mention.as_ref() {
+            (mention.name(self.text()), mention.range())
         } else {
             let node = self.reference_node_at_position(position)?;
             (node.text(), self.range_for_node(node))
         };
-        let symbol = if let Some(reference) = documentation_reference {
-            self.documentation_symbol(&reference)?
+        let symbol = if let Some(mention) = mention {
+            self.mention_symbol(&mention)?
         } else {
             self.source_symbol_at(name, position)?
         };
@@ -233,8 +271,10 @@ impl DocumentSnapshot {
         })
     }
 
-    pub fn documentation_references(&self) -> &[DocumentationReference] {
-        self.documentation.references()
+    /// Every symbol the document names outside of code, in source order:
+    /// documentation links and the names its packages export.
+    pub fn symbol_mentions(&self) -> &[SymbolMention] {
+        &self.symbol_mentions
     }
 
     pub fn documentation_snippets(&self) -> &[DocumentationSnippet] {
@@ -260,31 +300,30 @@ impl DocumentSnapshot {
         self.documentation.for_installation(installation)
     }
 
-    pub fn documentation_reference_at(&self, position: Position) -> Option<DocumentationReference> {
-        self.documentation
-            .references()
+    pub fn symbol_mention_at(&self, position: Position) -> Option<SymbolMention> {
+        self.symbol_mentions
             .iter()
-            .find(|reference| reference.contains(position))
+            .find(|mention| mention.contains(position))
             .cloned()
     }
 
-    pub fn documentation_symbol(
-        &self,
-        reference: &DocumentationReference,
-    ) -> Option<BindingView<'_>> {
+    /// The binding `mention` refers to: the one its name resolves to at its
+    /// position, or else the global the name is assigned to anywhere, since a
+    /// mention, unlike code, may precede the definition it names.
+    pub fn mention_symbol(&self, mention: &SymbolMention) -> Option<BindingView<'_>> {
         self.analysis
-            .documentation_symbol_at(reference.name(self.text()), reference.range().start)
+            .mention_symbol_at(mention.name(self.text()), mention.range().start)
             .filter(|binding| {
                 Analysis::source_binding_is_visible(
                     *binding,
-                    &self.object_registry.at(reference.range().start),
+                    &self.object_registry.at(mention.range().start),
                 )
             })
     }
 
     pub fn symbol_occurrence_at(&self, position: Position) -> Option<(&str, TextRange)> {
-        if let Some(reference) = self.documentation_reference_at(position) {
-            return Some((reference.name(self.text()), reference.range()));
+        if let Some(mention) = self.symbol_mention_at(position) {
+            return Some((mention.name(self.text()), mention.range()));
         }
         let node = self.reference_node_at_position(position)?;
         Some((node.text(), self.range_for_node(node)))
@@ -383,42 +422,53 @@ impl DocumentSnapshot {
 
         let tree = M2Parser::new()?.parse_tree(self.text(), Some(&edited_tree))?;
         let source = std::mem::replace(&mut self.source, DocumentSource::new(String::new()));
-        let previous_tests = std::mem::take(&mut self.package_tests);
-        *self = Self::analyze(source, tree, knowledge_provider, previous_tests);
+        let previous_sessions = std::mem::take(&mut self.package_sessions);
+        *self = Self::analyze(source, tree, knowledge_provider, previous_sessions);
         Some(())
     }
 }
 
-impl PackageTest {
-    /// The TEST blocks of `packages`, declared in `source`, each analyzed
-    /// alone against `knowledge_provider` plus the packages its package
-    /// exports along. A block whose code, positions, and session match a
-    /// test of `previous` keeps that analysis; the others are analyzed in
+impl PackageSession {
+    /// The sessions running `code`, declared in `source` with `packages`,
+    /// each analyzed alone against `knowledge_provider` plus the packages its
+    /// package exports along. A session whose code, positions, and packages
+    /// match one of `previous` keeps that analysis; the others are analyzed in
     /// parallel.
     fn analyze_all(
+        code: &[&PackageSessionCode],
         packages: &SourcePackages,
         source: &DocumentSource,
         knowledge_provider: &ObjectRegistry,
-        mut previous: Vec<PackageTest>,
-    ) -> Vec<PackageTest> {
-        let mut tests = Vec::with_capacity(packages.tests().len());
+        mut previous: Vec<PackageSession>,
+    ) -> Vec<PackageSession> {
+        let mut sessions = Vec::with_capacity(code.len());
         let mut pending = Vec::new();
-        for (ordinal, block) in packages.tests().iter().enumerate() {
-            let isolated_source = block.isolated_source(source.text());
-            let exported_packages = packages
-                .declarations()
-                .iter()
-                .find(|declaration| declaration.name == block.package)
-                .expect("a TEST block belongs to a package the document declares")
-                .exported_packages
-                .clone();
-            match previous.iter().position(|test| {
-                test.package == block.package
-                    && test.exported_packages == exported_packages
-                    && test.snapshot.text() == isolated_source
+        for (ordinal, session_code) in code.iter().copied().enumerate() {
+            let isolated_source = session_code.isolated_source(source.text());
+            let exported_packages = session_code
+                .package
+                .as_ref()
+                .map(|package| {
+                    packages
+                        .declarations()
+                        .iter()
+                        .find(|declaration| declaration.name == *package)
+                        .expect("session code belongs to a package the document declares")
+                        .exported_packages
+                        .clone()
+                })
+                .unwrap_or_default();
+            match previous.iter().position(|session| {
+                session.code.package == session_code.package
+                    && session.exported_packages == exported_packages
+                    && session.snapshot.text() == isolated_source
             }) {
-                Some(unchanged) => tests.push((ordinal, previous.swap_remove(unchanged))),
-                None => pending.push((ordinal, block, isolated_source, exported_packages)),
+                Some(unchanged) => {
+                    let mut kept = previous.swap_remove(unchanged);
+                    kept.code = session_code.clone();
+                    sessions.push((ordinal, kept));
+                }
+                None => pending.push((ordinal, session_code, isolated_source, exported_packages)),
             }
         }
 
@@ -433,14 +483,15 @@ impl PackageTest {
                     .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
                     .spawn_scoped(scope, || loop {
                         // Taken in its own statement, so the lock is released
-                        // before the block is analyzed.
-                        let next_block = queue.lock().expect("queue lock").next();
-                        let Some((ordinal, block, isolated_source, exported_packages)) = next_block
+                        // before the code is analyzed.
+                        let next_code = queue.lock().expect("queue lock").next();
+                        let Some((ordinal, session_code, isolated_source, exported_packages)) =
+                            next_code
                         else {
                             break;
                         };
-                        if let Some(test) = Self::analyze(
-                            block,
+                        if let Some(session) = Self::analyze(
+                            session_code,
                             isolated_source,
                             exported_packages,
                             knowledge_provider,
@@ -448,21 +499,21 @@ impl PackageTest {
                             analyzed
                                 .lock()
                                 .expect("analyzed lock")
-                                .push((ordinal, test));
+                                .push((ordinal, session));
                         }
                     })
-                    .expect("TEST analysis worker starts");
+                    .expect("package session analysis worker starts");
             }
         });
-        tests.extend(analyzed.into_inner().expect("analyzed lock"));
-        tests.sort_by_key(|(ordinal, _)| *ordinal);
-        tests.into_iter().map(|(_, test)| test).collect()
+        sessions.extend(analyzed.into_inner().expect("analyzed lock"));
+        sessions.sort_by_key(|(ordinal, _)| *ordinal);
+        sessions.into_iter().map(|(_, session)| session).collect()
     }
 
-    /// `block`, whose isolated code is `isolated_source`, analyzed against
+    /// `code`, isolated as `isolated_source`, analyzed against
     /// `knowledge_provider` plus `exported_packages`.
     fn analyze(
-        block: &PackageTestBlock,
+        code: &PackageSessionCode,
         isolated_source: String,
         exported_packages: Vec<ObjectName>,
         knowledge_provider: &ObjectRegistry,
@@ -479,9 +530,8 @@ impl PackageTest {
             &knowledge_provider.with_imports(&session_imports),
         )?;
         Some(Self {
-            package: block.package.clone(),
+            code: code.clone(),
             exported_packages,
-            body_range: block.body_range,
             snapshot,
         })
     }
@@ -592,7 +642,7 @@ mod tests {
             .apply_changes(&[edit(4, 17, "\nafter = 2")], &ObjectRegistry::default())
             .expect("an edit after the TEST block should parse");
         assert_eq!(
-            document.package_tests()[0].snapshot.text().trim(),
+            document.package_sessions()[0].snapshot.text().trim(),
             "first = 1"
         );
 
@@ -600,14 +650,14 @@ mod tests {
             .apply_changes(&[edit(0, 0, "before = 0\n")], &ObjectRegistry::default())
             .expect("an edit before the TEST block should parse");
         assert_eq!(
-            document.package_tests()[0].body_range.start,
+            document.package_sessions()[0].code.fragments[0].range.start,
             Position::new(2, 8)
         );
 
         document
             .apply_changes(&[edit(3, 0, "second = 2\n")], &ObjectRegistry::default())
             .expect("an edit inside the TEST block should parse");
-        let test = &document.package_tests()[0];
+        let test = &document.package_sessions()[0];
         assert!(test
             .snapshot
             .analysis()

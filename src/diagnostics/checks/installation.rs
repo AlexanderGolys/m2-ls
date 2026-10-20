@@ -4,7 +4,10 @@
 use m2_syn::Token;
 
 use super::{DiagnosticSink, InstallationContext};
-use crate::analysis::{CallableHeadKind, Dispatch, MethodHead, MethodInstallationSyntax, Operator};
+use crate::analysis::{
+    CallableHeadKind, Dispatch, InstalledValue, MethodHead, MethodInstallationSyntax,
+    MethodOptions, Operator,
+};
 use crate::diagnostics::{catalog, Finding};
 use crate::node_metadata::matches_token;
 use crate::object_registry::OperatorForm;
@@ -15,6 +18,7 @@ pub(super) fn spawn(context: &InstallationContext, sink: &mut DiagnosticSink) {
     install_no_effect(context, sink);
     operator_not_flexible(context, sink);
     install_arity(context, sink);
+    install_option_form(context, sink);
 }
 
 fn install_no_effect(context: &InstallationContext, sink: &mut DiagnosticSink) {
@@ -24,7 +28,7 @@ fn install_no_effect(context: &InstallationContext, sink: &mut DiagnosticSink) {
         MethodHead::Operator(operator)
             if operator.form == OperatorForm::Binary
                 && matches_token::<Token![??]>(operator.token.name())
-                && installation.expected_rhs_arity() == method.domain.len() =>
+                && installation.expected_argument_arity() == method.domain.len() =>
         {
             sink.spawn(
                 &catalog::INSTALL_NO_EFFECT,
@@ -137,10 +141,31 @@ fn operator_form_is_flexible(
 
 fn install_arity(context: &InstallationContext, sink: &mut DiagnosticSink) {
     let installation = context.installation;
-    let Some(Dispatch::Fixed(actual)) = installation.rhs_lambda_dispatch else {
+    let expected = installation.expected_argument_arity();
+    if matches!(
+        installation.options,
+        MethodOptions::Table | MethodOptions::TableOrForwarded
+    ) {
+        if let Some(Dispatch::Fixed(actual @ (0 | 2..))) = installation.installed_lambda_dispatch {
+            let head = installation.method.head.name();
+            sink.spawn(
+                &catalog::INSTALL_ARITY,
+                Finding::new(
+                    installation.span,
+                    format!(
+                        "`{head}` takes options, so its installed function receives only the \
+                         option table, not {actual} argument(s). Return the function of the \
+                         arguments from it: `opts -> {} -> …`.",
+                        parameter_list(expected)
+                    ),
+                ),
+            );
+            return;
+        }
+    }
+    let Some(Dispatch::Fixed(actual)) = installation.argument_lambda_dispatch else {
         return;
     };
-    let expected = installation.expected_rhs_arity();
     if actual == expected {
         return;
     }
@@ -154,4 +179,66 @@ fn install_arity(context: &InstallationContext, sink: &mut DiagnosticSink) {
             ),
         ),
     );
+}
+
+fn install_option_form(context: &InstallationContext, sink: &mut DiagnosticSink) {
+    let installation = context.installation;
+    let head = installation.method.head.name();
+    let arguments = parameter_list(installation.expected_argument_arity());
+    let (rule, message) = match (installation.options, installation.installed) {
+        (MethodOptions::Table, InstalledValue::OptionDeclaring) => (
+            &catalog::INSTALL_OPTION_FORM,
+            format!(
+                "`{head}` passes its options as a table to the installed function, so a \
+                 function declaring options with `>>` never receives them and the call fails. \
+                 Install `o -> {arguments} -> …`."
+            ),
+        ),
+        (MethodOptions::Table, InstalledValue::LibraryFunction { .. }) => (
+            &catalog::INSTALL_OPTION_FORM,
+            format!(
+                "`{head}` calls the installed function with its option table and applies the \
+                 result to the arguments, so a library function here makes the call fail. \
+                 Install `o -> {arguments} -> …`."
+            ),
+        ),
+        (MethodOptions::Forwarded, InstalledValue::Lambda)
+        | (
+            MethodOptions::Forwarded,
+            InstalledValue::LibraryFunction {
+                declares_options: false,
+            },
+        ) => (
+            &catalog::INSTALL_OPTION_FORM,
+            format!(
+                "`{head}` forwards its options (`Options => true`), so the installed function \
+                 must declare them; this one receives the option table as an extra argument. \
+                 Install `{{…}} >> o -> {arguments} -> …`."
+            ),
+        ),
+        (MethodOptions::Absent, InstalledValue::OptionDeclaring) => (
+            &catalog::INSTALL_UNREACHABLE_OPTIONS,
+            format!(
+                "`{head}` has no options, so calls cannot pass any and the defaults declared \
+                 with `>>` always apply. Install `{arguments} -> …`, or create `{head}` with \
+                 `Options => true` to accept them."
+            ),
+        ),
+        _ => return,
+    };
+    sink.spawn(rule, Finding::new(installation.span, message));
+}
+
+/// Placeholder parameters for an example lambda taking `arity` arguments.
+fn parameter_list(arity: usize) -> String {
+    match arity {
+        1 => "x".to_string(),
+        _ => format!(
+            "({})",
+            (1..=arity)
+                .map(|index| format!("x{index}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }

@@ -937,6 +937,176 @@ async fn method_codomain_diagnostics_offer_annotation_quick_fixes() {
 }
 
 #[tokio::test]
+async fn methods_with_options_install_functions_of_the_option_table() {
+    let mut session = DocumentSession::open("f = method()\nf\n").await;
+    for (declaration, class) in [
+        ("method()", "MethodFunction"),
+        ("method(Options => {Y => 1})", "MethodFunctionWithOptions"),
+        ("method(Options => {})", "MethodFunctionWithOptions"),
+        ("method(Options => false)", "MethodFunctionWithOptions"),
+        ("method(Options => null)", "MethodFunction"),
+        (
+            "method(Options => {Binary => true})",
+            "MethodFunctionWithOptions",
+        ),
+        ("method(Dispatch => Thing)", "MethodFunctionSingle"),
+        (
+            "method(Options => {}, Dispatch => Type)",
+            "MethodFunctionSingle",
+        ),
+        (
+            "method(Binary => true, Options => true)",
+            "MethodFunctionBinary",
+        ),
+    ] {
+        session.replace(&format!("f = {declaration}\nf\n")).await;
+        assert_eq!(
+            hover_type_at(&mut session, 1, 0).await,
+            class,
+            "{declaration}"
+        );
+    }
+
+    // With options, the domain types the arguments of the returned function;
+    // without them, the installed function's only parameter.
+    session
+        .replace(concat!(
+            "foo = method(Options => {Y => 1})\n",
+            "foo ZZ := opt -> x -> x + opt.Y\n",
+            "bar = method()\n",
+            "bar ZZ := opt -> x -> x + 1\n",
+            "baz = method(Options => {Y => 1})\n",
+            "baz ZZ := ZZ => opt -> x -> x + opt.Y\n",
+            "y := baz 1\n",
+            "y\n",
+            "qux = method(Options => true)\n",
+            "qux ZZ := ZZ => {Y => 1} >> o -> x -> x + o.Y\n",
+            "z := qux 1\n",
+            "z\n",
+        ))
+        .await;
+    assert_eq!(hover_type_at(&mut session, 9, 38).await, "ZZ");
+    assert_eq!(hover_type_at(&mut session, 11, 0).await, "ZZ");
+    assert_eq!(hover_type_at(&mut session, 1, 22).await, "ZZ");
+    assert_eq!(hover_type_at(&mut session, 3, 10).await, "ZZ");
+    let option_table = session
+        .request(
+            "textDocument/hover",
+            json!({
+                "textDocument": {"uri": session.uri()},
+                "position": {"line": 1, "character": 10}
+            }),
+        )
+        .await;
+    assert!(
+        !option_table["contents"]["value"]
+            .as_str()
+            .unwrap()
+            .contains("Type: `ZZ`"),
+        "the option table is not the domain argument: {option_table}"
+    );
+    assert_eq!(hover_type_at(&mut session, 7, 0).await, "ZZ");
+
+    session
+        .replace(concat!(
+            "f = method(Options => {})\n",
+            "f(ZZ,ZZ) := (x,y) -> x + y\n",
+            "f(QQ,QQ) := o -> (x,y) -> x + y\n",
+            "f(RR,RR) := o -> (x,y,z) -> x\n",
+            "g = method()\n",
+            "g(ZZ,ZZ) := (x,y) -> x + y\n",
+            "gb String := o -> x -> x\n",
+            "intersect(String,String) := o -> (x,y) -> x\n",
+        ))
+        .await;
+    assert_eq!(diagnostic_lines(&session, "E03"), vec![1, 3]);
+    let option_table_arity = session
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic["range"]["start"]["line"] == 1)
+        .and_then(|diagnostic| diagnostic["message"].as_str())
+        .unwrap()
+        .to_string();
+    assert!(
+        option_table_arity.contains("`f` takes options")
+            && option_table_arity.contains("opts -> (x1, x2) -> …"),
+        "{option_table_arity}"
+    );
+
+    // Each way of passing options admits one installed form: an option table
+    // takes `o -> x -> …`, forwarded options `{…} >> o -> x -> …`, and no
+    // options `x -> …` (a lambda returning a lambda is then a functional value).
+    session
+        .replace(concat!(
+            "foo = method(Options => {Foo => 1, Bar => true})\n",
+            "bar = method(Options => true)\n",
+            "m = method()\n",
+            "foo ZZ := o -> x -> f(o, x)\n",
+            "foo QQ := print\n",
+            "foo RR := {} >> o -> print\n",
+            "bar ZZ := {} >> o -> print\n",
+            "bar QQ := o -> x -> f(o, x)\n",
+            "bar RR := print\n",
+            "m ZZ := o -> x -> f(o, x)\n",
+            "m QQ := print\n",
+            "m RR := {} >> o -> print\n",
+            "codim String := {} >> o -> x -> x\n",
+            "gb String := o -> x -> x\n",
+            "local := o -> x -> x\n",
+            "foo String := local\n",
+        ))
+        .await;
+    assert_eq!(diagnostic_lines(&session, "E11"), vec![4, 5, 7, 8]);
+    assert_eq!(diagnostic_lines(&session, "E12"), vec![11]);
+    assert!(!session.diagnostic_codes().contains(&"E03"));
+
+    // The codomain is the value of the function receiving the arguments, and
+    // its annotation precedes the installed function.
+    for (source, codomain) in [
+        (
+            "foo = method(Options => {Y => 1})\nfoo ZZ := opt -> x -> [x]\n",
+            "Array",
+        ),
+        (
+            "bar = method()\nbar ZZ := opt -> x -> [x]\n",
+            "FunctionClosure",
+        ),
+        (
+            "qux = method(Options => true)\nqux ZZ := {} >> o -> x -> [x]\n",
+            "Array",
+        ),
+    ] {
+        session.replace(source).await;
+        let missing = session
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic["code"] == "T03")
+            .unwrap_or_else(|| panic!("expected a codomain hint for {source}"))
+            .clone();
+        let uri = session.uri().to_string();
+        let actions = session
+            .request(
+                "textDocument/codeAction",
+                json!({
+                    "textDocument": {"uri": uri},
+                    "range": missing["range"],
+                    "context": {"diagnostics": [missing]}
+                }),
+            )
+            .await;
+        let edit = &response_array(&actions)
+            .iter()
+            .find(|action| action["title"] == "Add codomain annotation")
+            .unwrap_or_else(|| panic!("expected a codomain quick fix for {source}"))["edit"]
+            ["changes"][&uri][0];
+        assert_eq!(edit["newText"], format!("{codomain} => "), "{source}");
+        assert_eq!(edit["range"]["start"]["character"], 10, "{source}");
+    }
+
+    session.shutdown().await;
+}
+
+#[tokio::test]
 async fn nonexact_call_arguments_join_every_possible_dispatch_codomain() {
     let source = concat!(
         "children CstNode := List => node -> apply(childRawIndices node, rawIndex ->\n",
@@ -2455,17 +2625,124 @@ const PACKAGE_WITH_TEST: &str = concat!(
     "endPackage \"Pkg\"\n",
 );
 
+const PACKAGE_WITH_OPTIONS: &str = concat!(
+    "newPackage(\"Pkg\", PackageImports => {\"Graphs\"}, PackageExports => {\"Chordal\"})\n",
+    "export {\"double\", \"Twice\" => \"double\"}\n",
+    "double = x -> 2 * x\n",
+    "shape = (Digraph, ChordalGraph)\n",
+    "endPackage \"Pkg\"\n",
+);
+
 #[tokio::test]
-async fn a_package_must_close_its_section_with_end_package() {
-    let mut session = DocumentSession::open(PACKAGE_WITH_TEST).await;
-    assert!(!session.diagnostic_codes().contains(&"E10"));
+async fn exported_name_strings_refer_to_the_globals_they_name() {
+    let mut session = DocumentSession::open(PACKAGE_WITH_OPTIONS).await;
+    let definition_line = 2;
 
-    let unclosed = PACKAGE_WITH_TEST.replace("endPackage \"Pkg\"\n", "");
-    replace_and_assert_diagnostic(&mut session, &unclosed, "E10", true).await;
-    assert_eq!(diagnostic_lines(&session, "E10"), [0]);
+    for occurrence in [0, 1] {
+        let definition = session
+            .request_at("textDocument/definition", "double", occurrence)
+            .await;
+        assert_eq!(
+            definition["range"]["start"]["line"], definition_line,
+            "an exported name resolves to the global it names: {definition}"
+        );
+    }
 
-    let mismatched = PACKAGE_WITH_TEST.replace("endPackage \"Pkg\"", "endPackage \"Other\"");
-    replace_and_assert_diagnostic(&mut session, &mismatched, "E10", true).await;
+    let references = session
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": session.uri()},
+                "position": position(PACKAGE_WITH_OPTIONS, "double", 2),
+                "context": {"includeDeclaration": true}
+            }),
+        )
+        .await;
+    assert_eq!(
+        response_array(&references).len(),
+        3,
+        "both export strings and the definition: {references}"
+    );
+
+    let highlights = session
+        .request_at("textDocument/documentHighlight", "double", 0)
+        .await;
+    assert_eq!(
+        response_array(&highlights).len(),
+        3,
+        "an export string highlights the global it names: {highlights}"
+    );
+
+    let hover = session.request_at("textDocument/hover", "double", 0).await;
+    assert!(
+        hover.to_string().contains("double"),
+        "an export string hovers as the global it names: {hover}"
+    );
+
+    let rename = session
+        .request(
+            "textDocument/rename",
+            json!({
+                "textDocument": {"uri": session.uri()},
+                "position": position(PACKAGE_WITH_OPTIONS, "double", 0),
+                "newName": "triple"
+            }),
+        )
+        .await;
+    let edited_starts = response_array(&rename["changes"][session.uri()])
+        .iter()
+        .map(|edit| edit["range"]["start"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        edited_starts,
+        [0, 1, 2].map(|occurrence| position(PACKAGE_WITH_OPTIONS, "double", occurrence)),
+        "renaming from an export string renames the name inside its quotes and the global"
+    );
+    let synonym = session
+        .request_at("textDocument/definition", "Twice", 0)
+        .await;
+    assert!(
+        response_array_or_empty(&synonym).is_empty(),
+        "a synonym is a new name, not a use of a package global: {synonym}"
+    );
+
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn package_options_load_the_packages_they_list() {
+    let mut session = DocumentSession::open(PACKAGE_WITH_OPTIONS).await;
+    let tokens = semantic_tokens(&mut session).await;
+    let namespace = session.semantic_token_type("namespace");
+    let unresolved = session.semantic_token_modifier("unresolved");
+
+    for package in ["Graphs", "Chordal"] {
+        assert_eq!(
+            token_at(&tokens, PACKAGE_WITH_OPTIONS, &format!("\"{package}\""), 0).0,
+            namespace,
+            "a package an option lists is a package object"
+        );
+    }
+    for loaded in ["Digraph", "ChordalGraph"] {
+        assert_eq!(
+            token_at(&tokens, PACKAGE_WITH_OPTIONS, loaded, 0).1 & unresolved,
+            0,
+            "{loaded} is loaded by the option listing its package"
+        );
+    }
+
+    let without_options = PACKAGE_WITH_OPTIONS.replace(
+        ", PackageImports => {\"Graphs\"}, PackageExports => {\"Chordal\"}",
+        "",
+    );
+    session.replace(&without_options).await;
+    let tokens = semantic_tokens(&mut session).await;
+    assert_ne!(
+        token_at(&tokens, &without_options, "Digraph", 0).1 & unresolved,
+        0,
+        "without the option the package is not loaded"
+    );
+
     session.shutdown().await;
 }
 
@@ -2533,8 +2810,8 @@ async fn test_block_code_is_analyzed_as_a_session_that_loaded_the_package() {
         .await;
     assert_eq!(
         response_array(&exported_references).len(),
-        2,
-        "the package's definition and the TEST block's use: {exported_references}"
+        3,
+        "the export, the package's definition, and the TEST block's use: {exported_references}"
     );
 
     let broken = PACKAGE_WITH_TEST.replace("assert(result == 6)", "assert(result == ]");

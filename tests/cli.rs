@@ -78,21 +78,47 @@ fn formatter_check_write_and_stdin_agree() {
 }
 
 #[test]
-fn directory_scan_defaults_to_current_directory_and_skips_build_and_hidden_files() {
+fn tools_take_exactly_one_file() {
     let workspace = Workspace::new();
-    for directory in ["nested", "target", ".hidden"] {
-        fs::create_dir(workspace.0.join(directory)).unwrap();
-        fs::write(workspace.0.join(directory).join("file.m2"), "x=1\n").unwrap();
+    fs::create_dir(workspace.0.join("nested")).unwrap();
+    for name in ["a.m2", "b.m2", "nested/c.m2"] {
+        fs::write(workspace.0.join(name), "x=1\n").unwrap();
     }
-    fs::write(workspace.0.join("notes.txt"), "x=1\n").unwrap();
-    assert!(workspace.run(FMT, &[], "").status.success());
-    assert_eq!(
-        fs::read_to_string(workspace.0.join("nested/file.m2")).unwrap(),
-        "x = 1\n"
+    for binary in [FMT, LINT] {
+        for args in [
+            vec![],
+            vec!["a.m2", "b.m2"],
+            vec!["nested"],
+            vec!["-", "a.m2"],
+        ] {
+            let output = workspace.run(binary, &args, "");
+            assert_eq!(output.status.code(), Some(2), "{binary} {args:?}");
+        }
+    }
+    for name in ["a.m2", "b.m2", "nested/c.m2"] {
+        assert_eq!(fs::read_to_string(workspace.0.join(name)).unwrap(), "x=1\n");
+    }
+    let lint = workspace.run(LINT, &["nested/c.m2"], "");
+    assert!(lint.status.success(), "{lint:?}");
+    let lint = workspace.run(
+        LINT,
+        &["--deny-warnings", "-"],
+        "L = {10, 20}\nsecond = L.1\n",
     );
-    for path in ["target/file.m2", ".hidden/file.m2", "notes.txt"] {
-        assert_eq!(fs::read_to_string(workspace.0.join(path)).unwrap(), "x=1\n");
-    }
+    assert!(
+        String::from_utf8_lossy(&lint.stdout).starts_with("-:2:"),
+        "{lint:?}"
+    );
+    fs::write(
+        workspace.0.join("nested/c.m2"),
+        "L = {10, 20}\nsecond = L.1\n",
+    )
+    .unwrap();
+    let lint = workspace.run(LINT, &["nested/c.m2"], "");
+    assert!(
+        String::from_utf8_lossy(&lint.stdout).starts_with("nested/c.m2:2:"),
+        "{lint:?}"
+    );
 }
 
 #[test]
@@ -186,18 +212,13 @@ fn lint_warning_policy_and_formatter_configuration() {
 }
 
 #[test]
-fn formatter_leaves_invalid_source_untouched_and_continues_other_files() {
+fn formatter_leaves_invalid_source_untouched() {
     let workspace = Workspace::new();
     let invalid = "x = (1 + ]\n";
     fs::write(workspace.0.join("a.m2"), invalid).unwrap();
-    fs::write(workspace.0.join("b.m2"), "x=1\n").unwrap();
-    assert_eq!(workspace.run(FMT, &["."], "").status.code(), Some(2));
+    assert_eq!(workspace.run(FMT, &["a.m2"], "").status.code(), Some(2));
     assert_eq!(
         fs::read_to_string(workspace.0.join("a.m2")).unwrap(),
         invalid
-    );
-    assert_eq!(
-        fs::read_to_string(workspace.0.join("b.m2")).unwrap(),
-        "x = 1\n"
     );
 }
