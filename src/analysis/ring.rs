@@ -1,6 +1,6 @@
 //! Ring construction, generator rebinding, and ring-specific type rules.
 
-use m2_syn::nodes::{ExprNew as NewStatement, FloatLiteral, IntegerLiteral, Symbol};
+use m2_syn::nodes::{Array, ExprNew as NewStatement, FloatLiteral, IntegerLiteral, Symbol};
 use m2_syn::Token;
 
 use crate::node_metadata::visit_expression_nodes;
@@ -21,6 +21,7 @@ struct RingGeneratorBinding<'tree> {
     name: String,
     kind: RingGeneratorKind,
     node: M2Node<'tree>,
+    indices: Option<IndexSelection>,
 }
 
 /// Compact reference retained for later ring-generator rebinding.
@@ -28,6 +29,105 @@ struct RingGeneratorBinding<'tree> {
 pub struct RingGenerator {
     name: ObjectName,
     kind: RingGeneratorKind,
+    indices: Option<IndexSelection>,
+}
+
+/// Source-ordered writes to an indexed variable table. Ranges stay compact even
+/// when their Cartesian product contains many generators.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexedGeneratorTypes {
+    entries: Vec<(IndexSelection, ObjectName)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IndexKey {
+    Integer(i64),
+    String(String),
+    List(Vec<IndexKey>),
+    Sequence(Vec<IndexKey>),
+}
+
+impl IndexKey {
+    fn from_node(node: M2Node<'_>) -> Option<Self> {
+        let node = parenthesized_value(node)?;
+        if node.is::<IntegerLiteral>() {
+            return node.text().parse().ok().map(Self::Integer);
+        }
+        if node.is_prefix_expr() && node.child_by_field_name("operator")?.text() == "-" {
+            let Self::Integer(value) = Self::from_node(node.child_by_field_name("operand")?)?
+            else {
+                return None;
+            };
+            return value.checked_neg().map(Self::Integer);
+        }
+        if let Some(text) = node.string_literal_inner_text() {
+            // Escaped strings require evaluation; do not compare their raw spelling.
+            return (!text.contains('\\')).then(|| Self::String(text.to_string()));
+        }
+        if node.is::<List>() || node.is::<Sequence>() {
+            let items = node
+                .collection_elements()
+                .map(Self::from_node)
+                .collect::<Option<Vec<_>>>()?;
+            return Some(if node.is::<List>() {
+                Self::List(items)
+            } else {
+                Self::Sequence(items)
+            });
+        }
+        None
+    }
+
+    fn in_range(&self, start: &Self, end: &Self, exclusive: bool) -> bool {
+        match (self, start, end) {
+            (Self::Integer(value), Self::Integer(start), Self::Integer(end)) => {
+                start <= value && if exclusive { value < end } else { value <= end }
+            }
+            (Self::List(values), Self::List(starts), Self::List(ends))
+            | (Self::Sequence(values), Self::Sequence(starts), Self::Sequence(ends)) => {
+                values.len() == starts.len()
+                    && values.len() == ends.len()
+                    && values
+                        .iter()
+                        .zip(starts)
+                        .zip(ends)
+                        .all(|((value, start), end)| value.in_range(start, end, exclusive))
+            }
+            (Self::String(value), Self::String(start), Self::String(end)) => {
+                value.chars().count() == start.chars().count()
+                    && value.chars().count() == end.chars().count()
+                    && value.chars().zip(start.chars()).zip(end.chars()).all(
+                        |((value, start), end)| {
+                            start <= value && if exclusive { value < end } else { value <= end }
+                        },
+                    )
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IndexSelection {
+    Exact(IndexKey),
+    Range {
+        start: IndexKey,
+        end: IndexKey,
+        exclusive: bool,
+    },
+}
+
+impl IndexSelection {
+    fn contains(&self, key: &IndexKey) -> bool {
+        match self {
+            Self::Exact(index) => index == key,
+            Self::Range {
+                start,
+                end,
+                exclusive,
+            } => key.in_range(start, end, *exclusive),
+        }
+    }
 }
 
 /// Hardcoded static semantics that supplement indexed ring dispatch facts.
@@ -78,11 +178,13 @@ impl Analysis {
                 generators.push(RingGenerator {
                     name: ObjectName::new(&generator.name),
                     kind: generator.kind,
+                    indices: generator.indices.clone(),
                 });
                 self.register_ring_generator(
                     ring_name,
                     &generator.name,
                     generator.kind,
+                    generator.indices,
                     generator.node,
                     source,
                 );
@@ -99,6 +201,7 @@ impl Analysis {
                     ring_name,
                     generator.name.name(),
                     generator.kind,
+                    generator.indices.clone(),
                     rebind_node,
                     source,
                 );
@@ -165,6 +268,7 @@ impl Analysis {
         ring_name: &str,
         generator_name: &str,
         kind: RingGeneratorKind,
+        indices: Option<IndexSelection>,
         node: M2Node,
         source: &(impl SourceNavigation + ?Sized),
     ) {
@@ -179,11 +283,20 @@ impl Analysis {
                 );
             }
             RingGeneratorKind::IndexedTable => {
+                let mut elements = self
+                    // Several disjoint specs can be rebound at the same anchor
+                    // (for example by a quotient). Include earlier writes there.
+                    .get_binding_from_scope(generator_name, 0, source.range_for_node(node).end)
+                    .and_then(|binding| binding.state.indexed_element_type.clone())
+                    .unwrap_or_default();
+                if let Some(indices) = indices {
+                    elements.entries.push((indices, ObjectName::new(ring_name)));
+                }
                 self.register_dynamic_global(
                     generator_name,
                     node,
                     ObjectName::new("IndexedVariableTable"),
-                    Some(ObjectName::new(ring_name)),
+                    Some(elements),
                     source,
                 );
             }
@@ -195,7 +308,7 @@ impl Analysis {
         name: &str,
         node: M2Node,
         type_name: ObjectName,
-        indexed_element_type: Option<ObjectName>,
+        indexed_element_type: Option<IndexedGeneratorTypes>,
         source: &(impl SourceNavigation + ?Sized),
     ) {
         let position = source.position_for_node(node);
@@ -249,13 +362,15 @@ impl Analysis {
 
 impl<'tree> RingGeneratorBinding<'tree> {
     fn constructor_variables(application: M2Node<'tree>) -> Option<M2Node<'tree>> {
-        let argument = application.child_by_field_name("right")?;
-        if argument.is_collection_expression() {
+        let argument = parenthesized_value(application.child_by_field_name("right")?)?;
+        let is_constructor_argument =
+            |node: &M2Node<'tree>| node.is::<Array>() || node.is::<List>();
+        if is_constructor_argument(&argument) {
             return Some(argument);
         }
         argument
             .child_by_field_name("left")
-            .filter(M2Node::is_collection_expression)
+            .filter(is_constructor_argument)
     }
 
     fn collect(container: M2Node<'tree>) -> Vec<Self> {
@@ -277,6 +392,16 @@ impl<'tree> RingGeneratorBinding<'tree> {
                                 name,
                                 kind: RingGeneratorKind::IndexedTable,
                                 node: variables,
+                                indices: variables
+                                    .text()
+                                    .parse::<i64>()
+                                    .ok()
+                                    .filter(|n| *n > 0)
+                                    .map(|n| IndexSelection::Range {
+                                        start: IndexKey::Integer(0),
+                                        end: IndexKey::Integer(n - 1),
+                                        exclusive: false,
+                                    }),
                             },
                         );
                     } else {
@@ -309,6 +434,9 @@ impl<'tree> RingGeneratorBinding<'tree> {
     }
 
     fn collect_spec(node: M2Node<'tree>, bindings: &mut Vec<RingGeneratorBinding<'tree>>) {
+        let Some(node) = parenthesized_value(node) else {
+            return;
+        };
         if node.is::<Symbol>() {
             Self::push(
                 bindings,
@@ -316,6 +444,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
                     name: node.text().to_string(),
                     kind: RingGeneratorKind::Direct,
                     node,
+                    indices: None,
                 },
             );
             return;
@@ -324,6 +453,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
         if node.has_binary_operator::<Token![_]>() {
             if let Some(base) = node
                 .child_by_field_name("left")
+                .and_then(parenthesized_value)
                 .filter(|base| base.is::<Symbol>())
             {
                 Self::push(
@@ -332,6 +462,10 @@ impl<'tree> RingGeneratorBinding<'tree> {
                         name: base.text().to_string(),
                         kind: RingGeneratorKind::IndexedTable,
                         node: base,
+                        indices: node
+                            .child_by_field_name("right")
+                            .and_then(IndexKey::from_node)
+                            .map(IndexSelection::Exact),
                     },
                 );
             }
@@ -339,23 +473,43 @@ impl<'tree> RingGeneratorBinding<'tree> {
         }
 
         if node.has_binary_operator::<Token![..]>() || node.has_binary_operator::<Token![..<]>() {
-            let left = node.child_by_field_name("left");
-            let right = node.child_by_field_name("right");
+            let left = node
+                .child_by_field_name("left")
+                .and_then(parenthesized_value);
+            let right = node
+                .child_by_field_name("right")
+                .and_then(parenthesized_value);
             if let (Some(left), Some(right)) = (left, right) {
                 if let (Some(left_base), Some(right_base)) =
                     (Self::indexed_base(left), Self::indexed_base(right))
                 {
-                    if left_base.text() == right_base.text() {
-                        Self::push(
-                            bindings,
-                            RingGeneratorBinding {
-                                name: left_base.text().to_string(),
-                                kind: RingGeneratorKind::IndexedTable,
-                                node,
-                            },
-                        );
-                        return;
+                    let indices = left
+                        .child_by_field_name("right")
+                        .and_then(IndexKey::from_node)
+                        .zip(
+                            right
+                                .child_by_field_name("right")
+                                .and_then(IndexKey::from_node),
+                        )
+                        .map(|(start, end)| IndexSelection::Range {
+                            start,
+                            end,
+                            exclusive: node.has_binary_operator::<Token![..<]>(),
+                        });
+                    if let Some(names) = Self::symbol_range(node, left_base, right_base) {
+                        for name in names {
+                            Self::push(
+                                bindings,
+                                RingGeneratorBinding {
+                                    name,
+                                    kind: RingGeneratorKind::IndexedTable,
+                                    node,
+                                    indices: indices.clone(),
+                                },
+                            );
+                        }
                     }
+                    return;
                 }
 
                 if let Some(names) = Self::symbol_range(node, left, right) {
@@ -366,6 +520,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
                                 name,
                                 kind: RingGeneratorKind::Direct,
                                 node,
+                                indices: None,
                             },
                         );
                     }
@@ -382,6 +537,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
     }
 
     fn indexed_base(node: M2Node<'tree>) -> Option<M2Node<'tree>> {
+        let node = parenthesized_value(node)?;
         node.has_binary_operator::<Token![_]>()
             .then(|| node.child_by_field_name("left"))
             .flatten()
@@ -396,38 +552,34 @@ impl<'tree> RingGeneratorBinding<'tree> {
         if !left.is::<Symbol>() || !right.is::<Symbol>() {
             return None;
         }
-        let [start] = left.text().as_bytes() else {
-            return None;
-        };
-        let [end] = right.text().as_bytes() else {
-            return None;
-        };
-        if !start.is_ascii_alphabetic()
-            || !end.is_ascii_alphabetic()
-            || start.is_ascii_lowercase() != end.is_ascii_lowercase()
-            || start > end
-        {
-            return None;
+        let names = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        // Equal endpoints also support names outside the standard vars alphabet.
+        if left.text() == right.text() {
+            return Some(if range.has_binary_operator::<Token![..<]>() {
+                Vec::new()
+            } else {
+                vec![left.text().to_string()]
+            });
         }
-
-        let exclusive = range.has_binary_operator::<Token![..<]>();
-        let stop = if exclusive {
-            *end
-        } else {
-            end.saturating_add(1)
-        };
+        let start = names.chars().position(|c| c.to_string() == left.text())?;
+        let end = names.chars().position(|c| c.to_string() == right.text())?;
+        let stop = end + usize::from(!range.has_binary_operator::<Token![..<]>());
         Some(
-            (*start..stop)
-                .map(|letter| (letter as char).to_string())
+            names
+                .chars()
+                .skip(start)
+                .take(stop.saturating_sub(start))
+                .map(|c| c.to_string())
                 .collect(),
         )
     }
 
     fn push(bindings: &mut Vec<RingGeneratorBinding<'tree>>, binding: RingGeneratorBinding<'tree>) {
-        if !bindings
-            .iter()
-            .any(|existing| existing.name == binding.name)
-        {
+        if !bindings.iter().any(|existing| {
+            existing.name == binding.name
+                && existing.kind == binding.kind
+                && existing.indices == binding.indices
+        }) {
             bindings.push(binding);
         }
     }
@@ -465,7 +617,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         if matches_token::<Token![_]>(query.operator)
             && left_name.as_ref() == "IndexedVariableTable"
         {
-            if let Some(element_type) = self
+            if let Some(elements) = self
                 .get_binding_from_scope(
                     query.left.text(),
                     query.scope_idx,
@@ -473,9 +625,25 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
                 )
                 .and_then(|binding| binding.state.indexed_element_type.as_ref())
             {
-                return Some(InferredType::exact(element_type.name()));
+                if let Some(index) = query.right.and_then(IndexKey::from_node) {
+                    return Some(
+                        elements
+                            .entries
+                            .iter()
+                            .rev()
+                            .find(|(selection, _)| selection.contains(&index))
+                            .map_or_else(
+                                || InferredType::exact("IndexedVariable"),
+                                |(_, ring)| InferredType::exact_from_id(ring.clone()),
+                            ),
+                    );
+                }
+                return Some(elements.entries.iter().fold(
+                    InferredType::exact("IndexedVariable"),
+                    |types, (_, ring)| types | InferredType::exact_from_id(ring.clone()),
+                ));
             }
-            return Some(InferredType::upward("RingElement"));
+            return Some(InferredType::exact("IndexedVariable"));
         }
 
         if matches_token::<Token![/]>(query.operator)
@@ -564,56 +732,317 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
                 .is_some_and(|type_name| knowledge.has_type_role(type_name, TypeRole::Ring))
         })
     }
+}
 
-    /// Square-bracket ring construction binds specially in Macaulay2 source:
-    /// `R[x]/I` has a CST shaped like `R SPACE ([x] / I)`, while evaluation
-    /// constructs `R[x]` before applying `/ I`. Preserve the parser's grouping,
-    /// but lower that one type-directed application chain through the same
-    /// dispatch table used for ordinary operators.
-    pub fn ring_application_with_trailing_operator_type(
-        &self,
-        application_operator: &Operator,
-        head: &InferredType,
-        argument: M2Node,
-        source: &(impl SourceNavigation + ?Sized),
-        scope_idx: usize,
-        knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> Option<InferredType> {
-        let head_name = head.single()?;
-        if !knowledge.has_type_role(head_name, TypeRole::Ring) {
-            return None;
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::DocumentSnapshot;
+    use crate::object_registry::ObjectRegistry;
+    use std::sync::OnceLock;
 
-        let operator = argument.binary_operator()?;
-        let variables = argument.child_by_field_name("left")?;
-        if !variables.is_collection_expression() {
-            return None;
-        }
-        let trailing_operand = argument.child_by_field_name("right")?;
+    fn document(source: &str) -> DocumentSnapshot {
+        static BUILTINS: OnceLock<ObjectRegistry> = OnceLock::new();
+        let builtins =
+            BUILTINS.get_or_init(|| ObjectRegistry::load(include_str!("../data/m2-index.jsonl")));
+        DocumentSnapshot::from_text(source.to_string(), builtins).expect("fixture should parse")
+    }
 
-        let variables_type = self.type_of(variables, source, scope_idx);
-        let ring_type = self.dispatch_codomain(
-            knowledge,
-            application_operator,
-            &[head.clone(), variables_type],
-            &[],
-            source.position_for_node(argument),
+    /// Check complete expressions, including indexed accesses, rather than the
+    /// types of their symbol children or the presence of an unrelated inlay hint.
+    fn assert_types(setup: &str, probes: &[(&str, &str)]) {
+        let source = format!(
+            "{setup}\n{}\n",
+            probes
+                .iter()
+                .map(|(expr, _)| *expr)
+                .collect::<Vec<_>>()
+                .join("\n")
         );
-        let ring_name = ring_type.single()?;
-        if !knowledge.has_type_role(ring_name, TypeRole::Ring) {
-            return None;
+        let document = document(&source);
+        assert!(
+            !document.root_node().has_error(),
+            "invalid fixture: {source}"
+        );
+        let checker = TypeChecker::new(document.analysis(), document.object_registry());
+        let first_line = setup.lines().count();
+        for (offset, (expression, expected)) in probes.iter().enumerate() {
+            let line = (first_line + offset) as u32;
+            let node = document
+                .root_node()
+                .descendants()
+                .filter(|node| {
+                    node.text() == *expression && document.position_for_node(*node).line == line
+                })
+                .last()
+                .unwrap_or_else(|| panic!("missing probe {expression:?} on line {line}: {source}"));
+            let inferred = checker.type_of(node, &document, 0);
+            assert_eq!(
+                inferred.single().map(ObjectName::name),
+                Some(*expected),
+                "wrong type for {expression:?} after {setup:?}: {inferred:?}"
+            );
         }
+    }
 
-        let trailing_type = self.type_of(trailing_operand, source, scope_idx);
-        Some(self.dispatch_codomain(
-            knowledge,
-            &Operator {
-                token: ObjectName::new(operator),
-                form: OperatorForm::Binary,
-            },
-            &[ring_type, trailing_type],
-            &[],
-            source.position_for_node(argument),
-        ))
+    #[test]
+    fn polynomial_constructors_recognize_coefficient_rings_and_spacing() {
+        for constructor in [
+            "QQ[x]",
+            "ZZ[x]",
+            "(ZZ/101)[x]",
+            "ZZ/101[x]",
+            "(QQ)[x]",
+            "((QQ))[x]",
+            "QQ [x]",
+            "QQ\t[x]",
+            "QQ[ x , y ]",
+            "QQ([x])",
+            "QQ[(((x)))]",
+            "QQ[(x,y)]",
+            "QQ[\r\nx,\r\ny\r\n]",
+            "QQ{ x, y }",
+            "QQ[{x,y}]",
+            "QQ[\n -- generators\n x,\n y\n]",
+        ] {
+            assert_types(
+                &format!("R = {constructor}"),
+                &[("R", "PolynomialRing"), ("x", "R")],
+            );
+        }
+    }
+
+    #[test]
+    fn polynomial_constructors_recognize_options_and_empty_variable_sets() {
+        for constructor in [
+            "QQ[]",
+            "QQ{}",
+            "QQ[{}]",
+            "QQ[Variables => 0]",
+            "QQ[x, Degrees => {2}]",
+            "QQ[x, MonomialOrder => Lex]",
+            "QQ[MonomialOrder => Lex, x]",
+            "QQ[Variables => {x,y}]",
+            "QQ[Variables => [x,y]]",
+            "QQ[Variables => 3]",
+            "QQ[Variables => 3, VariableBaseName => v]",
+            "QQ[VariableBaseName => \"v\", Variables => 3]",
+        ] {
+            assert_types(&format!("R = {constructor}"), &[("R", "PolynomialRing")]);
+        }
+        assert_types("R = QQ[Variables => {x,y}]", &[("x", "R"), ("y", "R")]);
+        assert_types(
+            "R = QQ[Variables => 2]",
+            &[
+                ("p", "IndexedVariableTable"),
+                ("p_0", "R"),
+                ("p_1", "R"),
+                ("p_2", "IndexedVariable"),
+            ],
+        );
+        assert_types(
+            "R = QQ[VariableBaseName => \"v\", Variables => 2]",
+            &[("v_1", "R"), ("v_2", "IndexedVariable")],
+        );
+    }
+
+    #[test]
+    fn polynomial_constructors_follow_aliases_and_existing_ring_heads() {
+        for setup in [
+            "P = QQ\nR = P[x]",
+            "P := QQ\nR := P[x]",
+            "P = QQ\nA = P\nR = A[x]",
+            "P = 1\nP = QQ\nR = P[x]",
+            "P = QQ[t]\nR = P[x]",
+            "P = QQ[t]\nI = ideal(t^2)\nA = P/I\nR = A[x]",
+            "R = QQ[t][x]",
+            "R = (QQ[t])[x]",
+            "R = (QQ[x])",
+            "R = ((QQ[x]))",
+        ] {
+            assert_types(setup, &[("R", "PolynomialRing"), ("x", "R")]);
+        }
+    }
+
+    #[test]
+    fn polynomial_constructors_preserve_trailing_operator_dispatch() {
+        for setup in [
+            "I = ideal(0)\nR = QQ[x]/I",
+            "I = ideal(0)\nR = (QQ[x])/I",
+            "I = ideal(0)\nR = QQ[x] / I",
+            "I = ideal(0)\nR = (QQ[x]/I)",
+            "A = QQ[t]\nI = ideal(t^2)\nR = A[x]/I",
+        ] {
+            assert_types(setup, &[("R", "QuotientRing"), ("x", "R")]);
+        }
+        assert_types("M = QQ[x]^2", &[("M", "Module")]);
+    }
+
+    #[test]
+    fn polynomial_constructor_detection_does_not_confuse_other_applications() {
+        // Brackets alone, a familiar name, or a Ring result from an ordinary
+        // function call must not turn its arguments into ring generators.
+        for setup in [
+            "R = [x,y]",
+            "R = {x,y}",
+            "R = (x,y)",
+            "f = args -> args\nR = f[x]",
+            "f = args -> args\nR = f{x}",
+            "f = args -> QQ\nR = f[x]",
+            "R = unknownHead[x]",
+            "R = P[x]\nP = QQ",
+            "P = 1\nR = P[x]\nP = QQ",
+            "R = QQ(x,y)",
+            "R = QQ<|x|>",
+            "P = 7\nR = P[x]",
+            "P = \"QQ\"\nR = P[x]",
+            "P = QQ\nP = 7\nR = P[x]",
+            "QQ = 7\nR = QQ[x]",
+            "R = \"QQ[x]\"",
+            "-- R = QQ[x]\nR = 1",
+        ] {
+            assert_types(setup, &[("x", "Symbol")]);
+        }
+    }
+
+    #[test]
+    fn polynomial_constructor_symbol_detection_uses_the_head_type_and_scope() {
+        for (source, expected) in [
+            ("R = QQ[longName]", vec!["longName"]),
+            ("R = QQ[((longName))]", vec!["longName"]),
+            ("R = QQ([longName])", vec!["longName"]),
+            ("P = QQ\nR = P[longName]", vec!["longName"]),
+            ("P = QQ\nf = () -> P[longName]", vec!["longName"]),
+            ("f = () -> (P := QQ; P[longName])", vec!["longName"]),
+            ("R = (ZZ/101)[longName]", vec!["longName"]),
+            ("R = QQ[longName]/ideal(0)", vec!["longName"]),
+            ("R = QQ[x]/ideal(x^2)", vec!["x"]),
+            (
+                "R = QQ[longName, otherName, x_1, a..c]",
+                vec!["longName", "otherName"],
+            ),
+            ("R = QQ[Degrees => {longName}, x]", vec!["x"]),
+            ("R = QQ[Variables => {longName, x_1}]", vec!["longName"]),
+            ("R = QQ[x_1..y_3, Variables => 2]", vec![]),
+            ("R = [longName]", vec![]),
+            ("R = QQ(longName, otherName)", vec![]),
+            ("R = QQ<|longName|>", vec![]),
+            ("R = unknownHead[longName]", vec![]),
+            ("f = x -> x\nR = f[longName]", vec![]),
+            ("P = QQ\nf = P -> P[longName]", vec![]),
+            ("P = QQ\nf = () -> (P := 1; P[longName])", vec![]),
+            ("P = QQ\nP = 1\nR = P[longName]", vec![]),
+        ] {
+            let document = document(source);
+            let found = document
+                .root_node()
+                .descendants()
+                .flat_map(|node| {
+                    let scope = document
+                        .analysis()
+                        .find_scope_at(document.position_for_node(node))
+                        .unwrap_or(0);
+                    document.analysis().ring_constructor_symbol_variables(
+                        node,
+                        &document,
+                        document.object_registry(),
+                        scope,
+                    )
+                })
+                .map(|node| node.text().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(found, expected, "wrong constructor symbols in {source:?}");
+        }
+    }
+
+    #[test]
+    fn polynomial_generator_ranges_cover_boundaries_and_index_shapes() {
+        for (constructor, probes) in [
+            (
+                "QQ[a..c]",
+                vec![("a", "R"), ("b", "R"), ("c", "R"), ("d", "Symbol")],
+            ),
+            ("QQ[a..<d]", vec![("c", "R"), ("d", "Symbol")]),
+            (
+                "QQ[z..B]",
+                vec![("z", "R"), ("A", "R"), ("B", "R"), ("C", "Symbol")],
+            ),
+            ("QQ[longName..longName]", vec![("longName", "R")]),
+            ("QQ[c..a]", vec![("a", "Symbol"), ("c", "Symbol")]),
+            (
+                "QQ[((x)_1)]",
+                vec![
+                    ("x", "IndexedVariableTable"),
+                    ("x_1", "R"),
+                    ("x_2", "IndexedVariable"),
+                ],
+            ),
+            (
+                "QQ[(x_1)..(x_3)]",
+                vec![("x_1", "R"), ("x_3", "R"), ("x_4", "IndexedVariable")],
+            ),
+            (
+                "QQ[x_1, x_3]",
+                vec![("x_1", "R"), ("x_2", "IndexedVariable"), ("x_3", "R")],
+            ),
+            (
+                "QQ[x_(-2)..x_1]",
+                vec![
+                    ("x_(-3)", "IndexedVariable"),
+                    ("x_(-2)", "R"),
+                    ("x_0", "R"),
+                    ("x_2", "IndexedVariable"),
+                ],
+            ),
+            (
+                "QQ[x_{1,2}]",
+                vec![
+                    ("x_{1,2}", "R"),
+                    ("x_{2,1}", "IndexedVariable"),
+                    ("x_(1,2)", "IndexedVariable"),
+                ],
+            ),
+            (
+                "QQ[x_(1,2)]",
+                vec![("x_(1,2)", "R"), ("x_{1,2}", "IndexedVariable")],
+            ),
+            (
+                "QQ[x_\"a\"]",
+                vec![("x_\"a\"", "R"), ("x_\"b\"", "IndexedVariable")],
+            ),
+            (
+                "QQ[x_1..z_1000000000]",
+                vec![
+                    ("x_1", "R"),
+                    ("y_500000000", "R"),
+                    ("z_1000000000", "R"),
+                    ("z_1000000001", "IndexedVariable"),
+                ],
+            ),
+        ] {
+            assert_types(&format!("R = {constructor}"), &probes);
+        }
+    }
+
+    #[test]
+    fn polynomial_cartesian_ranges_preserve_holes_and_dimension_boundaries() {
+        assert_types(
+            "R = QQ[x_{1,2}..z_{2,4}, x_{4,1}, y_7, a..c, w]",
+            &[
+                ("x_{1,2}", "R"),
+                ("y_{2,3}", "R"),
+                ("z_{2,4}", "R"),
+                ("x_{0,3}", "IndexedVariable"),
+                ("x_{1,5}", "IndexedVariable"),
+                ("x_{1}", "IndexedVariable"),
+                ("x_{1,2,3}", "IndexedVariable"),
+                ("x_{4,1}", "R"),
+                ("y_{4,1}", "IndexedVariable"),
+                ("y_7", "R"),
+                ("x_7", "IndexedVariable"),
+                ("w", "R"),
+                ("b", "R"),
+            ],
+        );
     }
 }

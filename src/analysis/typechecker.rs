@@ -869,12 +869,35 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> InferredType {
-        let (Some(callable_node), Some(argument_node)) = (
-            node.child_by_field_name("left"),
-            node.child_by_field_name("right"),
-        ) else {
+        let Some(argument_node) = node.child_by_field_name("right") else {
             return InferredType::unknown();
         };
+        self.application_type_for_argument(node, argument_node, source, scope_idx, knowledge)
+    }
+
+    /// Infer application to a syntactic argument independently of the CST's
+    /// enclosing application node, so delimited arguments can bind before a
+    /// trailing operator for every callable.
+    fn application_type_for_argument(
+        &self,
+        node: M2Node,
+        argument_node: M2Node,
+        source: &(impl SourceNavigation + ?Sized),
+        scope_idx: usize,
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> InferredType {
+        let Some(callable_node) = node.child_by_field_name("left") else {
+            return InferredType::unknown();
+        };
+        if let Some(result) = self.application_with_trailing_operator_type(
+            node,
+            argument_node,
+            source,
+            scope_idx,
+            knowledge,
+        ) {
+            return result;
+        }
         let Some(operator) = Operator::from_expression(node) else {
             return InferredType::unknown();
         };
@@ -937,17 +960,6 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
             return InferredType::unknown();
         }
 
-        if let Some(result) = self.ring_application_with_trailing_operator_type(
-            &operator,
-            &head,
-            argument_node,
-            source,
-            scope_idx,
-            knowledge,
-        ) {
-            return result;
-        }
-
         let argument_type = self.type_of(argument_node, source, scope_idx);
         self.dispatch_codomain(
             knowledge,
@@ -975,6 +987,48 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
             return None;
         }
         self.function_for_binding(binding)
+    }
+
+    /// Lower a delimited application before a trailing operator when the CST
+    /// puts that operator inside the argument (for example `f[x]^2`). This is
+    /// syntax precedence, independent of the head's type. Explicit parentheses
+    /// around the argument's operator expression keep their original meaning.
+    fn application_with_trailing_operator_type(
+        &self,
+        application: M2Node,
+        argument: M2Node,
+        source: &(impl SourceNavigation + ?Sized),
+        scope_idx: usize,
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Option<InferredType> {
+        let operator = argument.binary_operator()?;
+        if argument.is_space_application() {
+            return None;
+        }
+        let left = argument.child_by_field_name("left")?;
+        let applied_type = if left.is_collection_expression() || left.is_holder() {
+            self.application_type_for_argument(application, left, source, scope_idx, knowledge)
+        } else {
+            self.application_with_trailing_operator_type(
+                application,
+                left,
+                source,
+                scope_idx,
+                knowledge,
+            )?
+        };
+        let right = argument.child_by_field_name("right")?;
+        let right_type = self.type_of(right, source, scope_idx);
+        Some(self.dispatch_codomain(
+            knowledge,
+            &Operator {
+                token: ObjectName::new(operator),
+                form: OperatorForm::Binary,
+            },
+            &[applied_type, right_type],
+            &[],
+            source.position_for_node(argument),
+        ))
     }
 
     /// A prefix/postfix operator's type: `typicalValue(op, operand)`.

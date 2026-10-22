@@ -471,7 +471,7 @@ pub struct BindingStateInfo {
     pub presentation_kind: SymbolKind,
     pub inferred_type: Option<InferredType>,
     pub object_id: Option<CallableObjectId>,
-    pub indexed_element_type: Option<ObjectName>,
+    pub indexed_element_type: Option<ring::IndexedGeneratorTypes>,
     pub source_type: Option<TypeId>,
     pub value_range: Option<TextRange>,
     pub definition_range: TextRange,
@@ -628,7 +628,7 @@ struct BindingEnrichment {
     presentation_kind: SymbolKind,
     inferred_type: Option<InferredType>,
     object_id: Option<CallableObjectId>,
-    indexed_element_type: Option<ObjectName>,
+    indexed_element_type: Option<ring::IndexedGeneratorTypes>,
     parent_type: Option<TypeId>,
 }
 

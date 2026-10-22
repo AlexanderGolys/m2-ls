@@ -221,3 +221,75 @@ mod descendants_tests {
         assert_eq!(naked.collection_elements().count(), 2);
     }
 }
+
+#[cfg(test)]
+mod application_precedence_tests {
+    use super::*;
+
+    #[test]
+    fn delimited_applications_bind_before_division_for_every_head() {
+        for source in [
+            "R[x]/I",
+            "R [x] / I",
+            "f[x]/g",
+            "f [x] / g",
+            "f<|x|>/g",
+            "f <|x|> / g",
+            "f{x}/g",
+            "f(x)/g",
+            "(f)[x]/g",
+            "(f<|x|>)/g",
+        ] {
+            let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+            let root = parser.parse(source).expect("fixture should parse");
+            assert!(!root.has_error(), "invalid fixture {source:?}");
+            let division = root
+                .descendants()
+                .find(|node| node.binary_operator() == Some("/"))
+                .unwrap_or_else(|| panic!("missing division in {source:?}"));
+            let left = division
+                .child_by_field_name("left")
+                .expect("division has a left operand");
+            let left =
+                crate::analysis::parenthesized_value(left).expect("left operand has a value");
+            assert!(
+                left.is_space_application(),
+                "division must follow application in {source:?}"
+            );
+            assert!(
+                division
+                    .child_by_field_name("right")
+                    .is_some_and(|right| right.text() == "I" || right.text() == "g"),
+                "division must keep its RHS in {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_argument_grouping_keeps_division_inside_the_call() {
+        for source in ["f([x]/g)", "f(<|x|>/g)", "R([x]/I)"] {
+            let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+            let root = parser.parse(source).expect("fixture should parse");
+            assert!(!root.has_error(), "invalid fixture {source:?}");
+            let application = root
+                .descendants()
+                .find(M2Node::is_space_application)
+                .expect("fixture contains application");
+            assert_eq!(
+                application.text(),
+                source,
+                "the call must enclose division in {source:?}"
+            );
+            let argument = application
+                .child_by_field_name("right")
+                .expect("call has an argument");
+            let argument =
+                crate::analysis::parenthesized_value(argument).expect("argument has a value");
+            assert_eq!(
+                argument.binary_operator(),
+                Some("/"),
+                "explicit grouping controls precedence in {source:?}"
+            );
+        }
+    }
+}

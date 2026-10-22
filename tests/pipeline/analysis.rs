@@ -2599,6 +2599,147 @@ async fn algebraic_runtime_types_and_generator_rebinding_reach_hover() {
 }
 
 #[tokio::test]
+async fn ring_indexed_generators_distinguish_indices_and_cartesian_ranges() {
+    let source = concat!(
+        "R = QQ[a..c, x_1..y_3, w_2, v, t_{1,2}..u_{2,3}, z_{-1,2}]\n",
+        "a\nb\nc\nd\nx\nx_1\nx_3\nx_4\ny_2\ny_0\nw_2\nw_3\nv\n",
+        "t_{1,2}\nt_{2,3}\nt_{1,3}\nt_{2,2}\nt_{3,2}\nu_{2,3}\nu_{1,4}\nz_{-1,2}\nz_{1,2}\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let hints = inlay_labels_by_line(&mut session).await;
+    for (line, expected) in [
+        (1, "R"),
+        (2, "R"),
+        (3, "R"),
+        (4, "Symbol"),
+        (5, "IndexedVariableTable"),
+        (6, "R"),
+        (7, "R"),
+        (8, "IndexedVariable"),
+        (9, "R"),
+        (10, "IndexedVariable"),
+        (11, "R"),
+        (12, "IndexedVariable"),
+        (13, "R"),
+        (14, "R"),
+        (15, "R"),
+        (16, "R"),
+        (17, "R"),
+        (18, "IndexedVariable"),
+        (19, "R"),
+        (20, "IndexedVariable"),
+        (21, "R"),
+        (22, "IndexedVariable"),
+    ] {
+        assert!(
+            hints.contains(&(line, expected.to_string())),
+            "missing {expected} on line {line}: {hints:?}"
+        );
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn ring_generator_reuse_updates_only_the_current_table_entries() {
+    let source = concat!(
+        "R = QQ[x_1, x_3, a]\n",
+        "x_1\nx_2\nx_3\na\n",
+        "S = QQ[x_2..x_3, a]\n",
+        "x_1\nx_2\nx_3\na\n",
+        "T = QQ[x]\n",
+        "x\nx_1\n",
+        "U = QQ[x_4]\n",
+        "x\nx_1\nx_4\n",
+        "Q = U/ideal(x_4^2)\n",
+        "x_1\nx_4\n",
+        "x = 7\nx\n",
+        "V = QQ[x_5]\nx_4\nx_5\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let hints = inlay_labels_by_line(&mut session).await;
+    for (line, expected) in [
+        (1, "R"),
+        (2, "IndexedVariable"),
+        (3, "R"),
+        (4, "R"),
+        (6, "R"),
+        (7, "S"),
+        (8, "S"),
+        (9, "S"),
+        (11, "T"),
+        (12, "IndexedVariable"),
+        (14, "IndexedVariableTable"),
+        (15, "IndexedVariable"),
+        (16, "U"),
+        (18, "IndexedVariable"),
+        (19, "Q"),
+        (21, "ZZ"),
+        (23, "IndexedVariable"),
+        (24, "V"),
+    ] {
+        assert!(
+            hints.contains(&(line, expected.to_string())),
+            "missing {expected} on line {line}: {hints:?}"
+        );
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn ring_generated_variable_counts_bound_the_indices() {
+    let mut session = DocumentSession::open(concat!(
+        "R = QQ[Variables => 3, VariableBaseName => v]\n",
+        "v_0\nv_2\nv_3\nv_(-1)\n",
+        "S = QQ[v_1]\nv_0\nv_1\nv_2\nv_3\n",
+    ))
+    .await;
+    let hints = inlay_labels_by_line(&mut session).await;
+    for (line, expected) in [
+        (1, "R"),
+        (2, "R"),
+        (3, "IndexedVariable"),
+        (4, "IndexedVariable"),
+        (6, "R"),
+        (7, "S"),
+        (8, "R"),
+        (9, "IndexedVariable"),
+    ] {
+        assert!(
+            hints.contains(&(line, expected.to_string())),
+            "missing {expected} on line {line}: {hints:?}"
+        );
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn ring_quotients_rebind_all_disjoint_index_specs() {
+    let mut session = DocumentSession::open(concat!(
+        "R = QQ[x_1, x_3, x_5..x_7]\n",
+        "S = QQ[x_2]\n",
+        "Q = R/ideal(x_1^2)\n",
+        "x_1\nx_2\nx_3\nx_4\nx_5\nx_7\nx_8\n",
+    ))
+    .await;
+    let hints = inlay_labels_by_line(&mut session).await;
+    for (line, expected) in [
+        (3, "Q"),
+        (4, "S"),
+        (5, "Q"),
+        (6, "IndexedVariable"),
+        (7, "Q"),
+        (8, "Q"),
+        (9, "IndexedVariable"),
+    ] {
+        assert!(
+            hints.contains(&(line, expected.to_string())),
+            "missing {expected} on line {line}: {hints:?}"
+        );
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test]
 async fn numeric_literal_promotion_preserves_the_ring_element_type() {
     let mut session = DocumentSession::open(
         "S = QQ[x]\nR = S\na := 1_R\nb := (2)_R\nc := (2.5)_(R)\nq := 3_QQ\na\nb\nc\nq\n",
@@ -2887,5 +3028,40 @@ async fn an_installation_of_a_library_method_inherits_its_typical_value() {
         "`toString` already has the typical value `String`: {:?}",
         session.diagnostics()
     );
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn delimited_application_precedence_is_independent_of_ring_semantics() {
+    let mut session = DocumentSession::open("").await;
+    for (domain, argument) in [("Array", "[1]"), ("AngleBarList", "<|1|>"), ("List", "{1}")] {
+        for (expression, expected) in [
+            (format!("f{argument}/2"), "Boolean"),
+            (format!("f {argument} / 2"), "Boolean"),
+            (format!("(f{argument})/2"), "Boolean"),
+            (format!("f{argument} / 2 / 3"), "RR"),
+            (format!("f{argument} / (2+1)"), "Boolean"),
+            (format!("f{argument} ^ 2"), "Boolean"),
+        ] {
+            let source = format!(
+                concat!(
+                    "f = method()\n",
+                    "f {domain} := String => values -> \"value\"\n",
+                    "String / ZZ := Boolean => (left, right) -> true\n",
+                    "Boolean / ZZ := RR => (left, right) -> 1.0\n",
+                    "String ^ ZZ := Boolean => (left, right) -> true\n",
+                    "result = {expression}\nresult\n",
+                ),
+                domain = domain,
+                expression = expression
+            );
+            session.replace(&source).await;
+            assert_eq!(
+                hover_type_at(&mut session, 6, 0).await,
+                expected,
+                "wrong application precedence for {expression:?}"
+            );
+        }
+    }
     session.shutdown().await;
 }
