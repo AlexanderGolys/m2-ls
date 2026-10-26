@@ -3,8 +3,7 @@
 use std::backtrace::Backtrace;
 use std::collections::HashMap;
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::panic;
 use std::sync::Arc;
 
@@ -31,6 +30,7 @@ mod diagnostics;
 mod document;
 mod documentation;
 mod library_index;
+mod macaulay2;
 mod meta;
 mod node_metadata;
 mod object_registry;
@@ -42,6 +42,7 @@ mod session;
 mod settings;
 mod source;
 mod source_package;
+mod telemetry;
 #[cfg(test)]
 mod test_support;
 mod typesystem;
@@ -92,6 +93,7 @@ struct Backend {
     registry: ObjectRegistry,
     environment: Macaulay2Environment,
     documents: DashMap<Url, DocumentSnapshot>,
+    document_versions: DashMap<Url, i32>,
     workspace_index: Arc<WorkspaceIndex>,
     library: SettingsStore<Arc<LibraryIndex>>,
     settings: SettingsStore<ServerSettings>,
@@ -115,6 +117,7 @@ impl Backend {
             registry,
             environment,
             documents: DashMap::new(),
+            document_versions: DashMap::new(),
             workspace_index: Arc::new(WorkspaceIndex::default()),
             settings: SettingsStore::default(),
             semantic_tokens_augment_syntax: ClientSupport::default(),
@@ -206,7 +209,10 @@ impl Backend {
         position: Position,
         request: impl FnOnce(&DocumentSnapshot, &ObjectRegistry, WorkspaceView) -> R,
     ) -> Option<R> {
+        let lookup_timing =
+            telemetry::Timing::start("document.lock", serde_json::json!({"uri": uri}));
         let document = self.documents.get(uri)?;
+        drop(lookup_timing);
         let (source, workspace) = self.source_at(document.value(), position);
         Some(request(source, source.object_registry(), workspace))
     }
@@ -220,18 +226,20 @@ impl Backend {
         position: Position,
         request: impl Fn(&DocumentSnapshot, &ObjectRegistry, WorkspaceView, &LibrarySources) -> R,
     ) -> Option<R> {
-        loop {
+        const MAX_INDEXING_STEPS: usize = 8;
+        for step in 0..=MAX_INDEXING_STEPS {
             let library_index = self.library.snapshot();
             let library = library_index.sources();
             let response = self.with_source_at(uri, position, |document, knowledge, workspace| {
                 request(document, knowledge, workspace, &library)
             });
             let wanted_packages = library.into_wanted_packages();
-            if wanted_packages.is_empty() {
+            if wanted_packages.is_empty() || step == MAX_INDEXING_STEPS {
                 return response;
             }
             library_index.index_packages(wanted_packages).await;
         }
+        unreachable!("navigation returns at its indexing limit")
     }
 
     /// Collect occurrences of a global symbol across every indexed file
@@ -283,7 +291,8 @@ impl Backend {
 
     async fn publish_document_diagnostics(&self, uri: Url, document: &DocumentSnapshot) {
         let settings = self.settings.snapshot();
-        publish_diagnostics(&self.client, uri, document, &settings.diagnostics).await;
+        let version = self.document_versions.get(&uri).map(|version| *version);
+        publish_diagnostics(&self.client, uri, document, &settings.diagnostics, version).await;
     }
 
     /// Tell the user, not just the log, which settings were ignored and why.
@@ -354,71 +363,127 @@ impl Backend {
     }
 
     async fn on_open(&self, params: TextDocumentItem) {
+        let _timing = telemetry::Timing::start(
+            "document.open",
+            serde_json::json!({"uri": params.uri, "source_bytes": params.text.len()}),
+        );
         let Some(document) = DocumentSnapshot::from_text(params.text, &self.registry) else {
             return;
         };
         let uri = params.uri;
-        let text = document.text().to_string();
-        // Served before indexing, which may read the document's loads from disk.
+        let loaded = self
+            .workspace_index
+            .index_snapshot(&uri, &document, &self.registry);
+        self.document_versions.insert(uri.clone(), params.version);
         self.documents.insert(uri.clone(), document);
-        self.index_in_background(uri.clone(), text).await;
+        self.index_loaded_in_background(loaded).await;
         if let Some(document) = self.documents.get(&uri) {
             self.publish_document_diagnostics(uri, document.value())
                 .await;
         }
     }
 
-    async fn on_change(&self, uri: Url, changes: Vec<TextDocumentContentChangeEvent>) {
-        let text = {
+    async fn on_change(
+        &self,
+        uri: Url,
+        version: i32,
+        changes: Vec<TextDocumentContentChangeEvent>,
+    ) {
+        let _timing = telemetry::Timing::start(
+            "document.change",
+            serde_json::json!({"uri": uri, "version": version, "changes": changes.len()}),
+        );
+        self.document_versions.insert(uri.clone(), version);
+        {
             let Some(mut document) = self.documents.get_mut(&uri) else {
                 return;
             };
             if document.apply_changes(&changes, &self.registry).is_none() {
                 return;
             }
-            document.text().to_string()
-        };
-        self.index_in_background(uri.clone(), text).await;
+            let library = self.library.snapshot();
+            let library_file = uri.to_file_path().ok().is_some_and(|path| {
+                library
+                    .source_resolver()
+                    .package_of_source_file(&path)
+                    .is_some()
+            });
+            if !library_file {
+                self.workspace_index
+                    .index_snapshot(&uri, document.value(), &self.registry);
+            }
+        }
+
         if let Some(document) = self.documents.get(&uri) {
             self.publish_document_diagnostics(uri, document.value())
                 .await;
         }
     }
 
-    /// Index `text` as `uri`, plus the files it loads, on the blocking pool:
-    /// the session's one task also writes outgoing messages, so indexing it
-    /// in place would hold back every notification until it finishes.
-    async fn index_in_background(&self, uri: Url, text: String) {
+    /// Refresh transitive disk dependencies on open/save, sharing the open document's facts.
+    async fn index_loaded_in_background(&self, loaded: Vec<Url>) {
         let index = Arc::clone(&self.workspace_index);
         let registry = self.registry.clone();
-        task::spawn_blocking(move || index.index_file(&uri, &text, &registry))
+        task::spawn_blocking(move || index.index_files_from_disk(loaded, &registry))
             .await
             .expect("workspace indexing task panicked");
     }
+
+    async fn on_save(&self, uri: Url) {
+        let _timing = telemetry::Timing::start("document.save", serde_json::json!({"uri": uri}));
+        self.library.snapshot().invalidate_saved_file(&uri);
+        let Some(version) = self.document_versions.get(&uri).map(|version| *version) else {
+            return;
+        };
+        let job = {
+            let Some(document) = self.documents.get(&uri) else {
+                return;
+            };
+            document.save_job(self.registry.clone())
+        };
+        let saved = task::spawn_blocking(job)
+            .await
+            .expect("save analysis task panicked");
+        let loaded = {
+            let Some(current) = self.document_versions.get(&uri) else {
+                return;
+            };
+            if *current != version {
+                return;
+            }
+            let dashmap::mapref::entry::Entry::Occupied(mut document) =
+                self.documents.entry(uri.clone())
+            else {
+                return;
+            };
+            if document.get().text() != saved.text() {
+                return;
+            }
+            let loaded = self
+                .workspace_index
+                .index_snapshot(&uri, &saved, &self.registry);
+            document.insert(saved);
+            loaded
+        };
+        self.index_loaded_in_background(loaded).await;
+        if let Some(document) = self.documents.get(&uri) {
+            self.publish_document_diagnostics(uri, document.value())
+                .await;
+        }
+    }
 }
 
-fn append_debug_log(message: &str) {
-    let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/m2-ls.log")
-    else {
-        return;
-    };
-    let _ = writeln!(file, "{message}");
-}
-
-/// Install the crash hook: a panic always logs its backtrace to
-/// `/tmp/m2-ls.log` (crash diagnostics are worth the write). Routine chatter
-/// is opt-in via the `M2_LS_LOG` environment variable.
+/// Preserve panic diagnostics alongside request and stage timings.
 fn install_panic_logging() {
     panic::set_hook(Box::new(|panic_info| {
-        let backtrace = Backtrace::force_capture();
-        append_debug_log(&format!("panic: {panic_info}\n{backtrace}"));
+        telemetry::event(serde_json::json!({
+            "operation": "panic", "message": panic_info.to_string(),
+            "backtrace": Backtrace::force_capture().to_string(),
+        }));
     }));
-    if std::env::var_os("M2_LS_LOG").is_some() {
-        append_debug_log("m2-ls starting");
-    }
+    telemetry::event(
+        serde_json::json!({"operation": "startup", "version": env!("CARGO_PKG_VERSION")}),
+    );
 }
 
 #[tower_lsp::async_trait]
@@ -443,8 +508,13 @@ impl LanguageServer for Backend {
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::INCREMENTAL,
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::INCREMENTAL),
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                        ..Default::default()
+                    },
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
@@ -549,8 +619,16 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        self.on_change(params.text_document.uri, params.content_changes)
-            .await;
+        self.on_change(
+            params.text_document.uri,
+            params.text_document.version,
+            params.content_changes,
+        )
+        .await;
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        self.on_save(params.text_document.uri).await;
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
@@ -569,6 +647,7 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.documents.remove(&uri);
+        self.document_versions.remove(&uri);
         // Re-index from disk so the workspace index reflects the saved file
         // rather than the last in-editor edit.
         self.reindex_from_disk(&uri);
@@ -596,8 +675,8 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .with_source_at(uri, position, |document, knowledge, _| {
-                hover_response(document, position, &knowledge.at(position))
+            .with_source_at(uri, position, |document, knowledge, workspace| {
+                hover_response(document, uri, position, &knowledge.at(position), &workspace)
             })
             .flatten())
     }
@@ -1051,6 +1130,7 @@ async fn serve() {
         () = Server::new(stdin, stdout, socket).serve(service) => {}
         () = session_end.ended() => {}
     }
+    telemetry::summary();
     // Returning from `main` would wait for tokio's blocking stdin reader, which
     // outlives the session; the process ends here instead.
     std::process::exit(session_end.exit_code());

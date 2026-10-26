@@ -1,83 +1,158 @@
-//! Configured parser and owned syntax-tree lifecycle.
+//! Native parsing and retained syntax ownership.
 
-use m2_syn::nodes::SourceFile;
-use tree_sitter::{InputEdit, Parser, Tree};
+use super::cells::SyntaxSnapshot;
+use super::native::{indexes, CellIndex};
+use super::{SyntaxNode, TypedSource};
+use std::sync::Arc;
 
-use super::M2Node;
-
-/// A Macaulay2 parser with its language configured.
-///
-/// Parser construction and grammar selection are centralized here so syntax
-/// consumers receive typed [`M2Node`] roots instead of configuring Tree-sitter
-/// themselves.
-pub struct M2Parser {
-    parser: Parser,
-    tree: Option<M2Tree>,
+/// Native Macaulay2 parser, retaining the syntax backing borrowed results.
+pub struct SyntaxParser {
+    tree: Option<SyntaxTree>,
 }
 
-impl M2Parser {
-    /// Construct a parser configured for the pinned Macaulay2 grammar.
+impl SyntaxParser {
     pub fn new() -> Option<Self> {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_macaulay2::language())
-            .ok()?;
-        Some(Self { parser, tree: None })
+        Some(Self { tree: None })
     }
-
-    /// Parse source and return its typed root.
-    ///
-    /// The parser retains the backing syntax tree. Consequently Rust prevents a
-    /// second parse through this parser while the returned root is still used.
-    pub fn parse<'tree>(&'tree mut self, source: &'tree str) -> Option<M2Node<'tree>> {
-        let tree = self.parser.parse(source, None).map(M2Tree::new)?;
-        self.tree = Some(tree);
+    pub fn parse<'a>(&'a mut self, source: &'a str) -> Option<SyntaxNode<'a>> {
+        self.tree = self.parse_tree(source, None);
         self.tree.as_ref().map(|tree| tree.root(source))
     }
-
-    /// Parse source into an opaque tree retained by long-lived document state.
-    pub fn parse_tree(&mut self, source: &str, old_tree: Option<&M2Tree>) -> Option<M2Tree> {
-        self.parser
-            .parse(source, old_tree.map(|tree| &tree.tree))
-            .map(M2Tree::new)
+    pub fn parse_tree(
+        &mut self,
+        source: &str,
+        old_tree: Option<&SyntaxTree>,
+    ) -> Option<SyntaxTree> {
+        let mut timing = crate::telemetry::Timing::start(
+            "syntax.parse",
+            serde_json::json!({"source_bytes": source.len(), "incremental": old_tree.is_some()}),
+        );
+        let framing = crate::telemetry::Timing::start(
+            "syntax.cells",
+            serde_json::json!({"source_bytes": source.len()}),
+        );
+        let snapshot = SyntaxSnapshot::parse(source, old_tree.map(|tree| tree.snapshot()));
+        drop(framing);
+        let indexing = crate::telemetry::Timing::start(
+            "syntax.navigation_index",
+            serde_json::json!({"source_bytes": source.len()}),
+        );
+        let indexes = indexes(
+            &snapshot,
+            old_tree.map(|old| (&old.syntax.snapshot, old.indexes.as_slice())),
+        );
+        drop(indexing);
+        let reparsed = snapshot.changed_ranges().len();
+        timing.record("reparsed_cells", reparsed);
+        timing.record(
+            "reused_cells",
+            snapshot.cells().len().saturating_sub(reparsed),
+        );
+        let line_starts = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(i, _)| i + 1))
+            .collect::<Vec<_>>()
+            .into();
+        Some(SyntaxTree {
+            syntax: TypedSource { snapshot },
+            indexes,
+            line_starts,
+        })
     }
 }
 
-/// An owned Macaulay2 syntax tree.
-///
-/// The raw Tree-sitter tree remains private; consumers obtain a typed root with
-/// [`M2Tree::root`]. Document snapshots retain this wrapper to support
-/// incremental reparsing.
+/// One authoritative native syntax snapshot and its navigation metadata.
 #[derive(Debug, Clone)]
-pub struct M2Tree {
-    tree: Tree,
+pub struct SyntaxTree {
+    pub(super) syntax: TypedSource,
+    pub(super) indexes: Vec<Arc<CellIndex>>,
+    line_starts: Arc<[usize]>,
 }
 
-impl M2Tree {
-    fn new(tree: Tree) -> Self {
-        Self { tree }
+impl SyntaxTree {
+    pub fn root<'a>(&'a self, source: &'a str) -> SyntaxNode<'a> {
+        debug_assert_eq!(source, self.syntax.snapshot.source());
+        SyntaxNode::root_for(self)
+    }
+    pub fn snapshot(&self) -> &SyntaxSnapshot {
+        &self.syntax.snapshot
+    }
+    pub fn syntax(&self) -> &TypedSource {
+        &self.syntax
+    }
+    pub(super) fn point_for_byte(&self, byte: usize) -> crate::source::SourcePoint {
+        let row = self
+            .line_starts
+            .partition_point(|&start| start <= byte)
+            .saturating_sub(1);
+        crate::source::SourcePoint::new(row, byte - self.line_starts[row])
+    }
+    pub(super) fn byte_for_point(&self, point: crate::source::SourcePoint) -> Option<usize> {
+        let byte = self.line_starts.get(point.row)?.checked_add(point.column)?;
+        (byte <= self.snapshot().source().len()).then_some(byte)
+    }
+    pub fn changed_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        self.snapshot().changed_ranges().to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_typed_lookups_do_not_rebuild_syntax_children() {
+        let source = format!(
+            "values = {{{}}}\n",
+            (0..256)
+                .map(|value| format!("symbol value{value}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let tree = SyntaxParser::new()
+            .unwrap()
+            .parse_tree(&source, None)
+            .unwrap();
+        let enumerations = crate::node_metadata::syntax_ref::child_enumerations();
+        for _ in 0..3 {
+            for node in tree.root(&source).descendants() {
+                let _ = node.syntax();
+                let _ = node.get::<m2_syn::nodes::Symbol>();
+            }
+        }
+        assert_eq!(
+            crate::node_metadata::syntax_ref::child_enumerations(),
+            enumerations
+        );
     }
 
-    /// Return the typed root paired with the source represented by this tree.
-    pub fn root<'tree>(&'tree self, source: &'tree str) -> M2Node<'tree> {
-        M2Node::new(self.tree.root_node(), source)
+    #[test]
+    fn cached_typed_references_survive_original_revision_drop_and_cell_relocation() {
+        let mut parser = SyntaxParser::new().unwrap();
+        let before = parser.parse_tree("a\nb\nc\n", None).unwrap();
+        let after = parser.parse_tree("a -\nb\nc\n", Some(&before)).unwrap();
+        assert!(Arc::ptr_eq(&before.indexes[2], &after.indexes[1]));
+        drop(before);
+        drop(parser);
+        let root = after.root(after.snapshot().source());
+        let c = root.symbols().find(|symbol| symbol.text() == "c").unwrap();
+        assert!(c.get::<m2_syn::nodes::Symbol>().is_some());
+        assert_eq!(c.start_position().row, 2);
     }
 
-    /// The typed syntax for this tree's source.
-    ///
-    /// An editing session spends most of its time mid-keystroke, where the
-    /// strict entry point rejects the whole document over one incomplete
-    /// expression. Recovery keeps the usable syntax instead, so analysis stays
-    /// on the typed tree rather than falling back to untyped traversal.
-    /// `None` means the source could not be lexed at all.
-    pub fn typed_source_file(&self, source: &str) -> Option<SourceFile> {
-        m2_syn::parse_file_recovering(source)
-            .ok()
-            .map(|recovered| recovered.value)
-    }
-
-    /// Apply an incremental source edit before reparsing.
-    pub fn edit(&mut self, edit: &InputEdit) {
-        self.tree.edit(edit);
+    #[test]
+    fn changed_revisions_reuse_unaffected_navigation_indexes() {
+        let mut parser = SyntaxParser::new().unwrap();
+        let before = parser.parse_tree("x = 1\ny = 2\n", None).unwrap();
+        let after = parser
+            .parse_tree("x = 123\ny = 2\n", Some(&before))
+            .unwrap();
+        assert!(Arc::ptr_eq(&before.indexes[1], &after.indexes[1]));
+        let y = after
+            .root(after.snapshot().source())
+            .symbols()
+            .find(|symbol| symbol.text() == "y")
+            .unwrap();
+        assert_eq!(y.start_byte(), 8);
+        assert_eq!(y.start_position().row, 1);
     }
 }

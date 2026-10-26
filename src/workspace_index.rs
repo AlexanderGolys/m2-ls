@@ -12,22 +12,22 @@
 //! everyone else sees only the names the package exports. A file belongs to a
 //! package by declaring it, or by being loaded from inside its section.
 
+use dashmap::DashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-
-use dashmap::DashMap;
 use tower_lsp::lsp_types::{Location, Position, Range as TextRange, Url};
 
 use crate::analysis::AssignmentFactKind;
 use crate::capabilities::document_symbols::{collect_workspace_symbols, WorkspaceSourceSymbol};
 use crate::document::DocumentSnapshot;
 use crate::object_registry::{ObjectName, ObjectRegistry};
+use crate::package_documentation::DocumentedSubject;
 use crate::package_index::collect_loaded_files_in_tree;
 use crate::semantic_token::{local_symbol_semantic_token, M2SemanticTokenType};
 use crate::source::SourceNavigation;
-use crate::source_package::{PackageDeclaration, PackageExport};
+use crate::source_package::{ExportAccess, PackageDeclaration, PackageExport};
 
 #[derive(Debug, Clone)]
 struct DefLocation {
@@ -35,6 +35,9 @@ struct DefLocation {
     range: TextRange,
     semantic_token_type: M2SemanticTokenType,
     is_declaration: bool,
+    /// The statement defining the name, as written, when it is more than
+    /// the name.
+    code: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +62,29 @@ struct IndexedExport {
     /// The exporting package.
     package: ObjectName,
     export: PackageExport,
+}
+
+/// One documentation page of an indexed file, filed under the name one of
+/// its keys documents.
+#[derive(Debug, Clone)]
+struct IndexedPage {
+    file: Url,
+    /// The key documenting the name.
+    key: DocumentedSubject,
+    /// The page as Markdown.
+    markdown: String,
+}
+
+impl IndexedPage {
+    /// How directly the page's key documents its name: the name itself
+    /// before an optional argument it is, before a method it heads.
+    fn directness(&self) -> u8 {
+        match self.key {
+            DocumentedSubject::Name(_) => 0,
+            DocumentedSubject::OptionalArgument { .. } => 1,
+            DocumentedSubject::Method { .. } | DocumentedSubject::Expression(_) => 2,
+        }
+    }
 }
 
 /// Whether the index hides a package's unexported globals from the files
@@ -86,6 +112,18 @@ enum WorkspaceViewer<'a> {
     /// definitions of the document holding it, and sees every package, its
     /// own included, only through the exports.
     PackageSession,
+}
+
+/// What the workspace says about a name besides where it is defined: its
+/// documentation pages, which are global — every session that loads a package
+/// sees its documentation — and the code defining it.
+pub trait WorkspaceDocumentationKnowledge {
+    /// The Markdown of the page documenting `name` most directly.
+    fn documentation(&self, name: &str) -> Option<String>;
+
+    /// The statement defining the global `name` that the document `exclude`
+    /// sees in another file, as written.
+    fn declaration_code(&self, name: &str, exclude: &Url) -> Option<String>;
 }
 
 pub trait WorkspaceSymbolKnowledge {
@@ -129,6 +167,9 @@ pub trait WorkspaceDefinitionKnowledge {
     fn type_definitions(&self, name: &str, exclude: &Url) -> Vec<Location>;
     fn is_defined(&self, name: &str, exclude: &Url) -> bool;
     fn semantic_token_type(&self, name: &str, exclude: &Url) -> Option<M2SemanticTokenType>;
+    /// Whether a package of the workspace exports `name` with
+    /// `exportMutable`, so the sessions loading it may assign it.
+    fn is_mutable_export(&self, name: &str) -> bool;
 }
 
 impl<T: WorkspaceDefinitionKnowledge + ?Sized> WorkspaceDefinitionKnowledge for Arc<T> {
@@ -151,6 +192,10 @@ impl<T: WorkspaceDefinitionKnowledge + ?Sized> WorkspaceDefinitionKnowledge for 
     fn semantic_token_type(&self, name: &str, exclude: &Url) -> Option<M2SemanticTokenType> {
         self.as_ref().semantic_token_type(name, exclude)
     }
+
+    fn is_mutable_export(&self, name: &str) -> bool {
+        self.as_ref().is_mutable_export(name)
+    }
 }
 
 /// Global navigation index, keyed by symbol name, kept in sync with edits and
@@ -161,6 +206,7 @@ pub struct WorkspaceIndex {
     definitions_by_name: DashMap<ObjectName, Vec<DefLocation>>,
     implementations_by_name: DashMap<ObjectName, Vec<ImplementationLocation>>,
     method_declarations_by_name: DashMap<ObjectName, Vec<Location>>,
+    pages_by_name: DashMap<ObjectName, Vec<IndexedPage>>,
     names_by_file: DashMap<Url, Vec<ObjectName>>,
     symbols_by_file: DashMap<Url, Vec<WorkspaceSourceSymbol>>,
     /// Every indexed file, mapped to the files it loads and the user packages
@@ -206,11 +252,21 @@ impl WorkspaceIndex {
     /// wave of newly discovered files is parsed in parallel; files already
     /// indexed keep their facts.
     pub fn index_files_from_disk(&self, files: Vec<Url>, knowledge_provider: &ObjectRegistry) {
+        let mut timing = crate::telemetry::Timing::start(
+            "workspace.dependencies",
+            serde_json::json!({"roots": files.len()}),
+        );
+        let mut processed = 0;
         let mut pending = files;
         while !pending.is_empty() {
             pending.sort();
             pending.dedup();
+            let candidates = pending.len();
             pending.retain(|file| !self.is_indexed(file));
+            crate::telemetry::event(
+                serde_json::json!({"operation": "workspace.index_wave", "queued": pending.len(), "cache_hits": candidates - pending.len()}),
+            );
+            processed += pending.len();
             let workers = thread::available_parallelism()
                 .map_or(1, usize::from)
                 .min(pending.len());
@@ -241,6 +297,8 @@ impl WorkspaceIndex {
             });
             pending = loaded.into_inner().expect("loaded lock");
         }
+        timing.record("processed_files", processed);
+        timing.record("cached_files", self.loads_by_file.len());
     }
 
     pub fn is_indexed(&self, uri: &Url) -> bool {
@@ -250,48 +308,62 @@ impl WorkspaceIndex {
     /// Replace the navigation facts recorded for `uri` with those parsed from
     /// `text`, returning the files it loads and the user packages it imports.
     fn index_source(&self, uri: &Url, text: &str, knowledge_provider: &ObjectRegistry) -> Vec<Url> {
+        let _timing = crate::telemetry::Timing::start(
+            "workspace.index_file",
+            serde_json::json!({"uri": uri, "source_bytes": text.len()}),
+        );
         self.remove_file(uri);
         let Some(snapshot) = DocumentSnapshot::from_text(text.to_string(), knowledge_provider)
         else {
             self.loads_by_file.insert(uri.clone(), Vec::new());
             return Vec::new();
         };
+        self.index_snapshot(uri, &snapshot, knowledge_provider)
+    }
+
+    /// Records an existing document's facts without parsing or analyzing its source.
+    pub fn index_snapshot(
+        &self,
+        uri: &Url,
+        snapshot: &DocumentSnapshot,
+        knowledge_provider: &ObjectRegistry,
+    ) -> Vec<Url> {
+        self.remove_file(uri);
         let declarations = snapshot.packages().declarations().to_vec();
         if !declarations.is_empty() {
             self.declared_packages_by_file
                 .insert(uri.clone(), declarations);
         }
-        let mut loads = self.record_loaded_files(uri, &snapshot);
+        let mut loads = self.record_loaded_files(uri, snapshot);
         loads.extend(imported_user_package_files(
             uri,
-            &snapshot,
+            snapshot,
             knowledge_provider,
         ));
         self.loads_by_file.insert(uri.clone(), loads.clone());
-        let definitions = top_level_definitions(&snapshot);
-        let implementations = top_level_implementations(&snapshot);
-        let method_declarations = top_level_method_declarations(&snapshot);
-        let symbols = collect_workspace_symbols(&snapshot, uri);
+        let definitions = top_level_definitions(uri, snapshot);
+        let implementations = top_level_implementations(snapshot);
+        let method_declarations = top_level_method_declarations(snapshot);
+        let pages = documentation_pages(uri, snapshot);
+        let symbols = collect_workspace_symbols(snapshot, uri);
         if !symbols.is_empty() {
             self.symbols_by_file.insert(uri.clone(), symbols);
         }
-        if definitions.is_empty() && implementations.is_empty() && method_declarations.is_empty() {
+        if definitions.is_empty()
+            && implementations.is_empty()
+            && method_declarations.is_empty()
+            && pages.is_empty()
+        {
             return loads;
         }
         let mut names = Vec::with_capacity(
-            definitions.len() + implementations.len() + method_declarations.len(),
+            definitions.len() + implementations.len() + method_declarations.len() + pages.len(),
         );
-        for (name, range, semantic_token_type, is_declaration) in definitions {
-            let name = ObjectName::new(name);
+        for (name, definition) in definitions {
             self.definitions_by_name
                 .entry(name.clone())
                 .or_default()
-                .push(DefLocation {
-                    uri: uri.clone(),
-                    range,
-                    semantic_token_type,
-                    is_declaration,
-                });
+                .push(definition);
             names.push(name);
         }
         for (name, range, kind, requires_declaration) in implementations {
@@ -313,6 +385,13 @@ impl WorkspaceIndex {
                 .entry(name.clone())
                 .or_default()
                 .push(Location::new(uri.clone(), range));
+            names.push(name);
+        }
+        for (name, page) in pages {
+            self.pages_by_name
+                .entry(name.clone())
+                .or_default()
+                .push(page);
             names.push(name);
         }
         names.sort();
@@ -383,6 +462,15 @@ impl WorkspaceIndex {
                 };
             if declarations_empty {
                 self.method_declarations_by_name.remove(&name);
+            }
+            let pages_empty = if let Some(mut pages) = self.pages_by_name.get_mut(&name) {
+                pages.retain(|page| &page.file != uri);
+                pages.is_empty()
+            } else {
+                false
+            };
+            if pages_empty {
+                self.pages_by_name.remove(&name);
             }
         }
     }
@@ -536,12 +624,10 @@ impl WorkspaceIndex {
         locations
     }
 
-    fn semantic_token_type_for(
-        &self,
-        name: &str,
-        viewer: WorkspaceViewer<'_>,
-    ) -> Option<M2SemanticTokenType> {
-        let token_type_of = |definition: &str| {
+    /// The definition `viewer` sees of the global `name`, or of the global
+    /// a package exports `name` as a synonym of.
+    fn visible_definition(&self, name: &str, viewer: WorkspaceViewer<'_>) -> Option<DefLocation> {
+        let definition_of = |definition: &str| {
             self.definitions_by_name
                 .get(definition)
                 .and_then(|locations| {
@@ -551,20 +637,32 @@ impl WorkspaceIndex {
                         .find(|location| {
                             self.is_visible(viewer, definition, &location.uri, location.range)
                         })
-                        .map(|location| location.semantic_token_type)
+                        .cloned()
                 })
         };
-        token_type_of(name).or_else(|| {
-            let exports = self.exports_named(name);
-            exports
+        definition_of(name).or_else(|| {
+            self.exports_named(name)
                 .iter()
                 .find_map(|IndexedExport { export, .. }| {
                     (export.definition.name() != name)
-                        .then(|| token_type_of(export.definition.name()))
+                        .then(|| definition_of(export.definition.name()))
                         .flatten()
                 })
-                .or_else(|| (!exports.is_empty()).then_some(M2SemanticTokenType::Symbol))
         })
+    }
+
+    /// The token type of the global `name` as `viewer` sees it; an exported
+    /// name defined nowhere is the symbol the export creates.
+    fn semantic_token_type_for(
+        &self,
+        name: &str,
+        viewer: WorkspaceViewer<'_>,
+    ) -> Option<M2SemanticTokenType> {
+        self.visible_definition(name, viewer)
+            .map(|definition| definition.semantic_token_type)
+            .or_else(|| {
+                (!self.exports_named(name).is_empty()).then_some(M2SemanticTokenType::Symbol)
+            })
     }
 
     fn implementations_for(
@@ -617,6 +715,38 @@ impl WorkspaceIndex {
                         && self.is_visible(viewer, name, &declaration.uri, declaration.range)
                 })
             })
+    }
+}
+
+impl WorkspaceDocumentationKnowledge for WorkspaceIndex {
+    fn documentation(&self, name: &str) -> Option<String> {
+        let pages = self.pages_by_name.get(name)?;
+        pages
+            .iter()
+            .min_by(|left, right| {
+                left.directness()
+                    .cmp(&right.directness())
+                    .then_with(|| left.file.as_str().cmp(right.file.as_str()))
+            })
+            .map(|page| page.markdown.clone())
+    }
+
+    fn declaration_code(&self, name: &str, exclude: &Url) -> Option<String> {
+        self.visible_definition(name, WorkspaceViewer::Document(exclude))?
+            .code
+    }
+}
+
+impl WorkspaceDocumentationKnowledge for WorkspaceView<'_> {
+    fn documentation(&self, name: &str) -> Option<String> {
+        match self {
+            Self::Document(index) | Self::PackageSession(index) => index.documentation(name),
+        }
+    }
+
+    fn declaration_code(&self, name: &str, exclude: &Url) -> Option<String> {
+        let (index, viewer) = self.viewer(exclude);
+        index.visible_definition(name, viewer)?.code
     }
 }
 
@@ -678,6 +808,12 @@ impl WorkspaceDefinitionKnowledge for WorkspaceIndex {
     fn semantic_token_type(&self, name: &str, exclude: &Url) -> Option<M2SemanticTokenType> {
         self.semantic_token_type_for(name, WorkspaceViewer::Document(exclude))
     }
+
+    fn is_mutable_export(&self, name: &str) -> bool {
+        self.exports_named(name)
+            .iter()
+            .any(|indexed| indexed.export.access == ExportAccess::Mutable)
+    }
 }
 
 impl WorkspaceView<'_> {
@@ -718,6 +854,12 @@ impl WorkspaceDefinitionKnowledge for WorkspaceView<'_> {
     fn semantic_token_type(&self, name: &str, exclude: &Url) -> Option<M2SemanticTokenType> {
         let (index, viewer) = self.viewer(exclude);
         index.semantic_token_type_for(name, viewer)
+    }
+
+    fn is_mutable_export(&self, name: &str) -> bool {
+        match self {
+            Self::Document(index) | Self::PackageSession(index) => index.is_mutable_export(name),
+        }
     }
 }
 
@@ -796,22 +938,45 @@ fn imported_user_package_files(
 /// Parse `text` and return its global-scope definitions as `(name, range)`,
 /// where `range` is the definition site — the same range go-to-definition
 /// returns for an in-file symbol.
-fn top_level_definitions(
-    snapshot: &DocumentSnapshot,
-) -> Vec<(String, TextRange, M2SemanticTokenType, bool)> {
+/// The documentation pages of `snapshot` (the document `uri`), each filed
+/// under every name its keys document.
+fn documentation_pages(uri: &Url, snapshot: &DocumentSnapshot) -> Vec<(ObjectName, IndexedPage)> {
+    snapshot
+        .package_documentation()
+        .nodes()
+        .iter()
+        .flat_map(|node| {
+            node.keys.iter().filter_map(|key| {
+                let name = key.subject.documented_name()?.clone();
+                Some((
+                    name,
+                    IndexedPage {
+                        file: uri.clone(),
+                        key: key.subject.clone(),
+                        markdown: node.markdown.clone(),
+                    },
+                ))
+            })
+        })
+        .collect()
+}
+
+/// The global definitions of `snapshot`, the document `uri`, by name.
+fn top_level_definitions(uri: &Url, snapshot: &DocumentSnapshot) -> Vec<(ObjectName, DefLocation)> {
     let knowledge = snapshot.object_registry();
     let analysis = snapshot.analysis();
     analysis
         .binding_states()
         .filter(|binding| binding.state.scope_idx == 0)
         .map(|binding| {
-            let token_type = local_symbol_semantic_token(&binding, &knowledge).token_type;
-            (
-                binding.name.name().to_string(),
-                binding.state.span,
-                token_type,
-                binding.state.span == binding.range,
-            )
+            let definition = DefLocation {
+                uri: uri.clone(),
+                range: binding.state.span,
+                semantic_token_type: local_symbol_semantic_token(&binding, &knowledge).token_type,
+                is_declaration: binding.state.span == binding.range,
+                code: snapshot.declaration_code(binding).map(str::to_string),
+            };
+            (binding.name.clone(), definition)
         })
         .collect()
 }

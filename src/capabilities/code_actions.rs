@@ -11,11 +11,12 @@ use crate::analysis::MethodCodomainEdit;
 use crate::diagnostics::rewrites::{
     ambiguous_float_member_access_rewrite, coalescence_rewrite, else_if_chain_rewrite,
     if_condition_rewrite, if_null_branch_rewrite, redundant_control_parentheses_inner,
-    try_statement_rewrite, Coalescence,
+    simplification_of, try_statement_rewrite, Coalescence,
 };
+use crate::diagnostics::suppression::{DiagnosticSuppressions, SuppressionScope};
 use crate::diagnostics::{catalog, DiagnosticCode, DiagnosticRule};
 use crate::document::DocumentSnapshot;
-use crate::node_metadata::{token_spelling, M2Node};
+use crate::node_metadata::{token_spelling, SyntaxNode};
 use crate::settings::FormattingSettings;
 use crate::source::SourceNavigation;
 use crate::util::TextRangeExt;
@@ -26,7 +27,7 @@ struct CodeActionContext<'tree, 'request> {
     document: &'tree DocumentSnapshot,
     uri: &'request Url,
     position: Position,
-    cursor: M2Node<'tree>,
+    cursor: SyntaxNode<'tree>,
     diagnostics: &'request [Diagnostic],
 }
 
@@ -41,11 +42,11 @@ const CODE_ACTION_PRODUCERS: &[CodeActionProducer] = &[
     ambiguous_float_member_access_action,
     colon_equal_part_assignment_action,
     option_key_convention_action,
-    redundant_control_parentheses_action,
     coalescence_action,
     install_needs_colon_equals_action,
     method_codomain_action,
     convert_to_raw_string_action,
+    redundant_control_parentheses_action,
     conditional_null_action,
     simplify_try_action,
     simplify_if_condition_action,
@@ -83,7 +84,7 @@ fn method_codomain_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAct
                     };
                     return Some(
                         CodeActionSpec {
-                            title: "Add codomain annotation",
+                            title: "Add codomain annotation".into(),
                             kind: CodeActionKind::QUICKFIX,
                             is_preferred: Some(true),
                             diagnostics: Some(vec![diagnostic]),
@@ -133,10 +134,10 @@ fn assignment_operator_action(
     let mut current = Some(context.cursor);
     while let Some(node) = current {
         if node.binary_operator() == Some(current_operator) {
-            let operator = node.child_by_field_name("operator")?;
+            let operator = node.operator_node()?;
             return Some(
                 CodeActionSpec {
-                    title,
+                    title: title.into(),
                     kind: CodeActionKind::QUICKFIX,
                     is_preferred: Some(true),
                     diagnostics: Some(vec![diagnostic]),
@@ -160,7 +161,7 @@ fn option_key_convention_action(context: &CodeActionContext<'_, '_>) -> Option<C
     replacement.get_mut(..1)?.make_ascii_uppercase();
     Some(
         CodeActionSpec {
-            title: "Capitalize option key",
+            title: "Capitalize option key".into(),
             kind: CodeActionKind::QUICKFIX,
             is_preferred: Some(true),
             diagnostics: Some(vec![diagnostic]),
@@ -173,20 +174,34 @@ fn option_key_convention_action(context: &CodeActionContext<'_, '_>) -> Option<C
     )
 }
 
+/// Refactor: drop the parentheses around a condition, `try` value, or loop
+/// range that its keyword already delimits (`if (n > 0) then` → `if n > 0
+/// then`), offered inside the parentheses or on the control expression
+/// holding them.
 fn redundant_control_parentheses_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, &catalog::REDUNDANT_CONTROL_PARENTHESES)?;
-    let parentheses =
-        enclosing_node_with_range(context, diagnostic.range, |node| node.is_holder())?;
+    let is_redundant = |node: &SyntaxNode<'_>| redundant_control_parentheses_inner(*node).is_some();
+    let parentheses = std::iter::once(context.cursor)
+        .chain(context.cursor.ancestors())
+        .find_map(|node| {
+            if is_redundant(&node) {
+                Some(node)
+            } else {
+                node.named_children().find(is_redundant)
+            }
+        })?;
     let inner = redundant_control_parentheses_inner(parentheses)?;
-    let range = diagnostic.range;
     Some(
         CodeActionSpec {
-            title: "Remove redundant parentheses",
-            kind: CodeActionKind::QUICKFIX,
-            is_preferred: Some(true),
-            diagnostics: Some(vec![diagnostic]),
+            title: "Remove redundant parentheses".into(),
+            kind: CodeActionKind::REFACTOR_REWRITE,
+            is_preferred: None,
+            diagnostics: None,
         }
-        .build(context.uri, range, inner.text().to_string()),
+        .build(
+            context.uri,
+            context.document.range_for_node(parentheses),
+            inner.text().to_string(),
+        ),
     )
 }
 
@@ -204,7 +219,7 @@ fn coalescence_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction>
             let range = diagnostic.range;
             return Some(
                 CodeActionSpec {
-                    title,
+                    title: title.into(),
                     kind: CodeActionKind::QUICKFIX,
                     is_preferred: Some(true),
                     diagnostics: Some(vec![diagnostic]),
@@ -220,8 +235,8 @@ fn coalescence_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction>
 fn enclosing_node_with_range<'tree>(
     context: &CodeActionContext<'tree, '_>,
     range: TextRange,
-    matches: impl Fn(M2Node<'tree>) -> bool,
-) -> Option<M2Node<'tree>> {
+    matches: impl Fn(SyntaxNode<'tree>) -> bool,
+) -> Option<SyntaxNode<'tree>> {
     if let Some(symbol) = context.document.reference_node_at_position(range.start) {
         if matches(symbol) && context.document.range_for_node(symbol) == range {
             return Some(symbol);
@@ -259,6 +274,7 @@ pub fn available_code_actions(
     let actions: CodeActionResponse = CODE_ACTION_PRODUCERS
         .iter()
         .filter_map(|produce| produce(&context))
+        .chain(suppression_actions(&context))
         .map(|mut action| {
             if let Some(changes) = action.edit.as_mut().and_then(|edit| edit.changes.as_mut()) {
                 for edit in changes.values_mut().flatten() {
@@ -272,13 +288,61 @@ pub fn available_code_actions(
     (!actions.is_empty()).then_some(actions)
 }
 
+/// Quick fixes silencing each m2-ls diagnostic at the cursor with a
+/// directive comment: on its line, then in the whole file. They come last,
+/// after the fixes that address the diagnostic.
+fn suppression_actions(context: &CodeActionContext<'_, '_>) -> Vec<CodeAction> {
+    let mut actions = Vec::new();
+    for diagnostic in context
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.range.contains_position(context.position))
+    {
+        let Some(code) = DiagnosticCode::from_lsp(diagnostic) else {
+            continue;
+        };
+        for (scope, place) in [
+            (SuppressionScope::NextLine, "on this line"),
+            (SuppressionScope::File, "in this file"),
+        ] {
+            let position =
+                DiagnosticSuppressions::directive_position(scope, diagnostic.range.start);
+            let indentation = match scope {
+                SuppressionScope::NextLine => context
+                    .document
+                    .text()
+                    .lines()
+                    .nth(position.line as usize)
+                    .map(|line| &line[..line.len() - line.trim_start().len()])
+                    .unwrap_or_default(),
+                _ => "",
+            };
+            let comment = DiagnosticSuppressions::directive_comment(scope, code);
+            actions.push(
+                CodeActionSpec {
+                    title: format!("Disable {} {place}", code.as_str()),
+                    kind: CodeActionKind::QUICKFIX,
+                    is_preferred: None,
+                    diagnostics: Some(vec![diagnostic.clone()]),
+                }
+                .build(
+                    context.uri,
+                    TextRange::new(position, position),
+                    format!("{indentation}{comment}\n"),
+                ),
+            );
+        }
+    }
+    actions
+}
+
 /// The shared shape of every action this module emits: a title, a kind, and
 /// the optional LSP flags (`is_preferred`, `diagnostics`) — plus a single
 /// text edit applied to `uri`. Bundling them here collapses the ~15-line
 /// `WorkspaceEdit`/`CodeAction` boilerplate that every per-action producer
 /// would otherwise repeat.
 struct CodeActionSpec {
-    title: &'static str,
+    title: String,
     kind: CodeActionKind,
     is_preferred: Option<bool>,
     diagnostics: Option<Vec<Diagnostic>>,
@@ -287,7 +351,7 @@ struct CodeActionSpec {
 impl CodeActionSpec {
     fn build(self, uri: &Url, range: TextRange, new_text: String) -> CodeAction {
         CodeAction {
-            title: self.title.to_string(),
+            title: self.title,
             kind: Some(self.kind),
             diagnostics: self.diagnostics,
             edit: Some(WorkspaceEdit {
@@ -316,7 +380,7 @@ fn convert_to_raw_string_action(context: &CodeActionContext<'_, '_>) -> Option<C
 
     Some(
         CodeActionSpec {
-            title: "Convert to raw string",
+            title: "Convert to raw string".into(),
             kind: CodeActionKind::REFACTOR_REWRITE,
             is_preferred: None,
             diagnostics: None,
@@ -340,7 +404,7 @@ fn ambiguous_float_member_access_action(context: &CodeActionContext<'_, '_>) -> 
 
     Some(
         CodeActionSpec {
-            title: "Rewrite as member access",
+            title: "Rewrite as member access".into(),
             kind: CodeActionKind::QUICKFIX,
             is_preferred: Some(true),
             diagnostics: Some(vec![diagnostic]),
@@ -356,18 +420,17 @@ fn ambiguous_float_member_access_action(context: &CodeActionContext<'_, '_>) -> 
 /// Refactor: drop a redundant `else null` (or `then null`, negating the
 /// condition) from an `if` statement.
 fn conditional_null_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, &catalog::SIMPLIFIABLE_EXPRESSION)?;
     let if_node = context
         .cursor
         .enclosing_node(|node| node.is::<IfStatement>())?;
-    let replacement = if_null_branch_rewrite(if_node)?;
+    let replacement = simplification_of(if_node, if_null_branch_rewrite(if_node))?;
 
     Some(
         CodeActionSpec {
-            title: "Simplify unnecessary null branch",
+            title: "Simplify unnecessary null branch".into(),
             kind: CodeActionKind::REFACTOR_REWRITE,
             is_preferred: None,
-            diagnostics: Some(vec![diagnostic]),
+            diagnostics: None,
         }
         .build(
             context.uri,
@@ -380,18 +443,17 @@ fn conditional_null_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAc
 /// Refactor: simplify a `try` statement — drop a redundant `then` echo or a
 /// redundant `else null`.
 fn simplify_try_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, &catalog::SIMPLIFIABLE_EXPRESSION)?;
     let try_node = context
         .cursor
         .enclosing_node(|node| node.is::<TryStatement>())?;
-    let replacement = try_statement_rewrite(try_node)?;
+    let replacement = simplification_of(try_node, try_statement_rewrite(try_node))?;
 
     Some(
         CodeActionSpec {
-            title: "Simplify try",
+            title: "Simplify try".into(),
             kind: CodeActionKind::REFACTOR_REWRITE,
             is_preferred: None,
-            diagnostics: Some(vec![diagnostic]),
+            diagnostics: None,
         }
         .build(
             context.uri,
@@ -404,18 +466,17 @@ fn simplify_try_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction
 /// Refactor: push a leading `not` through a parenthesized comparison
 /// (`if not (a == b) then x` → `if a != b then x`).
 fn simplify_if_condition_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, &catalog::SIMPLIFIABLE_EXPRESSION)?;
     let if_node = context
         .cursor
         .enclosing_node(|node| node.is::<IfStatement>())?;
-    let replacement = if_condition_rewrite(if_node)?;
+    let replacement = simplification_of(if_node, if_condition_rewrite(if_node))?;
 
     Some(
         CodeActionSpec {
-            title: "Simplify if condition",
+            title: "Simplify if condition".into(),
             kind: CodeActionKind::REFACTOR_REWRITE,
             is_preferred: None,
-            diagnostics: Some(vec![diagnostic]),
+            diagnostics: None,
         }
         .build(
             context.uri,
@@ -425,13 +486,14 @@ fn simplify_if_condition_action(context: &CodeActionContext<'_, '_>) -> Option<C
     )
 }
 
+/// Refactor: flatten the outermost nested `if` around the cursor into an
+/// `else if` chain.
 fn flatten_else_if_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, &catalog::SIMPLIFIABLE_EXPRESSION)?;
     let mut current = Some(context.cursor);
     let mut candidate = None;
     while let Some(node) = current {
         if node.is::<IfStatement>() {
-            if let Some(replacement) = else_if_chain_rewrite(node) {
+            if let Some(replacement) = simplification_of(node, else_if_chain_rewrite(node)) {
                 candidate = Some((node, replacement));
             }
         }
@@ -440,10 +502,10 @@ fn flatten_else_if_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAct
     let (node, replacement) = candidate?;
     Some(
         CodeActionSpec {
-            title: "Flatten nested if into else-if chain",
+            title: "Flatten nested if into else-if chain".into(),
             kind: CodeActionKind::REFACTOR_REWRITE,
             is_preferred: None,
-            diagnostics: Some(vec![diagnostic]),
+            diagnostics: None,
         }
         .build(
             context.uri,
@@ -453,7 +515,7 @@ fn flatten_else_if_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAct
     )
 }
 
-fn raw_string_replacement(string_node: M2Node<'_>) -> Option<String> {
+fn raw_string_replacement(string_node: SyntaxNode<'_>) -> Option<String> {
     let content = string_node.string_literal_inner_text()?;
     let escape_count = count_string_escapes(content);
     if escape_count <= 2 {
@@ -511,12 +573,12 @@ mod tests {
     use super::*;
     use crate::capabilities::formatting::{format_document_with_options, ControlFlowLayout};
     use crate::diagnostics::visible_diagnostics;
-    use crate::node_metadata::M2Parser;
+    use crate::node_metadata::SyntaxParser;
     use crate::object_registry::ObjectRegistry;
     use crate::settings::DiagnosticSettings;
 
     fn formatted(text: &str, settings: &FormattingSettings) -> String {
-        let mut parser = M2Parser::new().unwrap();
+        let mut parser = SyntaxParser::new().unwrap();
         let root = parser.parse(text).unwrap();
         assert!(!root.has_error(), "{text}");
         format_document_with_options(root, &FormatOptions::from(settings))
@@ -532,14 +594,6 @@ mod tests {
             DocumentSnapshot::from_text(source.into(), &ObjectRegistry::default()).unwrap();
         let uri = Url::parse("file:///test.m2").unwrap();
         let diagnostics = visible_diagnostics(&document, &uri, &DiagnosticSettings::default());
-        assert!(
-            !diagnostics.iter().any(|diagnostic| {
-                matches!(DiagnosticCode::from_lsp(diagnostic), Some(code) if
-                code == catalog::SIMPLIFIABLE_EXPRESSION.code ||
-                code == catalog::REDUNDANT_CONTROL_PARENTHESES.code)
-            }),
-            "{diagnostics:?}"
-        );
         assert!(available_code_actions(
             &document,
             &uri,
@@ -548,6 +602,13 @@ mod tests {
             &FormattingSettings::default(),
         )
         .is_none());
+    }
+
+    /// Where the fixture's expression, the first one of the function body on
+    /// line 2, starts.
+    fn rewritten_expression_start(document: &DocumentSnapshot) -> Position {
+        let line = document.text().lines().nth(2).unwrap();
+        Position::new(2, (line.len() - line.trim_start().len()) as u32)
     }
 
     #[test]
@@ -608,23 +669,15 @@ mod tests {
                             .unwrap();
                     let diagnostics =
                         visible_diagnostics(&document, &uri, &DiagnosticSettings::default());
-                    let diagnostic = diagnostics
-                        .iter()
-                        .find(|diagnostic| {
-                            matches!(DiagnosticCode::from_lsp(diagnostic), Some(code) if
-                            code == catalog::SIMPLIFIABLE_EXPRESSION.code ||
-                            code == catalog::REDUNDANT_CONTROL_PARENTHESES.code ||
-                            code == catalog::PREFER_COALESCENCE.code)
-                        })
-                        .unwrap_or_else(|| panic!("missing hint: {source}"));
+                    let expression_start = rewritten_expression_start(&document);
                     let actions = available_code_actions(
                         &document,
                         &uri,
-                        diagnostic.range.start,
+                        expression_start,
                         &diagnostics,
                         &settings,
                     )
-                    .unwrap();
+                    .unwrap_or_else(|| panic!("missing {title}: {source}"));
                     let action = actions
                         .into_iter()
                         .find_map(|action| match action {
@@ -646,13 +699,22 @@ mod tests {
                     assert!(result.starts_with(&format!("-- λ 😀{newline}")));
                     let rewritten =
                         DocumentSnapshot::from_text(result, &ObjectRegistry::default()).unwrap();
+                    let offered_again = available_code_actions(
+                        &rewritten,
+                        &uri,
+                        rewritten_expression_start(&rewritten),
+                        &[],
+                        &settings,
+                    )
+                    .into_iter()
+                    .flatten()
+                    .any(|action| {
+                        matches!(action, CodeActionOrCommand::CodeAction(action)
+                            if action.title == title)
+                    });
                     assert!(
-                        !rewritten.diagnostics().iter().any(|diagnostic| {
-                            diagnostic.rule.code == catalog::SIMPLIFIABLE_EXPRESSION.code
-                                || diagnostic.rule.code
-                                    == catalog::REDUNDANT_CONTROL_PARENTHESES.code
-                        }),
-                        "{title} must clear the hint without another simplification: {source}"
+                        !offered_again,
+                        "{title} must not apply to its own result: {source}"
                     );
                 }
             }

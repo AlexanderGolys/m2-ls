@@ -1,21 +1,22 @@
 //! Syntax-only collection performed before semantic enrichment.
 
+use crate::node_metadata::TypedSource;
 use std::cmp::Ordering;
 
 use m2_syn::nodes::{
     ArgumentListContent, AssignmentArgument as AssignmentPackComponent,
-    AssignmentList as AssignmentPack, ElseClause, Expr, ExprAssign as Assignment,
+    AssignmentList as AssignmentPack, Expr, ExprAssign as Assignment,
     ExprAssignParallel as ParallelAssignment, ExprAssignSimple as SimpleBinding,
     ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
     ExprOpBinAdj as AdjacentExpr, ExprTry as TryStatement, ExprWhile as WhileLoop, LoopBody,
-    SourceFile, Symbol, ThenClause, TryFallback, WhenCondition,
+    Symbol, TryFallback, WhenCondition,
 };
 use m2_syn::visit::{self, Visit};
-use m2_syn::{Spanned, Token};
+use m2_syn::Spanned;
 use tower_lsp::lsp_types::{Position, Range as TextRange};
 
 use crate::meta::BindingRole;
-use crate::node_metadata::{syntax_byte_range, M2Node};
+use crate::node_metadata::SyntaxNode;
 use crate::object_registry::ObjectName;
 use crate::package_index::declared_package_name;
 use crate::source::SourceNavigation;
@@ -79,8 +80,8 @@ pub struct BindingFact {
 
 impl BindingFact {
     pub fn from_node(
-        target: M2Node<'_>,
-        value: Option<M2Node<'_>>,
+        target: SyntaxNode<'_>,
+        value: Option<SyntaxNode<'_>>,
         role: BindingRole,
         effect: BindingEffect,
         scope: usize,
@@ -106,8 +107,8 @@ impl BindingFact {
     /// The global binding `newPackage "P"` makes of `P`, anchored on the text
     /// inside the name string.
     fn package_declaration(
-        name: M2Node<'_>,
-        call: M2Node<'_>,
+        name: SyntaxNode<'_>,
+        call: SyntaxNode<'_>,
         definition: TextRange,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<Self> {
@@ -126,7 +127,7 @@ impl BindingFact {
 
 /// Where the binding of a `newPackage` name string is anchored.
 pub(super) fn package_name_range(
-    name: M2Node<'_>,
+    name: SyntaxNode<'_>,
     source: &(impl SourceNavigation + ?Sized),
 ) -> Option<TextRange> {
     name.string_literal_inner_bytes()
@@ -137,169 +138,17 @@ pub fn syntax_range(
     syntax: &(impl Spanned + ?Sized),
     source: &(impl SourceNavigation + ?Sized),
 ) -> Option<TextRange> {
-    let (start, end) = syntax_byte_range(syntax)?;
-    Some(source.range_for_bytes(start..end))
-}
-
-pub(super) fn walk_cst(
-    root: M2Node<'_>,
-    source: &(impl SourceNavigation + ?Sized),
-    mut collect: impl FnMut(BindingFact, &ScopeTree),
-) -> ScopeTree {
-    let mut scopes = ScopeTree::default();
-    walk_nested(
-        root,
-        source,
-        TraversalContext {
-            scope: 0,
-            assignment_scope: 0,
-            declaration_scope: 0,
-        },
-        &mut scopes,
-        &mut collect,
-    );
-    scopes
-}
-
-fn walk_nested<'tree>(
-    node: M2Node<'tree>,
-    source: &(impl SourceNavigation + ?Sized),
-    inherited: TraversalContext,
-    scopes: &mut ScopeTree,
-    collect: &mut impl FnMut(BindingFact, &ScopeTree),
-) {
-    let context = if node.is::<LambdaExpression>() {
-        let scope = scopes.push(
-            node,
-            source,
-            inherited.scope,
-            true,
-            cst_function_dispatch(node),
-        );
-        TraversalContext {
-            scope,
-            assignment_scope: scope,
-            declaration_scope: scope,
-        }
-    } else if node.is::<ForLoop>() {
-        let scope = scopes.push(node, source, inherited.scope, false, None);
-        TraversalContext {
-            scope,
-            declaration_scope: scope,
-            ..inherited
-        }
-    } else {
-        inherited
-    };
-
-    collect_bindings(node, context, source, scopes, collect);
-
-    for child in node.children() {
-        let child_context = control_flow_scope(node, child).map_or(context, |kind| {
-            let scope = scopes.push(
-                child,
-                source,
-                context.scope,
-                kind.assignments_may_escape(),
-                None,
-            );
-            TraversalContext {
-                scope,
-                assignment_scope: kind.assignment_scope(scope, context.assignment_scope),
-                declaration_scope: context.declaration_scope,
-            }
-        });
-        walk_nested(child, source, child_context, scopes, collect);
-    }
-}
-
-fn collect_bindings<'tree>(
-    node: M2Node<'tree>,
-    context: TraversalContext,
-    source: &(impl SourceNavigation + ?Sized),
-    scopes: &ScopeTree,
-    collect: &mut impl FnMut(BindingFact, &ScopeTree),
-) {
-    let parameters = if node.is::<LambdaExpression>() {
-        node.child_by_field_name("parameters")
-    } else if node.is::<ForLoop>() {
-        node.child_by_field_name("variable")
-    } else {
-        None
-    };
-    if let Some(target) = parameters {
-        for target in nested_symbols(target, M2Node::is_parameter_container) {
-            collect(
-                BindingFact::from_node(
-                    target,
-                    None,
-                    BindingRole::Parameter,
-                    BindingEffect::Declare,
-                    context.scope,
-                    false,
-                    source,
-                ),
-                scopes,
-            );
-        }
-    }
-
-    if let Some(fact) = declared_package_name(node).and_then(|name| {
-        let definition = source_cell(node)
-            .filter(|cell| is_value_cell(*cell))
-            .unwrap_or(node);
-        BindingFact::package_declaration(name, node, source.range_for_node(definition), source)
-    }) {
-        collect(fact, scopes);
-    }
-
-    if !node.is_assignment() {
-        return;
-    }
-    let Some(target) = node.child_by_field_name("left") else {
-        return;
-    };
-    let value = node.child_by_field_name("right");
-    let (effect, scope, potential_export) = if node.has_binary_operator::<Token![:=]>() {
-        (
-            BindingEffect::Declare,
-            context.declaration_scope,
-            context.declaration_scope == 0,
-        )
-    } else if node.has_binary_operator::<Token![=]>() {
-        (
-            BindingEffect::Assign,
-            context.assignment_scope,
-            context.assignment_scope == 0
-                || scopes.assignments_may_escape(context.assignment_scope),
-        )
-    } else {
-        return;
-    };
-    for target in nested_symbols(target, M2Node::is_collection_expression) {
-        collect(
-            BindingFact::from_node(
-                target,
-                value,
-                BindingRole::Ordinary,
-                effect,
-                scope,
-                potential_export,
-                source,
-            ),
-            scopes,
-        );
-    }
+    Some(source.range_for_bytes(source.syntax_bytes(syntax)?))
 }
 
 pub fn walk(
-    syntax: &SourceFile,
-    root: M2Node<'_>,
+    syntax: &TypedSource,
+    root: SyntaxNode<'_>,
     source: &(impl SourceNavigation + ?Sized),
     mut collect: impl FnMut(BindingFact, &ScopeTree),
 ) -> ScopeTree {
     let mut walker = TypedWalker::new(root, source);
-    walker.visit_source_file(syntax);
+    syntax.visit(&mut walker);
     for fact in walker.bindings {
         collect(fact, &walker.scopes);
     }
@@ -307,7 +156,7 @@ pub fn walk(
 }
 
 struct TypedWalker<'tree, 'source, Source: ?Sized> {
-    root: M2Node<'tree>,
+    root: SyntaxNode<'tree>,
     source: &'source Source,
     scopes: ScopeTree,
     bindings: Vec<BindingFact>,
@@ -316,7 +165,7 @@ struct TypedWalker<'tree, 'source, Source: ?Sized> {
 }
 
 impl<'tree, 'source, Source: SourceNavigation + ?Sized> TypedWalker<'tree, 'source, Source> {
-    fn new(root: M2Node<'tree>, source: &'source Source) -> Self {
+    fn new(root: SyntaxNode<'tree>, source: &'source Source) -> Self {
         Self {
             root,
             source,
@@ -511,7 +360,7 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, '_
     }
 
     fn visit_expr_op_bin_adj(&mut self, node: &'ast AdjacentExpr) {
-        if let Some(fact) = self.root.descendant_for_syntax(node).and_then(|call| {
+        if let Some(fact) = self.root.related(node).and_then(|call| {
             BindingFact::package_declaration(
                 declared_package_name(call)?,
                 call,
@@ -669,17 +518,6 @@ fn typed_function_dispatch(lambda: &LambdaExpression) -> Dispatch {
     }
 }
 
-fn cst_function_dispatch(lambda: M2Node) -> Option<Dispatch> {
-    let parameters = lambda.child_by_field_name("parameters")?;
-    if parameters.is_holder() {
-        Some(Dispatch::Fixed(1))
-    } else if parameters.is_collection_expression() {
-        Some(Dispatch::Fixed(parameters.collection_elements().count()))
-    } else {
-        Some(Dispatch::Variadic)
-    }
-}
-
 fn symbols_in_assignment_pack(binding: &AssignmentPack) -> Vec<&Symbol> {
     let mut symbols = Vec::new();
     if let Some(components) = &binding.contents.contents {
@@ -713,22 +551,6 @@ fn collect_assignment_symbol<'ast>(
 }
 
 impl ScopeTree {
-    fn push(
-        &mut self,
-        owner: M2Node,
-        source: &(impl SourceNavigation + ?Sized),
-        parent: usize,
-        assignments_may_escape: bool,
-        function_dispatch: Option<Dispatch>,
-    ) -> usize {
-        self.push_range(
-            source.range_for_node(owner),
-            parent,
-            assignments_may_escape,
-            function_dispatch,
-        )
-    }
-
     fn push_range(
         &mut self,
         range: TextRange,
@@ -748,7 +570,7 @@ impl ScopeTree {
 
     pub(super) fn owned_by(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
     ) -> usize {
         let range = source.range_for_node(node);
@@ -801,7 +623,7 @@ impl ScopeTree {
 
     pub(super) fn function_dispatch(
         &self,
-        owner: M2Node,
+        owner: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<Dispatch> {
         self.scopes[self.owned_by(owner, source)].function_dispatch
@@ -827,38 +649,10 @@ impl ControlFlowScope {
     }
 }
 
-pub(super) fn control_flow_scope(
-    parent: M2Node<'_>,
-    child: M2Node<'_>,
-) -> Option<ControlFlowScope> {
-    let is_field = |field| {
-        parent
-            .child_by_field_name(field)
-            .is_some_and(|value| value.id() == child.id())
-    };
-    if parent.is::<IfStatement>() {
-        (is_field("condition") || child.is::<ThenClause>() || child.is::<ElseClause>())
-            .then_some(ControlFlowScope::Branch)
-    } else if parent.is::<TryStatement>() {
-        (is_field("value")
-            || child.is::<ThenClause>()
-            || child.is::<ElseClause>()
-            || child.is_except_clause())
-        .then_some(ControlFlowScope::Branch)
-    } else if parent.is::<ForLoop>() {
-        (child.is_iteration_range() || is_field("filter") || child.is::<LoopBody>())
-            .then_some(ControlFlowScope::LoopClause)
-    } else if parent.is::<WhileLoop>() {
-        (is_field("condition") || child.is::<LoopBody>()).then_some(ControlFlowScope::LoopClause)
-    } else {
-        None
-    }
-}
-
 pub(super) fn nested_symbols<'tree>(
-    node: M2Node<'tree>,
-    contains_symbols: impl Fn(&M2Node<'tree>) -> bool + Copy,
-) -> Vec<M2Node<'tree>> {
+    node: SyntaxNode<'tree>,
+    contains_symbols: impl Fn(&SyntaxNode<'tree>) -> bool + Copy,
+) -> Vec<SyntaxNode<'tree>> {
     if node.is::<Symbol>() {
         return vec![node];
     }

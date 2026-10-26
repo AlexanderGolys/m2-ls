@@ -14,7 +14,7 @@ use tower_lsp::lsp_types::{
 
 use crate::analysis::{Analysis, FunctionInfo, Method};
 use crate::document::DocumentSnapshot;
-use crate::node_metadata::M2Node;
+use crate::node_metadata::SyntaxNode;
 use crate::object_registry::ObjectName;
 use crate::record_lsp::{LspKnowledge, ResolvedSignature};
 use crate::source::SourceNavigation;
@@ -60,15 +60,15 @@ pub fn signature_help_response(
 /// contains the cursor — i.e. the cursor sits in the argument list, not on the
 /// head. Returns `(head, arguments)`.
 pub fn enclosing_application<'tree>(
-    node: M2Node<'tree>,
+    node: SyntaxNode<'tree>,
     cursor: usize,
-) -> Option<(M2Node<'tree>, M2Node<'tree>)> {
+) -> Option<(SyntaxNode<'tree>, SyntaxNode<'tree>)> {
     let mut current = Some(node);
     while let Some(node) = current {
         if node.is_space_application() {
             if let (Some(left), Some(right)) = (
-                node.child_by_field_name("left"),
-                node.child_by_field_name("right"),
+                node.binary_parts().map(|parts| parts.left),
+                node.binary_parts().map(|parts| parts.right),
             ) {
                 if right.start_byte() <= cursor && cursor <= right.end_byte() {
                     return Some((left, right));
@@ -84,7 +84,7 @@ pub fn enclosing_application<'tree>(
 /// strictly before the cursor (`f(a, |b)` → 1, the cursor is on the second
 /// argument). Strict `<` keeps the cursor on an argument while it sits at that
 /// argument's trailing edge (`f(a|, b)` stays on the first argument).
-fn active_parameter_index(argument_node: M2Node, cursor: usize) -> u32 {
+fn active_parameter_index(argument_node: SyntaxNode, cursor: usize) -> u32 {
     argument_list(argument_node)
         .into_iter()
         .filter(|argument| argument.end_byte() < cursor)
@@ -94,7 +94,7 @@ fn active_parameter_index(argument_node: M2Node, cursor: usize) -> u32 {
 /// The individual arguments of a call's argument operand: the elements of a
 /// `(a, b)` sequence (peeling the parentheses), or the single bare argument of
 /// `f x`. Empty for `f ()`.
-fn argument_list(argument_node: M2Node) -> Vec<M2Node> {
+fn argument_list(argument_node: SyntaxNode) -> Vec<SyntaxNode> {
     let inner = if argument_node.is_holder() {
         match argument_node.final_value_child() {
             Some(inner) => inner,
@@ -177,8 +177,8 @@ fn local_signatures(
     function: &FunctionInfo,
 ) -> Vec<SignatureInformation> {
     analysis
-        .methods_for(function)
-        .map(|method| local_signature_information(callable, method))
+        .effective_installations(function)
+        .map(|installation| local_signature_information(callable, &installation.method))
         .collect()
 }
 
@@ -256,7 +256,8 @@ mod tests {
             .find(|node| node.is_space_application())
             .expect("fixture should contain an application");
         let arguments = application
-            .child_by_field_name("right")
+            .binary_parts()
+            .map(|parts| parts.right)
             .expect("application should have an argument");
         argument_list(arguments)
             .into_iter()

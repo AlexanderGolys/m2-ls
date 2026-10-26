@@ -112,11 +112,14 @@ PARALLEL_ASSIGNMENT_ARITY {
         severity: ERROR,
     }
 
-    /// A lowercase option key in a call; Macaulay2 option names are
-    /// capitalized.
+    /// A lowercase option name where a function declares its options, in
+    /// `method(Options => {…})` or `{…} >> o -> …`; Macaulay2 option names
+    /// are capitalized. Entries of hash tables and options passed to a call
+    /// are not checked: their keys are not declared there.
     ///
     /// ```m2
-    /// y = g(1, verbose => true)
+    /// f = method(Options => {verbose => false})
+    /// g = {limit => 10} >> o -> x -> x
     /// ```
 OPTION_KEY_CONVENTION {
         code: "S01",
@@ -139,18 +142,6 @@ UNUSED_BINDING {
         tags: [UNNECESSARY],
     }
 
-    /// Parentheses around a condition, `try` value, or loop range that the
-    /// keyword already delimits.
-    ///
-    /// ```m2
-    /// f = n -> if (n > 0) then 1 else 2
-    /// ```
-REDUNDANT_CONTROL_PARENTHESES {
-        code: "S03",
-        name: "redundant-control-parentheses",
-        severity: HINT,
-    }
-
     /// A null test that `??` expresses directly: here `x ?? 0`, and
     /// `typeInfo ??= class value` for an `if` that only assigns the fallback.
     ///
@@ -164,19 +155,6 @@ REDUNDANT_CONTROL_PARENTHESES {
 PREFER_COALESCENCE {
         code: "S04",
         name: "prefer-coalescence",
-        severity: HINT,
-    }
-
-    /// An `if` or `try` with a shorter equivalent form: a redundant `null`
-    /// branch, a negated condition, or a nesting that flattens into an
-    /// `else if` chain.
-    ///
-    /// ```m2
-    /// f = n -> if n > 0 then 1 else null
-    /// ```
-SIMPLIFIABLE_EXPRESSION {
-        code: "S05",
-        name: "simplifiable-expression",
         severity: HINT,
     }
 

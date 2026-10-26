@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::{
 
 use crate::builtin_index::{CallableKind, Record};
 use crate::document::DocumentSnapshot;
-use crate::node_metadata::M2Node;
+use crate::node_metadata::SyntaxNode;
 use crate::object_registry::{ObjectKnowledge, ObjectName};
 use crate::package_index::is_package_import_string;
 use crate::record_lsp::LspKnowledge;
@@ -84,8 +84,8 @@ pub struct CompletionContext<'a> {
     document: &'a DocumentSnapshot,
     position: Position,
     cursor: usize,
-    node: M2Node<'a>,
-    symbol: Option<M2Node<'a>>,
+    node: SyntaxNode<'a>,
+    symbol: Option<SyntaxNode<'a>>,
     symbol_prefix: Option<CompletionPrefix>,
 }
 
@@ -255,13 +255,12 @@ impl<'a> CompletionContext<'a> {
         })
     }
 
-    fn symbol_node(&self) -> Option<M2Node<'a>> {
+    fn symbol_node(&self) -> Option<SyntaxNode<'a>> {
         self.symbol
     }
 
-    fn package_prefix(&self, string: M2Node<'_>) -> Option<CompletionPrefix> {
-        let opening = string.child(0)?;
-        let start = opening.end_byte();
+    fn package_prefix(&self, string: SyntaxNode<'_>) -> Option<CompletionPrefix> {
+        let start = string.string_literal_inner_bytes()?.start;
         (start <= self.cursor && self.cursor <= string.end_byte()).then(|| CompletionPrefix {
             text: self.document.text()[start..self.cursor].to_string(),
             replace: self.document.range_for_bytes(start..self.cursor),
@@ -273,7 +272,7 @@ impl CompletionPrefix {
     fn symbol(
         source: &(impl SourceNavigation + ?Sized),
         cursor: usize,
-        symbol: M2Node<'_>,
+        symbol: SyntaxNode<'_>,
     ) -> Option<Self> {
         let start = symbol.start_byte();
         (start < cursor && cursor <= symbol.end_byte()).then(|| Self {
@@ -305,7 +304,7 @@ impl CompletionPattern for NewTypePattern {
         let prefix = context.symbol_prefix.clone()?;
         let symbol = context.symbol_node()?;
         let new_statement = symbol.enclosing_node(|node| node.is::<NewStatement>())?;
-        let class = new_statement.child_by_field_name("type")?;
+        let class = new_statement.new_class()?;
         class.contains(symbol).then(|| {
             CompletionQuery::new(prefix, KnownSymbols::of_type(TypeRole::Type.object_name()))
         })
@@ -318,10 +317,11 @@ impl CompletionPattern for OptionValuePattern {
         let symbol = context.symbol_node()?;
         let option = symbol.enclosing_node(|node| node.is::<OptionExpression>())?;
         option
-            .child_by_field_name("right")?
+            .binary_parts()
+            .map(|parts| parts.right)?
             .contains(symbol)
             .then_some(())?;
-        let key = option.child_by_field_name("left")?;
+        let key = option.binary_parts().map(|parts| parts.left)?;
         key.is::<Symbol>().then_some(())?;
         let (callable, _) = super::signature_help::enclosing_application(option, context.cursor)?;
         callable.is::<Symbol>().then(|| {
@@ -347,7 +347,7 @@ impl CompletionPattern for OptionKeyPattern {
         let symbol = context.symbol_node()?;
         if symbol
             .enclosing_node(|node| node.is::<OptionExpression>())
-            .and_then(|option| option.child_by_field_name("right"))
+            .and_then(|option| option.binary_parts().map(|parts| parts.right))
             .is_some_and(|value| value.contains(symbol))
         {
             return None;

@@ -2,50 +2,35 @@
 //! clearer form a flagged expression has, as replacement text.
 
 use m2_syn::nodes::{
-    ElseClause, ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
-    ExprTry as TryStatement, ExprWhile as WhileLoop, FloatLiteral, Symbol, ThenClause,
-    TokenParseRule, TOKEN_PARSE_RULES,
+    ElseClause, ExprIf as IfStatement, ExprLambda as LambdaExpression, ExprTry as TryStatement,
+    FloatLiteral, Symbol, ThenClause, TokenParseRule, TOKEN_PARSE_RULES,
 };
 use m2_syn::Token;
 
 use crate::analysis::{clause_of, clause_value, parenthesized_value, symbol_node_text};
-use crate::node_metadata::{matches_token, token_spelling, M2Node};
+use crate::node_metadata::{matches_token, token_spelling, SyntaxNode};
 
-pub fn redundant_control_parentheses_inner(node: M2Node<'_>) -> Option<M2Node<'_>> {
+pub fn redundant_control_parentheses_inner(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     if !node.is_holder() {
         return None;
     }
     let parent = node.parent()?;
-    let is_field = |field| {
-        parent
-            .child_by_field_name(field)
-            .is_some_and(|value| value.id() == node.id())
-    };
-    let is_control_expression = if parent.is::<IfStatement>() || parent.is::<WhileLoop>() {
-        is_field("condition")
-    } else if parent.is::<TryStatement>() {
-        is_field("value")
-    } else if parent.is_iteration_range() {
-        ["iterated_collection", "range_start", "range_end"]
-            .into_iter()
-            .any(is_field)
-    } else if parent.is::<ForLoop>() {
-        is_field("filter")
-    } else {
-        false
-    };
+    let is_value =
+        |value: Option<SyntaxNode<'_>>| value.is_some_and(|value| value.id() == node.id());
+    let is_control_expression =
+        is_value(parent.control_condition()) || is_value(parent.clause_value());
     is_control_expression
         .then(|| parenthesized_value(node))
         .flatten()
 }
 
-pub fn ambiguous_float_member_access_rewrite(node: M2Node<'_>) -> Option<String> {
+pub fn ambiguous_float_member_access_rewrite(node: SyntaxNode<'_>) -> Option<String> {
     if !node.is_space_application() {
         return None;
     }
 
-    let left = node.child_by_field_name("left")?;
-    let right = node.child_by_field_name("right")?;
+    let left = node.binary_parts().map(|parts| parts.left)?;
+    let right = node.binary_parts().map(|parts| parts.right)?;
     if symbol_node_text(left).is_none()
         || !right.is::<FloatLiteral>()
         || left.end_byte() != right.start_byte()
@@ -89,13 +74,13 @@ impl Coalescence {
 /// - `if (try e) === null then v else e` and `try (if e === null then v else e)
 ///   else v` become `e ?? v`, since `??` turns errors in its left side into the
 ///   fallback just as the `try` does.
-pub fn coalescence_rewrite(node: M2Node<'_>) -> Option<Coalescence> {
+pub fn coalescence_rewrite(node: SyntaxNode<'_>) -> Option<Coalescence> {
     if node.is::<TryStatement>() {
         return guarded_conditional_rewrite(node);
     }
     if node.has_binary_operator::<Token![=]>() {
-        let target = node.child_by_field_name("left")?;
-        let conditional = node.child_by_field_name("right")?;
+        let target = node.binary_parts().map(|parts| parts.left)?;
+        let conditional = node.binary_parts().map(|parts| parts.right)?;
         if !target.is::<Symbol>() || !conditional.is::<IfStatement>() {
             return None;
         }
@@ -123,7 +108,7 @@ pub fn coalescence_rewrite(node: M2Node<'_>) -> Option<Coalescence> {
 /// `try (if e === null then v else e) else v`, whose `try` turns errors in `e`
 /// into the fallback as `??` does. Its `else` must repeat the fallback, or an
 /// error would yield something else.
-fn guarded_conditional_rewrite(try_statement: M2Node<'_>) -> Option<Coalescence> {
+fn guarded_conditional_rewrite(try_statement: SyntaxNode<'_>) -> Option<Coalescence> {
     let has_other_clauses = clause_of::<ThenClause>(try_statement).is_some()
         || try_statement
             .children()
@@ -131,7 +116,7 @@ fn guarded_conditional_rewrite(try_statement: M2Node<'_>) -> Option<Coalescence>
     if has_other_clauses {
         return None;
     }
-    let conditional = parenthesized_value(try_statement.child_by_field_name("value")?)?;
+    let conditional = parenthesized_value(try_statement.clause_value()?)?;
     if !conditional.is::<IfStatement>() {
         return None;
     }
@@ -141,7 +126,7 @@ fn guarded_conditional_rewrite(try_statement: M2Node<'_>) -> Option<Coalescence>
 }
 
 /// The `try` whose value is `node`, seen through parentheses.
-fn enclosing_try(node: M2Node<'_>) -> Option<M2Node<'_>> {
+fn enclosing_try(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     let mut current = node.parent()?;
     while current.is_holder() {
         current = current.parent()?;
@@ -151,7 +136,7 @@ fn enclosing_try(node: M2Node<'_>) -> Option<M2Node<'_>> {
 
 /// `subject ?? fallback`, each side parenthesized where it would otherwise
 /// regroup around `??`.
-fn coalescence_expression(subject: M2Node<'_>, fallback: M2Node<'_>) -> Coalescence {
+fn coalescence_expression(subject: SyntaxNode<'_>, fallback: SyntaxNode<'_>) -> Coalescence {
     Coalescence::Expression(format!(
         "{} ?? {}",
         coalescence_subject(subject),
@@ -160,7 +145,7 @@ fn coalescence_expression(subject: M2Node<'_>, fallback: M2Node<'_>) -> Coalesce
 }
 
 /// The `??` form of an `if` that assigns a fallback when its subject is null.
-fn coalescing_assignment_rewrite(if_statement: M2Node<'_>) -> Option<Coalescence> {
+fn coalescing_assignment_rewrite(if_statement: SyntaxNode<'_>) -> Option<Coalescence> {
     let NullTest {
         subject,
         null_branch,
@@ -171,7 +156,7 @@ fn coalescing_assignment_rewrite(if_statement: M2Node<'_>) -> Option<Coalescence
         // so the two agree only when nothing uses the `if`'s own value.
         let value_is_discarded = if_statement
             .parent()
-            .is_some_and(|parent| parent.is_source_cell());
+            .is_some_and(|parent| parent.is_source_cell() || parent.is_muted_statement());
         let (target, operator, fallback) = symbol_assignment(then_value)?;
         return (null_branch == NullBranch::Then
             && value_is_discarded
@@ -208,21 +193,26 @@ fn coalescing_assignment_rewrite(if_statement: M2Node<'_>) -> Option<Coalescence
 }
 
 /// The target symbol, operator, and value of `x = v` or `x := v`.
-fn symbol_assignment(node: M2Node<'_>) -> Option<(M2Node<'_>, &str, M2Node<'_>)> {
+fn symbol_assignment(node: SyntaxNode<'_>) -> Option<(SyntaxNode<'_>, &str, SyntaxNode<'_>)> {
     let operator = node.binary_operator()?;
     if !(matches_token::<Token![=]>(operator) || matches_token::<Token![:=]>(operator)) {
         return None;
     }
     let target = node
-        .child_by_field_name("left")
+        .binary_parts()
+        .map(|parts| parts.left)
         .filter(|target| target.is::<Symbol>())?;
-    Some((target, operator, node.child_by_field_name("right")?))
+    Some((
+        target,
+        operator,
+        node.binary_parts().map(|parts| parts.right)?,
+    ))
 }
 
 /// `fallback` as the right operand of `??`, parenthesized when it binds more
 /// loosely than `??` and would otherwise take the coalescence as its own left
 /// operand, as `x ?? y -> y` reads `(x ?? y) -> y`.
-fn coalescence_operand(fallback: M2Node<'_>) -> String {
+fn coalescence_operand(fallback: SyntaxNode<'_>) -> String {
     let binds_looser = fallback.is::<LambdaExpression>()
         || operator_precedence_relative_to_coalescence(fallback)
             .is_some_and(|ordering| ordering.is_lt());
@@ -232,7 +222,7 @@ fn coalescence_operand(fallback: M2Node<'_>) -> String {
 /// `subject` as the left operand of `??`, parenthesized unless it binds more
 /// tightly: `??` groups to the right, so `a or b ?? v` reads `a or (b ?? v)`,
 /// and a keyword expression such as `try e` would take `?? v` as part of `e`.
-fn coalescence_subject(subject: M2Node<'_>) -> String {
+fn coalescence_subject(subject: SyntaxNode<'_>) -> String {
     let binds_tighter = !subject.is::<LambdaExpression>()
         && !subject
             .child(0)
@@ -244,14 +234,14 @@ fn coalescence_subject(subject: M2Node<'_>) -> String {
 
 /// How the binary operator at the top of `node` binds compared with `??`;
 /// `None` when `node` is not a binary expression with a known precedence.
-fn operator_precedence_relative_to_coalescence(node: M2Node<'_>) -> Option<std::cmp::Ordering> {
+fn operator_precedence_relative_to_coalescence(node: SyntaxNode<'_>) -> Option<std::cmp::Ordering> {
     let coalescence = binding_precedence(token_spelling::<Token![??]>())?;
     let operator = binding_precedence(node.binary_operator()?)?;
     Some(operator.cmp(&coalescence))
 }
 
 /// The trimmed text of `node`, in parentheses when `parenthesize` holds.
-fn parenthesized_if(node: M2Node<'_>, parenthesize: bool) -> String {
+fn parenthesized_if(node: SyntaxNode<'_>, parenthesize: bool) -> String {
     let text = node.text().trim();
     if parenthesize {
         format!("({text})")
@@ -262,7 +252,7 @@ fn parenthesized_if(node: M2Node<'_>, parenthesize: bool) -> String {
 
 /// Whether `left` and `right` spell the same expression, ignoring enclosing
 /// parentheses.
-fn same_expression(left: M2Node<'_>, right: M2Node<'_>) -> bool {
+fn same_expression(left: SyntaxNode<'_>, right: SyntaxNode<'_>) -> bool {
     parenthesized_value(left)
         .zip(parenthesized_value(right))
         .is_some_and(|(left, right)| left.text().trim() == right.text().trim())
@@ -301,7 +291,7 @@ enum SubjectErrors {
 /// What an `if` compares with `null`, and the branch that runs when it is null.
 #[derive(Debug, Clone, Copy)]
 struct NullTest<'tree> {
-    subject: M2Node<'tree>,
+    subject: SyntaxNode<'tree>,
     null_branch: NullBranch,
 }
 
@@ -310,11 +300,11 @@ struct NullTest<'tree> {
 /// whose errors are handled the same way: a symbol, which never fails to
 /// evaluate, an expression under a bare `try` (`(try f x) === null`), or any
 /// expression when a `try` around the conditional catches its errors.
-fn null_test(if_statement: M2Node<'_>, subject_errors: SubjectErrors) -> Option<NullTest<'_>> {
-    let condition = if_statement.child_by_field_name("condition")?;
+fn null_test(if_statement: SyntaxNode<'_>, subject_errors: SubjectErrors) -> Option<NullTest<'_>> {
+    let condition = if_statement.control_condition()?;
     let operator = condition.binary_operator()?;
-    let left = condition.child_by_field_name("left")?;
-    let right = condition.child_by_field_name("right")?;
+    let left = condition.binary_parts().map(|parts| parts.left)?;
+    let right = condition.binary_parts().map(|parts| parts.right)?;
     let tested = match (left.is_null_symbol(), right.is_null_symbol()) {
         (true, false) => right,
         (false, true) => left,
@@ -342,22 +332,22 @@ fn null_test(if_statement: M2Node<'_>, subject_errors: SubjectErrors) -> Option<
 
 /// The expression a bare `try e` evaluates, seen through parentheses; errors
 /// in it yield `null`.
-fn guarded_value(node: M2Node<'_>) -> Option<M2Node<'_>> {
+fn guarded_value(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     let guard = parenthesized_value(node)?;
     let is_bare_try = guard.is::<TryStatement>()
         && clause_of::<ThenClause>(guard).is_none()
         && clause_of::<ElseClause>(guard).is_none()
         && !guard.children().any(|child| child.is_except_clause());
     is_bare_try
-        .then(|| guard.child_by_field_name("value"))
+        .then(|| guard.clause_value())
         .flatten()
         .and_then(parenthesized_value)
 }
 
 fn coalescence_parts(
-    if_statement: M2Node<'_>,
+    if_statement: SyntaxNode<'_>,
     subject_errors: SubjectErrors,
-) -> Option<(M2Node<'_>, M2Node<'_>)> {
+) -> Option<(SyntaxNode<'_>, SyntaxNode<'_>)> {
     let NullTest {
         subject,
         null_branch,
@@ -371,8 +361,8 @@ fn coalescence_parts(
     same_expression(repeated_subject, subject).then_some((subject, fallback))
 }
 
-pub fn if_null_branch_rewrite(if_node: M2Node<'_>) -> Option<String> {
-    let condition = if_node.child_by_field_name("condition")?;
+pub fn if_null_branch_rewrite(if_node: SyntaxNode<'_>) -> Option<String> {
+    let condition = if_node.control_condition()?;
     let then_branch = clause_of::<ThenClause>(if_node).and_then(clause_value)?;
     let else_branch = clause_of::<ElseClause>(if_node).and_then(clause_value)?;
 
@@ -395,8 +385,8 @@ pub fn if_null_branch_rewrite(if_node: M2Node<'_>) -> Option<String> {
     None
 }
 
-pub fn try_statement_rewrite(try_node: M2Node<'_>) -> Option<String> {
-    let condition = try_node.child_by_field_name("value")?;
+pub fn try_statement_rewrite(try_node: SyntaxNode<'_>) -> Option<String> {
+    let condition = try_node.clause_value()?;
     let consequence = clause_of::<ThenClause>(try_node).and_then(clause_value);
     let else_clause = clause_of::<ElseClause>(try_node);
     let condition_text = condition.text();
@@ -420,8 +410,8 @@ pub fn try_statement_rewrite(try_node: M2Node<'_>) -> Option<String> {
     None
 }
 
-pub fn if_condition_rewrite(if_node: M2Node<'_>) -> Option<String> {
-    let condition = if_node.child_by_field_name("condition")?;
+pub fn if_condition_rewrite(if_node: SyntaxNode<'_>) -> Option<String> {
+    let condition = if_node.control_condition()?;
     let simplified = simplify_condition(condition)?;
     let then_branch = clause_of::<ThenClause>(if_node).and_then(clause_value)?;
     let else_clause = clause_of::<ElseClause>(if_node);
@@ -434,7 +424,7 @@ pub fn if_condition_rewrite(if_node: M2Node<'_>) -> Option<String> {
     Some(replacement)
 }
 
-pub fn else_if_chain_rewrite(if_node: M2Node<'_>) -> Option<String> {
+pub fn else_if_chain_rewrite(if_node: SyntaxNode<'_>) -> Option<String> {
     flatten_then_if_chain(if_node).or_else(|| flatten_parenthesized_else_if_chain(if_node))
 }
 
@@ -443,8 +433,8 @@ pub fn else_if_chain_rewrite(if_node: M2Node<'_>) -> Option<String> {
 /// swap only trades one nested branch for the other: the result is flattenable
 /// back into the original, so the quick fix would oscillate between the two
 /// forms without ever clearing its diagnostic.
-fn flatten_then_if_chain(if_node: M2Node<'_>) -> Option<String> {
-    let condition = if_node.child_by_field_name("condition")?;
+fn flatten_then_if_chain(if_node: SyntaxNode<'_>) -> Option<String> {
+    let condition = if_node.control_condition()?;
     let then_branch = clause_of::<ThenClause>(if_node).and_then(clause_value)?;
     let nested_if = unwrap_parentheses(then_branch);
     if !nested_if.is::<IfStatement>() {
@@ -465,7 +455,7 @@ fn flatten_then_if_chain(if_node: M2Node<'_>) -> Option<String> {
     ))
 }
 
-fn flatten_parenthesized_else_if_chain(if_node: M2Node<'_>) -> Option<String> {
+fn flatten_parenthesized_else_if_chain(if_node: SyntaxNode<'_>) -> Option<String> {
     let else_branch = clause_of::<ElseClause>(if_node).and_then(clause_value)?;
     let nested_if = unwrap_parentheses(else_branch);
     if !nested_if.is::<IfStatement>() {
@@ -490,11 +480,11 @@ fn flatten_parenthesized_else_if_chain(if_node: M2Node<'_>) -> Option<String> {
 /// expression. Proposing the original text back raises a diagnostic that its own
 /// quick fix cannot clear, so the user is told to fix code that is already in its
 /// simplest form and the warning survives applying the action.
-pub(super) fn simplification_of(node: M2Node<'_>, rewrite: Option<String>) -> Option<String> {
+pub fn simplification_of(node: SyntaxNode<'_>, rewrite: Option<String>) -> Option<String> {
     rewrite.filter(|replacement| replacement.trim() != node.text().trim())
 }
 
-fn simplify_condition(node: M2Node<'_>) -> Option<String> {
+fn simplify_condition(node: SyntaxNode<'_>) -> Option<String> {
     // A condition's span runs up to the `then` keyword, so it carries the
     // separating whitespace. Comparing against the untrimmed text would make
     // every `not name` look like a change and propose itself back.
@@ -502,7 +492,7 @@ fn simplify_condition(node: M2Node<'_>) -> Option<String> {
     if !node.is_prefix_expr() {
         return None;
     }
-    let operator = node.child_by_field_name("operator")?;
+    let operator = node.operator_node()?;
     if !matches_token::<Token![not]>(operator.text()) {
         return None;
     }
@@ -518,7 +508,7 @@ fn simplify_condition(node: M2Node<'_>) -> Option<String> {
         .is_some();
     let cancels_negation = inner.is_prefix_expr()
         && inner
-            .child_by_field_name("operator")
+            .operator_node()
             .is_some_and(|operator| matches_token::<Token![not]>(operator.text()));
     if !inverts_comparison && !cancels_negation {
         return None;
@@ -527,7 +517,7 @@ fn simplify_condition(node: M2Node<'_>) -> Option<String> {
     (simplified != original).then_some(simplified)
 }
 
-fn unwrap_parentheses(node: M2Node<'_>) -> M2Node<'_> {
+fn unwrap_parentheses(node: SyntaxNode<'_>) -> SyntaxNode<'_> {
     if node.is_holder() && node.child_count() == 3 {
         if let Some(inner) = node.child(1) {
             return inner;
@@ -539,9 +529,9 @@ fn unwrap_parentheses(node: M2Node<'_>) -> M2Node<'_> {
 /// The negation of a condition, without the whitespace a condition's span
 /// carries up to the `then` keyword; callers supply their own separators, so
 /// keeping it would widen the gap before `then` on every rewrite.
-fn negated_condition_text(node: M2Node<'_>) -> String {
+fn negated_condition_text(node: SyntaxNode<'_>) -> String {
     if node.is_prefix_expr() {
-        if let Some(operator) = node.child_by_field_name("operator") {
+        if let Some(operator) = node.operator_node() {
             if matches_token::<Token![not]>(operator.text()) {
                 if let Some(child) = node
                     .named_children()
@@ -555,8 +545,8 @@ fn negated_condition_text(node: M2Node<'_>) -> String {
 
     if let Some(negated_operator) = node.binary_operator().and_then(negated_binary_operator) {
         if let (Some(left), Some(right)) = (
-            node.child_by_field_name("left"),
-            node.child_by_field_name("right"),
+            node.binary_parts().map(|parts| parts.left),
+            node.binary_parts().map(|parts| parts.right),
         ) {
             return format!(
                 "{} {} {}",
@@ -606,7 +596,7 @@ fn negated_binary_operator(operator: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node_metadata::M2Parser;
+    use crate::node_metadata::SyntaxParser;
 
     #[test]
     fn negating_a_condition_only_groups_operators_looser_than_not() {
@@ -617,7 +607,7 @@ mod tests {
             ("isNode raw", "not isNode raw"),
         ] {
             let text = format!("if {condition} then null else value\n");
-            let mut parser = M2Parser::new().unwrap();
+            let mut parser = SyntaxParser::new().unwrap();
             let root = parser.parse(&text).unwrap();
             let conditional = root
                 .descendants()
@@ -631,10 +621,10 @@ mod tests {
     }
 
     /// The `??` form of the first `Syntax` node in `text`.
-    fn coalescence_of_first<Syntax: crate::node_metadata::M2SyntaxKind>(
+    fn coalescence_of_first<Syntax: crate::node_metadata::SyntaxKind>(
         text: &str,
     ) -> Option<Coalescence> {
-        let mut parser = M2Parser::new().expect("parser");
+        let mut parser = SyntaxParser::new().expect("parser");
         let tree = parser.parse_tree(text, None).expect("fixture should parse");
         let node = tree
             .root(text)

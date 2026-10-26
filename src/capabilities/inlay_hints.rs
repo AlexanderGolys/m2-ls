@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use serde::Deserialize;
+
 use m2_syn::nodes::{ExprLambda as LambdaExpression, ExprNew as NewStatement, Symbol};
 use m2_syn::Token;
 use tower_lsp::lsp_types::{
@@ -10,12 +12,31 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::document::DocumentSnapshot;
-use crate::node_metadata::{M2Node, SyntaxNodeId};
+use crate::meta::BindingRole;
+use crate::node_metadata::{SyntaxNode, SyntaxNodeId};
 use crate::object_registry::ObjectRegistry;
 use crate::settings::InlayHintSettings;
 use crate::source::SourceNavigation;
 use crate::typesystem::InferredType;
 use crate::util::TextRangeExt;
+
+/// What a call-result hint starts with, before the type the call returns.
+const CALL_RESULT_PREFIX: &str = "-> ";
+
+/// Which call results get a type hint when expression types are off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum CallHintPlacement {
+    /// None.
+    Off,
+    /// Those whose call ends its line while the expression around it goes
+    /// on below, as the links of a chain broken across lines.
+    #[default]
+    LineEnds,
+    /// Every call.
+    Every,
+}
 
 pub fn inlay_hint_provider_capability() -> Option<OneOf<bool, InlayHintServerCapabilities>> {
     Some(OneOf::Left(true))
@@ -27,32 +48,24 @@ pub fn inlay_hints_response(
     options: InlayHintSettings,
     knowledge: &ObjectRegistry,
 ) -> Vec<InlayHint> {
-    let inferred_types = inferred_expression_types(document, knowledge);
-    let binding_hints = binding_type_hints(
+    let context = HintContext {
         document,
-        &range,
-        options.all_known_types,
         knowledge,
-        &inferred_types,
-    );
+        options,
+        range,
+        inferred_types: inferred_expression_types(document, knowledge),
+    };
+    let binding_hints = context.binding_type_hints();
     let mut hints = binding_hints.clone();
-    hints.extend(lambda_return_type_hints(
-        document,
-        &range,
-        options.all_known_types,
-        knowledge,
-        &inferred_types,
-    ));
+    hints.extend(context.lambda_return_type_hints());
 
     if options.expression_types || options.all_known_types {
-        hints.extend(expression_type_hints(
-            document,
-            &range,
-            options.all_known_types,
-            knowledge,
-            &inferred_types,
-            &binding_hints,
-        ));
+        hints.extend(context.expression_type_hints(&binding_hints, ExpressionSelection::All));
+    } else if options.calls != CallHintPlacement::Off {
+        hints.extend(
+            context
+                .expression_type_hints(&binding_hints, ExpressionSelection::Calls(options.calls)),
+        );
     }
     hints.sort_by(|left, right| {
         (
@@ -77,14 +90,36 @@ pub fn inlay_hints_response(
     hints
 }
 
+/// The expressions whose types [`HintContext::expression_type_hints`]
+/// shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpressionSelection {
+    /// Every argument and subexpression.
+    All,
+    /// Only call results, placed as the setting says.
+    Calls(CallHintPlacement),
+}
+
+/// What the hints of one request are computed from: the document, the types
+/// analysis inferred for its expressions, and the settings choosing which
+/// are shown.
+struct HintContext<'request, 'tree> {
+    document: &'tree DocumentSnapshot,
+    knowledge: &'request ObjectRegistry,
+    options: InlayHintSettings,
+    /// The part of the document the client asks hints for.
+    range: TextRange,
+    inferred_types: HashMap<SyntaxNodeId, (SyntaxNode<'tree>, InferredType)>,
+}
+
 fn hint_order(label: &InlayHintLabel) -> bool {
-    label_text(label).starts_with("-> ")
+    label_text(label).starts_with(CALL_RESULT_PREFIX)
 }
 
 fn inferred_expression_types<'tree>(
     document: &'tree DocumentSnapshot,
     knowledge: &ObjectRegistry,
-) -> HashMap<SyntaxNodeId, (M2Node<'tree>, InferredType)> {
+) -> HashMap<SyntaxNodeId, (SyntaxNode<'tree>, InferredType)> {
     let mut inferred = HashMap::new();
     document.analysis().for_each_expression_type(
         document.root_node(),
@@ -98,43 +133,303 @@ fn inferred_expression_types<'tree>(
     inferred
 }
 
-fn lambda_return_type_hints(
-    document: &DocumentSnapshot,
-    range: &TextRange,
-    all_known_types: bool,
-    knowledge: &ObjectRegistry,
-    inferred_types: &HashMap<SyntaxNodeId, (M2Node<'_>, InferredType)>,
-) -> Vec<InlayHint> {
-    let analysis = document.analysis();
-    inferred_types
-        .values()
-        .filter_map(|(node, _)| {
-            let node = *node;
-            if node.is_return_expr() {
-                let value = node.control_transfer_value()?;
-                let view = knowledge.at(document.position_for_node(value));
-                analysis.control_transfer_target(node, document, &view)?;
-                Some(value)
-            } else if node.is::<LambdaExpression>() {
-                lambda_final_value(node)
+impl<'tree> HintContext<'_, 'tree> {
+    /// The types functions return, after the value they end with: their
+    /// final expression, or what `return` returns.
+    fn lambda_return_type_hints(&self) -> Vec<InlayHint> {
+        let analysis = self.document.analysis();
+        self.inferred_types
+            .values()
+            .filter_map(|(node, _)| {
+                let node = *node;
+                if node.is_return_expr() {
+                    let value = node.control_transfer_value()?;
+                    let view = self.knowledge.at(self.document.position_for_node(value));
+                    analysis.control_transfer_target(node, self.document, &view)?;
+                    Some(value)
+                } else if node.is::<LambdaExpression>() {
+                    lambda_final_value(node)
+                } else {
+                    None
+                }
+            })
+            .filter(|value| self.options.all_known_types || !is_self_describing_value(*value))
+            .filter_map(|value| {
+                let value_range = self.document.range_for_node(value);
+                if !self.range.contains_position(value_range.end) {
+                    return None;
+                }
+                let type_name = self.inferred_type_label(value)?;
+                Some(type_hint(
+                    value_range.end,
+                    &expression_label(value, type_name),
+                ))
+            })
+            .collect()
+    }
+
+    /// The label of the inferred type of `node`, when it is shown.
+    fn inferred_type_label(&self, node: SyntaxNode<'_>) -> Option<String> {
+        self.displayed_type(
+            self.document.position_for_node(node),
+            &self.inferred_types.get(&node.id())?.1,
+        )
+    }
+
+    /// The label of `inferred_type`, the type of a value at `position`; none
+    /// for a type that says nothing unless the settings ask for those.
+    fn displayed_type(&self, position: Position, inferred_type: &InferredType) -> Option<String> {
+        if inferred_type.is_unknown() && !self.options.unknown_types {
+            return None;
+        }
+        let view = self.knowledge.at(position);
+        inferred_type
+            .subset_label(|generator| {
+                self.document
+                    .analysis()
+                    .has_strict_subtype_at(generator, position, &view)
+            })
+            .map(inlay_type_label)
+    }
+
+    /// The types of bindings, after their names: where a binding is first
+    /// assigned or its type changes, unless the value states it.
+    fn binding_type_hints(&self) -> Vec<InlayHint> {
+        let all_known_types = self.options.all_known_types;
+        let assigned_values = self.assigned_values();
+        let self_describing_values = self
+            .self_describing_assignment_value_nodes()
+            .into_iter()
+            .map(|node| self.document.range_for_node(node))
+            .collect::<Vec<_>>();
+        let mut hints = Vec::new();
+
+        for binding in self.document.analysis().bindings() {
+            let mut previous_type: Option<String> = None;
+            for state in &binding.states {
+                if binding.role == BindingRole::Parameter && state.inferred_type.is_some() {
+                    continue;
+                }
+                let assigned = assigned_values
+                    .iter()
+                    .find(|value| value.target_range == state.span);
+                let type_name = assigned.map(|value| value.type_name.clone()).or_else(|| {
+                    state.inferred_type.as_ref().and_then(|inferred_type| {
+                        self.displayed_type(state.span.start, inferred_type)
+                    })
+                });
+                let Some(type_name) = type_name else {
+                    previous_type = None;
+                    continue;
+                };
+                let changed = previous_type.as_ref() != Some(&type_name);
+                previous_type = Some(type_name.clone());
+                if !all_known_types && !changed && assigned.is_none_or(|value| !value.destructured)
+                {
+                    continue;
+                }
+                let value_range = assigned
+                    .map(|value| value.value_range)
+                    .or(state.value_range);
+                if !all_known_types
+                    && value_range.is_some_and(|value_range| {
+                        self_describing_values.contains(&value_range)
+                            && assigned.is_none_or(|value| !value.destructured)
+                    })
+                {
+                    continue;
+                }
+                let position = state.span.end;
+                if self.range.contains_position(position) {
+                    hints.push(type_hint(position, &type_name));
+                }
+            }
+        }
+
+        hints
+    }
+
+    /// The types of the expressions `selection` picks, after them; a call
+    /// result reads `-> T`. None repeats a binding hint in `binding_hints`.
+    fn expression_type_hints(
+        &self,
+        binding_hints: &[InlayHint],
+        selection: ExpressionSelection,
+    ) -> Vec<InlayHint> {
+        let all_known_types = self.options.all_known_types;
+        let binding_value_types: Vec<TypeHintIdentity> = binding_hints
+            .iter()
+            .filter(|hint| hint.kind == Some(InlayHintKind::TYPE))
+            .map(|hint| TypeHintIdentity {
+                position: hint.position,
+                label: label_text(&hint.label).to_string(),
+            })
+            .collect();
+        let opaque_self_describing_values = self
+            .self_describing_assignment_value_nodes()
+            .into_iter()
+            .filter(|node| !parenthesized_value(*node).is::<LambdaExpression>())
+            .map(|node| self.document.range_for_node(node))
+            .collect::<Vec<_>>();
+        let assignment_parts = self.assignment_parts();
+        self.inferred_types
+            .values()
+            .filter_map(|(node, inferred_type)| {
+                let node = *node;
+                let expression_range = self.document.range_for_node(node);
+                let is_call = node.is_space_application();
+                let selected = match selection {
+                    ExpressionSelection::All => true,
+                    ExpressionSelection::Calls(CallHintPlacement::Every) => is_call,
+                    ExpressionSelection::Calls(_) => {
+                        is_call && self.ends_line_of_longer_expression(node)
+                    }
+                };
+                if !selected
+                    || !range_contains(self.range, expression_range)
+                    || self.type_is_stated_by_installation(node)
+                    || (!all_known_types
+                        && (assignment_parts.suppresses(expression_range, is_call)
+                            || is_self_describing_value(node)
+                            || opaque_self_describing_values
+                                .iter()
+                                .any(|value_range| range_contains(*value_range, expression_range))))
+                {
+                    return None;
+                }
+                let type_name = self.displayed_type(expression_range.start, inferred_type)?;
+                if binding_value_types.contains(&TypeHintIdentity {
+                    position: expression_range.end,
+                    label: type_name.clone(),
+                }) {
+                    return None;
+                }
+                Some(type_hint(
+                    expression_range.end,
+                    &expression_label(node, type_name),
+                ))
+            })
+            .collect()
+    }
+
+    /// Whether `node` ends its line — nothing but a comment follows it there —
+    /// while an expression around it goes on below, as a link of a chain
+    /// broken across lines does.
+    fn ends_line_of_longer_expression(&self, node: SyntaxNode<'_>) -> bool {
+        let text = self.document.text();
+        let rest_of_line = text[node.end_byte()..]
+            .split('\n')
+            .next()
+            .unwrap_or_default();
+        let next_token = node.end_byte() + rest_of_line.len() - rest_of_line.trim_start().len();
+        let ends_line = rest_of_line.trim().is_empty()
+            || self
+                .document
+                .node_at_position_minimal(
+                    self.document.range_for_bytes(next_token..next_token).start,
+                )
+                .is_some_and(|following| following.is_comment());
+        let line = self.document.range_for_node(node).end.line;
+        ends_line
+            && node
+                .ancestors()
+                .take_while(|ancestor| !ancestor.is_source_cell())
+                .any(|ancestor| self.document.range_for_node(ancestor).end.line > line)
+    }
+
+    /// Whether `node` names a parameter whose type its method installation
+    /// states.
+    fn type_is_stated_by_installation(&self, node: SyntaxNode<'_>) -> bool {
+        node.is::<Symbol>()
+            && self
+                .document
+                .analysis()
+                .get_binding_at(node.text(), self.document.position_for_node(node))
+                .is_some_and(|binding| {
+                    binding.role == BindingRole::Parameter && binding.state.inferred_type.is_some()
+                })
+    }
+
+    fn assignment_parts(&self) -> AssignmentParts {
+        let mut parts = AssignmentParts {
+            assignments: Vec::new(),
+            targets: Vec::new(),
+            values: Vec::new(),
+        };
+        for assignment in self
+            .inferred_types
+            .values()
+            .map(|(node, _)| *node)
+            .filter(SyntaxNode::is_assignment)
+        {
+            parts
+                .assignments
+                .push(self.document.range_for_node(assignment));
+            if let Some(target) = assignment.binary_parts().map(|parts| parts.left) {
+                parts.targets.push(self.document.range_for_node(target));
+            }
+            if let Some(value) = assignment.binary_parts().map(|parts| parts.right) {
+                parts.values.push(self.document.range_for_node(value));
+            }
+        }
+        parts
+    }
+
+    fn assigned_values(&self) -> Vec<AssignedValue> {
+        let mut values = Vec::new();
+        for assignment in self
+            .inferred_types
+            .values()
+            .map(|(node, _)| *node)
+            .filter(|node| {
+                node.has_binary_operator::<Token![=]>() || node.has_binary_operator::<Token![:=]>()
+            })
+        {
+            let (Some(left), Some(right)) = (
+                assignment.binary_parts().map(|parts| parts.left),
+                assignment.binary_parts().map(|parts| parts.right),
+            ) else {
+                continue;
+            };
+            let destructured = left.is_collection_expression();
+            let pairs = if destructured {
+                paired_assignment_values(left, right)
+            } else if left.is::<Symbol>() {
+                vec![(left, right)]
             } else {
-                None
+                Vec::new()
+            };
+            for (target, value) in pairs {
+                let Some(type_name) = self.inferred_type_label(value) else {
+                    continue;
+                };
+                values.push(AssignedValue {
+                    target_range: self.document.range_for_node(target),
+                    value_range: self.document.range_for_node(value),
+                    type_name,
+                    destructured,
+                });
             }
-        })
-        .filter(|value| all_known_types || !is_self_describing_value(*value))
-        .filter_map(|value| {
-            let value_range = document.range_for_node(value);
-            if !range.contains_position(value_range.end) {
-                return None;
-            }
-            let type_name = inferred_type_label(document, knowledge, inferred_types, value)?;
-            Some(type_hint(value_range.end, &type_name))
-        })
-        .collect()
+        }
+        values
+    }
+
+    fn self_describing_assignment_value_nodes(&self) -> Vec<SyntaxNode<'tree>> {
+        self.inferred_types
+            .values()
+            .map(|(node, _)| *node)
+            .filter(|node| node.is_assignment())
+            .filter_map(|assignment| {
+                let left = assignment.binary_parts().map(|parts| parts.left)?;
+                let right = assignment.binary_parts().map(|parts| parts.right)?;
+                (left.is::<Symbol>() && is_self_describing_value(right)).then_some(right)
+            })
+            .collect()
+    }
 }
 
-fn lambda_final_value(lambda: M2Node<'_>) -> Option<M2Node<'_>> {
-    let mut value = lambda.child_by_field_name("body")?;
+fn lambda_final_value(lambda: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    let mut value = lambda.lambda_body()?;
     while value.is_holder() {
         value = value.final_value_child()?;
     }
@@ -158,34 +453,14 @@ fn inlay_type_label(type_name: String) -> String {
     }
 }
 
-fn inferred_type_label(
-    document: &DocumentSnapshot,
-    knowledge: &ObjectRegistry,
-    inferred_types: &HashMap<SyntaxNodeId, (M2Node<'_>, InferredType)>,
-    node: M2Node<'_>,
-) -> Option<String> {
-    displayed_type(
-        document,
-        document.position_for_node(node),
-        knowledge,
-        &inferred_types.get(&node.id())?.1,
-    )
-}
-
-fn displayed_type(
-    document: &DocumentSnapshot,
-    position: Position,
-    knowledge: &ObjectRegistry,
-    inferred_type: &InferredType,
-) -> Option<String> {
-    let view = knowledge.at(position);
-    inferred_type
-        .subset_label(|generator| {
-            document
-                .analysis()
-                .has_strict_subtype_at(generator, position, &view)
-        })
-        .map(inlay_type_label)
+/// The hint label of `type_name`, the type of `expression`: a call result
+/// reads `-> T`.
+fn expression_label(expression: SyntaxNode<'_>, type_name: String) -> String {
+    if expression.is_space_application() {
+        format!("{CALL_RESULT_PREFIX}{type_name}")
+    } else {
+        type_name
+    }
 }
 
 fn type_hint(position: Position, type_name: &str) -> InlayHint {
@@ -214,133 +489,6 @@ struct TypeHintIdentity {
     label: String,
 }
 
-fn binding_type_hints(
-    document: &DocumentSnapshot,
-    range: &TextRange,
-    all_known_types: bool,
-    knowledge: &ObjectRegistry,
-    inferred_types: &HashMap<SyntaxNodeId, (M2Node<'_>, InferredType)>,
-) -> Vec<InlayHint> {
-    let assigned_values = assigned_values(document, knowledge, inferred_types);
-    let self_describing_values = self_describing_assignment_value_nodes(inferred_types)
-        .into_iter()
-        .map(|node| document.range_for_node(node))
-        .collect::<Vec<_>>();
-    let mut hints = Vec::new();
-
-    for binding in document.analysis().bindings() {
-        let mut previous_type: Option<String> = None;
-        for state in &binding.states {
-            if binding.role == crate::meta::BindingRole::Parameter && state.inferred_type.is_some()
-            {
-                continue;
-            }
-            let assigned = assigned_values
-                .iter()
-                .find(|value| value.target_range == state.span);
-            let type_name = assigned.map(|value| value.type_name.clone()).or_else(|| {
-                state.inferred_type.as_ref().and_then(|inferred_type| {
-                    displayed_type(document, state.span.start, knowledge, inferred_type)
-                })
-            });
-            let Some(type_name) = type_name else {
-                previous_type = None;
-                continue;
-            };
-            let changed = previous_type.as_ref() != Some(&type_name);
-            previous_type = Some(type_name.clone());
-            if !all_known_types && !changed && assigned.is_none_or(|value| !value.destructured) {
-                continue;
-            }
-            let value_range = assigned
-                .map(|value| value.value_range)
-                .or(state.value_range);
-            if !all_known_types
-                && value_range.is_some_and(|value_range| {
-                    self_describing_values.contains(&value_range)
-                        && assigned.is_none_or(|value| !value.destructured)
-                })
-            {
-                continue;
-            }
-            let position = state.span.end;
-            if range.contains_position(position) {
-                hints.push(type_hint(position, &type_name));
-            }
-        }
-    }
-
-    hints
-}
-
-fn expression_type_hints(
-    document: &DocumentSnapshot,
-    range: &TextRange,
-    all_known_types: bool,
-    knowledge: &ObjectRegistry,
-    inferred_types: &HashMap<SyntaxNodeId, (M2Node<'_>, InferredType)>,
-    binding_hints: &[InlayHint],
-) -> Vec<InlayHint> {
-    let binding_value_types: Vec<TypeHintIdentity> = binding_hints
-        .iter()
-        .filter(|hint| hint.kind == Some(InlayHintKind::TYPE))
-        .map(|hint| TypeHintIdentity {
-            position: hint.position,
-            label: label_text(&hint.label).to_string(),
-        })
-        .collect();
-    let opaque_self_describing_values = self_describing_assignment_value_nodes(inferred_types)
-        .into_iter()
-        .filter(|node| !parenthesized_value(*node).is::<LambdaExpression>())
-        .map(|node| document.range_for_node(node))
-        .collect::<Vec<_>>();
-    let assignment_parts = assignment_parts(document, inferred_types);
-    inferred_types
-        .values()
-        .filter_map(|(node, inferred_type)| {
-            let expression_range = document.range_for_node(*node);
-            let is_call = node.is_space_application();
-            if !range_contains(*range, expression_range)
-                || type_is_stated_by_installation(document, *node)
-                || (!all_known_types
-                    && (assignment_parts.suppresses(expression_range, is_call)
-                        || is_self_describing_value(*node)
-                        || opaque_self_describing_values
-                            .iter()
-                            .any(|value_range| range_contains(*value_range, expression_range))))
-            {
-                return None;
-            }
-            let type_name =
-                displayed_type(document, expression_range.start, knowledge, inferred_type)?;
-            let end = expression_range.end;
-            if binding_value_types.contains(&TypeHintIdentity {
-                position: end,
-                label: type_name.clone(),
-            }) {
-                return None;
-            }
-            let label = if is_call {
-                format!("-> {type_name}")
-            } else {
-                type_name
-            };
-            Some(type_hint(expression_range.end, &label))
-        })
-        .collect()
-}
-
-fn type_is_stated_by_installation(document: &DocumentSnapshot, node: M2Node<'_>) -> bool {
-    node.is::<Symbol>()
-        && document
-            .analysis()
-            .get_binding_at(node.text(), document.position_for_node(node))
-            .is_some_and(|binding| {
-                binding.role == crate::meta::BindingRole::Parameter
-                    && binding.state.inferred_type.is_some()
-            })
-}
-
 struct AssignmentParts {
     assignments: Vec<TextRange>,
     targets: Vec<TextRange>,
@@ -358,79 +506,10 @@ impl AssignmentParts {
     }
 }
 
-fn assignment_parts(
-    document: &DocumentSnapshot,
-    inferred_types: &HashMap<SyntaxNodeId, (M2Node<'_>, InferredType)>,
-) -> AssignmentParts {
-    let mut parts = AssignmentParts {
-        assignments: Vec::new(),
-        targets: Vec::new(),
-        values: Vec::new(),
-    };
-    for assignment in inferred_types
-        .values()
-        .map(|(node, _)| *node)
-        .filter(M2Node::is_assignment)
-    {
-        parts.assignments.push(document.range_for_node(assignment));
-        if let Some(target) = assignment.child_by_field_name("left") {
-            parts.targets.push(document.range_for_node(target));
-        }
-        if let Some(value) = assignment.child_by_field_name("right") {
-            parts.values.push(document.range_for_node(value));
-        }
-    }
-    parts
-}
-
-fn assigned_values(
-    document: &DocumentSnapshot,
-    knowledge: &ObjectRegistry,
-    inferred_types: &HashMap<SyntaxNodeId, (M2Node<'_>, InferredType)>,
-) -> Vec<AssignedValue> {
-    let mut values = Vec::new();
-    for assignment in inferred_types
-        .values()
-        .map(|(node, _)| *node)
-        .filter(|node| {
-            node.has_binary_operator::<Token![=]>() || node.has_binary_operator::<Token![:=]>()
-        })
-    {
-        let (Some(left), Some(right)) = (
-            assignment.child_by_field_name("left"),
-            assignment.child_by_field_name("right"),
-        ) else {
-            continue;
-        };
-        let destructured = left.is_collection_expression();
-        let pairs = if destructured {
-            paired_assignment_values(left, right)
-        } else if left.is::<Symbol>() {
-            vec![(left, right)]
-        } else {
-            Vec::new()
-        };
-        for (target, value) in pairs {
-            let value_range = document.range_for_node(value);
-            let Some(type_name) = inferred_type_label(document, knowledge, inferred_types, value)
-            else {
-                continue;
-            };
-            values.push(AssignedValue {
-                target_range: document.range_for_node(target),
-                value_range,
-                type_name,
-                destructured,
-            });
-        }
-    }
-    values
-}
-
 fn paired_assignment_values<'tree>(
-    target: M2Node<'tree>,
-    value: M2Node<'tree>,
-) -> Vec<(M2Node<'tree>, M2Node<'tree>)> {
+    target: SyntaxNode<'tree>,
+    value: SyntaxNode<'tree>,
+) -> Vec<(SyntaxNode<'tree>, SyntaxNode<'tree>)> {
     if target.is::<Symbol>() {
         return vec![(target, value)];
     }
@@ -456,22 +535,7 @@ fn paired_assignment_values<'tree>(
     }
 }
 
-fn self_describing_assignment_value_nodes<'tree>(
-    inferred_types: &HashMap<SyntaxNodeId, (M2Node<'tree>, InferredType)>,
-) -> Vec<M2Node<'tree>> {
-    inferred_types
-        .values()
-        .map(|(node, _)| *node)
-        .filter(|node| node.is_assignment())
-        .filter_map(|assignment| {
-            let left = assignment.child_by_field_name("left")?;
-            let right = assignment.child_by_field_name("right")?;
-            (left.is::<Symbol>() && is_self_describing_value(right)).then_some(right)
-        })
-        .collect()
-}
-
-fn is_self_describing_value(node: M2Node<'_>) -> bool {
+fn is_self_describing_value(node: SyntaxNode<'_>) -> bool {
     let node = parenthesized_value(node);
     node.is_literal()
         || node.is_nothing_value()
@@ -482,7 +546,7 @@ fn is_self_describing_value(node: M2Node<'_>) -> bool {
             && node.collection_elements().all(is_self_describing_value))
 }
 
-fn parenthesized_value(mut node: M2Node<'_>) -> M2Node<'_> {
+fn parenthesized_value(mut node: SyntaxNode<'_>) -> SyntaxNode<'_> {
     while node.is_holder() {
         let Some(value) = node.final_value_child() else {
             break;
@@ -502,19 +566,99 @@ mod tests {
     use crate::object_registry::ObjectRegistry;
 
     fn hints(text: &str, expression_types: bool) -> Vec<InlayHint> {
-        let registry = ObjectRegistry::default();
-        let document =
-            DocumentSnapshot::from_text(text.to_string(), &registry).expect("fixture should parse");
-        let range = TextRange::new(pos!(), pos!(u32::MAX, 0));
-        inlay_hints_response(
-            &document,
-            range,
+        hints_with(
+            text,
             InlayHintSettings {
                 expression_types,
-                all_known_types: false,
+                unknown_types: true,
+                ..InlayHintSettings::default()
             },
-            &registry,
+            &ObjectRegistry::default(),
         )
+    }
+
+    fn hints_with(
+        text: &str,
+        options: InlayHintSettings,
+        registry: &ObjectRegistry,
+    ) -> Vec<InlayHint> {
+        let document =
+            DocumentSnapshot::from_text(text.to_string(), registry).expect("fixture should parse");
+        let range = TextRange::new(pos!(), pos!(u32::MAX, 0));
+        inlay_hints_response(&document, range, options, registry)
+    }
+
+    /// The labels of `hints` at their positions.
+    fn placed_labels(hints: &[InlayHint]) -> Vec<(Position, String)> {
+        hints
+            .iter()
+            .map(|hint| (hint.position, label_text(&hint.label).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn call_results_show_where_a_longer_expression_breaks_its_line() {
+        let registry = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let source = concat!(
+            "f = L -> (
+",
+            "    if all(L, x -> instance(x, ZZ))
+",
+            "    then 1 else 2
+",
+            "    )
+",
+            "g = L -> if all(L, x -> instance(x, ZZ)) then 1 else 2
+",
+        );
+        let call_hints = |calls| {
+            placed_labels(&hints_with(
+                source,
+                InlayHintSettings {
+                    calls,
+                    ..InlayHintSettings::default()
+                },
+                &registry,
+            ))
+            .into_iter()
+            .filter(|(_, label)| label == "-> Boolean")
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>()
+        };
+
+        // The lambdas return what `instance` does, after its call.
+        let lambda_returns = vec![pos!(1, 34), pos!(4, 39)];
+        assert_eq!(call_hints(CallHintPlacement::Off), lambda_returns);
+        // `all(…)` ends line 1 while the `if` goes on; on line 4 it does not.
+        assert_eq!(
+            call_hints(CallHintPlacement::LineEnds),
+            vec![pos!(1, 34), pos!(1, 35), pos!(4, 39)]
+        );
+        assert_eq!(
+            call_hints(CallHintPlacement::Every),
+            vec![pos!(1, 34), pos!(1, 35), pos!(4, 39), pos!(4, 40)]
+        );
+    }
+
+    #[test]
+    fn types_that_say_nothing_are_shown_only_on_request() {
+        let source = "f = x -> x
+y = f 1
+";
+        let registry = ObjectRegistry::default();
+        let shown = |unknown_types| {
+            labels(&hints_with(
+                source,
+                InlayHintSettings {
+                    unknown_types,
+                    ..InlayHintSettings::default()
+                },
+                &registry,
+            ))
+        };
+
+        assert!(shown(false).is_empty(), "{:?}", shown(false));
+        assert!(shown(true).iter().any(|label| label.contains("Thing")));
     }
 
     fn labels(hints: &[InlayHint]) -> Vec<String> {

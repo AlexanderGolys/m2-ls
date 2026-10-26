@@ -12,7 +12,7 @@ use tower_lsp::lsp_types::*;
 
 use crate::document::{DocumentSnapshot, TargetSymbol};
 use crate::library_index::LibrarySources;
-use crate::node_metadata::M2Node;
+use crate::node_metadata::SyntaxNode;
 use crate::object_registry::ObjectName;
 use crate::package_index::package_source_string;
 use crate::record_lsp::LspKnowledge;
@@ -136,7 +136,7 @@ fn goto_symbol_response(
     let mention = document.symbol_mention_at(position);
 
     if let NavigationTarget::Definition = target {
-        if let Some(string_node) = node.enclosing_node(M2Node::is_string_literal) {
+        if let Some(string_node) = node.enclosing_node(SyntaxNode::is_string_literal) {
             if let Some(package_name) = crate::package_index::package_source_string(string_node) {
                 if let Some(path) = library.source_resolver().resolve_package_file(package_name) {
                     if let Ok(uri) = Url::from_file_path(path) {
@@ -187,14 +187,31 @@ fn goto_symbol_response(
         return locations_response(workspace_locations);
     }
 
-    let record_package = knowledge
-        .get_record_with_package(&ObjectName::new(node_text))
+    let library_record = knowledge.get_record_with_package(&ObjectName::new(node_text));
+    let record_package = library_record
+        .as_ref()
         .map(|(package, _)| ObjectName::new(package));
     let library_locations = library.locations(uri, record_package.clone(), |sources| {
         target.locations(sources, node_text, uri)
     });
     if !library_locations.is_empty() {
         return locations_response(library_locations);
+    }
+    if matches!(target, NavigationTarget::Definition)
+        && library_record
+            .and_then(|(_, record)| record.callable())
+            .is_some_and(|callable| callable.is_method_function())
+    {
+        // Core also creates method functions through setup calls rather than
+        // assignments. Their installed methods still provide source definitions.
+        let installations = library.method_installations(
+            uri,
+            record_package.clone().into_iter().collect(),
+            node_text,
+        );
+        if !installations.is_empty() {
+            return locations_response(installations);
+        }
     }
     // A library name is defined by its package, so it has a location only in
     // that package's `.m2` sources: none when they are not on disk, or when
@@ -287,9 +304,9 @@ pub fn goto_implementation_response(
         if !application.is_space_application() {
             return None;
         }
-        let head = application.child_by_field_name("left")?;
+        let head = application.binary_parts().map(|parts| parts.left)?;
         (head.id() == callable.id()).then_some(())?;
-        let argument = application.child_by_field_name("right")?;
+        let argument = application.binary_parts().map(|parts| parts.right)?;
         Some(analysis.local_call_installations(
             function,
             argument,
@@ -446,7 +463,7 @@ pub fn document_links_response(document: &DocumentSnapshot, uri: &Url) -> Vec<Do
         document
             .root_node()
             .descendants()
-            .filter(M2Node::is_string_literal)
+            .filter(SyntaxNode::is_string_literal)
             .filter_map(|node| {
                 let package = package_source_string(node)?;
                 Some(document_link(
@@ -1103,6 +1120,10 @@ mod tests {
                 _exclude: &Url,
             ) -> Option<crate::semantic_token::M2SemanticTokenType> {
                 None
+            }
+
+            fn is_mutable_export(&self, _name: &str) -> bool {
+                false
             }
         }
 

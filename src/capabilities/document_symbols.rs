@@ -223,7 +223,7 @@ fn build_scope_symbols(scope_idx: usize, by_scope: &mut [Vec<Declaration>]) -> V
 mod tests {
     use super::*;
     use crate::document::DocumentSnapshot;
-    use crate::node_metadata::{M2Node, M2Parser};
+    use crate::node_metadata::{SyntaxNode, SyntaxParser};
     use crate::object_registry::ObjectRegistry;
     use m2_syn::nodes::{ExprLambda as LambdaExpression, Symbol};
     use tower_lsp::lsp_types::Range as TextRange;
@@ -399,14 +399,14 @@ mod tests {
 
     #[test]
     fn document_symbols_cover_static_top_level_extractor_bindings() {
-        fn has_function_ancestor(node: M2Node) -> bool {
+        fn has_function_ancestor(node: SyntaxNode) -> bool {
             node.ancestors()
                 .any(|parent| parent.is::<LambdaExpression>())
         }
 
-        fn collect_static_top_level_bindings(node: M2Node, names: &mut Vec<String>) {
+        fn collect_static_top_level_bindings(node: SyntaxNode, names: &mut Vec<String>) {
             if node.is_assignment() && !has_function_ancestor(node) {
-                if let Some(left) = node.child_by_field_name("left") {
+                if let Some(left) = node.binary_parts().map(|parts| parts.left) {
                     if left.is::<Symbol>() {
                         let name = left.text().to_string();
                         if !names.contains(&name) {
@@ -423,7 +423,7 @@ mod tests {
 
         let text = include_str!("../../tests/fixtures/formatting_example.m2");
         let builtins = ObjectRegistry::default();
-        let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
         let root = parser.parse(text).expect("fixture should parse");
         let mut expected = Vec::new();
         collect_static_top_level_bindings(root, &mut expected);
@@ -527,8 +527,9 @@ X + Z := (a,b) -> \"X + Z\"
                 ("Y", Some("Type"), SymbolKind::CLASS),
                 ("Z", Some("Type"), SymbolKind::CLASS),
                 ("- X", Some("- X"), SymbolKind::METHOD),
-                ("Y + X", Some("Y + X"), SymbolKind::METHOD),
-                ("X + Z", Some("X + Z"), SymbolKind::METHOD),
+                // Both return a string, so that is their deduced codomain.
+                ("Y + X", Some("Y + X -> String"), SymbolKind::METHOD),
+                ("X + Z", Some("X + Z -> String"), SymbolKind::METHOD),
             ]
         );
     }

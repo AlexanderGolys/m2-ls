@@ -1,5 +1,6 @@
 //! Staged analysis of one immutable document snapshot.
 
+use crate::node_metadata::TypedSource;
 mod first_pass;
 mod ring;
 mod typechecker;
@@ -8,11 +9,11 @@ use m2_syn::nodes::{
     ElseClause, Expr, ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
     ExprNew as NewStatement, ExprOpBinIndex, ExprOpBinMember, ExprOpBinRegular as BinaryExpr,
     ExprOption as OptionExpression, ExprQuote as QuoteExpression, ExprWhile as WhileLoop,
-    FloatLiteral, IntegerLiteral, List, LoopBody, RawStringLiteral, Sequence, SourceFile,
-    StringLiteral, Symbol, ThenClause,
+    FloatLiteral, IntegerLiteral, List, LoopBody, RawStringLiteral, Sequence, StringLiteral,
+    Symbol, ThenClause,
 };
 use m2_syn::visit::{self, Visit};
-use m2_syn::{Spanned, Token};
+use m2_syn::Token;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::ops::Deref;
@@ -21,7 +22,7 @@ use tower_lsp::lsp_types::{Position, Range as TextRange, SymbolKind};
 use crate::builtin_index::{CallableKind, MethodSignature, Record};
 use crate::meta::{BindingRole, Meta, Metadata};
 use crate::node_metadata::{
-    matches_token, token_spelling, visit_source_nodes, M2Node, M2SyntaxKind,
+    matches_token, token_spelling, visit_source_nodes, SyntaxKind, SyntaxNode,
 };
 use crate::object_registry::ObjectName;
 use crate::object_registry::{ObjectId, OperatorForm, TypeData, TypeId};
@@ -33,10 +34,7 @@ use crate::typesystem::{
     TypeRole,
 };
 use crate::util::TextRangeExt;
-use first_pass::{
-    control_flow_scope, nested_symbols, package_name_range, walk, walk_cst, BindingEffect,
-    BindingFact, ScopeTree,
-};
+use first_pass::{nested_symbols, package_name_range, walk, BindingEffect, BindingFact, ScopeTree};
 pub(crate) use typechecker::TypeChecker;
 
 /// Identity of one scoped symbol binding within an immutable analysis snapshot.
@@ -58,7 +56,7 @@ pub struct Operator {
 }
 
 impl Operator {
-    fn from_expression(node: M2Node<'_>) -> Option<Self> {
+    fn from_expression(node: SyntaxNode<'_>) -> Option<Self> {
         let form = if node.is_adjacent_expr() || node.is_binary_expr() {
             OperatorForm::Binary
         } else if node.is_prefix_expr() {
@@ -70,9 +68,7 @@ impl Operator {
         };
         let token = match form {
             OperatorForm::Binary | OperatorForm::Assignment => node.binary_operator()?,
-            OperatorForm::Prefix | OperatorForm::Postfix => {
-                node.child_by_field_name("operator")?.text()
-            }
+            OperatorForm::Prefix | OperatorForm::Postfix => node.operator_node()?.text(),
         };
         Some(Self {
             token: ObjectName::new(token),
@@ -174,6 +170,22 @@ pub struct MethodInstallation {
     pub argument_lambda_dispatch: Option<Dispatch>,
     pub(crate) syntax: MethodInstallationSyntax,
     effect: MethodInstallationEffect,
+    /// Where [`Method::codomain`] comes from; `Some` exactly when it is.
+    pub codomain_origin: Option<CodomainOrigin>,
+}
+
+/// Where the codomain of a [`MethodInstallation`] comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CodomainOrigin {
+    /// Its annotation, the `T` of `f ZZ := T => x -> …`.
+    Annotation,
+    /// The `TypicalValue` of the method function it installs on.
+    TypicalValue,
+    /// Inference: the type the installed function always returns. Calls of
+    /// the method return it as if it were annotated, and the
+    /// `install-codomain-missing` hint suggests writing it down.
+    Deduction,
 }
 
 /// How a method function passes options to the functions installed on it,
@@ -233,7 +245,7 @@ impl MethodOptions {
     /// function of the form these options expect, or `None` when the form
     /// does not fit. With unrecorded options a lambda returning another lambda
     /// could be either form, so only one that does not is taken.
-    fn argument_lambda(self, installed: InstalledFunction<'_>) -> Option<M2Node<'_>> {
+    fn argument_lambda(self, installed: InstalledFunction<'_>) -> Option<SyntaxNode<'_>> {
         match (self, installed) {
             (Self::Absent, InstalledFunction::Lambda(lambda)) => Some(lambda),
             (Self::Unrecorded, InstalledFunction::Lambda(lambda)) => {
@@ -250,9 +262,9 @@ impl MethodOptions {
 }
 
 /// The lambda a lambda returns directly, as `x -> …` in `o -> x -> …`.
-fn returned_lambda(lambda: M2Node<'_>) -> Option<M2Node<'_>> {
+fn returned_lambda(lambda: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     lambda
-        .child_by_field_name("body")
+        .lambda_body()
         .and_then(parenthesized_value)
         .filter(|body| body.is::<LambdaExpression>())
 }
@@ -262,31 +274,32 @@ fn returned_lambda(lambda: M2Node<'_>) -> Option<M2Node<'_>> {
 #[derive(Debug, Clone, Copy)]
 enum InstalledFunction<'tree> {
     /// `x -> …`, or `o -> x -> …` receiving an option table.
-    Lambda(M2Node<'tree>),
+    Lambda(SyntaxNode<'tree>),
     /// `{…} >> o -> …`: a function declaring its own options, whose handler
     /// `o -> …` receives them.
     OptionDeclaring {
-        declaration: M2Node<'tree>,
-        handler: M2Node<'tree>,
+        declaration: SyntaxNode<'tree>,
+        handler: SyntaxNode<'tree>,
     },
     /// Any other value, such as a named function.
-    Other(M2Node<'tree>),
+    Other(SyntaxNode<'tree>),
 }
 
 impl<'tree> InstalledFunction<'tree> {
-    fn of(value: M2Node<'tree>) -> Option<Self> {
+    fn of(value: SyntaxNode<'tree>) -> Option<Self> {
         let value = parenthesized_value(value)?;
         if value.is::<LambdaExpression>() {
             return Some(Self::Lambda(value));
         }
         if value.is_option_assignment() {
-            return Self::of(value.child_by_field_name("right")?);
+            return Self::of(value.binary_parts().map(|parts| parts.right)?);
         }
         let handler = value
             .has_binary_operator::<Token![>>]>()
             .then(|| {
                 value
-                    .child_by_field_name("right")
+                    .binary_parts()
+                    .map(|parts| parts.right)
                     .and_then(parenthesized_value)
             })
             .flatten()
@@ -301,7 +314,7 @@ impl<'tree> InstalledFunction<'tree> {
     }
 
     /// The whole installed function, before which a codomain annotation goes.
-    fn node(self) -> M2Node<'tree> {
+    fn node(self) -> SyntaxNode<'tree> {
         match self {
             Self::Lambda(node)
             | Self::OptionDeclaring {
@@ -309,6 +322,44 @@ impl<'tree> InstalledFunction<'tree> {
             }
             | Self::Other(node) => node,
         }
+    }
+}
+
+/// A list declaring the options a function takes, with their defaults. Only
+/// these lists name options; the same `key => value` entry anywhere else is a
+/// hash table entry or an option a call passes to some function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OptionDeclaration {
+    /// The list of `method(Options => {…})`, the options of every
+    /// installation of the method.
+    Method,
+    /// The list of `{…} >> o -> …`, the options of one function.
+    Function,
+}
+
+impl OptionDeclaration {
+    /// The declaration the list holding `entry`, an option `key => default`,
+    /// makes, or `None` when that list declares no options.
+    pub fn of_entry(entry: SyntaxNode<'_>) -> Option<Self> {
+        let list = entry.parent().filter(|parent| parent.is::<List>())?;
+        let holder = list.parent()?;
+        let holds_list =
+            |side: Option<SyntaxNode<'_>>| side.is_some_and(|side| side.id() == list.id());
+        let parts = holder.binary_parts();
+        if holds_list(parts.map(|parts| parts.left))
+            && matches!(
+                InstalledFunction::of(holder),
+                Some(InstalledFunction::OptionDeclaring { .. })
+            )
+        {
+            return Some(Self::Function);
+        }
+        holder
+            .ancestors()
+            .find_map(MethodDeclaration::of)
+            .filter(|method| holds_list(method.option(MethodDeclarationOption::Options)))
+            .map(|_| Self::Method)
     }
 }
 
@@ -465,6 +516,16 @@ pub struct BindingInfo {
     introduced_by_assignment: bool,
 }
 
+impl BindingInfo {
+    /// Whether the binding is a local of a function or block: a parameter,
+    /// or a name declared with `:=` inside one. A name assigned with `=`
+    /// inside a function, with no such local in scope, is the global.
+    pub fn is_local(&self) -> bool {
+        self.role == BindingRole::Parameter
+            || (self.scope_idx != 0 && !self.introduced_by_assignment)
+    }
+}
+
 /// One source-ordered value and inferred-type state of a binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingStateInfo {
@@ -472,6 +533,7 @@ pub struct BindingStateInfo {
     pub inferred_type: Option<InferredType>,
     pub object_id: Option<CallableObjectId>,
     pub indexed_element_type: Option<ring::IndexedGeneratorTypes>,
+    pub is_ring_generator: bool,
     pub source_type: Option<TypeId>,
     pub value_range: Option<TextRange>,
     pub definition_range: TextRange,
@@ -531,7 +593,7 @@ fn source_range_key(range: TextRange) -> SourceRangeKey {
     ]
 }
 
-fn source_cell(node: M2Node<'_>) -> Option<M2Node<'_>> {
+fn source_cell(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     let root = node.root();
     node.ancestors().find(|ancestor| {
         ancestor
@@ -540,7 +602,7 @@ fn source_cell(node: M2Node<'_>) -> Option<M2Node<'_>> {
     })
 }
 
-fn is_value_cell(node: M2Node<'_>) -> bool {
+fn is_value_cell(node: SyntaxNode<'_>) -> bool {
     node.is_source_cell() && !node.is_muted_statement()
 }
 
@@ -596,7 +658,7 @@ impl OutputReference {
         )
     }
 
-    pub fn referenced_value<'tree>(self, node: M2Node<'tree>) -> Option<M2Node<'tree>> {
+    pub fn referenced_value<'tree>(self, node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
         let cell = source_cell(node)?;
         if !is_value_cell(cell) {
             return None;
@@ -613,11 +675,11 @@ impl OutputReference {
             Self::Relative(distance) => preceding_cells
                 .iter()
                 .rev()
-                .filter_map(M2Node::final_value_child)
+                .filter_map(SyntaxNode::final_value_child)
                 .nth(distance.get() - 1),
             Self::Absolute(number) => preceding_cells
                 .get(number.get() - 1)
-                .and_then(M2Node::final_value_child),
+                .and_then(SyntaxNode::final_value_child),
             Self::MissingAbsolute => None,
         }
     }
@@ -635,24 +697,24 @@ struct BindingEnrichment {
 /// The parsed loop or function body receiving a control transfer.
 #[derive(Clone, Copy)]
 pub enum ControlTransferTarget<'tree> {
-    Function(M2Node<'tree>),
-    ListLoop(M2Node<'tree>),
-    DoLoop(M2Node<'tree>),
+    Function(SyntaxNode<'tree>),
+    ListLoop(SyntaxNode<'tree>),
+    DoLoop(SyntaxNode<'tree>),
     LoopCallback {
-        function: M2Node<'tree>,
-        callable: M2Node<'tree>,
+        function: SyntaxNode<'tree>,
+        callable: SyntaxNode<'tree>,
     },
 }
 
 impl<'tree> ControlTransferTarget<'tree> {
-    pub fn owner(self) -> M2Node<'tree> {
+    pub fn owner(self) -> SyntaxNode<'tree> {
         match self {
             Self::Function(owner) | Self::ListLoop(owner) | Self::DoLoop(owner) => owner,
             Self::LoopCallback { function, .. } => function,
         }
     }
 
-    pub fn accepts(self, transfer: M2Node<'_>) -> bool {
+    pub fn accepts(self, transfer: SyntaxNode<'_>) -> bool {
         match self {
             Self::Function(_) => transfer.is_return_expr(),
             Self::ListLoop(_) => transfer.is_break_expr() || transfer.is_continue_expr(),
@@ -674,17 +736,19 @@ pub struct Analysis {
 }
 
 impl Analysis {
+    /// The binding a mention of `name` at `pos` — a name in a comment or a
+    /// string, not code — refers to: the one in scope there, or else a global
+    /// of that name, which a mention may name before its definition. A local
+    /// exists only in the scope declaring it, so no mention outside refers to
+    /// it.
     pub fn mention_symbol_at(&self, name: &str, pos: Position) -> Option<BindingView<'_>> {
         self.get_binding_at(name, pos).or_else(|| {
-            let mut fallback = None;
-            for binding_id in self.registry.bindings_by_name.get(name)? {
-                let binding = self.binding_anchor(*binding_id)?;
-                if binding.scope_idx == 0 {
-                    return Some(binding);
-                }
-                fallback.get_or_insert(binding);
-            }
-            fallback
+            self.registry
+                .bindings_by_name
+                .get(name)?
+                .iter()
+                .filter_map(|binding_id| self.binding_anchor(*binding_id))
+                .find(|binding| binding.scope_idx == 0)
         })
     }
 
@@ -723,7 +787,7 @@ impl Analysis {
 
     pub fn control_transfer_target<'tree>(
         &self,
-        transfer: M2Node<'tree>,
+        transfer: SyntaxNode<'tree>,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<ControlTransferTarget<'tree>> {
@@ -735,7 +799,7 @@ impl Analysis {
         while let Some(parent) = direct_child.parent() {
             if transfer.is_return_expr() && parent.is::<LambdaExpression>() {
                 return parent
-                    .child_by_field_name("body")
+                    .lambda_body()
                     .is_some_and(|body| body.contains(transfer))
                     .then_some(ControlTransferTarget::Function(parent));
             }
@@ -766,13 +830,13 @@ impl Analysis {
             if (parent.is::<ForLoop>() || parent.is::<WhileLoop>()) && direct_child.is::<LoopBody>()
             {
                 if direct_child
-                    .child_by_field_name("listed_value")
+                    .listed_value()
                     .is_some_and(|value| value.contains(transfer))
                 {
                     return Some(ControlTransferTarget::ListLoop(parent));
                 }
                 if direct_child
-                    .child_by_field_name("ignored_value")
+                    .ignored_value()
                     .is_some_and(|value| value.contains(transfer))
                 {
                     return Some(ControlTransferTarget::DoLoop(parent));
@@ -786,11 +850,11 @@ impl Analysis {
 
     pub fn for_each_control_transfer<'tree>(
         &self,
-        root: M2Node<'tree>,
-        syntax: Option<&SourceFile>,
+        root: SyntaxNode<'tree>,
+        syntax: Option<&TypedSource>,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
-        mut visit: impl FnMut(M2Node<'tree>, ControlTransferTarget<'tree>),
+        mut visit: impl FnMut(SyntaxNode<'tree>, ControlTransferTarget<'tree>),
     ) {
         visit_source_nodes(root, syntax, |node| {
             if node.is_control_transfer() {
@@ -993,23 +1057,24 @@ impl Analysis {
             .get(binding.state.object_id?.0)
     }
 
-    pub fn methods_for<'a>(
+    /// The installation each domain of `function` dispatches to, the last
+    /// one installed on it, in installation order.
+    pub fn effective_installations<'a>(
         &'a self,
         function: &'a FunctionInfo,
-    ) -> impl Iterator<Item = &'a Method> + 'a {
+    ) -> impl Iterator<Item = &'a MethodInstallation> + 'a {
         function
             .installations
             .iter()
             .rev()
             .filter_map(|id| self.method_installation(*id))
-            .fold(Vec::new(), |mut methods, installation| {
-                if !methods
-                    .iter()
-                    .any(|method: &&Method| method.domain == installation.method.domain)
-                {
-                    methods.push(&installation.method);
+            .fold(Vec::new(), |mut installations, installation| {
+                if !installations.iter().any(|effective: &&MethodInstallation| {
+                    effective.method.domain == installation.method.domain
+                }) {
+                    installations.push(installation);
                 }
-                methods
+                installations
             })
             .into_iter()
             .rev()
@@ -1107,29 +1172,35 @@ impl Analysis {
     }
 
     pub fn new_with_knowledge(
-        root: M2Node<'_>,
-        syntax: Option<&SourceFile>,
+        root: SyntaxNode<'_>,
+        syntax: Option<&TypedSource>,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl PositionedTypeKnowledge + ?Sized),
     ) -> Self {
         let mut analysis = Analysis {
             registry: SemanticRegistry::default(),
         };
-        analysis.registry.scopes = if let Some(syntax) = syntax {
-            walk(syntax, root, source, |fact, scopes| {
-                analysis.collect_binding_fact(fact, scopes);
-            })
-        } else {
-            walk_cst(root, source, |fact, scopes| {
-                analysis.collect_binding_fact(fact, scopes);
-            })
-        };
-        if let Some(syntax) = syntax {
-            analysis.enrich_types_typed(syntax, root, source, knowledge);
-        } else {
-            analysis.enrich_types_cst(root, source, 0, 0, knowledge);
-        }
-        analysis.collect_semantics(root, syntax, source, knowledge);
+        let syntax = syntax.unwrap_or_else(|| root.typed_source());
+        let source = crate::source::SyntaxNavigation::new(source, root.snapshot());
+        let bindings_timing = crate::telemetry::Timing::start(
+            "analysis.bindings",
+            serde_json::json!({"source_bytes": source.text().len()}),
+        );
+        analysis.registry.scopes = walk(syntax, root, &source, |fact, scopes| {
+            analysis.collect_binding_fact(fact, scopes);
+        });
+        drop(bindings_timing);
+        let inference_timing = crate::telemetry::Timing::start(
+            "analysis.inference",
+            serde_json::json!({"source_bytes": source.text().len()}),
+        );
+        analysis.enrich_types_typed(syntax, root, &source, knowledge);
+        drop(inference_timing);
+        let _semantics_timing = crate::telemetry::Timing::start(
+            "analysis.semantic_tokens",
+            serde_json::json!({"source_bytes": source.text().len()}),
+        );
+        analysis.collect_semantics(root, Some(syntax), &source, knowledge);
         analysis.registry.pending_source_semantic_roles.clear();
         analysis
     }
@@ -1140,63 +1211,55 @@ impl Analysis {
 
     fn collect_semantics(
         &mut self,
-        root: M2Node,
-        syntax: Option<&SourceFile>,
+        root: SyntaxNode,
+        syntax: Option<&TypedSource>,
         source: &(impl SourceNavigation + ?Sized),
         knowledge_provider: &(impl PositionedTypeKnowledge + ?Sized),
     ) {
         if let Some(syntax) = syntax {
-            TypedSemanticRoles {
+            syntax.visit(&mut TypedSemanticRoles {
                 analysis: self,
                 root,
                 source,
                 knowledge_provider,
-            }
-            .visit_source_file(syntax);
+            });
         }
+        let mut covered_until = 0;
         for node in root.descendants() {
+            if node.start_byte() < covered_until {
+                continue;
+            }
             let knowledge = knowledge_provider.at_position(source.position_for_node(node));
-            if syntax.is_none() {
-                self.record_cst_source_semantic_roles(node, source, &knowledge);
+            if self.is_indexed_ring_generator(node, source) {
+                covered_until = node.end_byte();
+                self.registry
+                    .source_semantic_tokens
+                    .push(SourceSemanticToken {
+                        span: source.span_for_node(node),
+                        syntax_token_type: None,
+                        source_role: Some(SourceSemanticRole::RingGenerator),
+                        is_symbol: false,
+                        is_unquoted_symbol: false,
+                        is_expression_symbol: false,
+                        is_condition_value: false,
+                    });
+                continue;
             }
             self.record_source_semantic_token(node, source, &knowledge);
         }
-    }
-
-    fn record_cst_source_semantic_roles(
-        &mut self,
-        node: M2Node,
-        source: &(impl SourceNavigation + ?Sized),
-        knowledge: &(impl TypeKnowledge + ?Sized),
-    ) {
-        if node.is_option_assignment() {
-            if let Some(left) = node.child_by_field_name("left") {
-                self.register_option_roles(left, node.child_by_field_name("right"), source);
-            }
-        }
-
-        if let Some(property) = node.property_key() {
-            self.register_source_semantic_role(
-                source.range_for_node(property),
-                SourceSemanticRole::PropertyKey,
-            );
-        }
-
-        self.record_quoted_symbol_role(node, source);
-        self.record_namespace_role(node, source, knowledge);
     }
 
     /// A quote yields its operand as a `Symbol` instead of evaluating it, so the
     /// quoted name reads as a symbol regardless of what it is bound to.
     fn record_quoted_symbol_role(
         &mut self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
     ) {
         if !node.is::<QuoteExpression>() {
             return;
         }
-        if let Some(quoted) = node.child_by_field_name("token") {
+        if let Some(quoted) = node.quoted_symbol() {
             self.register_source_semantic_role(
                 source.range_for_node(quoted),
                 SourceSemanticRole::QuotedSymbol,
@@ -1206,8 +1269,8 @@ impl Analysis {
 
     fn register_option_roles(
         &mut self,
-        left: M2Node,
-        right: Option<M2Node>,
+        left: SyntaxNode,
+        right: Option<SyntaxNode>,
         source: &(impl SourceNavigation + ?Sized),
     ) {
         self.register_source_semantic_role(
@@ -1224,7 +1287,7 @@ impl Analysis {
 
     fn record_namespace_role(
         &mut self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) {
@@ -1269,7 +1332,7 @@ impl Analysis {
 
     fn record_source_semantic_token(
         &mut self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) {
@@ -1294,7 +1357,16 @@ impl Analysis {
             .pending_source_semantic_roles
             .iter()
             .find(|(range, _)| *range == span.range())
-            .map(|(_, role)| role.clone());
+            .map(|(_, role)| role.clone())
+            .or_else(|| {
+                let binding = is_symbol.then(|| {
+                    self.visible_source_binding_at(node.text(), span.range().start, knowledge)
+                })??;
+                binding
+                    .state
+                    .is_ring_generator
+                    .then_some(SourceSemanticRole::RingGenerator)
+            });
         self.registry
             .source_semantic_tokens
             .push(SourceSemanticToken {
@@ -1310,9 +1382,9 @@ impl Analysis {
 
     fn record_assignment_fact(
         &mut self,
-        assignment: M2Node,
-        target: M2Node,
-        value: Option<M2Node>,
+        assignment: SyntaxNode,
+        target: SyntaxNode,
+        value: Option<SyntaxNode>,
         scope_idx: usize,
         installation_id: Option<MethodInstallationId>,
         source: &(impl SourceNavigation + ?Sized),
@@ -1331,7 +1403,14 @@ impl Analysis {
                 return;
             }
         };
-        let target_end = if target.is::<NewStatement>() {
+        let target_end = if let Some(installation) =
+            assignment.get::<m2_syn::nodes::ExprAssignInstallMethod>()
+        {
+            assignment
+                .related(installation.signature.as_ref())
+                .map(|node| node.trimmed_end_byte())
+                .unwrap_or_else(|| target.trimmed_end_byte())
+        } else if target.is::<NewStatement>() {
             assignment_parts(assignment)
                 .map(|(_, operator, _)| operator.start_byte())
                 .unwrap_or_else(|| target.trimmed_end_byte())
@@ -1356,7 +1435,7 @@ impl Analysis {
     /// The domain of the installation whose arguments `lambda` receives.
     fn argument_lambda_domain(
         &self,
-        lambda: M2Node,
+        lambda: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<&Vec<ObjectName>> {
         let id = self
@@ -1368,7 +1447,7 @@ impl Analysis {
 
     pub fn installation_for(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<&MethodInstallation> {
         let span = source.range_for_node(node);
@@ -1391,14 +1470,36 @@ impl Analysis {
     fn classify_installation<'tree>(
         &self,
         id: MethodInstallationId,
-        node: M2Node<'tree>,
+        node: SyntaxNode<'tree>,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<ClassifiedInstallation<'tree>> {
         let (left, operator_node, right) = assignment_parts(node)?;
         let operator = operator_node.text();
         let position = source.position_for_node(left);
-        let (head, domain_nodes) = self.installation_shape(left, position, knowledge)?;
+        let (head, domain_nodes) =
+            if let Some(installation) = node.get::<m2_syn::nodes::ExprAssignInstallMethod>() {
+                let method = node.related(installation.method.as_ref())?;
+                let signature = node.related(installation.signature.as_ref())?;
+                let name = symbol_node_text(method)?;
+                if self.operand_is_type(name, position, knowledge) {
+                    symbol_node_text(signature)?;
+                    (
+                        MethodHead::Operator(Operator {
+                            token: ObjectName::new("SPACE"),
+                            form: OperatorForm::Binary,
+                        }),
+                        vec![method, signature],
+                    )
+                } else {
+                    (
+                        MethodHead::Function(ObjectName::new(name)),
+                        method_installation_domain_nodes(signature)?,
+                    )
+                }
+            } else {
+                self.installation_shape(left, position, knowledge)?
+            };
         let domain = domain_nodes
             .iter()
             .map(|node| ObjectName::new(symbol_node_text(*node).unwrap_or_else(|| node.text())))
@@ -1414,17 +1515,31 @@ impl Analysis {
             .and_then(symbol_node_text)
             .map(ObjectName::new);
         let codomain_span = codomain_node.map(|node| source.range_for_node(node));
+        // What the installation installs on: the method function named on
+        // the left, or the operator written between its operands.
+        let head_node = match &head {
+            MethodHead::Function(name) => left
+                .descendants()
+                .find(|node| node.is::<Symbol>() && node.text() == name.name()),
+            MethodHead::Operator(_) => left.operator_node(),
+        };
         let method_semantic_spans = domain_spans
             .iter()
-            .copied()
-            .chain(codomain_span)
-            .map(|range| (range, SourceSemanticRole::MethodTypeParameter))
+            .map(|range| (*range, SourceSemanticRole::MethodTypeParameter))
+            .chain(codomain_span.map(|range| (range, SourceSemanticRole::CodomainAnnotation)))
+            .chain(head_node.map(|node| {
+                (
+                    source.range_for_node(node),
+                    SourceSemanticRole::InstallationHead,
+                )
+            }))
             .collect::<Vec<_>>();
         if matches_token::<Token![:=]>(operator) {
             // `:=` installs by shape alone — no type check on the operands.
             Some(ClassifiedInstallation {
                 installation: MethodInstallation {
                     id,
+                    codomain_origin: codomain.is_some().then_some(CodomainOrigin::Annotation),
                     method: Method::new(head, domain, codomain),
                     span,
                     expected_argument_arity: operand_arity,
@@ -1452,6 +1567,9 @@ impl Analysis {
                     Some(ClassifiedInstallation {
                         installation: MethodInstallation {
                             id,
+                            codomain_origin: codomain
+                                .is_some()
+                                .then_some(CodomainOrigin::Annotation),
                             method: Method::new(MethodHead::Operator(op), domain, codomain),
                             span,
                             expected_argument_arity: operand_arity + 1,
@@ -1479,16 +1597,20 @@ impl Analysis {
     fn classify_install_method<'tree>(
         &self,
         id: MethodInstallationId,
-        node: M2Node<'tree>,
+        node: SyntaxNode<'tree>,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<ClassifiedInstallation<'tree>> {
         if !node.is_space_application()
-            || node.child_by_field_name("left").and_then(symbol_node_text) != Some("installMethod")
+            || node
+                .binary_parts()
+                .map(|parts| parts.left)
+                .and_then(symbol_node_text)
+                != Some("installMethod")
         {
             return None;
         }
-        let arguments = node.child_by_field_name("right")?;
+        let arguments = node.binary_parts().map(|parts| parts.right)?;
         let mut arguments = arguments.collection_elements().collect::<Vec<_>>();
         if arguments.len() < 2 {
             return None;
@@ -1526,6 +1648,7 @@ impl Analysis {
             installation: MethodInstallation {
                 id,
                 method: Method::new(head, domain, None),
+                codomain_origin: None,
                 span: source.range_for_node(node),
                 expected_argument_arity,
                 options: MethodOptions::Absent,
@@ -1542,7 +1665,7 @@ impl Analysis {
 
     fn install_method_head(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         domain_arity: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<MethodHead> {
@@ -1552,9 +1675,7 @@ impl Analysis {
         if !node.is::<QuoteExpression>() {
             return None;
         }
-        let token = node
-            .child_by_field_name("token")
-            .or_else(|| node.named_child(0))?;
+        let token = node.quoted_symbol().or_else(|| node.named_child(0))?;
         let token = ObjectName::new(token.text());
         let operator = knowledge.get_record(&token)?.operator_info()?;
         let supports = |form| operator.forms.iter().any(|candidate| candidate == form);
@@ -1570,10 +1691,10 @@ impl Analysis {
 
     pub(crate) fn installation_shape<'tree>(
         &self,
-        node: M2Node<'tree>,
+        node: SyntaxNode<'tree>,
         position: Position,
         knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> Option<(MethodHead, Vec<M2Node<'tree>>)> {
+    ) -> Option<(MethodHead, Vec<SyntaxNode<'tree>>)> {
         // A parenthesized expression is identified with its final value, so
         // `(T op S) := f` installs exactly like `T op S := f`. A final `muted`
         // child means the group evaluates to null and is not an installation
@@ -1583,7 +1704,7 @@ impl Analysis {
             return self.installation_shape(inner, position, knowledge);
         }
         if node.is::<NewStatement>() {
-            let target_type = new_statement_value(node.child_by_field_name("type")?)?;
+            let target_type = new_statement_value(node.new_class()?)?;
             symbol_node_text(target_type)?;
             let mut domain = vec![target_type];
             for value in [new_statement_parent(node), new_statement_instance(node)]
@@ -1601,8 +1722,8 @@ impl Analysis {
             ));
         }
         if node.is_adjacent_expr() || node.is_binary_expr() {
-            let left = node.child_by_field_name("left")?;
-            let right = node.child_by_field_name("right")?;
+            let left = node.binary_parts().map(|parts| parts.left)?;
+            let right = node.binary_parts().map(|parts| parts.right)?;
             let operator = Operator::from_expression(node)?;
             if node.is_space_application() {
                 // `A B` (juxtaposition = the SPACE operator): a method on the
@@ -1628,7 +1749,7 @@ impl Analysis {
                 Some((MethodHead::Operator(operator), vec![left, right]))
             }
         } else if node.is_prefix_expr() || node.is_postfix_expr() {
-            let operand = node.child_by_field_name("operand")?;
+            let operand = node.unary_operand()?;
             symbol_node_text(operand)?;
             Some((
                 MethodHead::Operator(Operator::from_expression(node)?),
@@ -1658,7 +1779,7 @@ impl Analysis {
 
     fn declared_type_parent(
         &self,
-        value: M2Node<'_>,
+        value: SyntaxNode<'_>,
         type_name: Option<&ObjectName>,
         position: Position,
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -1738,11 +1859,11 @@ impl Analysis {
 
     fn enrich_parameters(
         &mut self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         parameter_types: Option<&[ObjectName]>,
     ) {
-        let parameter_nodes = nested_symbols(node, M2Node::is_parameter_container);
+        let parameter_nodes = nested_symbols(node, SyntaxNode::is_parameter_container);
         let typed_parameters = parameter_types.filter(|types| types.len() == parameter_nodes.len());
         for (index, parameter_node) in parameter_nodes.into_iter().enumerate() {
             self.enrich_symbol(
@@ -1790,12 +1911,12 @@ impl Analysis {
 
     fn enrich_definitions(
         &mut self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         enrichment: BindingEnrichment,
     ) {
         let structured_target = !node.is::<Symbol>();
-        for definition in nested_symbols(node, M2Node::is_collection_expression) {
+        for definition in nested_symbols(node, SyntaxNode::is_collection_expression) {
             let enrichment = if structured_target {
                 BindingEnrichment {
                     inferred_type: None,
@@ -1812,7 +1933,7 @@ impl Analysis {
     /// A `newPackage` name string binds its global symbol to the new package.
     fn enrich_package_declaration(
         &mut self,
-        call: M2Node,
+        call: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
     ) {
         let Some(binding_state) = declared_package_name(call)
@@ -1841,7 +1962,7 @@ impl Analysis {
 
     fn enrich_symbol(
         &mut self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         enrichment: BindingEnrichment,
     ) {
@@ -1899,6 +2020,7 @@ impl Analysis {
             inferred_type: None,
             object_id: None,
             indexed_element_type: None,
+            is_ring_generator: false,
             source_type: None,
             value_range: fact.value,
             definition_range: fact.definition,
@@ -1940,6 +2062,7 @@ impl Analysis {
             inferred_type: None,
             object_id: None,
             indexed_element_type: None,
+            is_ring_generator: false,
             source_type: None,
             value_range: fact.value,
             definition_range: fact.definition,
@@ -1980,7 +2103,7 @@ impl Analysis {
 
     pub fn local_method_installation_signature_at<'a>(
         &'a self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<(&'a FunctionInfo, &'a MethodInstallation)> {
         let assignment = method_installation_assignment_for_callable_node(node)?;
@@ -1997,7 +2120,7 @@ impl Analysis {
 
     pub fn is_method_installation_callable(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
     ) -> bool {
         method_installation_assignment_for_callable_node(node)
@@ -2007,7 +2130,7 @@ impl Analysis {
 
     pub fn infer_call_static_facts(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> CallStaticFacts {
@@ -2020,7 +2143,7 @@ impl Analysis {
     pub fn local_call_installations<'a>(
         &'a self,
         function: &'a FunctionInfo,
-        argument: M2Node,
+        argument: SyntaxNode,
         position: Position,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -2040,7 +2163,7 @@ impl Analysis {
 
     pub fn infer_expression_static_type(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<ObjectName> {
@@ -2051,7 +2174,7 @@ impl Analysis {
 
     pub fn infer_expression_type(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> InferredType {
@@ -2074,7 +2197,7 @@ impl Analysis {
 
     pub fn method_codomain_deduction(
         &self,
-        assignment: M2Node,
+        assignment: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<MethodCodomainDeduction> {
@@ -2083,29 +2206,21 @@ impl Analysis {
         // The annotation precedes the installed lambda, while the codomain is
         // the value of the lambda receiving the arguments.
         let installed = InstalledFunction::of(right)?;
-        let body = installation
-            .options
-            .argument_lambda(installed)?
-            .child_by_field_name("body")?;
-        let codomain = self.infer_expression_static_type(body, source, knowledge)?;
-        if codomain == TypeRole::Thing.object_name() {
-            return None;
-        }
-        // The annotation is evaluated where the method is installed. A codomain
-        // named by a value of the lambda's own scope, such as `T` in
-        // `(T, x) -> new T from x`, exists only when the method runs, so no
-        // annotation can state it.
-        let names_the_same_object = self
-            .binding_id_at(codomain.name(), source.position_for_node(assignment))
-            == self.binding_id_at(codomain.name(), source.position_for_node(body));
-        if !names_the_same_object {
-            return None;
-        }
+        let codomain = self.deducible_codomain(
+            installation.options.argument_lambda(installed)?,
+            source.position_for_node(assignment),
+            source,
+            knowledge,
+        )?;
 
         let annotation = method_codomain_annotation(right);
         // Without a local annotation the installation inherits the method's
-        // `TypicalValue`; annotating that same type again adds nothing.
-        if annotation.is_none() && installation.method.codomain.as_ref() == Some(&codomain) {
+        // `TypicalValue`; annotating that same type again adds nothing. A
+        // codomain only deduced is still worth writing down.
+        if annotation.is_none()
+            && installation.codomain_origin == Some(CodomainOrigin::TypicalValue)
+            && installation.method.codomain.as_ref() == Some(&codomain)
+        {
             return None;
         }
         let annotated_codomain = annotation.map(|annotation| ObjectName::new(annotation.text()));
@@ -2134,7 +2249,16 @@ impl Analysis {
             codomain,
             annotated_codomain,
             diagnostic_range: annotation.map_or_else(
-                || source.range_for_bytes(left.start_byte()..left.trimmed_end_byte()),
+                || {
+                    source.range_for_bytes(
+                        left.start_byte()
+                            ..assignment
+                                .method_installation_head()
+                                .map_or(left.trimmed_end_byte(), |head| {
+                                    head.right.trimmed_end_byte()
+                                }),
+                    )
+                },
                 |node| source.range_for_node(node),
             ),
             edit,
@@ -2143,7 +2267,7 @@ impl Analysis {
 
     fn callable_object_for_value(
         &mut self,
-        value: M2Node,
+        value: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -2229,7 +2353,7 @@ impl Analysis {
     /// fact to the local callable registry when the installation takes effect.
     fn record_method_installation(
         &mut self,
-        assignment: M2Node,
+        assignment: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<MethodInstallationId> {
@@ -2250,7 +2374,7 @@ impl Analysis {
 
     fn record_install_method_call(
         &mut self,
-        call: M2Node,
+        call: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<MethodInstallationId> {
@@ -2303,8 +2427,57 @@ impl Analysis {
         }
         let id = installation.id;
         debug_assert_eq!(installation.id.0, self.registry.installations.len());
+        let position = installation.span.start;
         self.registry.installations.push(installation);
+        if let Some(lambda) = argument_lambda {
+            self.deduce_installation_codomain(id, lambda, position, source, knowledge);
+        }
         Some(id)
+    }
+
+    /// Take the type the lambda `argument_lambda` of the installation `id`,
+    /// at `position`, returns as its codomain when nothing states one: calls
+    /// of the method then return it, as they would were it annotated.
+    fn deduce_installation_codomain(
+        &mut self,
+        id: MethodInstallationId,
+        argument_lambda: SyntaxNode,
+        position: Position,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) {
+        if self.registry.installations[id.0].method.codomain.is_some() {
+            return;
+        }
+        let Some(codomain) = self.deducible_codomain(argument_lambda, position, source, knowledge)
+        else {
+            return;
+        };
+        let installation = &mut self.registry.installations[id.0];
+        installation.method.codomain = Some(codomain);
+        installation.codomain_origin = Some(CodomainOrigin::Deduction);
+    }
+
+    /// The type the lambda `argument_lambda`, installed at `position`,
+    /// always returns, when inference knows it and an annotation at the
+    /// installation could name it: a type named by a value of the lambda's
+    /// own scope, such as `T` in `(T, x) -> new T from x`, exists only when
+    /// the method runs.
+    fn deducible_codomain(
+        &self,
+        argument_lambda: SyntaxNode,
+        position: Position,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Option<ObjectName> {
+        let body = argument_lambda.lambda_body()?;
+        let codomain = self.infer_expression_static_type(body, source, knowledge)?;
+        if codomain == TypeRole::Thing.object_name() {
+            return None;
+        }
+        (self.binding_id_at(codomain.name(), position)
+            == self.binding_id_at(codomain.name(), source.position_for_node(body)))
+        .then_some(codomain)
     }
 
     fn installed_value(
@@ -2364,6 +2537,11 @@ impl Analysis {
                             .and_then(|callable| callable.typical_value.as_ref())
                             .and_then(|type_id| knowledge.type_name(type_id))
                             .cloned();
+                        installation.codomain_origin = installation
+                            .method
+                            .codomain
+                            .as_ref()
+                            .map(|_| CodomainOrigin::TypicalValue);
                     }
                     return MethodInstallationEffect::Effective;
                 };
@@ -2375,6 +2553,11 @@ impl Analysis {
                         .method
                         .codomain
                         .clone_from(&function.typical_value);
+                    installation.codomain_origin = installation
+                        .method
+                        .codomain
+                        .as_ref()
+                        .map(|_| CodomainOrigin::TypicalValue);
                 }
                 function.installations.push(installation.id);
                 MethodInstallationEffect::Effective
@@ -2405,7 +2588,7 @@ impl Analysis {
 struct TypedSemanticRoles<'analysis, 'tree, 'source, 'knowledge, Source: ?Sized, Knowledge: ?Sized>
 {
     analysis: &'analysis mut Analysis,
-    root: M2Node<'tree>,
+    root: SyntaxNode<'tree>,
     source: &'source Source,
     knowledge_provider: &'knowledge Knowledge,
 }
@@ -2416,21 +2599,21 @@ where
     Knowledge: PositionedTypeKnowledge + ?Sized,
 {
     fn register_option(&mut self, node: &OptionExpression) {
-        let Some(expression) = self.root.descendant_for_syntax(node) else {
+        let Some(expression) = self.root.related(node) else {
             return;
         };
-        let Some(left) = expression.child_by_field_name("left") else {
+        let Some(left) = expression.binary_parts().map(|parts| parts.left) else {
             return;
         };
         self.analysis.register_option_roles(
             left,
-            expression.child_by_field_name("right"),
+            expression.binary_parts().map(|parts| parts.right),
             self.source,
         );
     }
 
-    fn register_property(&mut self, node: &(impl Spanned + ?Sized)) {
-        let Some(expression) = self.root.descendant_for_syntax(node) else {
+    fn register_property(&mut self, node: &(impl crate::node_metadata::SyntaxType + ?Sized)) {
+        let Some(expression) = self.root.related(node) else {
             return;
         };
         if let Some(property) = expression.property_key() {
@@ -2443,9 +2626,9 @@ where
 
     fn register_namespace<Syntax>(&mut self, syntax: &Syntax)
     where
-        Syntax: Spanned,
+        Syntax: crate::node_metadata::SyntaxType,
     {
-        let Some(node) = self.root.descendant_for_syntax(syntax) else {
+        let Some(node) = self.root.related(syntax) else {
             return;
         };
         let knowledge = self
@@ -2482,7 +2665,7 @@ where
     }
 
     fn visit_expr_quote(&mut self, node: &'ast QuoteExpression) {
-        if let Some(quote) = self.root.descendant_for_syntax(node) {
+        if let Some(quote) = self.root.related(node) {
             self.analysis.record_quoted_symbol_role(quote, self.source);
         }
         visit::visit_expr_quote(self, node);
@@ -2499,32 +2682,46 @@ where
     }
 }
 
-pub(crate) fn assigned_lambda(node: M2Node<'_>) -> Option<M2Node<'_>> {
+pub(crate) fn assigned_lambda(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     let node = parenthesized_value(node)?;
     if node.is::<LambdaExpression>() {
         return Some(node);
     }
     node.has_binary_operator::<Token![=>]>()
-        .then(|| node.child_by_field_name("right"))
+        .then(|| node.binary_parts().map(|parts| parts.right))
         .flatten()
         .and_then(assigned_lambda)
 }
 
-pub(crate) fn method_codomain_annotation(node: M2Node<'_>) -> Option<M2Node<'_>> {
+pub(crate) fn method_codomain_annotation(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    if let Some(parent) = node.parent() {
+        let annotation = parent
+            .get::<m2_syn::nodes::ExprAssignInstallMethod>()
+            .and_then(|node| node.typical_value.as_ref())
+            .or_else(|| {
+                parent
+                    .get::<m2_syn::nodes::ExprAssignInstallOp>()
+                    .and_then(|node| node.typical_value.as_ref())
+            });
+        if let Some(annotation) = annotation {
+            return parent.related(annotation.typical_value.as_ref());
+        }
+    }
+
     node.is_option_assignment()
-        .then(|| node.child_by_field_name("left"))
+        .then(|| node.binary_parts().map(|parts| parts.left))
         .flatten()
 }
 
-fn single_symbol_assignment_target<'tree>(node: M2Node<'tree>) -> Option<&'tree str> {
+fn single_symbol_assignment_target<'tree>(node: SyntaxNode<'tree>) -> Option<&'tree str> {
     node.is::<Symbol>().then(|| node.text())
 }
 
-pub fn symbol_node_text<'tree>(node: M2Node<'tree>) -> Option<&'tree str> {
+pub fn symbol_node_text<'tree>(node: SyntaxNode<'tree>) -> Option<&'tree str> {
     node.is_symbol_like().then(|| node.text())
 }
 
-fn is_expression_symbol(node: M2Node<'_>) -> bool {
+fn is_expression_symbol(node: SyntaxNode<'_>) -> bool {
     if !node.is::<Symbol>() || matches!(node.text(), "true" | "false") {
         return false;
     }
@@ -2539,7 +2736,8 @@ fn is_expression_symbol(node: M2Node<'_>) -> bool {
     while let Some(parent) = current.parent() {
         if parent.is_assignment() {
             return parent
-                .child_by_field_name("left")
+                .binary_parts()
+                .map(|parts| parts.left)
                 .is_none_or(|left| !left.contains(node));
         }
         current = parent;
@@ -2548,7 +2746,7 @@ fn is_expression_symbol(node: M2Node<'_>) -> bool {
     true
 }
 
-fn is_condition_value(node: M2Node<'_>) -> bool {
+fn is_condition_value(node: SyntaxNode<'_>) -> bool {
     if !node.is::<Symbol>() {
         return false;
     }
@@ -2556,7 +2754,8 @@ fn is_condition_value(node: M2Node<'_>) -> bool {
     if node.parent().is_some_and(|parent| {
         parent.is_space_application()
             && parent
-                .child_by_field_name("left")
+                .binary_parts()
+                .map(|parts| parts.left)
                 .is_some_and(|left| left.id() == node.id())
     }) {
         return false;
@@ -2565,7 +2764,7 @@ fn is_condition_value(node: M2Node<'_>) -> bool {
     let mut condition = node;
     while let Some(parent) = condition.parent() {
         let owner_condition = (parent.is::<IfStatement>() || parent.is::<WhileLoop>())
-            .then(|| parent.child_by_field_name("condition"))
+            .then(|| parent.control_condition())
             .flatten();
         if let Some(owner_condition) = owner_condition {
             return owner_condition.id() == condition.id();
@@ -2602,18 +2801,22 @@ impl MethodDeclarationOption {
 /// such as `Options => {Binary => true}` does not configure the method itself.
 #[derive(Debug, Clone, Copy)]
 struct MethodDeclaration<'tree> {
-    call: M2Node<'tree>,
+    call: SyntaxNode<'tree>,
 }
 
 impl<'tree> MethodDeclaration<'tree> {
-    fn of(node: M2Node<'tree>) -> Option<Self> {
+    fn of(node: SyntaxNode<'tree>) -> Option<Self> {
         (node.is_space_application()
-            && node.child_by_field_name("left").and_then(symbol_node_text) == Some("method"))
+            && node
+                .binary_parts()
+                .map(|parts| parts.left)
+                .and_then(symbol_node_text)
+                == Some("method"))
         .then_some(Self { call: node })
     }
 
-    fn option(self, option: MethodDeclarationOption) -> Option<M2Node<'tree>> {
-        let arguments = parenthesized_value(self.call.child_by_field_name("right")?)?;
+    fn option(self, option: MethodDeclarationOption) -> Option<SyntaxNode<'tree>> {
+        let arguments = parenthesized_value(self.call.binary_parts().map(|parts| parts.right)?)?;
         let mut arguments = if arguments.is_sequence() {
             arguments.collection_elements().collect::<Vec<_>>()
         } else {
@@ -2622,11 +2825,12 @@ impl<'tree> MethodDeclaration<'tree> {
         arguments.retain(|argument| {
             argument.is_option_assignment()
                 && argument
-                    .child_by_field_name("left")
+                    .binary_parts()
+                    .map(|parts| parts.left)
                     .and_then(symbol_node_text)
                     == Some(option.name())
         });
-        arguments.pop()?.child_by_field_name("right")
+        arguments.pop()?.binary_parts().map(|parts| parts.right)
     }
 
     fn typical_value(self) -> Option<ObjectName> {
@@ -2671,13 +2875,13 @@ impl<'tree> MethodDeclaration<'tree> {
     }
 }
 
-fn literal_option_assignment(node: M2Node) -> Option<LiteralOption> {
+fn literal_option_assignment(node: SyntaxNode) -> Option<LiteralOption> {
     if !node.is_option_assignment() {
         return None;
     }
 
-    let left = node.child_by_field_name("left")?;
-    let right = node.child_by_field_name("right")?;
+    let left = node.binary_parts().map(|parts| parts.left)?;
+    let right = node.binary_parts().map(|parts| parts.right)?;
     let key = symbol_node_text(left)?;
     let value = literal_option_value(right)?;
     Some(LiteralOption {
@@ -2686,7 +2890,7 @@ fn literal_option_assignment(node: M2Node) -> Option<LiteralOption> {
     })
 }
 
-fn literal_option_value(node: M2Node<'_>) -> Option<&str> {
+fn literal_option_value(node: SyntaxNode<'_>) -> Option<&str> {
     if symbol_node_text(node).is_some()
         || node.is::<IntegerLiteral>()
         || node.is::<FloatLiteral>()
@@ -2700,8 +2904,19 @@ fn literal_option_value(node: M2Node<'_>) -> Option<&str> {
 }
 
 fn method_installation_assignment_for_callable_node<'tree>(
-    node: M2Node<'tree>,
-) -> Option<M2Node<'tree>> {
+    node: SyntaxNode<'tree>,
+) -> Option<SyntaxNode<'tree>> {
+    if let Some(parent) = node.parent() {
+        if let Some(installation) = parent.get::<m2_syn::nodes::ExprAssignInstallMethod>() {
+            if parent
+                .related(installation.method.as_ref())
+                .is_some_and(|method| method.contains(node))
+            {
+                return Some(parent);
+            }
+        }
+    }
+
     let mut current = node;
     while let Some(parent) = current.parent() {
         current = parent;
@@ -2710,7 +2925,7 @@ fn method_installation_assignment_for_callable_node<'tree>(
             continue;
         }
 
-        let callable = current.child_by_field_name("left")?;
+        let callable = current.binary_parts().map(|parts| parts.left)?;
         if !callable.contains(node) {
             continue;
         }
@@ -2724,61 +2939,69 @@ fn method_installation_assignment_for_callable_node<'tree>(
 }
 
 /// The first direct clause of `node` of the given kind (`then`/`else`/`do`/…).
-pub(crate) fn clause_of<'tree, Syntax: M2SyntaxKind>(node: M2Node<'tree>) -> Option<M2Node<'tree>> {
+pub(crate) fn clause_of<'tree, Syntax: SyntaxKind>(
+    node: SyntaxNode<'tree>,
+) -> Option<SyntaxNode<'tree>> {
     node.named_children().find(|child| child.is::<Syntax>())
 }
 
 /// The value expression a clause wraps (`then E` → `E`): its single named child.
-pub(crate) fn clause_value(clause: M2Node) -> Option<M2Node> {
+pub(crate) fn clause_value(clause: SyntaxNode) -> Option<SyntaxNode> {
     clause
-        .child_by_field_name("value")
+        .clause_value()
         .or_else(|| clause.named_children().next())
 }
 
-fn new_statement_parent(node: M2Node<'_>) -> Option<M2Node<'_>> {
-    new_statement_value(node.child_by_field_name("parent")?)
+fn new_statement_parent(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    new_statement_value(clause_value(node.new_parent_clause()?)?)
 }
 
-fn new_statement_instance(node: M2Node<'_>) -> Option<M2Node<'_>> {
-    new_statement_value(node.child_by_field_name("instance")?)
+fn new_statement_instance(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    new_statement_value(clause_value(node.new_instance_clause()?)?)
 }
 
-fn new_statement_value(node: M2Node<'_>) -> Option<M2Node<'_>> {
+fn new_statement_value(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     if node.is_assignment() {
-        node.child_by_field_name("left")
+        node.binary_parts().map(|parts| parts.left)
     } else {
         Some(node)
     }
 }
 
-fn new_statement_installation_assignment(node: M2Node<'_>) -> Option<M2Node<'_>> {
+fn new_statement_installation_assignment(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     node.is::<NewStatement>()
         .then(|| {
-            ["type", "parent", "instance"]
-                .into_iter()
-                .filter_map(|field| node.child_by_field_name(field))
-                .find(|value| value.is_assignment())
+            [
+                node.new_class(),
+                node.new_parent_clause(),
+                node.new_instance_clause(),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|value| value.is_assignment())
         })
         .flatten()
 }
 
-pub(crate) fn assignment_parts(node: M2Node<'_>) -> Option<(M2Node<'_>, M2Node<'_>, M2Node<'_>)> {
+pub(crate) fn assignment_parts(
+    node: SyntaxNode<'_>,
+) -> Option<(SyntaxNode<'_>, SyntaxNode<'_>, SyntaxNode<'_>)> {
     if node.is::<NewStatement>() {
         let assignment = new_statement_installation_assignment(node)?;
         return Some((
             node,
-            assignment.child_by_field_name("operator")?,
-            assignment.child_by_field_name("right")?,
+            assignment.operator_node()?,
+            assignment.binary_parts().map(|parts| parts.right)?,
         ));
     }
     Some((
-        node.child_by_field_name("left")?,
-        node.child_by_field_name("operator")?,
-        node.child_by_field_name("right")?,
+        node.binary_parts().map(|parts| parts.left)?,
+        node.operator_node()?,
+        node.binary_parts().map(|parts| parts.right)?,
     ))
 }
 
-fn direct_callback_callable(lambda: M2Node<'_>) -> Option<M2Node<'_>> {
+fn direct_callback_callable(lambda: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     let mut argument = lambda;
     let mut parent = argument.parent()?;
     while parent.is::<Sequence>() || parent.is_holder() {
@@ -2796,13 +3019,15 @@ fn direct_callback_callable(lambda: M2Node<'_>) -> Option<M2Node<'_>> {
 
     if !parent.is_space_application()
         || parent
-            .child_by_field_name("right")
+            .binary_parts()
+            .map(|parts| parts.right)
             .is_none_or(|right| right.id() != argument.id())
     {
         return None;
     }
     parent
-        .child_by_field_name("left")
+        .binary_parts()
+        .map(|parts| parts.left)
         .filter(|callable| callable.is::<Symbol>())
 }
 
@@ -2810,7 +3035,7 @@ fn direct_callback_callable(lambda: M2Node<'_>) -> Option<M2Node<'_>> {
 /// `((a))` → `a`. A parenthesized expression whose final child is `muted`
 /// (`(a;)`) denotes null, so it has no value node. A non-parenthesized node is
 /// its own value. `()` and `(a, b)` are `Sequence` nodes, left untouched.
-pub(crate) fn parenthesized_value(node: M2Node) -> Option<M2Node> {
+pub(crate) fn parenthesized_value(node: SyntaxNode) -> Option<SyntaxNode> {
     let mut current = node;
     while current.is_holder() {
         current = current.final_value_child()?;
@@ -2818,7 +3043,7 @@ pub(crate) fn parenthesized_value(node: M2Node) -> Option<M2Node> {
     Some(current)
 }
 
-fn method_installation_domain_nodes(node: M2Node) -> Option<Vec<M2Node>> {
+fn method_installation_domain_nodes(node: SyntaxNode) -> Option<Vec<SyntaxNode>> {
     let node = parenthesized_value(node)?;
     if node.is::<Sequence>() || node.is::<List>() {
         let domain = node.collection_elements().collect::<Vec<_>>();
@@ -2829,7 +3054,7 @@ fn method_installation_domain_nodes(node: M2Node) -> Option<Vec<M2Node>> {
 }
 
 fn call_like_left_symbol_for_argument<'tree>(
-    mut node: M2Node<'tree>,
+    mut node: SyntaxNode<'tree>,
     allow_list_argument: bool,
 ) -> Option<&'tree str> {
     let mut parent = node.parent()?;
@@ -2839,7 +3064,7 @@ fn call_like_left_symbol_for_argument<'tree>(
 
     loop {
         if parent.is_space_application() {
-            let left = parent.child_by_field_name("left")?;
+            let left = parent.binary_parts().map(|parts| parts.left)?;
             if left.is::<Symbol>() {
                 return Some(left.text());
             }
@@ -2858,7 +3083,7 @@ fn call_like_left_symbol_for_argument<'tree>(
 }
 
 fn indexed_string_names_package(
-    node: M2Node<'_>,
+    node: SyntaxNode<'_>,
     knowledge: &(impl TypeKnowledge + ?Sized),
 ) -> bool {
     let Some(callable_name) = call_like_left_symbol_for_argument(node, false) else {
@@ -2890,7 +3115,7 @@ fn indexed_string_names_package(
     accepts_string && (accepts_package || returns_package)
 }
 
-fn is_colon_equal_assignment_left(node: M2Node) -> bool {
+fn is_colon_equal_assignment_left(node: SyntaxNode) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -2898,13 +3123,14 @@ fn is_colon_equal_assignment_left(node: M2Node) -> bool {
         return false;
     }
     if parent
-        .child_by_field_name("left")
+        .binary_parts()
+        .map(|parts| parts.left)
         .is_none_or(|left| left.id() != node.id())
     {
         return false;
     }
 
     parent
-        .child_by_field_name("operator")
+        .operator_node()
         .is_some_and(|operator| matches_token::<Token![:=]>(operator.text()))
 }

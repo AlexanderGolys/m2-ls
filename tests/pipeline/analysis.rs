@@ -44,10 +44,15 @@ async fn hover_type_at(session: &mut DocumentSession, line: u64, character: u64)
     let markdown = hover["contents"]["value"]
         .as_str()
         .unwrap_or_else(|| panic!("expected a markdown hover at {line}:{character}, got {hover}"));
+    // The type is the first fact on the line under the code heading the hover.
     markdown
         .lines()
-        .find_map(|line| line.strip_prefix("Type: `")?.strip_suffix('`'))
-        .unwrap_or_else(|| panic!("hover should contain a type line: {markdown}"))
+        .skip(1)
+        .skip_while(|line| *line != "```")
+        .nth(1)
+        .and_then(|facts| facts.strip_prefix('`')?.split_once('`'))
+        .map(|(type_name, _)| type_name)
+        .unwrap_or_else(|| panic!("hover should state a type: {markdown}"))
         .to_string()
 }
 
@@ -366,7 +371,7 @@ async fn diverging_error_branches_do_not_widen_inferred_types() {
 }
 
 #[tokio::test]
-async fn method_codomains_are_type_parameters_and_all_known_types_are_configurable() {
+async fn method_codomains_are_annotations_and_all_known_types_are_configurable() {
     let source = concat!(
         "p = method(TypicalValue => List)\n",
         "p(ZZ) := Array => x -> [x]\n",
@@ -376,7 +381,7 @@ async fn method_codomains_are_type_parameters_and_all_known_types_are_configurab
     let tokens = semantic_tokens(&mut session).await;
     assert_eq!(
         token_at(&tokens, source, "Array", 0).0,
-        session.semantic_token_type("typeParameter")
+        session.semantic_token_type("decorator")
     );
 
     session.set_expression_type_hints(false).await;
@@ -477,27 +482,27 @@ async fn unknown_condition_types_remain_possible_booleans() {
 }
 
 #[tokio::test]
-async fn only_original_core_compiled_functions_are_builtin() {
+async fn only_original_core_compiled_functions_are_default_library() {
     let source = "f = scan\nf\nscan\nscan = f\nscan\n";
     let mut session = DocumentSession::open(source).await;
     let tokens = semantic_tokens(&mut session).await;
     let function = session.semantic_token_type("function");
-    let builtin = session.semantic_token_modifier("builtin");
+    let default_library = session.semantic_token_modifier("defaultLibrary");
 
     for occurrence in [0, 1] {
         let (token_type, modifiers) = token_at(&tokens, source, "scan", occurrence);
         assert_eq!(token_type, function);
-        assert_eq!(modifiers, builtin);
+        assert_eq!(modifiers, default_library);
     }
     for occurrence in [2, 3] {
         let (token_type, modifiers) = token_at(&tokens, source, "scan", occurrence);
         assert_eq!(token_type, function);
-        assert_eq!(modifiers & builtin, 0);
+        assert_eq!(modifiers & default_library, 0);
     }
     for occurrence in 0..=2 {
         let (token_type, modifiers) = token_at(&tokens, source, "f", occurrence);
         assert_eq!(token_type, function);
-        assert_eq!(modifiers & builtin, 0);
+        assert_eq!(modifiers & default_library, 0);
     }
 
     session.shutdown().await;
@@ -519,7 +524,7 @@ async fn registered_source_roles_drive_semantic_tokens_through_the_server() {
 
     for (needle, expected_role, description) in [
         ("ZZ", "typeParameter", "method domain"),
-        ("Array", "typeParameter", "method codomain"),
+        ("Array", "decorator", "method codomain"),
         ("Strategy", "enumMember", "option key"),
         ("name", "property", "quoted member key"),
         ("\"key\"", "property", "lookup key"),
@@ -669,8 +674,22 @@ async fn installation_and_syntax_diagnostics_run_through_the_server_pipeline() {
         ),
         ("if x then y else z", "X01", false),
         ("if x then y", "X01", false),
-        ("gb(I, strategy => 4)\n", "S01", true),
+        ("f = method(Options => {strategy => 4})\n", "S01", true),
+        ("f = method(Options => {Strategy => 4})\n", "S01", false),
+        ("g = {limit => 10} >> o -> x -> x\n", "S01", true),
+        ("gb(I, strategy => 4)\n", "S01", false),
         ("hashTable {a => 1, b => 2}\n", "S01", false),
+        ("new OptionTable from {a => 1}\n", "S01", false),
+        (
+            "apply(pairs pages, (page, tag) -> page => render(tag, () -> tag))\n",
+            "S01",
+            false,
+        ),
+        (
+            "f = method(Options => {Binary => {a => 1}})\n",
+            "S01",
+            false,
+        ),
         ("x.3\n", "X03", true),
         ("x .3\n", "X03", false),
     ] {
@@ -890,7 +909,33 @@ async fn method_codomain_diagnostics_offer_annotation_quick_fixes() {
             }),
         )
         .await;
-    assert!(actions.is_null());
+    // Nothing fixes the mismatch; only silencing it is offered.
+    let offered = response_array(&actions)
+        .iter()
+        .map(|action| {
+            (
+                action["title"].as_str().unwrap_or_default().to_string(),
+                action["edit"]["changes"][&uri][0]["newText"].clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        offered,
+        vec![
+            (
+                "Disable T04 on this line".to_string(),
+                json!("-- m2-ls: disable-next-line T04\n")
+            ),
+            (
+                "Disable T04 in this file".to_string(),
+                json!("-- m2-ls: disable T04\n")
+            ),
+        ]
+    );
+    session
+        .replace("-- m2-ls: disable-next-line T04\nf ZZ := List => x -> [x]\n")
+        .await;
+    assert!(!session.diagnostic_codes().contains(&"T04"));
 
     for source in [
         "f ZZ := Array => x -> [x]\n",
@@ -1002,7 +1047,7 @@ async fn methods_with_options_install_functions_of_the_option_table() {
         !option_table["contents"]["value"]
             .as_str()
             .unwrap()
-            .contains("Type: `ZZ`"),
+            .contains("`ZZ` · "),
         "the option table is not the domain argument: {option_table}"
     );
     assert_eq!(hover_type_at(&mut session, 7, 0).await, "ZZ");
@@ -1125,14 +1170,14 @@ async fn nonexact_call_arguments_join_every_possible_dispatch_codomain() {
         .as_str()
         .unwrap_or_else(|| panic!("expected apply hover markdown, got {hover}"));
     assert!(
-        !markdown.starts_with("**apply** `(Thing, Function) -> Iterator`"),
+        !markdown.starts_with("```macaulay2\napply(Thing, Function) -> Iterator"),
         "a nonexact Thing range must not pin the Thing overload: {markdown}"
     );
     for signature in [
-        "`(BasicList, Function) -> BasicList`",
-        "`(ZZ, Function) -> List`",
-        "`(String, Function) -> Sequence`",
-        "`(Thing, Function) -> Iterator`",
+        "apply(BasicList, Function) -> BasicList",
+        "apply(ZZ, Function) -> List",
+        "apply(String, Function) -> Sequence",
+        "apply(Thing, Function) -> Iterator",
     ] {
         assert!(
             markdown.contains(signature),
@@ -1171,16 +1216,10 @@ async fn declarative_diagnostics_expose_their_coupled_quick_fixes() {
             ":=",
         ),
         (
-            "gb(I, strategy => 4)\n",
+            "f = method(Options => {strategy => 4})\n",
             "S01",
             "Capitalize option key",
             "Strategy",
-        ),
-        (
-            "if (condition) then x else y\n",
-            "S03",
-            "Remove redundant parentheses",
-            "condition",
         ),
         (
             "value = if value === null then fallback else value\n",
@@ -1230,9 +1269,15 @@ async fn declarative_diagnostics_expose_their_coupled_quick_fixes() {
     session.shutdown().await;
 }
 
+/// Style simplifications are refactors, not diagnostics: they are offered on
+/// the code they rewrite, which no hint marks.
 #[tokio::test]
-async fn expression_simplification_actions_are_backed_by_hints() {
+async fn expression_simplification_actions_are_offered_without_hints() {
     let cases = [
+        (
+            "if (condition) then x else y\n",
+            "Remove redundant parentheses",
+        ),
         (
             "if ready then value else null\n",
             "Simplify unnecessary null branch",
@@ -1251,22 +1296,21 @@ async fn expression_simplification_actions_are_backed_by_hints() {
 
     for (source, title) in cases {
         session.replace(source).await;
-        let diagnostic = session
-            .diagnostics()
-            .iter()
-            .find(|diagnostic| diagnostic["code"] == "S05")
-            .unwrap_or_else(|| panic!("expected a simplification hint for `{source}`"))
-            .clone();
-        assert_eq!(diagnostic["severity"], 4);
+        let codes = session.diagnostic_codes();
+        assert!(
+            !codes.contains(&"S03") && !codes.contains(&"S05"),
+            "a simplification is no diagnostic: `{source}` {codes:?}"
+        );
 
         let uri = session.uri().to_string();
+        let start = json!({"line": 0, "character": 0});
         let response = session
             .request(
                 "textDocument/codeAction",
                 json!({
                     "textDocument": {"uri": uri},
-                    "range": diagnostic["range"],
-                    "context": {"diagnostics": [diagnostic]}
+                    "range": {"start": start, "end": start},
+                    "context": {"diagnostics": []}
                 }),
             )
             .await;
@@ -1274,11 +1318,9 @@ async fn expression_simplification_actions_are_backed_by_hints() {
             .iter()
             .find(|action| action["title"] == title)
             .unwrap_or_else(|| panic!("expected `{title}` for `{source}`"));
-        assert_eq!(action["diagnostics"][0]["code"], "S05");
+        assert_eq!(action["kind"], "refactor.rewrite");
     }
 
-    session.replace("if ready then value\n").await;
-    assert!(!session.diagnostic_codes().contains(&"S05"));
     session.shutdown().await;
 }
 
@@ -1401,6 +1443,7 @@ async fn assignment_and_protection_diagnostics_preserve_source_sensitive_analysi
             "if condition then (\n  conditionalExport = true;\n);\nif conditionalExport == true then null\ng = () -> if condition then (\n  branchLocal := 1;\n)\n",
         )
         .await;
+    session.save().await;
     // `:=` declares in the enclosing function, not the branch, so the unread
     // local is reported there.
     assert_eq!(diagnostic_lines(&session, "S02"), vec![5]);
@@ -1431,6 +1474,7 @@ async fn callback_equal_assignments_are_not_unused_variables() {
     );
 
     session.replace("f = x -> (unused := x; x)\n").await;
+    session.save().await;
     let diagnostic = session
         .diagnostics()
         .iter()
@@ -2219,6 +2263,17 @@ async fn inferred_subsets_are_reduced_with_source_type_edges() {
         "f = x -> if condition then known x else mystery x\n",
     );
     let mut session = DocumentSession::open(source).await;
+    session
+        .set_inlay_hint_settings(json!({ "unknownTypes": false }))
+        .await;
+    let calm = inlay_labels_by_line(&mut session).await;
+    assert!(
+        calm.iter().all(|(_, label)| !label.contains("Thing")),
+        "a type that says nothing is hidden by default: {calm:?}"
+    );
+    session
+        .set_inlay_hint_settings(json!({ "unknownTypes": true }))
+        .await;
     let hints = inlay_labels_by_line(&mut session).await;
 
     assert!(
@@ -2300,7 +2355,7 @@ async fn lambda_bodies_keep_intermediate_and_return_type_hints() {
     assert!(
         hints
             .iter()
-            .any(|(line, label)| *line == 3 && label.as_str() == "↑List"),
+            .any(|(line, label)| *line == 3 && label.as_str() == "-> ↑List"),
         "missing lambda return type: {hints:?}"
     );
     assert!(hints.iter().all(|(_, label)| label != "Nothing"));
@@ -2347,11 +2402,12 @@ async fn lambda_return_values_receive_nontrivial_type_hints() {
     assert_eq!(
         type_hints,
         [
-            (0, "↑List".into()),
+            // Each returns what its final call does.
+            (0, "-> ↑List".into()),
             (1, "↑Thing".into()),
-            (1, "↑List".into()),
-            (2, "↑List".into()),
-            (4, "↑List".into()),
+            (1, "-> ↑List".into()),
+            (2, "-> ↑List".into()),
+            (4, "-> ↑List".into()),
         ]
     );
 
@@ -2906,7 +2962,8 @@ async fn test_block_code_is_analyzed_as_a_session_that_loaded_the_package() {
     );
     assert_eq!(
         token_at(&tokens, PACKAGE_WITH_TEST, "assert", 0).0,
-        function
+        session.semantic_token_type("method"),
+        "assert is a method function"
     );
 
     let definition = session
@@ -2957,6 +3014,7 @@ async fn test_block_code_is_analyzed_as_a_session_that_loaded_the_package() {
 
     let broken = PACKAGE_WITH_TEST.replace("assert(result == 6)", "assert(result == ]");
     session.replace(&broken).await;
+    session.save().await;
     assert!(
         diagnostic_lines(&session, "X01")
             .iter()
@@ -3063,5 +3121,271 @@ async fn delimited_application_precedence_is_independent_of_ring_semantics() {
             );
         }
     }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn documentation_strings_highlight_their_code_as_what_it_names() {
+    let source = concat!(
+        "newPackage \"Foo\"\n",
+        "export {\"bar\", \"Baz\"}\n",
+        "exportMutable {\"counter\"}\n",
+        "Baz = new Type of HashTable\n",
+        "counter = 0\n",
+        "bar = method()\n",
+        "bar ZZ := n -> n + 1\n",
+        "beginDocumentation()\n",
+        "doc ///\n",
+        "Key\n",
+        "  (bar, ZZ)\n",
+        "Usage\n",
+        "  bar(arg, n)\n",
+        "Inputs\n",
+        "  arg:ZZ\n",
+        "Description\n",
+        "  Text\n",
+        "    See @TO \"Foo\"@ and @TO Baz@ and @TO \"no such page\"@.\n",
+        "///\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let tokens = semantic_tokens(&mut session).await;
+    let token_type =
+        |needle: &str, occurrence: usize| token_at(&tokens, source, needle, occurrence).0;
+
+    assert_eq!(
+        token_type("Key", 0),
+        session.semantic_token_type("decorator")
+    );
+    assert_eq!(
+        token_type("bar, ZZ", 0),
+        session.semantic_token_type("method")
+    );
+    assert_eq!(token_type("ZZ)", 0), session.semantic_token_type("type"));
+    assert_eq!(
+        token_type("bar(arg", 0),
+        session.semantic_token_type("method")
+    );
+    // `arg` is an input of the page; `n`, only some function's parameter.
+    assert_eq!(
+        token_type("arg, n", 0),
+        session.semantic_token_type("parameter")
+    );
+    let unrelated_parameter = position(source, "n)\nInputs", 0);
+    assert!(
+        !tokens.iter().any(|(line, character, ..)| {
+            Some(*line) == unrelated_parameter["line"].as_u64()
+                && Some(*character) == unrelated_parameter["character"].as_u64()
+        }),
+        "a name only some function binds stays text"
+    );
+    assert_eq!(
+        token_type("arg:", 0),
+        session.semantic_token_type("parameter")
+    );
+    assert_eq!(
+        token_type("Foo\"@", 0),
+        session.semantic_token_type("namespace")
+    );
+    assert_eq!(token_type("Baz@", 0), session.semantic_token_type("type"));
+    let counter = token_at(&tokens, source, "counter\"", 0);
+    assert_eq!(counter.0, session.semantic_token_type("variable"));
+    assert_ne!(counter.1 & session.semantic_token_modifier("mutable"), 0);
+    // A link to no symbol leaves its string uncovered.
+    let unknown_link = position(source, "no such page", 0);
+    assert!(
+        !tokens.iter().any(|(line, character, ..)| {
+            Some(*line) == unknown_link["line"].as_u64()
+                && Some(*character) == unknown_link["character"].as_u64()
+        }),
+        "a link to no symbol keeps its string's highlight"
+    );
+
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn deduced_codomains_type_later_calls_and_are_marked_in_hover() {
+    let source = concat!(
+        "Point2D = new Type of List\n",
+        "point = method()\n",
+        "point(ZZ,ZZ) := (x,y) -> new Point2D from {x,y}\n",
+        "p = point(1,2)\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+
+    assert_eq!(hover_type_at(&mut session, 3, 0).await, "Point2D");
+    assert!(
+        session.diagnostic_codes().contains(&"T03"),
+        "a deduced codomain is still worth annotating: {:?}",
+        session.diagnostics()
+    );
+    let hover = session.request_at("textDocument/hover", "point", 0).await;
+    let markdown = hover["contents"]["value"].as_str().unwrap_or_default();
+    assert!(
+        markdown.contains("point(ZZ, ZZ) -> Point2D  -- deduced"),
+        "{markdown}"
+    );
+
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn simple_doc_prose_reads_its_tex_markup_and_the_string_is_documentation() {
+    let source = concat!(
+        "newPackage \"Foo\"\n",
+        "export {\"f\"}\n",
+        "f = n -> n + 1\n",
+        "beginDocumentation()\n",
+        "doc ///\n",
+        "Key\n",
+        "  f\n",
+        "Headline\n",
+        "  adds one\n",
+        "Description\n",
+        "  Text\n",
+        "    Takes {\\tt n} to {\\bf the next} number -- see \\url{https://macaulay2.com}, 1--2.\n",
+        "  Example\n",
+        "    f 2\n",
+        "///\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+
+    let hover = session.request_at("textDocument/hover", "f", 2).await;
+    let markdown = hover["contents"]["value"].as_str().unwrap_or_default();
+    assert!(
+        markdown.contains("Takes `n` to **the next** number -- see <https://macaulay2.com>, 1–2."),
+        "{markdown}"
+    );
+
+    let tokens = semantic_tokens(&mut session).await;
+    let markup = session.semantic_token_type("macro");
+    for delimiter in ["{\\tt", "} to", "{\\bf", "} number", "\\url{", "}, 1"] {
+        assert_eq!(
+            token_at(&tokens, source, delimiter, 0).0,
+            markup,
+            "{delimiter} is markup"
+        );
+    }
+    for (styled, style) in [
+        ("n} to", "monospace"),
+        ("the next", "strong"),
+        ("https://", "link"),
+        ("adds one", "strong"),
+    ] {
+        let (token_type, modifiers) = token_at(&tokens, source, styled, 0);
+        assert_eq!(
+            token_type,
+            session.semantic_token_type("string"),
+            "styled text stays text"
+        );
+        assert_ne!(
+            modifiers & session.semantic_token_modifier(style),
+            0,
+            "{styled} is {style}"
+        );
+    }
+    assert_eq!(
+        token_at(&tokens, source, "Text", 0),
+        (
+            session.semantic_token_type("decorator"),
+            session.semantic_token_modifier("documentation")
+        ),
+        "a part of a section is a section keyword like any other"
+    );
+    let documentation = session.semantic_token_modifier("documentation");
+    let (string_type, modifiers) = token_at(&tokens, source, "///\nKey", 0);
+    assert_eq!(string_type, session.semantic_token_type("string"));
+    assert_ne!(
+        modifiers & documentation,
+        0,
+        "the doc string is documentation"
+    );
+    assert_eq!(
+        token_at(&tokens, source, "2\n///", 0).0,
+        session.semantic_token_type("number"),
+        "syntax highlighting cannot see the literals of example code"
+    );
+
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn documentation_markup_marks_delimiters_links_and_option_keys() {
+    let source = concat!(
+        "newPackage \"Pkg\"\n",
+        "export {\"area\", \"Coarse\"}\n",
+        "area = method(Options => {Coarse => false})\n",
+        "area ZZ := o -> n -> n\n",
+        "beginDocumentation()\n",
+        "doc ///\n",
+        "Key\n",
+        "  [area, Coarse]\n",
+        "Headline\n",
+        "  coarse areas\n",
+        "Description\n",
+        "  Text\n",
+        "    See @TO area@ and {\\tt typed} text.\n",
+        "  Example\n",
+        "    area 3\n",
+        "///\n",
+        "document { Key => [area, Coarse], PARA { TT \"mono\", TO area } }\n",
+        "endPackage \"Pkg\"\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let tokens = semantic_tokens(&mut session).await;
+    let token = |needle: &str, occurrence: usize| token_at(&tokens, source, needle, occurrence);
+    let documentation = session.semantic_token_modifier("documentation");
+    let option = session.semantic_token_modifier("option");
+    let example = session.semantic_token_modifier("example");
+    let monospace = session.semantic_token_modifier("monospace");
+    let macro_type = session.semantic_token_type("macro");
+    let string = session.semantic_token_type("string");
+    let decorator = session.semantic_token_type("decorator");
+
+    for occurrence in [2, 3] {
+        assert_eq!(
+            token("Coarse", occurrence),
+            (
+                session.semantic_token_type("property"),
+                option | documentation
+            ),
+            "the option of an optional-argument key is an option name"
+        );
+    }
+    assert_eq!(
+        token("{\\tt ", 0).0,
+        macro_type,
+        "the TeX delimiter is markup"
+    );
+    assert_eq!(
+        token("} text", 0).0,
+        macro_type,
+        "the closing brace is markup"
+    );
+    assert_eq!(
+        token("typed", 0),
+        (string, documentation | monospace),
+        "styled text stays text"
+    );
+    assert_eq!(token("TT", 0).0, macro_type);
+    assert_eq!(token("mono", 0), (string, documentation | monospace));
+    for occurrence in [0, 1] {
+        assert_eq!(token("TO area", occurrence).0, decorator, "a link is a tag");
+    }
+    let (keyword_type, keyword_modifiers) = token("Example", 0);
+    assert_eq!(keyword_type, decorator);
+    assert_eq!(
+        keyword_modifiers & example,
+        0,
+        "the keyword is not example code"
+    );
+    let (example_type, example_modifiers) = token("area 3", 0);
+    assert_eq!(
+        example_type,
+        session.semantic_token_type("method"),
+        "example code sees the package's exports"
+    );
+    assert_ne!(example_modifiers & example, 0);
+
     session.shutdown().await;
 }

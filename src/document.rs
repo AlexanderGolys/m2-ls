@@ -1,41 +1,44 @@
 //! Versioned document snapshots that combine source text, parse tree, and
 //! analysis for LSP requests.
 
-use crate::node_metadata::{M2Node, M2Parser, M2Tree};
-use m2_syn::nodes::{ExprLambda as LambdaExpression, SourceFile};
-use std::sync::Mutex;
-use std::thread;
-use tower_lsp::lsp_types::{Position, Range as TextRange, TextDocumentContentChangeEvent};
-
-use tree_sitter::{InputEdit, Point};
-
-use crate::analysis::{Analysis, BindingView, FunctionInfo};
+use crate::analysis::{Analysis, BindingView, FunctionInfo, MethodInstallation};
+use crate::diagnostics::suppression::DiagnosticSuppressions;
 use crate::diagnostics::{self, M2Diagnostic};
 use crate::documentation::{
     collect_documentation, DocumentationBlock, DocumentationIndex, DocumentationSnippet,
 };
+use crate::node_metadata::TypedSource;
+use crate::node_metadata::{SyntaxNode, SyntaxParser, SyntaxTree};
 use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::package_documentation::PackageDocumentation;
 use crate::package_index::{collect_imported_packages_in_tree, PackageImport};
-use crate::source::{DocumentSource, SourceNavigation, SymbolMention};
+use crate::source::SourcePoint as Point;
+use crate::source::{ByteRange, DocumentSource, SourceNavigation, SymbolMention};
 use crate::source_package::{PackageSessionCode, SourcePackages};
+use m2_syn::nodes::ExprLambda as LambdaExpression;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use tower_lsp::lsp_types::{Position, Range as TextRange, TextDocumentContentChangeEvent};
 
 /// One immutable source, syntax, and semantic-analysis snapshot served to LSP
 /// requests.
 #[derive(Debug)]
 pub struct DocumentSnapshot {
     source: DocumentSource,
-    tree: M2Tree,
-    syntax: Option<SourceFile>,
+    tree: SyntaxTree,
     analysis: Analysis,
     diagnostics: Vec<M2Diagnostic>,
     object_registry: ObjectRegistry,
     documentation: DocumentationIndex,
     symbol_mentions: Vec<SymbolMention>,
+    package_mentions: Vec<SymbolMention>,
     imported_packages: Vec<PackageImport>,
     packages: SourcePackages,
     package_documentation: PackageDocumentation,
-    package_sessions: Vec<PackageSession>,
+    diagnostic_suppressions: DiagnosticSuppressions,
+    package_sessions: OnceLock<Vec<PackageSession>>,
+    previous_sessions: Mutex<Vec<PackageSession>>,
+    session_knowledge: ObjectRegistry,
 }
 
 /// Code run in a separate session that loaded its package — a TEST block,
@@ -44,14 +47,14 @@ pub struct DocumentSnapshot {
 /// seeing the package only through its exports. Its snapshot shares the
 /// document's LSP positions, so whatever it answers for the code holds in the
 /// document as is.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PackageSession {
     /// The code and the package whose exports it sees.
     pub code: PackageSessionCode,
     /// The packages the session loads along with the package.
     pub exported_packages: Vec<ObjectName>,
     /// The code analyzed on its own.
-    pub snapshot: DocumentSnapshot,
+    pub snapshot: Arc<DocumentSnapshot>,
 }
 
 impl SourceNavigation for DocumentSnapshot {
@@ -74,8 +77,35 @@ pub struct TargetSymbol<'a> {
 impl DocumentSnapshot {
     pub fn from_text(text: String, knowledge_provider: &ObjectRegistry) -> Option<Self> {
         let source = DocumentSource::new(text);
-        let tree = M2Parser::new()?.parse_tree(source.text(), None)?;
-        Some(Self::analyze(source, tree, knowledge_provider, Vec::new()))
+        let parsing = crate::telemetry::Timing::start(
+            "document.parse",
+            serde_json::json!({"source_bytes": source.text().len(), "incremental": false}),
+        );
+        let tree = SyntaxParser::new()?.parse_tree(source.text(), None)?;
+        drop(parsing);
+        Some(Self::analyze(
+            source,
+            tree,
+            knowledge_provider,
+            Vec::new(),
+            true,
+        ))
+    }
+
+    /// A saved library file needed for navigation. Documentation examples and
+    /// TEST sessions belong to the opened document, not the navigation cache.
+    pub(crate) fn from_text_for_navigation(
+        text: String,
+        knowledge: &ObjectRegistry,
+    ) -> Option<Self> {
+        let source = DocumentSource::new(text);
+        let parsing = crate::telemetry::Timing::start(
+            "document.parse",
+            serde_json::json!({"source_bytes": source.text().len(), "incremental": false}),
+        );
+        let tree = SyntaxParser::new()?.parse_tree(source.text(), None)?;
+        drop(parsing);
+        Some(Self::analyze(source, tree, knowledge, Vec::new(), false))
     }
 
     /// Analyze `source`, parsed as `tree`, against the packages
@@ -85,26 +115,51 @@ impl DocumentSnapshot {
     /// `previous_sessions`.
     fn analyze(
         source: DocumentSource,
-        tree: M2Tree,
+        tree: SyntaxTree,
         knowledge_provider: &ObjectRegistry,
         previous_sessions: Vec<PackageSession>,
+        full: bool,
     ) -> Self {
-        let typed_ast = tree.typed_source_file(source.text());
+        let mut source = source;
+        source.register_syntax(tree.snapshot());
+        let typed_ast = Some(tree.syntax());
         let root = tree.root(source.text());
-        let imported_packages =
-            collect_imported_packages_in_tree(root, typed_ast.as_ref(), &source);
+        let imported_packages = collect_imported_packages_in_tree(root, typed_ast, &source);
         let knowledge = knowledge_provider.with_imports(&imported_packages);
-        let analysis = Analysis::new_with_knowledge(root, typed_ast.as_ref(), &source, &knowledge);
+        let analysis_timing = crate::telemetry::Timing::start(
+            "document.analysis",
+            serde_json::json!({"source_bytes": source.text().len(), "full": full}),
+        );
+        let analysis = Analysis::new_with_knowledge(root, typed_ast, &source, &knowledge);
+        drop(analysis_timing);
+        let documentation_timing = crate::telemetry::Timing::start(
+            "document.documentation",
+            serde_json::json!({"source_bytes": source.text().len()}),
+        );
         let packages = SourcePackages::collect(root, &source);
         let package_documentation = PackageDocumentation::collect(root, &source, &packages);
-        let mut diagnostics = diagnostics::collect(
-            &analysis,
-            root,
-            typed_ast.as_ref(),
-            &source,
-            &knowledge,
-            &packages,
-            &package_documentation,
+        let diagnostic_suppressions = DiagnosticSuppressions::collect(root, &source);
+        drop(documentation_timing);
+        let diagnostics_timing = crate::telemetry::Timing::start(
+            "document.diagnostics",
+            serde_json::json!({"source_bytes": source.text().len()}),
+        );
+        let diagnostics = diagnostics::collect(
+            diagnostics::DiagnosticInputs {
+                analysis: &analysis,
+                root,
+                syntax: typed_ast,
+                source: &source,
+                knowledge: &knowledge,
+                packages: &packages,
+                documentation: &package_documentation,
+            },
+            !full,
+        );
+        drop(diagnostics_timing);
+        let documentation_timing = crate::telemetry::Timing::start(
+            "document.attached_documentation",
+            serde_json::json!({"source_bytes": source.text().len()}),
         );
         let mut documentation = collect_documentation(&source, root, &analysis);
         documentation.extend_blocks(package_documentation.documentation_blocks(&analysis));
@@ -122,37 +177,82 @@ impl DocumentSnapshot {
             .collect::<Vec<_>>();
         symbol_mentions.sort_by_key(SymbolMention::byte_span);
         symbol_mentions.dedup_by_key(|mention| mention.byte_span());
-        let session_code = packages
-            .tests()
+        let namespace_strings = analysis
+            .source_semantic_tokens()
             .iter()
-            .chain(package_documentation.example_sessions())
-            .collect::<Vec<_>>();
-        let package_sessions = PackageSession::analyze_all(
-            &session_code,
-            &packages,
-            &source,
-            knowledge_provider,
-            previous_sessions,
-        );
-        diagnostics.extend(
-            package_sessions
-                .iter()
-                .flat_map(|session| session.snapshot.diagnostics.iter().cloned()),
-        );
-        Self {
+            .filter(|token| {
+                matches!(
+                    token.source_role,
+                    Some(crate::semantic_token::SourceSemanticRole::NamespaceArgument)
+                )
+            })
+            .map(|token| token.span.bytes())
+            .collect::<std::collections::HashSet<_>>();
+        let package_mentions = root
+            .descendants()
+            .filter(|node| {
+                node.is_string_literal()
+                    && namespace_strings.contains(&(node.start_byte()..node.end_byte()))
+            })
+            .filter_map(|node| node.string_literal_inner_bytes())
+            .map(|bytes| SymbolMention::new(source.span_for_bytes(bytes)))
+            .collect();
+        drop(documentation_timing);
+        let mut snapshot = Self {
             source,
             tree,
-            syntax: typed_ast,
             analysis,
             diagnostics,
             object_registry: knowledge,
             documentation,
             symbol_mentions,
+            package_mentions,
             imported_packages,
             packages,
             package_documentation,
-            package_sessions,
+            diagnostic_suppressions,
+            package_sessions: OnceLock::new(),
+            previous_sessions: Mutex::new(previous_sessions),
+            session_knowledge: knowledge_provider.clone(),
+        };
+        if full {
+            let _timing = crate::telemetry::Timing::start(
+                "document.package_sessions",
+                serde_json::json!({"source_bytes": snapshot.text().len()}),
+            );
+            let session_diagnostics = snapshot
+                .package_sessions()
+                .iter()
+                .flat_map(|session| session.snapshot.diagnostics.iter().cloned())
+                .collect::<Vec<_>>();
+            snapshot.diagnostics.extend(session_diagnostics);
         }
+        snapshot
+    }
+
+    /// Prepares save-time work using retained syntax, without holding a document lock.
+    pub fn save_job(&self, knowledge: ObjectRegistry) -> impl FnOnce() -> Self + Send + 'static {
+        let source = self.source.clone();
+        let tree = self.tree.clone();
+        let previous = self.package_sessions.get().cloned().unwrap_or_else(|| {
+            self.previous_sessions
+                .lock()
+                .expect("session cache lock")
+                .clone()
+        });
+        move || Self::analyze(source, tree, &knowledge, previous, true)
+    }
+
+    fn take_sessions(&mut self) -> Vec<PackageSession> {
+        std::mem::take(&mut self.package_sessions)
+            .into_inner()
+            .unwrap_or_else(|| {
+                std::mem::take(
+                    self.previous_sessions
+                        .get_mut()
+                        .expect("session cache lock"),
+                )
+            })
     }
 
     pub fn apply_changes(
@@ -160,16 +260,51 @@ impl DocumentSnapshot {
         changes: &[TextDocumentContentChangeEvent],
         knowledge_provider: &ObjectRegistry,
     ) -> Option<()> {
+        let mut source = DocumentSource::new(self.text().to_owned());
         for change in changes {
             if let Some(range) = change.range {
-                self.apply_incremental_change(range, &change.text, knowledge_provider)?;
+                let bytes = source.bytes_for_range(range)?;
+                source.replace_range(bytes, &change.text);
             } else {
-                let replacement = change.text.clone();
-                let rebuilt = Self::from_text(replacement, knowledge_provider)?;
-                *self = rebuilt;
+                source = DocumentSource::new(change.text.clone());
             }
         }
-
+        if source.text() == self.text() {
+            return Some(());
+        }
+        let parsing = crate::telemetry::Timing::start(
+            "document.parse",
+            serde_json::json!({"source_bytes": source.text().len(), "incremental": true}),
+        );
+        let tree = SyntaxParser::new()?.parse_tree(source.text(), Some(&self.tree))?;
+        drop(parsing);
+        let unchanged_prefix = source
+            .text()
+            .bytes()
+            .zip(self.text().bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let cutoff = tree
+            .changed_ranges()
+            .first()
+            .map_or(unchanged_prefix, |range| range.start);
+        let retained = self
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.rule.code != diagnostics::catalog::UNUSED_BINDING.code
+                    && std::iter::once(diagnostic.finding.range)
+                        .chain(diagnostic.finding.notes.iter().map(|note| note.range))
+                        .all(|range| {
+                            self.bytes_for_range(range)
+                                .is_some_and(|bytes| bytes.end <= cutoff)
+                        })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let previous_sessions = self.take_sessions();
+        *self = Self::analyze(source, tree, knowledge_provider, previous_sessions, false);
+        self.diagnostics.extend(retained);
         Some(())
     }
 
@@ -185,12 +320,17 @@ impl DocumentSnapshot {
         &self.analysis
     }
 
-    pub fn syntax(&self) -> Option<&SourceFile> {
-        self.syntax.as_ref()
+    pub fn syntax(&self) -> Option<&TypedSource> {
+        Some(self.tree.syntax())
     }
 
     pub fn diagnostics(&self) -> &[M2Diagnostic] {
         &self.diagnostics
+    }
+
+    /// What the document's directive comments silence.
+    pub fn diagnostic_suppressions(&self) -> &DiagnosticSuppressions {
+        &self.diagnostic_suppressions
     }
 
     /// The packages the document imports, each from where it takes effect.
@@ -211,13 +351,38 @@ impl DocumentSnapshot {
     /// The code the document runs in package sessions — its TEST blocks and
     /// its documentation examples — each analyzed on its own.
     pub fn package_sessions(&self) -> &[PackageSession] {
-        &self.package_sessions
+        self.package_sessions.get_or_init(|| {
+            let code = self
+                .packages
+                .tests()
+                .iter()
+                .chain(self.package_documentation.example_sessions())
+                .collect::<Vec<_>>();
+            let previous =
+                std::mem::take(&mut *self.previous_sessions.lock().expect("session cache lock"));
+            PackageSession::analyze_all(
+                &code,
+                &self.packages,
+                &self.source,
+                &self.session_knowledge,
+                previous,
+            )
+        })
     }
 
     /// The package session whose code contains `position`, which answers for
     /// it in place of the document.
     pub fn package_session_at(&self, position: Position) -> Option<&PackageSession> {
-        self.package_sessions
+        if !self
+            .packages
+            .tests()
+            .iter()
+            .chain(self.package_documentation.example_sessions())
+            .any(|code| code.contains(position))
+        {
+            return None;
+        }
+        self.package_sessions()
             .iter()
             .find(|session| session.code.contains(position))
     }
@@ -277,6 +442,21 @@ impl DocumentSnapshot {
         &self.symbol_mentions
     }
 
+    /// Package names in string arguments, kept separate from renameable symbols.
+    pub fn package_mentions(&self) -> &[SymbolMention] {
+        &self.package_mentions
+    }
+
+    /// Comment spans accepted as attached documentation.
+    pub fn documentation_comment_ranges(&self) -> &[ByteRange] {
+        self.documentation.comment_ranges()
+    }
+
+    /// Code examples in attached Markdown documentation.
+    pub fn documentation_example_ranges(&self) -> &[ByteRange] {
+        self.documentation.example_ranges()
+    }
+
     pub fn documentation_snippets(&self) -> &[DocumentationSnippet] {
         self.documentation.snippets()
     }
@@ -284,6 +464,33 @@ impl DocumentSnapshot {
     #[cfg(test)]
     pub fn documentation_blocks(&self) -> &[DocumentationBlock] {
         self.documentation.blocks()
+    }
+
+    /// The statement declaring the state `binding` is in, as written: the
+    /// code a hover shows for it. `None` when the declaration is the name
+    /// alone, as for a parameter.
+    pub fn declaration_code(&self, binding: BindingView<'_>) -> Option<&str> {
+        if binding.state.definition_range == binding.state.span {
+            return None;
+        }
+        self.statement_code_at(binding.state.span.start)
+    }
+
+    /// The statement installing the method `installation`, as written.
+    pub fn installation_code(&self, installation: &MethodInstallation) -> Option<&str> {
+        self.statement_code_at(installation.span.start)
+    }
+
+    /// The code of the statement at `position`: its cell without the
+    /// comments around it, which document it rather than being its code.
+    fn statement_code_at(&self, position: Position) -> Option<&str> {
+        let cell = self
+            .node_at_position_minimal(position)?
+            .enclosing_node(|node| node.is_source_cell())?;
+        let mut code = cell.named_children().filter(|child| !child.is_comment());
+        let first = code.next()?;
+        let end = code.last().unwrap_or(first).end_byte();
+        Some(&self.text()[first.start_byte()..end])
     }
 
     pub fn documentation_for_binding(
@@ -351,18 +558,22 @@ impl DocumentSnapshot {
             .collect()
     }
 
-    pub fn root_node(&self) -> M2Node<'_> {
+    pub(crate) fn syntax_tree(&self) -> &SyntaxTree {
+        &self.tree
+    }
+
+    pub fn root_node(&self) -> SyntaxNode<'_> {
         self.tree.root(self.text())
     }
 
-    pub fn node_at_position_minimal(&self, position: Position) -> Option<M2Node<'_>> {
+    pub fn node_at_position_minimal(&self, position: Position) -> Option<SyntaxNode<'_>> {
         let point = self.point_for_position(position)?;
         self.root_node().descendant_for_point_range(point, point)
     }
 
     /// The symbol under the cursor that refers to a binding by name; `None`
     /// on a member key, which names the symbol itself.
-    pub fn reference_node_at_position(&self, position: Position) -> Option<M2Node<'_>> {
+    pub fn reference_node_at_position(&self, position: Position) -> Option<SyntaxNode<'_>> {
         let point = self.point_for_position(position)?;
         let root = self.root_node();
         // When the cursor sits on the boundary between the anonymous SPACE
@@ -390,41 +601,6 @@ impl DocumentSnapshot {
             }
         }
         None
-    }
-
-    fn apply_incremental_change(
-        &mut self,
-        range: TextRange,
-        replacement: &str,
-        knowledge_provider: &ObjectRegistry,
-    ) -> Option<()> {
-        let old_bytes = self.bytes_for_range(range)?;
-        let start_byte = old_bytes.start;
-        let old_end_byte = old_bytes.end;
-        let start_position = self.point_for_byte(start_byte);
-        let old_end_position = self.point_for_byte(old_end_byte);
-        let new_end_byte = start_byte + replacement.len();
-        let new_end_position = advance_point(start_position, replacement);
-
-        let edit = InputEdit {
-            start_byte,
-            old_end_byte,
-            new_end_byte,
-            start_position,
-            old_end_position,
-            new_end_position,
-        };
-
-        let mut edited_tree = self.tree.clone();
-        edited_tree.edit(&edit);
-        self.source
-            .replace_range(start_byte..old_end_byte, replacement);
-
-        let tree = M2Parser::new()?.parse_tree(self.text(), Some(&edited_tree))?;
-        let source = std::mem::replace(&mut self.source, DocumentSource::new(String::new()));
-        let previous_sessions = std::mem::take(&mut self.package_sessions);
-        *self = Self::analyze(source, tree, knowledge_provider, previous_sessions);
-        Some(())
     }
 }
 
@@ -532,25 +708,9 @@ impl PackageSession {
         Some(Self {
             code: code.clone(),
             exported_packages,
-            snapshot,
+            snapshot: Arc::new(snapshot),
         })
     }
-}
-
-fn advance_point(start: Point, inserted_text: &str) -> Point {
-    let mut row = start.row;
-    let mut column = start.column;
-
-    for byte in inserted_text.bytes() {
-        if byte == b'\n' {
-            row += 1;
-            column = 0;
-        } else {
-            column += 1;
-        }
-    }
-
-    Point::new(row, column)
 }
 
 #[cfg(test)]
@@ -663,5 +823,140 @@ mod tests {
             .analysis()
             .bindings()
             .any(|binding| binding.name.name() == "second"));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_scheduling_tests {
+    use super::*;
+
+    #[test]
+    fn batched_changes_and_save_share_unmodified_cell_syntax() {
+        let knowledge = ObjectRegistry::default();
+        let mut document =
+            DocumentSnapshot::from_text("x = 1\ny = 2\n".into(), &knowledge).unwrap();
+        let before = document.tree.snapshot().clone();
+        document
+            .apply_changes(
+                &[
+                    TextDocumentContentChangeEvent {
+                        range: Some(TextRange::new(pos!(0, 4), pos!(0, 5))),
+                        range_length: None,
+                        text: String::new(),
+                    },
+                    TextDocumentContentChangeEvent {
+                        range: Some(TextRange::new(pos!(0, 4), pos!(0, 4))),
+                        range_length: None,
+                        text: "1234".into(),
+                    },
+                ],
+                &knowledge,
+            )
+            .unwrap();
+        assert_eq!(document.text(), "x = 1234\ny = 2\n");
+        assert_eq!(
+            document.tree.snapshot().cells()[1].id(),
+            before.cells()[1].id()
+        );
+        let ids = document
+            .tree
+            .snapshot()
+            .cells()
+            .iter()
+            .map(|cell| cell.id())
+            .collect::<Vec<_>>();
+        let saved = document.save_job(knowledge)();
+        assert_eq!(
+            saved
+                .tree
+                .snapshot()
+                .cells()
+                .iter()
+                .map(|cell| cell.id())
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    #[test]
+    fn save_refreshes_document_checks_while_input_keeps_local_checks() {
+        let knowledge = ObjectRegistry::default();
+        let mut document = DocumentSnapshot::from_text("value = 1\n".into(), &knowledge).unwrap();
+        document
+            .apply_changes(
+                &[TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "f = x -> (unused := x; x)\n".into(),
+                }],
+                &knowledge,
+            )
+            .unwrap();
+        assert!(!document
+            .diagnostics()
+            .iter()
+            .any(|d| d.rule.code == diagnostics::catalog::UNUSED_BINDING.code));
+        let saved = document.save_job(knowledge)();
+        assert!(saved
+            .diagnostics()
+            .iter()
+            .any(|d| d.finding.message == "Unused variable unused"));
+    }
+
+    #[test]
+    fn live_updates_recheck_everything_after_the_edit() {
+        let knowledge = ObjectRegistry::load(include_str!("data/m2-index.jsonl"));
+        let mut document = DocumentSnapshot::from_text(
+            "-- points\np = method()\np ZZ := n -> n + 1\n".into(),
+            &knowledge,
+        )
+        .unwrap();
+        let codomain_lines = |document: &DocumentSnapshot| {
+            document
+                .diagnostics()
+                .iter()
+                .filter(|d| d.rule.code == diagnostics::catalog::INSTALL_CODOMAIN_MISSING.code)
+                .map(|d| d.finding.range.start.line)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(codomain_lines(&document), vec![2]);
+
+        document
+            .apply_changes(
+                &[TextDocumentContentChangeEvent {
+                    range: Some(TextRange::new(pos!(0, 9), pos!(0, 9))),
+                    range_length: None,
+                    text: " in the plane\n-- and space".into(),
+                }],
+                &knowledge,
+            )
+            .unwrap();
+        assert_eq!(
+            codomain_lines(&document),
+            vec![3],
+            "an edit above re-checks the code below it"
+        );
+    }
+
+    #[test]
+    fn live_updates_keep_local_findings_in_the_unchanged_prefix() {
+        let knowledge = ObjectRegistry::default();
+        let mut document =
+            DocumentSnapshot::from_text("x = (1 + )\ny = 2\n".into(), &knowledge).unwrap();
+        document
+            .apply_changes(
+                &[TextDocumentContentChangeEvent {
+                    range: Some(TextRange::new(pos!(1, 4), pos!(1, 5))),
+                    range_length: None,
+                    text: "3".into(),
+                }],
+                &knowledge,
+            )
+            .unwrap();
+        assert!(document
+            .diagnostics()
+            .iter()
+            .any(|d| d.rule.code == diagnostics::catalog::SYNTAX_ERROR.code
+                && d.finding.range.start.line == 0));
     }
 }

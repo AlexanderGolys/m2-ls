@@ -11,9 +11,10 @@
 //! the end of its file is closed by Macaulay2 from a file-exit hook, so its
 //! section then runs to the end of the file.
 
+use strum::{Display, EnumString, IntoStaticStr};
 use tower_lsp::lsp_types::{Position, Range as TextRange};
 
-use crate::node_metadata::M2Node;
+use crate::node_metadata::SyntaxNode;
 use crate::object_registry::ObjectName;
 use crate::package_index::{declared_package_name, first_call_argument, PackageLoadingOption};
 use crate::source::{ByteRange, SourceNavigation, SymbolMention};
@@ -21,9 +22,19 @@ use crate::source::{ByteRange, SourceNavigation, SymbolMention};
 /// The function that closes the package a `newPackage` section declares.
 const PACKAGE_CLOSER: &str = "endPackage";
 
-/// The functions whose arguments list the symbols a package exports;
-/// `exportMutable` exports them as assignable by the importing session.
-const EXPORTERS: [&str; 2] = ["export", "exportMutable"];
+/// What the sessions loading a package may do with a symbol it exports,
+/// decided by the function exporting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EnumString, IntoStaticStr, Display)]
+#[non_exhaustive]
+pub enum ExportAccess {
+    /// `export`: the symbol is protected, so assigning it outside the
+    /// package is an error.
+    #[strum(serialize = "export")]
+    Protected,
+    /// `exportMutable`: the sessions may assign the symbol.
+    #[strum(serialize = "exportMutable")]
+    Mutable,
+}
 
 /// The packages one source file declares, in source order, and the TEST blocks
 /// they register.
@@ -57,9 +68,13 @@ pub struct PackageExport {
     pub definition: ObjectName,
     /// The string that exports the name.
     pub range: TextRange,
+    /// The public name inside its export string.
+    pub name_mention: SymbolMention,
     /// The name of [`Self::definition`] inside its string, a use of the
     /// package global.
     pub definition_mention: SymbolMention,
+    /// Whether the sessions may assign the symbol.
+    pub access: ExportAccess,
 }
 
 /// Code Macaulay2 runs in a separate session that has loaded a package, so
@@ -145,15 +160,15 @@ impl PackageSessionCode {
 /// The package-structure calls of a source file, in source order, before they
 /// are grouped into sections.
 enum PackageCall<'tree> {
-    Declaration(M2Node<'tree>, M2Node<'tree>),
-    Closing(M2Node<'tree>, &'tree str),
-    Export(M2Node<'tree>),
-    Test(M2Node<'tree>, M2Node<'tree>),
+    Declaration(SyntaxNode<'tree>, SyntaxNode<'tree>),
+    Closing(SyntaxNode<'tree>, &'tree str),
+    Export(SyntaxNode<'tree>, ExportAccess),
+    Test(SyntaxNode<'tree>, SyntaxNode<'tree>),
 }
 
 impl SourcePackages {
     /// The packages declared in the syntax tree under `root`.
-    pub fn collect(root: M2Node<'_>, source: &(impl SourceNavigation + ?Sized)) -> Self {
+    pub fn collect(root: SyntaxNode<'_>, source: &(impl SourceNavigation + ?Sized)) -> Self {
         let calls = root
             .descendants()
             .filter_map(PackageCall::recognize)
@@ -209,9 +224,9 @@ impl SourcePackages {
         };
         for call in &calls {
             match call {
-                PackageCall::Export(argument) => {
+                PackageCall::Export(argument, access) => {
                     let start = source.position_for_node(*argument);
-                    let exports = exported_symbols(*argument, source);
+                    let exports = exported_symbols(*argument, *access, source);
                     if let Some(declaration) = packages.declaration_at_mut(start) {
                         declaration.exports.extend(exports);
                     }
@@ -294,7 +309,7 @@ impl PackageDeclaration {
 }
 
 impl<'tree> PackageCall<'tree> {
-    fn recognize(node: M2Node<'tree>) -> Option<Self> {
+    fn recognize(node: SyntaxNode<'tree>) -> Option<Self> {
         if let Some(name) = declared_package_name(node) {
             return Some(Self::Declaration(node, name));
         }
@@ -303,15 +318,19 @@ impl<'tree> PackageCall<'tree> {
         {
             return Some(Self::Closing(node, name));
         }
-        if let Some(argument) = first_call_argument(node, |callee| EXPORTERS.contains(&callee)) {
-            return Some(Self::Export(argument));
+        if let Some(access) = node
+            .applied_symbol_name()
+            .and_then(|callee| callee.parse::<ExportAccess>().ok())
+        {
+            let argument = first_call_argument(node, |callee| callee == <&str>::from(access))?;
+            return Some(Self::Export(argument, access));
         }
         test_body(node).map(|body| Self::Test(node, body))
     }
 }
 
 /// The raw string a `TEST ///…///` clause runs as code.
-fn test_body(clause: M2Node<'_>) -> Option<M2Node<'_>> {
+fn test_body(clause: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     if !clause.is_debug_expr()
         || !clause
             .children()
@@ -326,7 +345,7 @@ fn test_body(clause: M2Node<'_>) -> Option<M2Node<'_>> {
 
 /// The elements of a list argument, or the argument itself when it is a
 /// single element.
-fn string_list(argument: M2Node<'_>) -> Vec<M2Node<'_>> {
+fn string_list(argument: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
     if argument.is_collection_expression() {
         argument.collection_elements().collect()
     } else {
@@ -338,10 +357,11 @@ fn string_list(argument: M2Node<'_>) -> Vec<M2Node<'_>> {
 /// `"synonym" => "name"` options. Anything else is computed when the package
 /// loads and cannot be known here.
 fn exported_symbols(
-    argument: M2Node<'_>,
+    argument: SyntaxNode<'_>,
+    access: ExportAccess,
     source: &(impl SourceNavigation + ?Sized),
 ) -> Vec<PackageExport> {
-    let mention = |name: M2Node<'_>| {
+    let mention = |name: SyntaxNode<'_>| {
         Some(SymbolMention::new(
             source.span_for_bytes(name.string_literal_inner_bytes()?),
         ))
@@ -354,19 +374,23 @@ fn exported_symbols(
                     name: ObjectName::new(name),
                     definition: ObjectName::new(name),
                     range: source.range_for_node(element),
+                    name_mention: mention(element)?,
                     definition_mention: mention(element)?,
+                    access,
                 });
             }
             if !element.is_option_assignment() {
                 return None;
             }
-            let synonym = element.child_by_field_name("left")?;
-            let definition = element.child_by_field_name("right")?;
+            let synonym = element.binary_parts().map(|parts| parts.left)?;
+            let definition = element.binary_parts().map(|parts| parts.right)?;
             Some(PackageExport {
                 name: ObjectName::new(synonym.string_literal_inner_text()?),
                 definition: ObjectName::new(definition.string_literal_inner_text()?),
                 range: source.range_for_node(synonym),
+                name_mention: mention(synonym)?,
                 definition_mention: mention(definition)?,
+                access,
             })
         })
         .collect()
@@ -375,12 +399,12 @@ fn exported_symbols(
 #[cfg(test)]
 mod tests {
     use super::SourcePackages;
-    use crate::node_metadata::M2Parser;
+    use crate::node_metadata::SyntaxParser;
     use crate::source::DocumentSource;
 
     fn packages(text: &str) -> SourcePackages {
         let source = DocumentSource::new(text.to_string());
-        let mut parser = M2Parser::new().expect("parser");
+        let mut parser = SyntaxParser::new().expect("parser");
         let root = parser.parse(text).expect("parse");
         SourcePackages::collect(root, &source)
     }

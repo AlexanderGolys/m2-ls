@@ -14,7 +14,7 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::document::DocumentSnapshot;
-use crate::node_metadata::{matches_token, M2Node, M2Parser};
+use crate::node_metadata::{matches_token, SyntaxNode, SyntaxParser};
 
 mod layout;
 use crate::settings::FormattingSettings;
@@ -109,7 +109,7 @@ pub fn document_formatting_text_edits(
     }]
 }
 
-pub fn folding_ranges(root: M2Node<'_>) -> Vec<FoldingRange> {
+pub fn folding_ranges(root: SyntaxNode<'_>) -> Vec<FoldingRange> {
     folding_ranges_for_syntax(root)
         .into_iter()
         .map(|range| FoldingRange {
@@ -133,7 +133,7 @@ struct FormatEdit {
 /// Format the whole document: whitespace normalization around operators and
 /// punctuation, tree-derived indentation, and width-based wrapping at parsed
 /// syntax boundaries.
-pub fn format_document_with_options(root: M2Node<'_>, options: &FormatOptions) -> String {
+pub fn format_document_with_options(root: SyntaxNode<'_>, options: &FormatOptions) -> String {
     formatted_layout(root, options).into_text()
 }
 
@@ -154,22 +154,23 @@ pub(super) fn format_action_edit(
     let end = bytes.start + edit.new_text.len();
     let mut text = source.text().to_string();
     text.replace_range(bytes.clone(), &edit.new_text);
-    let Some(mut parser) = M2Parser::new() else {
+    let Some(mut parser) = SyntaxParser::new() else {
         return;
     };
-    let Some(root) = parser.parse(&text) else {
+    let Some(tree) = parser.parse_tree(&text, Some(source.syntax_tree())) else {
         return;
     };
-    let layout = formatted_layout(root, options);
+    let layout = formatted_layout(tree.root(&text), options);
     edit.new_text = layout.text_for_bytes(bytes.start..end).to_string();
 }
 
-fn formatted_layout(root: M2Node<'_>, options: &FormatOptions) -> LayoutSource {
+fn formatted_layout(root: SyntaxNode<'_>, options: &FormatOptions) -> LayoutSource {
     let root = root.root();
     let newline = detect_line_ending(root.source_text());
     let mut layout = LayoutSource::new(root);
     let mut passes = VecDeque::from([
         FormatPass::Spacing,
+        FormatPass::LeadingOperators,
         FormatPass::Options,
         FormatPass::EmptyBodies,
         FormatPass::ControlFlow,
@@ -182,6 +183,7 @@ fn formatted_layout(root: M2Node<'_>, options: &FormatOptions) -> LayoutSource {
         let node = LayoutNode::new(root, &layout);
         let edits = match pass {
             FormatPass::Spacing => normalize_whitespace(node, options),
+            FormatPass::LeadingOperators => lead_rows_with_operators(node, options, newline),
             FormatPass::Options => break_option_tables(node, newline),
             FormatPass::EmptyBodies => inline_empty_bodies(node),
             FormatPass::ControlFlow => format_control_flow(node, options, newline),
@@ -200,6 +202,7 @@ fn formatted_layout(root: M2Node<'_>, options: &FormatOptions) -> LayoutSource {
 #[derive(Clone, Copy)]
 enum FormatPass {
     Spacing,
+    LeadingOperators,
     Options,
     EmptyBodies,
     ControlFlow,
@@ -324,6 +327,50 @@ fn detect_line_ending(text: &str) -> &'static str {
     }
 }
 
+/// Moves every binary operator that dangles at a line end onto the start of
+/// the next row, when `breaks_before_operator` allows it:
+///
+/// ```m2
+/// total := (first
+///     + second
+///     + third)
+/// ```
+fn lead_rows_with_operators(
+    root: LayoutNode<'_>,
+    options: &FormatOptions,
+    newline: &'static str,
+) -> Vec<FormatEdit> {
+    let text = root.source_text();
+    let mut edits = Vec::new();
+    for expression in root.descendants() {
+        let Some((parts, operator)) = expression.binary_parts().zip(expression.operator_node())
+        else {
+            continue;
+        };
+        if !breaks_before_operator(operator, options.compact_factor_operators) {
+            continue;
+        }
+        let before = &text[parts.left.end_byte()..operator.start_byte()];
+        let after = &text[operator.end_byte()..parts.right.start_byte()];
+        let dangles = before.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+            && after.bytes().all(|byte| byte.is_ascii_whitespace())
+            && after.contains('\n');
+        if dangles {
+            edits.push(FormatEdit {
+                start_byte: parts.left.end_byte(),
+                end_byte: operator.start_byte(),
+                replacement: newline.to_string(),
+            });
+            edits.push(FormatEdit {
+                start_byte: operator.end_byte(),
+                end_byte: parts.right.start_byte(),
+                replacement: " ".to_string(),
+            });
+        }
+    }
+    edits
+}
+
 fn inline_empty_bodies(root: LayoutNode<'_>) -> Vec<FormatEdit> {
     let text = root.source_text();
     let mut edits = Vec::new();
@@ -357,7 +404,7 @@ fn empty_body_role(node: LayoutNode<'_>) -> bool {
     };
     if parent.is::<LambdaExpression>() {
         return parent
-            .child_by_field_name("body")
+            .lambda_body()
             .is_some_and(|body| body.id() == node.id());
     }
     if parent.is_keyword_clause() {
@@ -366,9 +413,9 @@ fn empty_body_role(node: LayoutNode<'_>) -> bool {
             .is_some_and(|body| body.id() == node.id());
     }
     if parent.is::<LoopBody>() {
-        return ["listed_value", "ignored_value"]
+        return [parent.listed_value(), parent.ignored_value()]
             .into_iter()
-            .filter_map(|field| parent.child_by_field_name(field))
+            .flatten()
             .any(|body| body.id() == node.id());
     }
     parent.is::<TryStatement>()
@@ -395,18 +442,21 @@ fn format_control_flow(
             continue;
         }
         if clause.is::<LoopBody>() {
-            for (keyword, field) in [
-                (direct_keyword::<Token![list]>(clause), "listed_value"),
-                (direct_keyword::<Token![do]>(clause), "ignored_value"),
+            for (keyword, body) in [
+                (
+                    direct_keyword::<Token![list]>(clause),
+                    clause.listed_value(),
+                ),
+                (direct_keyword::<Token![do]>(clause), clause.ignored_value()),
             ] {
-                let Some((keyword, body)) = keyword.zip(clause.child_by_field_name(field)) else {
+                let Some((keyword, body)) = keyword.zip(body) else {
                     continue;
                 };
                 push_control_clause_body_break(keyword, body, text, newline, &mut edits);
             }
             continue;
         }
-        if clause.is_except_clause() && clause.child_by_field_name("exception").is_some() {
+        if clause.is_except_clause() {
             push_control_flow_break(
                 text,
                 same_line_horizontal_whitespace_start(text, clause.start_byte()),
@@ -415,7 +465,7 @@ fn format_control_flow(
                 &mut edits,
             );
             if let Some((keyword, body)) =
-                direct_keyword::<Token![do]>(clause).zip(clause.child_by_field_name("value"))
+                direct_keyword::<Token![do]>(clause).zip(clause.clause_value())
             {
                 push_control_clause_body_break(keyword, body, text, newline, &mut edits);
             }
@@ -543,6 +593,12 @@ fn control_clause_breaks_are_parseable(clause: LayoutNode<'_>, text: &str) -> bo
             break;
         };
         layout_control = outer_if;
+    }
+
+    if std::iter::successors(layout_control.parent(), |node| node.parent())
+        .any(|node| node.is_delimited_expression())
+    {
+        return true;
     }
 
     let line_start = text[..layout_control.start_byte()]
@@ -729,13 +785,32 @@ impl LineBreakRule for OperatorBreakRule {
         let Some(parent) = node.parent() else {
             return;
         };
-        if node.is_operator()
-            && (parent.binary_operator().is_some() || parent.is::<LambdaExpression>())
+        if !node.is_operator() {
+            return;
+        }
+        if breaks_before_operator(node, options.compact_factor_operators) {
+            push_line_break_candidate_before(node, text, candidates);
+        } else if (parent.binary_operator().is_some() || parent.is::<LambdaExpression>())
             && is_spaced_line_final_operator(node.text(), options.compact_factor_operators)
         {
             push_line_break_candidate_after(node, text, candidates);
         }
     }
+}
+
+fn push_line_break_candidate_before(
+    node: LayoutNode<'_>,
+    text: &str,
+    candidates: &mut Vec<LineBreakCandidate>,
+) {
+    let end_byte = node.start_byte();
+    let Some(start_byte) = same_line_horizontal_whitespace_start(text, end_byte) else {
+        return;
+    };
+    candidates.push(LineBreakCandidate {
+        start_byte,
+        end_byte,
+    });
 }
 
 fn push_line_break_candidate_after(
@@ -871,7 +946,7 @@ fn visual_width(text: &str, tab_width: usize) -> usize {
 
 /// The document's fold ranges: tree-based indentation blocks plus multiline
 /// comments and strings.
-fn folding_ranges_for_syntax(root: M2Node<'_>) -> Vec<FormatFoldRange> {
+fn folding_ranges_for_syntax(root: SyntaxNode<'_>) -> Vec<FormatFoldRange> {
     let source = LayoutSource::new(root);
     let root = LayoutNode::new(root, &source);
     let text = root.source_text();
@@ -966,11 +1041,8 @@ fn collect_literal_fold_ranges(root: LayoutNode<'_>, line_leads: &[usize]) -> Ve
     for node in root.descendants() {
         let start = node.start_position();
         let end = node.end_position();
-        if node.is_line_comment()
-            && start.row == end.row
-            && line_leads.get(start.row).copied() == Some(start.column)
-        {
-            line_comment_rows.push(start.row as u32);
+        if node.is_line_comment() && line_leads.get(start.row).copied() == Some(start.column) {
+            line_comment_rows.extend((start.row..=end.row).map(|row| row as u32));
         } else if node.is_block_comment() && start.row < end.row {
             ranges.push(FormatFoldRange {
                 start_line: start.row as u32,
@@ -1059,8 +1131,8 @@ fn collect_bracket_groups(root: LayoutNode<'_>, line_count: usize) -> Vec<Bracke
     groups
 }
 
-/// Recover unclosed opener tokens that tree-sitter leaves loose inside an ERROR
-/// node (e.g. a `(` at EOF with no `)`). Each unmatched opener still indents its
+/// Collect unmatched opener tokens retained inside an invalid syntax region.
+/// Each unmatched opener still indents its
 /// body, so it opens a group from its row to the last line of the document.
 fn collect_unclosed_error_brackets(
     error: LayoutNode<'_>,
@@ -1126,8 +1198,8 @@ fn closes_at_line_start(
     })
 }
 
-/// `continuation(row)` is a flat +1 for a line that continues an expression or a
-/// clause body broken onto a later line (see the rule cases inline).
+/// Continuations add one level; bodies of inline conditionals add another
+/// level so they sit deeper than the conditional's clause keywords.
 fn line_continuation(
     row: usize,
     root: LayoutNode<'_>,
@@ -1145,10 +1217,25 @@ fn line_continuation(
         return 1;
     }
 
+    // (a') The first token is a binary operator leading the row, its left
+    // operand on an earlier row (`(a\n+ b)`).
+    if first.is_operator()
+        && first
+            .parent()
+            .and_then(|parent| parent.binary_parts())
+            .is_some_and(|parts| parts.left.start_position().row < row)
+    {
+        return 1;
+    }
+
     // (b) The first token starts a clause body whose keyword is on an earlier row
     // (`then\n  f(x)`, `else\n  c`, `do\n  body`).
     if is_clause_body_first_token(first, row) {
-        return 1;
+        let inline_conditional = enclosing_clause_owner(first).is_some_and(|owner| {
+            !(control_statement_is_standalone(owner, line_leads)
+                || owner.is::<IfStatement>() && if_statement_is_else_if(owner))
+        });
+        return 1 + usize::from(inline_conditional);
     }
 
     // (c) The first token is an `else`/`then` keyword whose controlling `if` is
@@ -1192,19 +1279,11 @@ fn is_right_operand_first_token(
 ) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
-        let right_field = if parent.binary_operator().is_some() {
-            Some("right")
-        } else if parent.is::<LambdaExpression>() {
-            Some("body")
-        } else {
-            None
-        };
-        if let Some((operator, right)) = right_field.and_then(|right_field| {
-            Some((
-                parent.child_by_field_name("operator")?,
-                parent.child_by_field_name(right_field)?,
-            ))
-        }) {
+        let right = parent
+            .binary_parts()
+            .map(|parts| parts.right)
+            .or_else(|| parent.lambda_body());
+        if let Some((operator, right)) = parent.operator_node().zip(right) {
             let assignment_conditional = parent.is_assignment() && right.is::<IfStatement>();
             // Chained assignments share a value, so their heads align rather
             // than looking like successively nested bodies.
@@ -1236,11 +1315,14 @@ fn is_clause_body_first_token(node: LayoutNode<'_>, row: usize) -> bool {
             }
         }
         if parent.is::<LoopBody>() {
-            for (keyword, field) in [
-                (direct_keyword::<Token![list]>(parent), "listed_value"),
-                (direct_keyword::<Token![do]>(parent), "ignored_value"),
+            for (keyword, body) in [
+                (
+                    direct_keyword::<Token![list]>(parent),
+                    parent.listed_value(),
+                ),
+                (direct_keyword::<Token![do]>(parent), parent.ignored_value()),
             ] {
-                let Some((keyword, body)) = keyword.zip(parent.child_by_field_name(field)) else {
+                let Some((keyword, body)) = keyword.zip(body) else {
                     continue;
                 };
                 if body.start_byte() == node.start_byte() && keyword.start_position().row < row {
@@ -1249,8 +1331,7 @@ fn is_clause_body_first_token(node: LayoutNode<'_>, row: usize) -> bool {
             }
         }
         if parent.is_except_clause() {
-            let clause_body =
-                direct_keyword::<Token![do]>(parent).zip(parent.child_by_field_name("value"));
+            let clause_body = direct_keyword::<Token![do]>(parent).zip(parent.clause_value());
             if let Some((keyword, body)) = clause_body {
                 if body.start_byte() == node.start_byte() && keyword.start_position().row < row {
                     return true;
@@ -1267,9 +1348,8 @@ fn is_clause_body_first_token(node: LayoutNode<'_>, row: usize) -> bool {
 ///   * A proper clause keyword inside an `if` or `try`: a continuation only when
 ///     its owner is not standalone (a standalone owner aligns the clause through
 ///     bracket depth instead).
-///   * An orphaned keyword that tree-sitter, recovering a line-broken ternary,
-///     demotes to a leading `symbol` with no enclosing `if` — always the
-///     continuation of the ternary begun on an earlier line.
+///   * A retained clause keyword without an enclosing conditional owner:
+///     a continuation of the expression begun on an earlier line.
 fn is_dangling_clause_keyword(node: LayoutNode<'_>, row: usize, line_leads: &[usize]) -> bool {
     if !is_clause_keyword_leaf(node) {
         return false;
@@ -1430,6 +1510,18 @@ fn collect_format_edits(
     }
 
     if !node.is_error() {
+        if let Some(parts) = node.method_installation_head() {
+            let start = parts.left.end_byte();
+            let end = parts.right.start_byte();
+            if text[start..end].bytes().all(|b| matches!(b, b' ' | b'\t')) {
+                edits.push(FormatEdit {
+                    start_byte: start,
+                    end_byte: end,
+                    replacement: " ".to_string(),
+                });
+            }
+        }
+
         if node.is_comma() {
             push_comma_whitespace_edits(text, node, edits);
         }
@@ -1440,7 +1532,7 @@ fn collect_format_edits(
             push_semicolon_whitespace_edits(text, node, break_after_semicolon, edits);
         }
 
-        if let Some(operator) = node.child_by_field_name("operator") {
+        if let Some(operator) = node.operator_node() {
             if is_parenthesized_call(node) {
                 // A call `f(...)` that is the head of a `:=` install reads as
                 // installation syntax, so it is spaced (`f (Types) := …`); an
@@ -1466,7 +1558,10 @@ fn collect_format_edits(
                         }
                     }
                     OperatorSpacing::Prefix => {
-                        push_prefix_operator_whitespace_edits(text, operator, edits)
+                        push_prefix_operator_whitespace_edits(text, operator, edits, "")
+                    }
+                    OperatorSpacing::SpacedPrefix => {
+                        push_prefix_operator_whitespace_edits(text, operator, edits, " ")
                     }
                     OperatorSpacing::None => {}
                 }
@@ -1497,6 +1592,8 @@ enum OperatorSpacing {
     Factor,
     /// Unary prefix form (`-x`, `#x`): collapse only the trailing space.
     Prefix,
+    /// Unary prefix form read as a command (`<< x`): exactly one trailing space.
+    SpacedPrefix,
     /// Not a spacing-relevant operator; leave its surrounding whitespace as-is.
     None,
 }
@@ -1590,6 +1687,9 @@ fn binary_operator_spacing(operator: &str) -> OperatorSpacing {
 }
 
 fn prefix_operator_spacing(operator: &str) -> OperatorSpacing {
+    if matches_token::<Token![<<]>(operator) {
+        return OperatorSpacing::SpacedPrefix;
+    }
     if matches_tokens!(
         operator,
         Token![+],
@@ -1601,7 +1701,6 @@ fn prefix_operator_spacing(operator: &str) -> OperatorSpacing {
         Token![>],
         Token![>=],
         Token![?],
-        Token![<<],
         Token![|-],
         Token![<===],
         Token![<==],
@@ -1617,10 +1716,10 @@ fn prefix_operator_spacing(operator: &str) -> OperatorSpacing {
 /// in which case spacing (`a * b`) would visually break a tight product such as
 /// `2*x*y`. Otherwise a space is required to separate the operands.
 fn binary_operator_all_factors(node: LayoutNode<'_>) -> bool {
-    let Some(left) = node.child_by_field_name("left") else {
+    let Some(left) = node.binary_parts().map(|parts| parts.left) else {
         return false;
     };
-    let Some(right) = node.child_by_field_name("right") else {
+    let Some(right) = node.binary_parts().map(|parts| parts.right) else {
         return false;
     };
     is_adjacent_factor(left) && is_adjacent_factor(right)
@@ -1641,15 +1740,34 @@ fn is_spaced_line_final_operator(operator: &str, compact_factor_operators: bool)
     }
 }
 
+/// Whether a line break beside the binary `operator` goes before it, so the
+/// operator starts the continuation row (`a\n+ b`) rather than ending the
+/// previous one. Macaulay2 ends an expression at a newline whenever the text
+/// so far is complete, so a leading operator only continues the expression
+/// inside brackets, where a newline is always whitespace; elsewhere the break
+/// stays after the operator. Bindings (`:=`, `=`, `=>`) keep their value on
+/// the next row and so always end the line.
+fn breaks_before_operator(operator: LayoutNode<'_>, compact_factor_operators: bool) -> bool {
+    let Some(expression) = operator.parent() else {
+        return false;
+    };
+    expression.binary_operator().is_some()
+        && !expression.is_assignment()
+        && !expression.is_option_assignment()
+        && is_spaced_line_final_operator(operator.text(), compact_factor_operators)
+        && std::iter::successors(expression.parent(), |node| node.parent())
+            .any(|node| node.is_delimited_expression())
+}
+
 fn is_parenthesized_call(node: LayoutNode<'_>) -> bool {
     if node.binary_operator().is_none() {
         return false;
     }
 
-    let Some(operator) = node.child_by_field_name("operator") else {
+    let Some(operator) = node.operator_node() else {
         return false;
     };
-    let Some(right) = node.child_by_field_name("right") else {
+    let Some(right) = node.binary_parts().map(|parts| parts.right) else {
         return false;
     };
 
@@ -1668,15 +1786,18 @@ fn is_method_installation_call_head(node: LayoutNode<'_>) -> bool {
     if parent.binary_operator().is_none() {
         return false;
     }
-    let Some(operator) = parent.child_by_field_name("operator") else {
+    let Some(operator) = parent.operator_node() else {
         return false;
     };
     if !operator.is::<Token![:=]>() {
         return false;
     }
-    parent.child_by_field_name("left").is_some_and(|left| {
-        left.start_byte() == node.start_byte() && left.end_byte() == node.end_byte()
-    })
+    parent
+        .binary_parts()
+        .map(|parts| parts.left)
+        .is_some_and(|left| {
+            left.start_byte() == node.start_byte() && left.end_byte() == node.end_byte()
+        })
 }
 
 fn push_call_gap_whitespace_edit(
@@ -1685,10 +1806,10 @@ fn push_call_gap_whitespace_edit(
     edits: &mut Vec<FormatEdit>,
     replacement: &'static str,
 ) {
-    let Some(left) = node.child_by_field_name("left") else {
+    let Some(left) = node.binary_parts().map(|parts| parts.left) else {
         return;
     };
-    let Some(right) = node.child_by_field_name("right") else {
+    let Some(right) = node.binary_parts().map(|parts| parts.right) else {
         return;
     };
     let gap = &text[left.end_byte()..right.start_byte()];
@@ -1764,6 +1885,7 @@ fn push_prefix_operator_whitespace_edits(
     text: &str,
     operator: LayoutNode<'_>,
     edits: &mut Vec<FormatEdit>,
+    separator: &str,
 ) {
     let Some(end_byte) = same_line_horizontal_whitespace_end(text, operator.end_byte()) else {
         return;
@@ -1772,7 +1894,7 @@ fn push_prefix_operator_whitespace_edits(
     edits.push(FormatEdit {
         start_byte: operator.end_byte(),
         end_byte,
-        replacement: String::new(),
+        replacement: separator.to_string(),
     });
 }
 
@@ -1870,7 +1992,7 @@ fn same_line_horizontal_whitespace_end(text: &str, byte_index: usize) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node_metadata::M2Parser;
+    use crate::node_metadata::SyntaxParser;
 
     // Exact-output fixtures specify a fixed style, independent of user defaults.
     fn fixture_options(tab_size: u32, insert_spaces: bool) -> FormatOptions {
@@ -1886,14 +2008,14 @@ mod tests {
     }
 
     fn format_fixture_with_options(text: &str, options: &FormatOptions) -> String {
-        let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
         let tree = parser.parse_tree(text, None).expect("fixture should parse");
         let root = tree.root(text);
         format_document_with_options(root, options)
     }
 
     fn fold_fixture(text: &str) -> Vec<FormatFoldRange> {
-        let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
         let tree = parser.parse_tree(text, None).expect("fixture should parse");
         folding_ranges_for_syntax(tree.root(text))
     }
@@ -1905,7 +2027,7 @@ mod tests {
     #[test]
     fn layout_edits_keep_the_supplied_syntax_and_token_contents() {
         let input = "  x:= f (\"λ 😀  \",1+2)  \r\n";
-        let mut parser = M2Parser::new().unwrap();
+        let mut parser = SyntaxParser::new().unwrap();
         let tree = parser.parse_tree(input, None).unwrap();
         let root = tree.root(input);
         let mut source = LayoutSource::new(root);
@@ -1929,7 +2051,7 @@ mod tests {
     #[test]
     fn layout_rejects_edits_inside_literal_whitespace() {
         let input = "x = \"a  b\"\n";
-        let mut parser = M2Parser::new().unwrap();
+        let mut parser = SyntaxParser::new().unwrap();
         let tree = parser.parse_tree(input, None).unwrap();
         let mut source = LayoutSource::new(tree.root(input));
         assert!(!source.apply(vec![FormatEdit {
@@ -2051,7 +2173,7 @@ mod tests {
 
     #[test]
     fn marks_comment_folds_for_lsp_clients() {
-        let mut parser = M2Parser::new().unwrap();
+        let mut parser = SyntaxParser::new().unwrap();
         let text = "-- first\n-- second\n";
         let tree = parser.parse_tree(text, None).unwrap();
         let root = tree.root(text);
@@ -2167,8 +2289,48 @@ mod tests {
     }
 
     #[test]
+    fn spaces_prefix_print_operator() {
+        assert_eq!(format_fixture("<<\"x\"\n"), "<< \"x\"\n");
+        assert_eq!(format_fixture("f = () -> (<<   x)\n"), "f = () -> (<< x)\n");
+    }
+
+    #[test]
+    fn operators_lead_continuation_rows_inside_brackets() {
+        for (input, expected) in [
+            ("(a and\nb)\n", "(a\n        and b)\n"),
+            ("f(a <<\n  b)\n", "f(a\n        << b)\n"),
+            // Outside brackets a leading operator would end the expression.
+            ("a <<\nb\n", "a <<\n    b\n"),
+            // Bindings keep their value on the next row.
+            ("(x :=\ny)\n", "(x :=\n        y)\n"),
+            ("{x =>\ny}\n", "{x =>\n        y}\n"),
+        ] {
+            let formatted = format_fixture(input);
+            assert_eq!(formatted, expected);
+            assert_eq!(format_fixture(&formatted), formatted);
+        }
+    }
+
+    #[test]
+    fn wraps_long_lines_before_operators_inside_brackets() {
+        let options = FormatOptions {
+            max_line_width: Some(30),
+            soft_line_width: Some(30),
+            ..fixture_options(4, true)
+        };
+        assert_eq!(
+            format_fixture_with_options("x = (alpha + beta + gamma + delta)\n", &options),
+            "x = (alpha + beta + gamma\n        + delta)\n"
+        );
+        assert_eq!(
+            format_fixture_with_options("stdio << alpha << beta << gamma\n", &options),
+            "stdio << alpha << beta <<\n    gamma\n"
+        );
+    }
+
+    #[test]
     fn aligns_chained_method_installations() {
-        let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
         for (input, expected) in [
             (
                 "plainText Option    :=\n    plainText Nothing := x -> \"\"\n",
@@ -2212,7 +2374,7 @@ mod tests {
         );
         assert_eq!(
             format_fixture_with_options("f := (a +\nb +\nc)\n", &options),
-            "f := (a +\n      b +\n      c)\n"
+            "f := (a\n      + b\n      + c)\n"
         );
         assert_eq!(
             format_fixture_with_options("-----\ntop = 1\n", &options),
@@ -2347,7 +2509,7 @@ mod tests {
             max_line_width: Some(24),
             ..fixture_options(4, true)
         };
-        let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
 
         for source in [
             "result = concatenate(alpha, beta, gamma)\n",
@@ -2496,7 +2658,7 @@ mod tests {
     #[test]
     fn preserves_literal_and_comment_bytes_with_mixed_line_endings() {
         fn protected_text(text: &str) -> Vec<String> {
-            let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+            let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
             let tree = parser.parse_tree(text, None).expect("source should parse");
             let root = tree.root(text);
             assert!(!root.has_error(), "source should parse:\n{text}");
@@ -2589,6 +2751,44 @@ mod tests {
         assert!(formatted.contains("randomPlanePoints = (delta, R) -> ("));
         assert!(formatted.contains("random(source gens Ip2, R^{-d})"));
         assert!(formatted.contains("SyzygyLimit => 60"));
+    }
+
+    #[test]
+    fn indents_inline_conditional_bodies_deeper_than_else() {
+        let input = concat!(
+            "(\n",
+            "    resolved := if opts.ResolveLink === null then\n",
+            "        resolveDocumentationLink(link, {}, \"markdown\", \"\")\n",
+            "        else opts.ResolveLink link;\n",
+            ")\n",
+        );
+        for insert_spaces in [true, false] {
+            let options = fixture_options(4, insert_spaces);
+            let indent = options.indent.clone();
+            let expected = format!(
+                "(\n{indent}resolved := if opts.ResolveLink === null then\n\
+                 {indent}{indent}{indent}resolveDocumentationLink(link, {{}}, \"markdown\", \"\")\n\
+                 {indent}{indent}else opts.ResolveLink link;\n)\n"
+            );
+            let formatted = format_fixture_with_options(input, &options);
+            assert_eq!(formatted, expected);
+            assert_eq!(format_fixture_with_options(&formatted, &options), formatted);
+
+            let multiline = FormatOptions {
+                control_flow_layout: ControlFlowLayout::Multiline,
+                ..options
+            };
+            let expected = expected.replace(
+                "else opts.ResolveLink link;",
+                &format!("else\n{indent}{indent}{indent}opts.ResolveLink link;"),
+            );
+            let formatted = format_fixture_with_options(input, &multiline);
+            assert_eq!(formatted, expected);
+            assert_eq!(
+                format_fixture_with_options(&formatted, &multiline),
+                formatted
+            );
+        }
     }
 
     #[test]
@@ -2756,7 +2956,7 @@ mod tests {
             control_flow_layout: ControlFlowLayout::Multiline,
             ..fixture_options(4, true)
         };
-        let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
 
         for (source, clause) in [
             ("value := (\nif ready then (\nwork\n)\n)\n", "then ("),

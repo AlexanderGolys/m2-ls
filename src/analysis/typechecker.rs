@@ -1,5 +1,6 @@
 //! Transient static type inference for a completed semantic snapshot.
 
+use crate::node_metadata::TypedSource;
 use std::cell::RefCell;
 use std::ops::Deref;
 
@@ -73,10 +74,10 @@ struct ResolvedDispatchDomain {
 
 enum TypeSubstitution<'tree> {
     Exact(ObjectName),
-    Follow(M2Node<'tree>),
+    Follow(SyntaxNode<'tree>),
     Union(Vec<Self>),
-    Symbol(M2Node<'tree>),
-    Dispatch(M2Node<'tree>),
+    Symbol(SyntaxNode<'tree>),
+    Dispatch(SyntaxNode<'tree>),
     Unknown,
 }
 
@@ -84,8 +85,8 @@ enum TypeSubstitution<'tree> {
 #[derive(Debug, Clone, Copy)]
 pub struct OperatorTypeQuery<'tree> {
     pub operator: &'tree str,
-    pub left: M2Node<'tree>,
-    pub right: Option<M2Node<'tree>>,
+    pub left: SyntaxNode<'tree>,
+    pub right: Option<SyntaxNode<'tree>>,
     pub scope_idx: usize,
 }
 
@@ -110,11 +111,11 @@ impl<Knowledge: ?Sized> Deref for TypeChecker<'_, '_, Knowledge> {
 impl Analysis {
     pub fn for_each_expression_type<'tree>(
         &self,
-        root: M2Node<'tree>,
-        syntax: Option<&SourceFile>,
+        root: SyntaxNode<'tree>,
+        syntax: Option<&TypedSource>,
         source: &(impl SourceNavigation + ?Sized),
         knowledge_provider: &(impl PositionedTypeKnowledge + ?Sized),
-        mut visit: impl FnMut(M2Node<'tree>, InferredType),
+        mut visit: impl FnMut(SyntaxNode<'tree>, InferredType),
     ) {
         let checker = TypeChecker::new(self, knowledge_provider);
         let mut nodes = Vec::new();
@@ -148,53 +149,8 @@ impl Analysis {
             })
     }
 
-    pub(super) fn enrich_types_cst(
-        &mut self,
-        node: M2Node,
-        source: &(impl SourceNavigation + ?Sized),
-        current_scope_idx: usize,
-        assignment_scope_idx: usize,
-        knowledge_provider: &(impl PositionedTypeKnowledge + ?Sized),
-    ) {
-        let knowledge = knowledge_provider.at_position(source.position_for_node(node));
-        let _ = self.record_install_method_call(node, source, &knowledge);
-        self.enrich_package_declaration(node, source);
-        let mut next_scope_idx = current_scope_idx;
-        let mut next_assignment_scope_idx = assignment_scope_idx;
-
-        if node.is::<LambdaExpression>() {
-            next_scope_idx = self.registry.scopes.owned_by(node, source);
-            next_assignment_scope_idx = next_scope_idx;
-            self.enrich_lambda_node(node, source);
-        } else if node.is::<ForLoop>() {
-            next_scope_idx = self.registry.scopes.owned_by(node, source);
-        } else if node.is_assignment() {
-            self.enrich_assignment_node(node, None, source, current_scope_idx, knowledge_provider);
-        }
-
-        for child in node.children() {
-            let (child_scope_idx, child_assignment_scope_idx) =
-                match control_flow_scope(node, child) {
-                    Some(scope_kind) => {
-                        let scope_idx = self.registry.scopes.owned_by(child, source);
-                        let assignment_scope_idx =
-                            scope_kind.assignment_scope(scope_idx, next_assignment_scope_idx);
-                        (scope_idx, assignment_scope_idx)
-                    }
-                    None => (next_scope_idx, next_assignment_scope_idx),
-                };
-            self.enrich_types_cst(
-                child,
-                source,
-                child_scope_idx,
-                child_assignment_scope_idx,
-                knowledge_provider,
-            );
-        }
-    }
-
-    fn enrich_lambda_node(&mut self, node: M2Node, source: &(impl SourceNavigation + ?Sized)) {
-        if let Some(parameters) = node.child_by_field_name("parameters") {
+    fn enrich_lambda_node(&mut self, node: SyntaxNode, source: &(impl SourceNavigation + ?Sized)) {
+        if let Some(parameters) = node.lambda_parameters() {
             let parameter_types = self.argument_lambda_domain(node, source).cloned();
             self.enrich_parameters(parameters, source, parameter_types.as_deref());
         }
@@ -202,7 +158,7 @@ impl Analysis {
 
     fn enrich_assignment_node(
         &mut self,
-        node: M2Node,
+        node: SyntaxNode,
         syntax: Option<&Assignment>,
         source: &(impl SourceNavigation + ?Sized),
         scope_idx: usize,
@@ -291,24 +247,23 @@ impl Analysis {
 
     pub(super) fn enrich_types_typed(
         &mut self,
-        syntax: &SourceFile,
-        root: M2Node,
+        syntax: &TypedSource,
+        root: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         knowledge_provider: &(impl PositionedTypeKnowledge + ?Sized),
     ) {
-        TypedTypeEnricher {
+        syntax.visit(&mut TypedTypeEnricher {
             analysis: self,
             root,
             source,
             knowledge_provider,
-        }
-        .visit_source_file(syntax);
+        });
     }
 }
 
 struct TypedTypeEnricher<'analysis, 'tree, 'source, 'knowledge, Source: ?Sized, Knowledge: ?Sized> {
     analysis: &'analysis mut Analysis,
-    root: M2Node<'tree>,
+    root: SyntaxNode<'tree>,
     source: &'source Source,
     knowledge_provider: &'knowledge Knowledge,
 }
@@ -318,7 +273,7 @@ where
     Source: SourceNavigation + ?Sized,
     Knowledge: PositionedTypeKnowledge + ?Sized,
 {
-    fn record_install_method_call(&mut self, node: M2Node) {
+    fn record_install_method_call(&mut self, node: SyntaxNode) {
         let knowledge = self
             .knowledge_provider
             .at_position(self.source.position_for_node(node));
@@ -334,7 +289,7 @@ where
     Knowledge: PositionedTypeKnowledge + ?Sized,
 {
     fn visit_expr_assign(&mut self, node: &'ast Assignment) {
-        if let Some(assignment) = self.root.descendant_for_syntax(node) {
+        if let Some(assignment) = self.root.related(node) {
             let scope_idx = self
                 .analysis
                 .find_scope_at(self.source.position_for_node(assignment))
@@ -351,14 +306,14 @@ where
     }
 
     fn visit_expr_lambda(&mut self, node: &'ast LambdaExpression) {
-        if let Some(lambda) = self.root.descendant_for_syntax(node) {
+        if let Some(lambda) = self.root.related(node) {
             self.analysis.enrich_lambda_node(lambda, self.source);
         }
         visit::visit_expr_lambda(self, node);
     }
 
     fn visit_expr_op_bin_adj(&mut self, node: &'ast AdjacentExpr) {
-        if let Some(call) = self.root.descendant_for_syntax(node) {
+        if let Some(call) = self.root.related(node) {
             self.record_install_method_call(call);
             self.analysis.enrich_package_declaration(call, self.source);
         }
@@ -549,7 +504,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
 
     pub fn type_of(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         scope_idx: usize,
     ) -> InferredType {
@@ -572,7 +527,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
     }
 }
 
-fn type_substitution(node: M2Node<'_>) -> TypeSubstitution<'_> {
+fn type_substitution(node: SyntaxNode<'_>) -> TypeSubstitution<'_> {
     use TypeSubstitution::{Dispatch, Exact, Follow, Symbol, Union, Unknown};
 
     let exact = |name| Exact(ObjectName::new(name));
@@ -598,7 +553,8 @@ fn type_substitution(node: M2Node<'_>) -> TypeSubstitution<'_> {
         node if node.is::<QuoteExpression>() => exact("Symbol"),
         node if node.is::<m2_syn::nodes::Symbol>() => Symbol(node),
         node if node.is_assignment() => node
-            .child_by_field_name("right")
+            .binary_parts()
+            .map(|parts| parts.right)
             .map(Follow)
             .unwrap_or(Unknown),
         node if node.is::<OptionExpression>() => exact("Option"),
@@ -610,7 +566,7 @@ fn type_substitution(node: M2Node<'_>) -> TypeSubstitution<'_> {
             Dispatch(node)
         }
         node if node.is::<NewStatement>() => node
-            .child_by_field_name("type")
+            .new_class()
             .filter(|type_node| type_node.is::<m2_syn::nodes::Symbol>())
             .map(|type_node| Exact(ObjectName::new(type_node.text())))
             .unwrap_or(Unknown),
@@ -626,7 +582,7 @@ fn type_substitution(node: M2Node<'_>) -> TypeSubstitution<'_> {
             Union(vec![then_value, else_value])
         }
         node if node.is::<TryStatement>() => {
-            let body = node.child_by_field_name("value");
+            let body = node.clause_value();
             let success = clause_of::<ThenClause>(node)
                 .and_then(clause_value)
                 .or(body)
@@ -642,7 +598,7 @@ fn type_substitution(node: M2Node<'_>) -> TypeSubstitution<'_> {
             let lists = node
                 .named_children()
                 .find(|child| child.is::<LoopBody>())
-                .and_then(|body| body.child_by_field_name("listed_value"))
+                .and_then(|body| body.listed_value())
                 .is_some();
             if lists {
                 exact("List")
@@ -724,7 +680,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
     /// unbound name evaluates to its own `Symbol` in M2).
     fn symbol_type(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -757,7 +713,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
 
     fn output_reference_type(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         reference: OutputReference,
         source: &(impl SourceNavigation + ?Sized),
     ) -> InferredType {
@@ -777,7 +733,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
     /// through the M2 type table.
     fn binary_expression_type(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -787,8 +743,8 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         }
 
         let operator = node.binary_operator();
-        let left = node.child_by_field_name("left");
-        let right = node.child_by_field_name("right");
+        let left = node.binary_parts().map(|parts| parts.left);
+        let right = node.binary_parts().map(|parts| parts.right);
 
         if let Some(operator) = operator {
             if let Some(result) =
@@ -824,8 +780,8 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
     fn special_operator_type(
         &self,
         operator: &str,
-        left: Option<M2Node>,
-        right: Option<M2Node>,
+        left: Option<SyntaxNode>,
+        right: Option<SyntaxNode>,
         source: &(impl SourceNavigation + ?Sized),
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -864,12 +820,12 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
     /// (`Ring × Array → PolynomialRing`).
     fn application_type(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> InferredType {
-        let Some(argument_node) = node.child_by_field_name("right") else {
+        let Some(argument_node) = node.binary_parts().map(|parts| parts.right) else {
             return InferredType::unknown();
         };
         self.application_type_for_argument(node, argument_node, source, scope_idx, knowledge)
@@ -880,13 +836,13 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
     /// trailing operator for every callable.
     fn application_type_for_argument(
         &self,
-        node: M2Node,
-        argument_node: M2Node,
+        node: SyntaxNode,
+        argument_node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> InferredType {
-        let Some(callable_node) = node.child_by_field_name("left") else {
+        let Some(callable_node) = node.binary_parts().map(|parts| parts.left) else {
             return InferredType::unknown();
         };
         if let Some(result) = self.application_with_trailing_operator_type(
@@ -995,8 +951,8 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
     /// around the argument's operator expression keep their original meaning.
     fn application_with_trailing_operator_type(
         &self,
-        application: M2Node,
-        argument: M2Node,
+        application: SyntaxNode,
+        argument: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -1005,7 +961,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         if argument.is_space_application() {
             return None;
         }
-        let left = argument.child_by_field_name("left")?;
+        let left = argument.binary_parts().map(|parts| parts.left)?;
         let applied_type = if left.is_collection_expression() || left.is_holder() {
             self.application_type_for_argument(application, left, source, scope_idx, knowledge)
         } else {
@@ -1017,7 +973,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
                 knowledge,
             )?
         };
-        let right = argument.child_by_field_name("right")?;
+        let right = argument.binary_parts().map(|parts| parts.right)?;
         let right_type = self.type_of(right, source, scope_idx);
         Some(self.dispatch_codomain(
             knowledge,
@@ -1034,15 +990,14 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
     /// A prefix/postfix operator's type: `typicalValue(op, operand)`.
     fn unary_operator_type(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> InferredType {
-        let (Some(operator), Some(operand)) = (
-            Operator::from_expression(node),
-            node.child_by_field_name("operand"),
-        ) else {
+        let (Some(operator), Some(operand)) =
+            (Operator::from_expression(node), node.unary_operand())
+        else {
             return InferredType::unknown();
         };
         let operand_type = self.type_of(operand, source, scope_idx);
@@ -1168,7 +1123,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
 
     pub fn infer_call_facts(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -1178,7 +1133,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
 
     fn infer_call_facts_for_callable(
         &self,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         scope_idx: usize,
         callable: Option<&str>,

@@ -30,8 +30,9 @@
 pub mod catalog;
 mod checks;
 pub mod rewrites;
+pub mod suppression;
 
-pub use checks::collect;
+pub use checks::{collect, DiagnosticInputs};
 
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location,
@@ -90,6 +91,11 @@ impl<'de> serde::Deserialize<'de> for DiagnosticCode {
 }
 
 impl DiagnosticCode {
+    /// The code as written, such as `S02`.
+    pub fn as_str(self) -> &'static str {
+        self.0
+    }
+
     /// The code of a diagnostic a client sends back with a code-action
     /// request; `None` for diagnostics another server published.
     pub fn from_lsp(diagnostic: &Diagnostic) -> Option<Self> {
@@ -208,6 +214,7 @@ pub fn visible_diagnostics(
         .diagnostics()
         .iter()
         .filter(|diagnostic| settings.allows(diagnostic.rule.code))
+        .filter(|diagnostic| !document.diagnostic_suppressions().suppresses(diagnostic))
         .map(|diagnostic| {
             let mut published = diagnostic.to_lsp(uri);
             published.severity = published
@@ -225,9 +232,10 @@ pub async fn publish_diagnostics(
     uri: Url,
     document: &DocumentSnapshot,
     settings: &DiagnosticSettings,
+    version: Option<i32>,
 ) {
     let diagnostics = visible_diagnostics(document, &uri, settings);
-    client.publish_diagnostics(uri, diagnostics, None).await;
+    client.publish_diagnostics(uri, diagnostics, version).await;
 }
 
 #[cfg(test)]

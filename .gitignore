@@ -16,3 +16,7 @@ example-workspace/
 /*.md
 !/README.md
 !/CONTRIBUTING.md
+
+# Local diagnostic logs
+*.log
+*.log.*

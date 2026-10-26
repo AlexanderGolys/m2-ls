@@ -3,6 +3,7 @@
 use std::env;
 
 use serde_json::{json, Value};
+use tower_lsp::lsp_types::Url;
 
 use crate::support::{document_position, position, response_array, LspProcess, TestWorkspace};
 
@@ -294,7 +295,7 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
     assert!(
         hover["contents"]["value"]
             .as_str()
-            .is_some_and(|markdown| markdown.contains("Package: `JSON`")),
+            .is_some_and(|markdown| markdown.contains("package `JSON`")),
         "imported package hover should survive the entire server pipeline: {hover}"
     );
     for occurrence in [1, 5] {
@@ -307,7 +308,7 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
         assert!(
             source_hover["contents"]["value"]
                 .as_str()
-                .is_some_and(|markdown| markdown.contains("User-defined")),
+                .is_some_and(|markdown| markdown.contains("user-defined")),
             "source definitions should own toJSON before the import and after the later redefinition: {source_hover}"
         );
     }
@@ -321,7 +322,7 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
         assert!(
             reassigned_hover["contents"]["value"]
                 .as_str()
-                .is_some_and(|markdown| markdown.contains(&format!("Type: `{expected_type}`"))),
+                .is_some_and(|markdown| markdown.contains(&format!("`{expected_type}` · "))),
             "reassignment types should be source ordered: {reassigned_hover}"
         );
     }
@@ -331,8 +332,10 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
             document_position(&workspace.related_uri, json!({"line": 1, "character": 1})),
         )
         .await;
+    // The other document's own global `toJSON` is visible across the
+    // workspace, as its definition is; the package's object is not.
     assert!(
-        unimported_hover.is_null(),
+        !unimported_hover.to_string().contains("package `JSON`"),
         "loading JSON in one document must not register it in another: {unimported_hover}"
     );
 
@@ -863,7 +866,7 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
     assert!(
         changed_hover["contents"]["value"]
             .as_str()
-            .is_some_and(|markdown| markdown.contains("User-defined binding")),
+            .is_some_and(|markdown| markdown.contains("user-defined binding")),
         "incremental document updates should rebuild analysis: {changed_hover}"
     );
 
@@ -901,7 +904,7 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
     assert!(
         formerly_imported_hover["contents"]["value"]
             .as_str()
-            .is_some_and(|markdown| markdown.contains("User-defined")),
+            .is_some_and(|markdown| markdown.contains("user-defined")),
         "removing an import must rederive source-ordered object visibility: {formerly_imported_hover}"
     );
 
@@ -933,7 +936,7 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
     assert!(
         replacement_hover["contents"]["value"]
             .as_str()
-            .is_some_and(|markdown| markdown.contains("Type: `ZZ`")),
+            .is_some_and(|markdown| markdown.contains("`ZZ` · ")),
         "a full-content change must replace and reanalyze the document: {replacement_hover}"
     );
 
@@ -1035,7 +1038,7 @@ async fn package_objects_become_visible_only_after_their_source_inclusion() {
     assert!(
         after["contents"]["value"]
             .as_str()
-            .is_some_and(|markdown| markdown.contains("Package: `JSON`")),
+            .is_some_and(|markdown| markdown.contains("package `JSON`")),
         "JSON must be registered after needsPackage: {after}"
     );
 
@@ -1268,7 +1271,10 @@ struct LibraryFixture {
 
 impl LibraryFixture {
     fn new() -> Self {
-        let root = env::temp_dir().join(format!("m2-ls-library-{}", std::process::id()));
+        static NEXT_LIBRARY_ID: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let sequence = NEXT_LIBRARY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = env::temp_dir().join(format!("m2-ls-library-{}-{sequence}", std::process::id()));
         let packages = root.join("usr-dist/common/share/Macaulay2");
         std::fs::create_dir_all(packages.join("Core")).expect("Core directory");
         std::fs::create_dir_all(root.join("usr-dist/x86_64-Linux/lib/Macaulay2"))
@@ -1456,6 +1462,42 @@ async fn navigation_enters_configured_library_sources_of_loaded_packages() {
     disabled.shutdown().await;
 }
 
+/// Documentation keys name the same library objects as ordinary expressions.
+/// Method setup can create an object without assigning its name in source.
+#[tokio::test]
+async fn definition_of_documented_library_method_finds_installed_methods() {
+    let library = LibraryFixture::new();
+    let methods = "transpose Matrix := M -> M\n";
+    std::fs::write(
+        library
+            .root
+            .join("usr-dist/common/share/Macaulay2/Core/betti.m2"),
+        methods,
+    )
+    .expect("method source");
+    let source = "document { Key => transpose, \"Transpose a matrix.\" }\ntranspose matrix{{1}}\n";
+    let workspace = TestWorkspace::new(source);
+    let mut server = LspProcess::spawn().await;
+    server
+        .initialize_with_options(&workspace.root_uri(), library.sources_settings(true))
+        .await;
+    server.open_document(&workspace.uri, source).await;
+
+    for occurrence in 0..2 {
+        assert_eq!(
+            locations_at(
+                &mut server,
+                "textDocument/definition",
+                &workspace.uri,
+                position(source, "transpose", occurrence),
+            )
+            .await,
+            vec![(library.uri("Core/betti.m2"), 0)],
+        );
+    }
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn standard_only_semantic_tokens_apply_live_with_a_refresh() {
     let source = "clearAll\n";
@@ -1472,7 +1514,13 @@ async fn standard_only_semantic_tokens_apply_live_with_a_refresh() {
             .position(|token_type| token_type == name)
             .unwrap_or_else(|| panic!("the legend should offer {name}: {legend}")) as u64
     };
-    let (command_type, function_type) = (type_index("command"), type_index("function"));
+    let function_type = type_index("function");
+    let command_modifier = 1u64
+        << response_array(&legend["tokenModifiers"])
+            .iter()
+            .position(|modifier| modifier == "command")
+            .expect("command modifier");
+    assert!(!token_types.iter().any(|token_type| token_type == "command"));
 
     let clear_all_type = |tokens: &Value| response_array(&tokens["data"])[3].clone();
     let semantic_tokens_request = json!({"textDocument": {"uri": workspace.uri}});
@@ -1484,8 +1532,13 @@ async fn standard_only_semantic_tokens_apply_live_with_a_refresh() {
         .await;
     assert_eq!(
         clear_all_type(&tokens),
-        json!(command_type),
-        "the clearAll Command is a command by default"
+        json!(function_type),
+        "the clearAll Command is a function by default"
+    );
+
+    assert_ne!(
+        response_array(&tokens["data"])[4].as_u64().unwrap() & command_modifier,
+        0
     );
 
     server
@@ -1504,6 +1557,11 @@ async fn standard_only_semantic_tokens_apply_live_with_a_refresh() {
         clear_all_type(&tokens),
         json!(function_type),
         "under standardOnly the same legend carries it as a function"
+    );
+
+    assert_eq!(
+        response_array(&tokens["data"])[4].as_u64().unwrap() & command_modifier,
+        0
     );
 
     server.shutdown().await;
@@ -1547,6 +1605,107 @@ async fn an_imported_user_package_shows_only_its_exports() {
         !private.to_string().contains(&package_uri),
         "a private name of the package stays hidden: {private}"
     );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn package_documentation_reaches_hover_across_the_workspace() {
+    let source = "needsPackage \"Pkg\"\ndouble(2, Smoothing => 1)\n";
+    let workspace = TestWorkspace::new(source);
+    workspace.write_file(
+        "Pkg.m2",
+        concat!(
+            "newPackage \"Pkg\"\n",
+            "export {\"double\", \"Smoothing\"}\n",
+            "double = method(Options => {Smoothing => 0})\n",
+            "double ZZ := o -> x -> 2 * x\n",
+            "beginDocumentation()\n",
+            "load \"Pkg/doc.m2\"\n",
+        ),
+    );
+    std::fs::create_dir(
+        Url::parse(&workspace.root_uri())
+            .unwrap()
+            .to_file_path()
+            .unwrap()
+            .join("Pkg"),
+    )
+    .expect("the documentation directory should be created");
+    let documentation = concat!(
+        "doc ///\n",
+        "Key\n",
+        "  double\n",
+        "  (double, ZZ)\n",
+        "Headline\n",
+        "  doubles a number\n",
+        "Usage\n",
+        "  double x\n",
+        "Inputs\n",
+        "  x:ZZ\n",
+        "  Smoothing => ZZ\n",
+        "Outputs\n",
+        "  :ZZ -- twice x\n",
+        "///\n",
+        "doc ///\n",
+        "Key\n",
+        "  Smoothing\n",
+        "  [double, Smoothing]\n",
+        "Headline\n",
+        "  how much to smooth\n",
+        "///\n",
+    );
+    let documentation_uri = workspace.write_file("Pkg/doc.m2", documentation);
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    server.open_document(&workspace.uri, source).await;
+
+    let hover_markdown = |hover: Value| {
+        hover["contents"]["value"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    let function = hover_markdown(
+        server
+            .request(
+                "textDocument/hover",
+                document_position(&workspace.uri, position(source, "double", 0)),
+            )
+            .await,
+    );
+    for expected in [
+        "user-defined method function",
+        "doubles a number",
+        "## Usage",
+        "## Parameters\n\n- **x** — `ZZ`",
+        "## Options\n\n- **`Smoothing`** — `ZZ`",
+        "## Returns\n\n- `ZZ`, twice x",
+    ] {
+        assert!(function.contains(expected), "{expected:?} in {function}");
+    }
+    let option = hover_markdown(
+        server
+            .request(
+                "textDocument/hover",
+                document_position(&workspace.uri, position(source, "Smoothing", 0)),
+            )
+            .await,
+    );
+    assert!(option.contains("how much to smooth"), "{option}");
+
+    server
+        .open_document(&documentation_uri, documentation)
+        .await;
+    let key = hover_markdown(
+        server
+            .request(
+                "textDocument/hover",
+                document_position(&documentation_uri, position(documentation, "double", 0)),
+            )
+            .await,
+    );
+    assert!(key.contains("doubles a number"), "{key}");
 
     server.shutdown().await;
 }

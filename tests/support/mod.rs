@@ -59,11 +59,7 @@ impl LspProcess {
     pub(crate) async fn initialize(&mut self, root_uri: &str) -> Value {
         self.initialize_with_options(
             root_uri,
-            json!({
-                "inlayHints": {
-                    "expressionTypes": true
-                }
-            }),
+            json!({ "inlayHints": base_inlay_hint_settings() }),
         )
         .await
     }
@@ -317,6 +313,12 @@ impl LspProcess {
     }
 }
 
+/// The `inlayHints` settings every test server starts with: every inferred
+/// type, so the tests observe all that inference finds.
+fn base_inlay_hint_settings() -> Value {
+    json!({ "expressionTypes": true, "unknownTypes": true })
+}
+
 /// A unique on-disk workspace removed when its test finishes.
 pub(crate) struct TestWorkspace {
     root: std::path::PathBuf,
@@ -486,6 +488,19 @@ impl DocumentSession {
             .await;
     }
 
+    pub(crate) async fn save(&mut self) {
+        self.server
+            .notify(
+                "textDocument/didSave",
+                json!({"textDocument": {"uri": self.workspace.uri}}),
+            )
+            .await;
+        self.diagnostics = self
+            .server
+            .wait_for_notification("textDocument/publishDiagnostics")
+            .await;
+    }
+
     pub(crate) fn diagnostic_codes(&self) -> Vec<&str> {
         response_array(&self.diagnostics["params"]["diagnostics"])
             .iter()
@@ -501,19 +516,20 @@ impl DocumentSession {
         self.server.request(method, params).await
     }
 
-    pub(crate) async fn set_expression_type_hints(&mut self, enabled: bool) {
+    /// Apply `changes` to the `inlayHints` settings the session starts with,
+    /// and wait for the refresh it causes.
+    pub(crate) async fn set_inlay_hint_settings(&mut self, changes: Value) {
+        let mut inlay_hints = base_inlay_hint_settings();
+        for (key, value) in changes
+            .as_object()
+            .expect("inlay hint settings are an object")
+        {
+            inlay_hints[key] = value.clone();
+        }
         self.server
             .notify(
                 "workspace/didChangeConfiguration",
-                json!({
-                    "settings": {
-                        "m2-ls": {
-                            "inlayHints": {
-                                "expressionTypes": enabled
-                            }
-                        }
-                    }
-                }),
+                json!({ "settings": { "m2-ls": { "inlayHints": inlay_hints } } }),
             )
             .await;
         self.server
@@ -521,23 +537,13 @@ impl DocumentSession {
             .await;
     }
 
-    pub(crate) async fn set_all_known_type_hints(&mut self, enabled: bool) {
-        self.server
-            .notify(
-                "workspace/didChangeConfiguration",
-                json!({
-                    "settings": {
-                        "m2-ls": {
-                            "inlayHints": {
-                                "allKnownTypes": enabled
-                            }
-                        }
-                    }
-                }),
-            )
+    pub(crate) async fn set_expression_type_hints(&mut self, enabled: bool) {
+        self.set_inlay_hint_settings(json!({ "expressionTypes": enabled }))
             .await;
-        self.server
-            .wait_for_server_request("workspace/inlayHint/refresh")
+    }
+
+    pub(crate) async fn set_all_known_type_hints(&mut self, enabled: bool) {
+        self.set_inlay_hint_settings(json!({ "allKnownTypes": enabled }))
             .await;
     }
 

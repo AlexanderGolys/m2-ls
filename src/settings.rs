@@ -23,6 +23,7 @@ use serde_path_to_error::{Path, Segment};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::capabilities::formatting::ControlFlowLayout;
+use crate::capabilities::inlay_hints::CallHintPlacement;
 use crate::diagnostics::DiagnosticCode;
 
 /// The current value of a setting that requests read while the client
@@ -111,26 +112,30 @@ pub struct FormattingSettings {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct InlayHintSettings {
-    /// Argument, subexpression, and call-result types. Default `false`.
+    /// The type of every argument and subexpression, call results
+    /// included. Default `false`.
     pub expression_types: bool,
     /// Also the types that are obvious from literals. Default `false`.
     pub all_known_types: bool,
+    /// Which call results are shown when `expressionTypes` is off: `off`,
+    /// `lineEnds` (those ending a line of a longer expression), or `every`.
+    /// Default `lineEnds`.
+    pub calls: CallHintPlacement,
+    /// Also the hints that say nothing, of values only known to be a
+    /// `Thing`. Default `false`.
+    pub unknown_types: bool,
 }
 
 /// `semanticTokens.*`: the vocabulary semantic highlighting is sent in.
 ///
-/// The legend always offers every M2-specific type and modifier besides the
-/// standard ones: clients render any legend entry, even when they declare
-/// only the standard ones, so their declaration cannot tell what they style.
-/// These settings choose which entries tokens are sent as, and a change
-/// takes effect at once through a semantic-token refresh.
+/// The legend offers standard token types and both standard and custom
+/// modifiers. Changes take effect through a semantic-token refresh.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct SemanticTokenSettings {
-    /// Only LSP-standard token types and modifiers: M2-specific types are
-    /// sent as their closest standard type (`command` as `function`),
-    /// `builtin` as `defaultLibrary`, and the other M2-specific modifiers
-    /// are dropped. Default `false`.
+    /// Only LSP-standard modifiers: the Macaulay2-specific ones, such as
+    /// `command` or `algebraic`, are dropped. Token types are always
+    /// standard. Default `false`.
     pub standard_only: bool,
 }
 
@@ -359,7 +364,9 @@ mod tests {
                 },
                 "inlayHints": {
                     "expressionTypes": true,
-                    "allKnownTypes": true
+                    "allKnownTypes": true,
+                    "calls": "every",
+                    "unknownTypes": true
                 },
                 "semanticTokens": {
                     "standardOnly": true
@@ -386,6 +393,8 @@ mod tests {
             InlayHintSettings {
                 expression_types: true,
                 all_known_types: true,
+                calls: CallHintPlacement::Every,
+                unknown_types: true,
             }
         );
         assert!(settings.semantic_tokens.standard_only);

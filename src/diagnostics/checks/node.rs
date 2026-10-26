@@ -1,24 +1,21 @@
 //! The node occasion: diagnostics spawned while visiting each syntax node.
 
 use m2_syn::nodes::{
-    AngleBarList, Array, ExprIf as IfStatement, ExprLambda as LambdaExpression,
-    ExprQuote as QuoteExpression, ExprTry as TryStatement, ExprWhile as WhileLoop, List, Sequence,
-    Symbol,
+    ExprIf as IfStatement, ExprLambda as LambdaExpression, ExprQuote as QuoteExpression,
+    ExprWhile as WhileLoop, Symbol,
 };
 use m2_syn::Token;
 
 use super::{DiagnosticSink, NodeContext};
 use crate::analysis::{
     assigned_lambda, parenthesized_value, CallableHeadKind, ControlTransferTarget,
-    MethodCodomainEdit, MethodHead, TypeChecker,
+    MethodCodomainEdit, MethodHead, OptionDeclaration, TypeChecker,
 };
 use crate::diagnostics::rewrites::{
-    ambiguous_float_member_access_rewrite, coalescence_rewrite, else_if_chain_rewrite,
-    if_condition_rewrite, if_null_branch_rewrite, redundant_control_parentheses_inner,
-    simplification_of, try_statement_rewrite, Coalescence,
+    ambiguous_float_member_access_rewrite, coalescence_rewrite, simplification_of, Coalescence,
 };
 use crate::diagnostics::{catalog, Finding};
-use crate::node_metadata::{matches_token, M2Node};
+use crate::node_metadata::{matches_token, SyntaxNode};
 use crate::object_registry::{ObjectKnowledge, ObjectName};
 use crate::source::SourceNavigation;
 use crate::typesystem::{SubtypeEvidence, TypeKnowledge, TypeRole};
@@ -32,9 +29,7 @@ pub(super) fn spawn(context: &NodeContext, sink: &mut DiagnosticSink) {
     colon_equal_part_assignment(context, sink);
     parallel_assignment(context, sink);
     option_key_convention(context, sink);
-    redundant_control_parentheses(context, sink);
     prefer_coalescence(context, sink);
-    simplifiable_expression(context, sink);
     ring_variable_naming(context, sink);
     install_needs_colon_equals(context, sink);
     protect_computed_symbol(context, sink);
@@ -46,14 +41,26 @@ pub(super) fn spawn(context: &NodeContext, sink: &mut DiagnosticSink) {
 
 fn syntax_error(context: &NodeContext, sink: &mut DiagnosticSink) {
     let node = context.node;
-    if node.is_error() && !node.is_recoverable_control_transfer_error() {
-        sink.spawn(
-            &catalog::SYNTAX_ERROR,
-            Finding::new(
-                context.source.remainder_of_line_range(node.start_byte()),
-                "Syntax error",
-            ),
-        );
+    if node.is_error() {
+        if matches!(
+            node.parse_error(),
+            Some(m2_syn::NativeParseError::InvalidAssignmentTarget { .. })
+        ) {
+            sink.spawn(
+                &catalog::MULTIPLE_ASSIGNMENT_TARGETS,
+                Finding::new(
+                    context.node_range(),
+                    "This parallel assignment contains a target that cannot be assigned",
+                ),
+            );
+            return;
+        }
+        for range in node.error_ranges() {
+            sink.spawn(
+                &catalog::SYNTAX_ERROR,
+                Finding::new(context.source.range_for_bytes(range), "Syntax error"),
+            );
+        }
     }
 }
 
@@ -99,10 +106,10 @@ fn multiple_assignment_targets(context: &NodeContext, sink: &mut DiagnosticSink)
     if !node.is_assignment() {
         return;
     }
-    let Some(left) = node.child_by_field_name("left") else {
+    let Some(left) = node.binary_parts().map(|parts| parts.left) else {
         return;
     };
-    let Some(operator) = node.child_by_field_name("operator") else {
+    let Some(operator) = node.operator_node() else {
         return;
     };
     let operator = operator.text();
@@ -142,7 +149,7 @@ fn multiple_assignment_targets(context: &NodeContext, sink: &mut DiagnosticSink)
 /// that installs nothing or a literal operand (`x + 1`) is rejected.
 fn parallel_targets_are_assignable(
     context: &NodeContext,
-    targets: M2Node,
+    targets: SyntaxNode,
     assignment: ParallelAssignment,
 ) -> bool {
     if !targets.is_collection_expression() {
@@ -161,7 +168,7 @@ fn parallel_targets_are_assignable(
 
 /// Whether `target` can receive a `:=` installation: it has an installation
 /// shape and no operand is a literal, which can never be a type.
-fn is_installation_target(context: &NodeContext, target: M2Node) -> bool {
+fn is_installation_target(context: &NodeContext, target: SyntaxNode) -> bool {
     let position = context.source.position_for_node(target);
     context
         .analysis
@@ -173,7 +180,7 @@ fn colon_equal_part_assignment(context: &NodeContext, sink: &mut DiagnosticSink)
     if !context.node.has_binary_operator::<Token![:=]>() {
         return;
     }
-    let Some(left) = context.node.child_by_field_name("left") else {
+    let Some(left) = context.node.binary_parts().map(|parts| parts.left) else {
         return;
     };
     if left.has_binary_operator::<Token![#]>() {
@@ -201,8 +208,8 @@ fn parallel_assignment(context: &NodeContext, sink: &mut DiagnosticSink) {
         return;
     }
     let (Some(targets), Some(value)) = (
-        node.child_by_field_name("left"),
-        node.child_by_field_name("right"),
+        node.binary_parts().map(|parts| parts.left),
+        node.binary_parts().map(|parts| parts.right),
     ) else {
         return;
     };
@@ -213,8 +220,8 @@ fn parallel_assignment(context: &NodeContext, sink: &mut DiagnosticSink) {
 /// nested lists of equal length.
 fn match_parallel_assignment(
     context: &NodeContext,
-    targets: M2Node,
-    value: M2Node,
+    targets: SyntaxNode,
+    value: SyntaxNode,
     sink: &mut DiagnosticSink,
 ) {
     if !targets.is_collection_expression() {
@@ -250,7 +257,7 @@ fn match_parallel_assignment(
 fn parallel_assignment_value_type(
     context: &NodeContext,
     target_count: usize,
-    value: M2Node,
+    value: SyntaxNode,
     sink: &mut DiagnosticSink,
 ) {
     if target_count < 2 {
@@ -308,7 +315,7 @@ fn option_key_convention(context: &NodeContext, sink: &mut DiagnosticSink) {
     if !node.has_binary_operator::<Token![=>]>() {
         return;
     }
-    let Some(key) = node.child_by_field_name("left") else {
+    let Some(key) = node.binary_parts().map(|parts| parts.left) else {
         return;
     };
     if !key.is::<Symbol>() {
@@ -319,44 +326,14 @@ fn option_key_convention(context: &NodeContext, sink: &mut DiagnosticSink) {
         .chars()
         .next()
         .is_some_and(|first| first.is_ascii_lowercase());
-    if !starts_lowercase || !is_function_option_context(node) {
+    if !starts_lowercase || OptionDeclaration::of_entry(node).is_none() {
         return;
     }
     sink.spawn(
         &catalog::OPTION_KEY_CONVENTION,
         Finding::new(
             context.source.range_for_node(key),
-            format!("Option key `{key_text}` should be capitalized by Macaulay2 convention"),
-        ),
-    );
-}
-
-fn is_function_option_context(option: M2Node<'_>) -> bool {
-    let mut current = option;
-    while let Some(parent) = current.parent() {
-        if parent.is::<Sequence>() {
-            return true;
-        }
-        if parent.is::<List>() || parent.is::<Array>() || parent.is::<AngleBarList>() {
-            return false;
-        }
-        current = parent;
-    }
-    false
-}
-
-fn redundant_control_parentheses(context: &NodeContext, sink: &mut DiagnosticSink) {
-    let Some(inner) = redundant_control_parentheses_inner(context.node) else {
-        return;
-    };
-    sink.spawn(
-        &catalog::REDUNDANT_CONTROL_PARENTHESES,
-        Finding::new(
-            context.node_range(),
-            format!(
-                "Parentheses around this control expression are redundant; use `{}`",
-                inner.text()
-            ),
+            format!("Option name `{key_text}` should be capitalized by Macaulay2 convention"),
         ),
     );
 }
@@ -376,30 +353,6 @@ fn prefer_coalescence(context: &NodeContext, sink: &mut DiagnosticSink) {
             format!("This conditional can be simplified to `{replacement}`"),
         ),
     );
-}
-
-fn simplifiable_expression(context: &NodeContext, sink: &mut DiagnosticSink) {
-    let node = context.node;
-    let rewrites = if node.is::<IfStatement>() {
-        [
-            if_null_branch_rewrite(node),
-            if_condition_rewrite(node),
-            else_if_chain_rewrite(node),
-        ]
-    } else if node.is::<TryStatement>() {
-        [try_statement_rewrite(node), None, None]
-    } else {
-        return;
-    };
-    let can_simplify = rewrites
-        .into_iter()
-        .any(|rewrite| simplification_of(node, rewrite).is_some());
-    if can_simplify {
-        sink.spawn(
-            &catalog::SIMPLIFIABLE_EXPRESSION,
-            Finding::new(context.node_range(), "This expression can be simplified"),
-        );
-    }
 }
 
 fn ring_variable_naming(context: &NodeContext, sink: &mut DiagnosticSink) {
@@ -484,10 +437,14 @@ fn illegal_equals_install_head(context: &NodeContext) -> Option<String> {
     if !node.has_binary_operator::<Token![=]>() {
         return None;
     }
-    if !node.child_by_field_name("right")?.is::<LambdaExpression>() {
+    if !node
+        .binary_parts()
+        .map(|parts| parts.right)?
+        .is::<LambdaExpression>()
+    {
         return None;
     }
-    let left = node.child_by_field_name("left")?;
+    let left = node.binary_parts().map(|parts| parts.left)?;
     let position = context.source.position_for_node(node);
     let (MethodHead::Function(name), _) =
         context
@@ -511,8 +468,8 @@ fn protect_computed_symbol(context: &NodeContext, sink: &mut DiagnosticSink) {
         return;
     }
     let (Some(callable), Some(argument)) = (
-        node.child_by_field_name("left"),
-        node.child_by_field_name("right"),
+        node.binary_parts().map(|parts| parts.left),
+        node.binary_parts().map(|parts| parts.right),
     ) else {
         return;
     };
@@ -590,19 +547,22 @@ fn invalid_control_transfer(context: &NodeContext, sink: &mut DiagnosticSink) {
 fn explicit_install_required(context: &NodeContext, sink: &mut DiagnosticSink) {
     let node = context.node;
     let is_classical_left_arrow_install = if node.has_binary_operator::<Token![<-]>() {
-        node.child_by_field_name("right")
+        node.binary_parts()
+            .map(|parts| parts.right)
             .filter(|right| right.has_binary_operator::<Token![:=]>())
-            .and_then(|right| right.child_by_field_name("right"))
+            .and_then(|right| right.binary_parts().map(|parts| parts.right))
             .and_then(assigned_lambda)
             .is_some()
     } else {
         node.has_binary_operator::<Token![:=]>()
             && node
-                .child_by_field_name("left")
+                .binary_parts()
+                .map(|parts| parts.left)
                 .and_then(parenthesized_value)
                 .is_some_and(|left| left.has_binary_operator::<Token![<-]>())
             && node
-                .child_by_field_name("right")
+                .binary_parts()
+                .map(|parts| parts.right)
                 .and_then(assigned_lambda)
                 .is_some()
     };
@@ -617,7 +577,7 @@ fn explicit_install_required(context: &NodeContext, sink: &mut DiagnosticSink) {
     }
     let parallel_targets = node
         .is_assignment()
-        .then(|| node.child_by_field_name("left"))
+        .then(|| node.binary_parts().map(|parts| parts.left))
         .flatten()
         .filter(|left| left.is_collection_expression());
     for target in parallel_targets.map(left_arrow_targets).unwrap_or_default() {
@@ -633,7 +593,7 @@ fn explicit_install_required(context: &NodeContext, sink: &mut DiagnosticSink) {
 }
 
 /// The `x <- y` targets of a parallel assignment, at any nesting depth.
-fn left_arrow_targets(node: M2Node<'_>) -> Vec<M2Node<'_>> {
+fn left_arrow_targets(node: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
     node.collection_elements()
         .flat_map(|target| {
             if target.has_binary_operator::<Token![<-]>() {
@@ -656,7 +616,7 @@ fn condition_type(context: &NodeContext, sink: &mut DiagnosticSink) {
     } else {
         return;
     };
-    let Some(condition) = node.child_by_field_name("condition") else {
+    let Some(condition) = node.control_condition() else {
         return;
     };
     let position = context.source.position_for_node(condition);
@@ -722,6 +682,9 @@ fn install_codomain(context: &NodeContext, sink: &mut DiagnosticSink) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostics::rewrites::{
+        else_if_chain_rewrite, if_condition_rewrite, if_null_branch_rewrite,
+    };
     use crate::document::DocumentSnapshot;
     use crate::object_registry::ObjectRegistry;
 
@@ -780,7 +743,7 @@ mod tests {
     /// the `then` conditional to the `else` position just swaps the two, and the
     /// swapped form proposes the original back, so the quick fix oscillated.
     #[test]
-    fn conditionals_in_both_branches_are_not_reported_as_flattenable() {
+    fn conditionals_in_both_branches_have_no_simplification() {
         let text = concat!(
             "f = (label, raw) -> (\n",
             "    if label == \"Token\" then {}\n",
@@ -794,10 +757,18 @@ mod tests {
             DocumentSnapshot::from_text(text.to_string(), &builtins).expect("fixture should parse");
 
         let simplifications = document
-            .diagnostics()
-            .iter()
-            .filter(|reported| reported.rule.code == catalog::SIMPLIFIABLE_EXPRESSION.code)
-            .map(|reported| &reported.finding.message)
+            .root_node()
+            .descendants()
+            .filter(|node| node.is::<IfStatement>())
+            .flat_map(|node| {
+                [
+                    if_null_branch_rewrite(node),
+                    if_condition_rewrite(node),
+                    else_if_chain_rewrite(node),
+                ]
+                .into_iter()
+                .filter_map(move |rewrite| simplification_of(node, rewrite))
+            })
             .collect::<Vec<_>>();
         assert!(
             simplifications.is_empty(),
@@ -805,10 +776,10 @@ mod tests {
         );
     }
 
-    /// A simplification diagnostic must be clearable by its own quick fix. A
-    /// condition's span reaches the `then` keyword and so carries the separating
-    /// space, which used to make `not name` compare unequal to itself and propose
-    /// the untouched line back — the warning then survived applying the action.
+    /// A simplification must change the code it rewrites. A condition's span
+    /// reaches the `then` keyword and so carries the separating space, which
+    /// used to make `not name` compare unequal to itself and propose the
+    /// untouched line back.
     #[test]
     fn simplification_is_not_reported_when_the_rewrite_changes_nothing() {
         let text = concat!(

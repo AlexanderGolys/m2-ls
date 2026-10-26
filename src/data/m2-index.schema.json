@@ -1,32 +1,52 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://macaulay2.com/fundocs/m2-index.schema.json",
+  "$id": "https://github.com/AlexanderGolys/M2Book/blob/main/m2-index.schema.json",
   "title": "Macaulay2 LSP Index",
-  "description": "Schema for ONE LINE of m2-index.jsonl, the combined reference the Macaulay2 LSP consumes (compressed typecheck corpus + per-object hover markdown). The file is JSONL: one JSON object per line, no array wrapper or comment header. The first line is a MetaRecord; every other line is a CompiledObject. Validate each line against this schema. Generated from the Markdown docs by scripts/assemble_jsonl.m2; do not edit by hand. Prose companion: docs/typecheck-schema.md.",
-  "oneOf": [ { "$ref": "#/$defs/MetaRecord" }, { "$ref": "#/$defs/CompiledObject" } ],
-
+  "description": "Schema for ONE LINE of m2-index.jsonl, the combined reference the Macaulay2 LSP consumes (compressed typecheck corpus + per-object hover markdown). The file is JSONL: one JSON object per line, no array wrapper or comment header. The first line is a MetaRecord; every other line is a CompiledObject. Validate each line against this schema. Generated from the Markdown docs by scripts/assemble_jsonl.m2; do not edit by hand.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/MetaRecord"
+    },
+    {
+      "$ref": "#/$defs/CompiledObject"
+    }
+  ],
   "$defs": {
     "MetaRecord": {
       "description": "The first line of the file. Carries the default-loaded package baseline: the packages M2 loads on a fresh `-q` start (Core plus its transitive dependencies), i.e. those usable without an explicit needsPackage. This is the LSP's 'in scope without import' baseline.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "default_loaded"],
+      "required": [
+        "kind",
+        "default_loaded"
+      ],
       "properties": {
-        "kind": { "const": "meta" },
-        "default_loaded": { "type": "array", "items": { "type": "string" } }
+        "kind": {
+          "const": "meta"
+        },
+        "default_loaded": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
       }
     },
-
     "RefKey": {
       "description": "A cross-reference to another object: a `$Package$Name` key (e.g. `$Core$ZZ`) once the target's home package is known, or a bare normalized name (no `$` prefix) when the target is not present in any extracted package. The leading `$` is deliberately invalid as an M2 identifier, so a reference key never collides with a real symbol name.",
       "type": "string"
     },
-
     "CompiledObject": {
       "description": "One documented object. Identity/resolution fields are present on every entry; the callable, operator, and type field groups appear only for the relevant kind. An absent field means not-applicable -- the corpus emits no empty placeholders.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["normalized_name", "name", "kind", "package", "class"],
+      "required": [
+        "normalized_name",
+        "name",
+        "kind",
+        "package",
+        "class"
+      ],
       "properties": {
         "normalized_name": {
           "description": "Primary resolution key, package-free (e.g. \"kernel\", \"_add_\").",
@@ -38,7 +58,16 @@
         },
         "kind": {
           "description": "Object category. Drives which optional field groups are present.",
-          "enum": ["function", "methodFunction", "operator", "type", "package", "symbol", "table", "object"]
+          "enum": [
+            "function",
+            "methodFunction",
+            "operator",
+            "type",
+            "package",
+            "symbol",
+            "table",
+            "object"
+          ]
         },
         "package": {
           "description": "Home package, as a reference to the package object (e.g. `$Core$Core`). With normalized_name this also disambiguates resolution across packages, mirroring M2's loaded-package scoping -- take refName to recover the bare package name (e.g. \"Core\").",
@@ -51,34 +80,46 @@
         "aliases": {
           "description": "Other names that resolve to this object.",
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         },
         "extra_keys": {
           "description": "Additional documentation lookup keys that resolve here.",
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         },
-
         "typical_value": {
           "description": "Function-level return type: a LOWER BOUND on the result type (the result is an instance of it or a subtype), possibly recovered from documentation. The per-method typicalValue is usually more precise. null when unknown. [callables]",
-          "oneOf": [ { "$ref": "#/$defs/RefKey" }, { "type": "null" } ]
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RefKey"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "methods": {
-          "description": "Per-domain installations -- the real call signatures. [callables]",
+          "description": "Callable signatures. For method functions and operators these are per-domain M2 installations; for a non-overloadable plain function an entry is a static signature, not an M2 method installation. [callables]",
           "type": "array",
-          "items": { "$ref": "#/$defs/CompiledMethod" }
+          "items": {
+            "$ref": "#/$defs/CompiledMethod"
+          }
         },
         "options": {
           "description": "Function-level keyword options. [callables]",
           "type": "array",
-          "items": { "$ref": "#/$defs/CompiledOption" }
+          "items": {
+            "$ref": "#/$defs/CompiledOption"
+          }
         },
-
         "operator": {
           "description": "Syntactic form metadata for parsing. [operators]",
           "$ref": "#/$defs/OperatorInfo"
         },
-
         "parent": {
           "description": "Immediate superclass. [types]",
           "$ref": "#/$defs/RefKey"
@@ -86,39 +127,89 @@
         "ancestors": {
           "description": "Transitive superclasses, for subtype checks. [types]",
           "type": "array",
-          "items": { "$ref": "#/$defs/RefKey" }
+          "items": {
+            "$ref": "#/$defs/RefKey"
+          }
         },
         "subtypes": {
           "description": "Immediate subclasses. [types]",
           "type": "array",
-          "items": { "$ref": "#/$defs/RefKey" }
+          "items": {
+            "$ref": "#/$defs/RefKey"
+          }
         },
         "instances": {
           "description": "Known instances. [types]",
           "type": "array",
-          "items": { "$ref": "#/$defs/RefKey" }
+          "items": {
+            "$ref": "#/$defs/RefKey"
+          }
         },
         "markdown": {
           "description": "Rendered hover documentation for this object (real `#` headings). Omitted when the object is undocumented -- absence means no hover, matching the corpus's 'absent = not applicable' convention.",
           "type": "string"
+        },
+        "protected": {
+          "description": "Whether the exported symbol is protected from reassignment; null when unknown.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "mutable": {
+          "description": "Result of isMutable on the exported value, independently of symbol protection; null when unknown. For a type this describes the type object itself, not its instances.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "source_location": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SourceLocation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Source lines covering the definition span when the source file is readable; null otherwise."
         }
       }
     },
-
     "CompiledMethod": {
-      "description": "A single installation: an ordered input domain and its return type. The core of type checking -- resolve a call's argument types against `domain` (walking each argument's class->parent chain), and take `typicalValue` as the result.",
+      "description": "A callable signature: an ordered input domain and its return type. It is an M2 installation for a method function or operator, but only a static signature for a non-overloadable plain function. The core of type checking -- resolve a call's argument types against `domain` (walking each argument's class->parent chain), and take `typicalValue` as the result.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["domain", "typicalValue", "exact", "options"],
+      "required": [
+        "domain",
+        "typicalValue",
+        "exact",
+        "options"
+      ],
       "properties": {
         "domain": {
           "description": "Input types in order; [] for a 0-ary or operator form.",
           "type": "array",
-          "items": { "$ref": "#/$defs/RefKey" }
+          "items": {
+            "$ref": "#/$defs/RefKey"
+          }
         },
         "typicalValue": {
           "description": "Return type, or null if unknown. Bounded by `exact`.",
-          "oneOf": [ { "$ref": "#/$defs/RefKey" }, { "type": "null" } ]
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RefKey"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "exact": {
           "description": "true: typicalValue is the EXACT return type. false (default): a LOWER BOUND -- the result is an instance of it or some subtype, so a checker must accept any subtype.",
@@ -131,16 +222,36 @@
         "options": {
           "description": "Per-installation keyword options.",
           "type": "array",
-          "items": { "$ref": "#/$defs/CompiledOption" }
+          "items": {
+            "$ref": "#/$defs/CompiledOption"
+          }
+        },
+        "source_location": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SourceLocation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Source lines covering the definition span when the source file is readable; null otherwise."
         }
       }
     },
-
     "CompiledOption": {
       "description": "A keyword option. The human-readable option description is dropped from the typecheck corpus.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["key"],
+      "required": [
+        "key"
+      ],
       "properties": {
         "key": {
           "description": "Option name (a Symbol), e.g. \"Strategy\".",
@@ -148,25 +259,43 @@
         },
         "default": {
           "description": "Default value, as a string; null when none is recorded.",
-          "oneOf": [ { "type": "string" }, { "type": "null" } ]
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "valueType": {
           "description": "Accepted value type, when known; null otherwise.",
-          "oneOf": [ { "$ref": "#/$defs/RefKey" }, { "type": "null" } ]
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RefKey"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "possibleValues": {
           "description": "Enumerated accepted values, when known; [] otherwise.",
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
-
     "OperatorInfo": {
       "description": "Syntactic shape of an operator. Read arity follows from the form: binary = 2 operands, prefix/postfix = 1. The per-domain read installations live in the object's `methods` array; the assignment form's installations are in `assignment` here.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["token", "forms"],
+      "required": [
+        "token",
+        "forms"
+      ],
       "properties": {
         "token": {
           "description": "The operator text, e.g. \"+\".",
@@ -175,14 +304,23 @@
         "forms": {
           "description": "Syntactic forms the operator supports. \"binary\"/\"prefix\"/\"postfix\" are read forms (from M2's operatorAttributes); \"assignment\" is the `x op y = z` form, present only when a genuine typed assignment installation exists (see `assignment`).",
           "type": "array",
-          "items": { "enum": ["binary", "prefix", "postfix", "assignment"] }
+          "items": {
+            "enum": [
+              "binary",
+              "prefix",
+              "postfix",
+              "assignment"
+            ]
+          }
         },
         "attributes": {
           "description": "Per-form attribute lists. The only attribute M2 exposes is \"Flexible\" (the form accepts user-installed methods).",
           "type": "object",
           "additionalProperties": {
             "type": "array",
-            "items": { "type": "string" }
+            "items": {
+              "type": "string"
+            }
           }
         },
         "assignment": {
@@ -191,17 +329,55 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["domain"],
+            "required": [
+              "domain"
+            ],
             "properties": {
               "domain": {
                 "description": "Operand types in order (the left/right of the operator), as reference keys; the assigned value's type is not part of the signature.",
                 "type": "array",
-                "items": { "$ref": "#/$defs/RefKey" }
+                "items": {
+                  "$ref": "#/$defs/RefKey"
+                }
               }
             }
           }
         }
       }
+    },
+    "SourceLocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "filename",
+        "start_row",
+        "start_col",
+        "stop_row",
+        "stop_col"
+      ],
+      "properties": {
+        "filename": {
+          "type": "string",
+          "description": "Absolute filename on the extraction machine."
+        },
+        "start_row": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "start_col": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stop_row": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "stop_col": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "description": "Definition span returned by Macaulay2 locate. Rows are one-based; columns are zero-based; the stop position is exclusive."
     }
   }
 }

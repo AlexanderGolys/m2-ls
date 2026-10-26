@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::Range as TextRange;
 use crate::analysis::{Analysis, AssignmentFactKind, BindingId, BindingView, MethodInstallationId};
 use crate::meta::BindingRole;
 use crate::node_metadata::markdown::MarkdownSyntaxParser;
-use crate::node_metadata::{M2Node, M2Parser};
+use crate::node_metadata::{SyntaxNode, SyntaxParser};
 use crate::object_registry::ObjectName;
 use crate::source::{ByteRange, SourceNavigation, SymbolMention};
 
@@ -100,12 +100,22 @@ pub struct DocumentationIndex {
     blocks: Vec<DocumentationBlock>,
     snippets: Vec<DocumentationSnippet>,
     references: Vec<SymbolMention>,
+    comment_ranges: Vec<ByteRange>,
+    example_ranges: Vec<ByteRange>,
 }
 
 impl DocumentationIndex {
     #[cfg(test)]
     pub fn blocks(&self) -> &[DocumentationBlock] {
         &self.blocks
+    }
+
+    pub fn comment_ranges(&self) -> &[ByteRange] {
+        &self.comment_ranges
+    }
+
+    pub fn example_ranges(&self) -> &[ByteRange] {
+        &self.example_ranges
     }
 
     pub fn snippets(&self) -> &[DocumentationSnippet] {
@@ -148,15 +158,15 @@ impl DocumentationIndex {
 /// explicit references.
 pub fn collect_documentation(
     source: &(impl SourceNavigation + ?Sized),
-    root: M2Node<'_>,
+    root: SyntaxNode<'_>,
     analysis: &Analysis,
 ) -> DocumentationIndex {
     let mut index = DocumentationIndex::default();
-    let mut m2_parser = M2Parser::new();
+    let mut m2_parser = SyntaxParser::new();
     let mut markdown_parser = MarkdownSyntaxParser::default();
     let comments = root
         .descendants()
-        .filter(M2Node::is_comment)
+        .filter(SyntaxNode::is_comment)
         .collect::<Vec<_>>();
 
     collect_line_documentation(
@@ -202,30 +212,34 @@ struct DocumentationText {
 }
 
 impl DocumentationText {
-    fn from_line_comments(comments: &[M2Node<'_>]) -> Self {
+    fn from_line_comments(comments: &[SyntaxNode<'_>]) -> Self {
         let mut markdown = String::new();
         let mut mappings = Vec::new();
-        for (index, comment) in comments.iter().enumerate() {
-            if index > 0 {
-                markdown.push('\n');
+        for comment in comments {
+            let mut offset = comment.start_byte();
+            for line in comment.text().split_inclusive('\n') {
+                if !markdown.is_empty() {
+                    markdown.push('\n');
+                }
+                let line_text = line.trim_end_matches(['\n', '\r']);
+                let raw = line_text
+                    .trim_start_matches([' ', '\t'])
+                    .trim_start_matches('-');
+                let content = raw.strip_prefix(' ').unwrap_or(raw);
+                let source_end = offset + line_text.len();
+                let markdown_start = markdown.len();
+                markdown.push_str(content);
+                mappings.push(DocumentationMapping {
+                    markdown: markdown_start..markdown.len(),
+                    source: source_end - content.len()..source_end,
+                });
+                offset += line.len();
             }
-            // A line comment opens with at least `--`, and a doc comment adds
-            // further dashes (`---`). Stripping a fixed `--` would leave the
-            // extra dash in the Markdown, where it reads as a list bullet.
-            let raw = comment.text().trim_start_matches('-');
-            let content = raw.strip_prefix(' ').unwrap_or(raw);
-            let source_start = comment.end_byte() - content.len();
-            let markdown_start = markdown.len();
-            markdown.push_str(content);
-            mappings.push(DocumentationMapping {
-                markdown: markdown_start..markdown.len(),
-                source: source_start..comment.end_byte(),
-            });
         }
         Self { markdown, mappings }
     }
 
-    fn from_block_comment(comment: M2Node<'_>) -> Self {
+    fn from_block_comment(comment: SyntaxNode<'_>) -> Self {
         // `-*` opens a block comment and `-**` a doc block comment, closing with
         // the mirrored `*-` / `**-`. Measuring the opening marker and mirroring
         // its width keeps a `*` that belongs to the text (`-* x**-`) while still
@@ -339,10 +353,10 @@ fn source_lines(text: &str, source_start: usize) -> Vec<SourceLine<'_>> {
 }
 
 fn collect_line_documentation(
-    comments: &[M2Node<'_>],
+    comments: &[SyntaxNode<'_>],
     source: &(impl SourceNavigation + ?Sized),
     analysis: &Analysis,
-    m2_parser: Option<&mut M2Parser>,
+    m2_parser: Option<&mut SyntaxParser>,
     markdown_parser: &mut MarkdownSyntaxParser,
     index: &mut DocumentationIndex,
 ) {
@@ -376,6 +390,11 @@ fn collect_line_documentation(
         if targets.is_empty() {
             continue;
         }
+        index.comment_ranges.extend(
+            block_comments
+                .iter()
+                .map(|comment| comment.start_byte()..comment.end_byte()),
+        );
         collect_markdown_block(
             DocumentationText::from_line_comments(block_comments),
             targets,
@@ -388,23 +407,27 @@ fn collect_line_documentation(
 }
 
 fn collect_inner_documentation(
-    comments: &[M2Node<'_>],
+    comments: &[SyntaxNode<'_>],
     source: &(impl SourceNavigation + ?Sized),
-    root: M2Node<'_>,
+    root: SyntaxNode<'_>,
     analysis: &Analysis,
-    m2_parser: Option<&mut M2Parser>,
+    m2_parser: Option<&mut SyntaxParser>,
     markdown_parser: &mut MarkdownSyntaxParser,
     index: &mut DocumentationIndex,
 ) {
     let mut m2_parser = m2_parser;
-    for comment in comments.iter().copied().filter(M2Node::is_block_comment) {
+    for comment in comments
+        .iter()
+        .copied()
+        .filter(SyntaxNode::is_block_comment)
+    {
         let Some(parent) = comment.parent() else {
             continue;
         };
         if !is_first_content(comment, parent) || following_item(comment).is_none() {
             continue;
         }
-        let target = if parent.id() == root.id() {
+        let target = if parent.id() == root.id() || parent.is_source_cell() {
             following_item(comment)
                 .is_some_and(is_new_package_declaration)
                 .then_some(DocumentationTarget::Package)
@@ -414,6 +437,9 @@ fn collect_inner_documentation(
         let Some(target) = target else {
             continue;
         };
+        index
+            .comment_ranges
+            .push(comment.start_byte()..comment.end_byte());
         collect_markdown_block(
             DocumentationText::from_block_comment(comment),
             vec![target],
@@ -429,7 +455,7 @@ fn collect_markdown_block(
     text: DocumentationText,
     targets: Vec<DocumentationTarget>,
     source: &(impl SourceNavigation + ?Sized),
-    m2_parser: Option<&mut M2Parser>,
+    m2_parser: Option<&mut SyntaxParser>,
     markdown_parser: &mut MarkdownSyntaxParser,
     index: &mut DocumentationIndex,
 ) {
@@ -448,6 +474,9 @@ fn collect_markdown_block(
     });
 
     for range in code_ranges {
+        index
+            .example_ranges
+            .extend(text.source_ranges(range.clone()));
         index.snippets.extend(
             text.source_ranges(range)
                 .into_iter()
@@ -483,7 +512,7 @@ fn collect_mapped_m2_references(
     text: &DocumentationText,
     target: ByteRange,
     source: &(impl SourceNavigation + ?Sized),
-    parser: &mut M2Parser,
+    parser: &mut SyntaxParser,
     index: &mut DocumentationIndex,
 ) {
     let candidate = &text.markdown[target.clone()];
@@ -501,9 +530,9 @@ fn collect_mapped_m2_references(
 }
 
 fn collect_legacy_backtick_snippets(
-    node: M2Node<'_>,
+    node: SyntaxNode<'_>,
     source: &(impl SourceNavigation + ?Sized),
-    parser: &mut M2Parser,
+    parser: &mut SyntaxParser,
     index: &mut DocumentationIndex,
 ) {
     let container = node.text();
@@ -549,14 +578,14 @@ fn collect_legacy_backtick_snippets(
 }
 
 fn targets_for_item(
-    item: M2Node<'_>,
+    item: SyntaxNode<'_>,
     source: &(impl SourceNavigation + ?Sized),
     analysis: &Analysis,
 ) -> Vec<DocumentationTarget> {
-    let Some(assignment) = first_item_expression(item).filter(M2Node::is_assignment) else {
+    let Some(assignment) = first_item_expression(item).filter(SyntaxNode::is_assignment) else {
         return Vec::new();
     };
-    let Some(target) = assignment.child_by_field_name("left") else {
+    let Some(target) = assignment.binary_parts().map(|parts| parts.left) else {
         return Vec::new();
     };
     let assignment_range = source.range_for_node(assignment);
@@ -601,7 +630,7 @@ fn targets_for_item(
     targets
 }
 
-fn first_item_expression(mut item: M2Node<'_>) -> Option<M2Node<'_>> {
+fn first_item_expression(mut item: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     while item.is_source_cell() {
         let next = {
             let mut children = item.named_children();
@@ -612,7 +641,7 @@ fn first_item_expression(mut item: M2Node<'_>) -> Option<M2Node<'_>> {
     Some(item)
 }
 
-fn is_new_package_declaration(item: M2Node<'_>) -> bool {
+fn is_new_package_declaration(item: SyntaxNode<'_>) -> bool {
     let Some(application) = first_item_expression(item) else {
         return false;
     };
@@ -620,7 +649,8 @@ fn is_new_package_declaration(item: M2Node<'_>) -> bool {
         return false;
     }
     application
-        .child_by_field_name("left")
+        .binary_parts()
+        .map(|parts| parts.left)
         .is_some_and(|callee| callee.is::<Symbol>() && callee.text() == "newPackage")
 }
 
@@ -628,7 +658,7 @@ fn range_contains(outer: TextRange, inner: TextRange) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 
-fn following_item(comment: M2Node<'_>) -> Option<M2Node<'_>> {
+fn following_item(comment: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     let parent = comment.parent()?;
     let mut found = false;
     for sibling in parent.named_children() {
@@ -640,7 +670,7 @@ fn following_item(comment: M2Node<'_>) -> Option<M2Node<'_>> {
     None
 }
 
-fn is_first_content(comment: M2Node<'_>, parent: M2Node<'_>) -> bool {
+fn is_first_content(comment: SyntaxNode<'_>, parent: SyntaxNode<'_>) -> bool {
     parent
         .named_children()
         .take_while(|child| child.id() != comment.id())
@@ -648,8 +678,8 @@ fn is_first_content(comment: M2Node<'_>, parent: M2Node<'_>) -> bool {
 }
 
 fn enclosing_scope_target(
-    comment: M2Node<'_>,
-    parent: M2Node<'_>,
+    comment: SyntaxNode<'_>,
+    parent: SyntaxNode<'_>,
     source: &(impl SourceNavigation + ?Sized),
     analysis: &Analysis,
 ) -> Option<DocumentationTarget> {
@@ -660,7 +690,7 @@ fn enclosing_scope_target(
         };
         let owns_parent = owner.id() == parent.id()
             || owner
-                .child_by_field_name("body")
+                .lambda_body()
                 .is_some_and(|body| body.id() == parent.id());
         if owns_parent {
             return analysis
@@ -681,7 +711,7 @@ fn enclosing_scope_target(
     None
 }
 
-fn takes_full_line(comment: M2Node<'_>, source: &str) -> bool {
+fn takes_full_line(comment: SyntaxNode<'_>, source: &str) -> bool {
     let column = comment.start_position().column;
     comment
         .start_byte()
@@ -689,7 +719,7 @@ fn takes_full_line(comment: M2Node<'_>, source: &str) -> bool {
         .is_some_and(|line_start| source[line_start..comment.start_byte()].trim().is_empty())
 }
 
-fn same_parent(left: M2Node<'_>, right: M2Node<'_>) -> bool {
+fn same_parent(left: SyntaxNode<'_>, right: SyntaxNode<'_>) -> bool {
     left.parent()
         .zip(right.parent())
         .is_some_and(|(left, right)| left.id() == right.id())

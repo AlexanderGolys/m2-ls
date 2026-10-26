@@ -128,9 +128,55 @@ Every setting is optional and applies without a restart. Send them under the
 | `formatting.breakAfterSemicolon` | See source | Starts the next statement on a new line. |
 | `inlayHints.expressionTypes` | `false` | Adds argument, subexpression, and call-result types. |
 | `inlayHints.allKnownTypes` | `false` | Also shows types that are obvious from literals. |
-| `semanticTokens.standardOnly` | `false` | Sends only LSP-standard token types and modifiers, for themes that style nothing else: `command` as `function`, `builtin` as `defaultLibrary`, and no `option`, `file`, or `unresolved`. |
+| `inlayHints.calls` | `lineEnds` | Call results shown without `expressionTypes`: `off`, `lineEnds` (calls ending a line of a longer expression, like a chain broken across lines), or `every`. |
+| `inlayHints.unknownTypes` | `false` | Also shows hints that say nothing, of values only known to be a `Thing`. |
+| `semanticTokens.standardOnly` | `false` | Drops the custom semantic token modifiers. Token types are always LSP-standard. |
 | `sources.enabled` | `true` | Lets navigation enter the Macaulay2 library source. |
 | `sources.paths` | `[]` | Extra places to find it: an `M2` executable, an installation prefix (a build tree's `usr-dist` included), or a directory to add to Macaulay2's `path`. |
+
+A comment can also silence rules in the source itself, for the whole file or
+for the next line; the quick fixes of every diagnostic write these for you.
+Without rules, a directive silences all of them.
+
+```m2
+-- m2-ls: disable unused-binding S04
+-- m2-ls: disable-next-line ring-variable-naming
+R = QQ[x0, x1]
+```
+
+Semantic tokens always use LSP-standard types. Additional distinctions are
+modifiers, so themes can inherit the standard type's styling.
+
+| Construct | Standard type | Additional modifiers |
+| --- | --- | --- |
+| Method functions (`det`, `source`, anything made by `method()`) | `method` | |
+| Other functions, scripted functors (`id`, `Ext`) | `function` | `defaultLibrary` for compiled `Core` functions |
+| Commands and manipulators (`exit`, `endl`) | `function` | `command` |
+| Ring generators | `variable` | `algebraic` |
+| SimpleDoc section keywords, `document` option names, and links (`TO`, `TOH`, `TO2`) | `decorator` | |
+| TeX delimiters and other hypertext constructors | `macro` | |
+| Styled documentation text | `string` | `strong`, `emphasis`, `monospace`, `link`, or `math` |
+| Options named by a key or link, the `Limit` of `[f, Limit]` | `property`, or `enumMember` for a protected symbol | `option` |
+
+Documentation calls, their tags and values, attached documentation comments,
+and embedded code carry the standard `documentation` modifier. Examples,
+including `CannedExample` and `EXAMPLE`, also carry `example`; `TEST` blocks
+carry `test`. Embedded code keeps its normal token types. These contexts are
+emitted even when the client also uses syntax highlighting.
+
+In Neovim, each modifier has a separate highlight group, such as
+`@lsp.typemod.function.command`, `@lsp.typemod.macro.monospace`, or
+`@lsp.typemod.variable.algebraic`. Multiple modifiers do not form a nested
+highlight name. The standard base groups continue to apply.
+
+Ring generators include `x` and `y` in `RR[x, y]`, or the whole `x_1` in
+`QQ[x_0 .. x_2]`. The indexed table `x` itself does not carry `algebraic`.
+
+Globals a package exports with `exportMutable` carry the custom modifier
+`mutable` on top of the token of what they name, in the export list and
+wherever the code uses them, so they are set apart even when they are plain
+variables. Library globals are mutable when their index record is not
+`protected`.
 
 Formatting defaults are defined in [`FormattingSettings::default()`](src/settings.rs);
 omitted settings use those values.
@@ -138,13 +184,30 @@ omitted settings use those values.
 An invalid value only affects its own setting, which keeps its default; the
 server reports what it ignored in a warning message.
 
+## Troubleshooting
+
+The server writes structured JSON lines to `/tmp/m2-ls.log`. Request errors
+include the method, request ID, document URI, and error code. Operations taking
+at least 100 ms are recorded automatically, with timing summaries every 30
+seconds of activity and at shutdown. Summaries include count, total, mean, and
+maximum wall time per operation; nested operations overlap.
+
+Set `M2_LS_LOG=1` before starting the editor to record every operation's start
+and finish, including parsing, inference, diagnostics, documentation, dependency
+indexing, and queue waits. Set it to a file path to use that path instead.
+Logs include paths and timing metadata, without document contents or full
+request parameters. The current log and one rotated backup are bounded to
+8 MiB each. Library source caches are updated on save, independently of edits
+to open buffers.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-The server source code is licensed under [MIT](LICENSE-MIT).
+The server source code is dual licensed under [MIT](LICENSE-MIT) or
+[Apache 2.0](LICENSE-APACHE), at your option.
 
 The builtin catalog `src/data/m2-index.jsonl` is derived from the Macaulay2
 documentation and is distributed under the GNU General Public License, version 2

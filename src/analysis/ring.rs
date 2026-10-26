@@ -20,7 +20,7 @@ pub enum RingGeneratorKind {
 struct RingGeneratorBinding<'tree> {
     name: String,
     kind: RingGeneratorKind,
-    node: M2Node<'tree>,
+    node: SyntaxNode<'tree>,
     indices: Option<IndexSelection>,
 }
 
@@ -48,14 +48,13 @@ enum IndexKey {
 }
 
 impl IndexKey {
-    fn from_node(node: M2Node<'_>) -> Option<Self> {
+    fn from_node(node: SyntaxNode<'_>) -> Option<Self> {
         let node = parenthesized_value(node)?;
         if node.is::<IntegerLiteral>() {
             return node.text().parse().ok().map(Self::Integer);
         }
-        if node.is_prefix_expr() && node.child_by_field_name("operator")?.text() == "-" {
-            let Self::Integer(value) = Self::from_node(node.child_by_field_name("operand")?)?
-            else {
+        if node.is_prefix_expr() && node.operator_node()?.text() == "-" {
+            let Self::Integer(value) = Self::from_node(node.unary_operand()?)? else {
                 return None;
             };
             return value.checked_neg().map(Self::Integer);
@@ -149,8 +148,8 @@ impl Analysis {
     pub fn collect_ring_generator_bindings(
         &mut self,
         ring_name: &str,
-        expression: (M2Node, Option<&Expr>),
-        rebind_node: M2Node,
+        expression: (SyntaxNode, Option<&Expr>),
+        rebind_node: SyntaxNode,
         scope_idx: usize,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -162,12 +161,16 @@ impl Analysis {
             .into_iter()
             .filter(|node| node.is_space_application())
             .filter_map(|node| {
-                let head = node.child_by_field_name("left")?;
+                let head = node.binary_parts().map(|parts| parts.left)?;
                 let variables = RingGeneratorBinding::constructor_variables(node)?;
                 TypeChecker::new(self, knowledge)
                     .type_of(head, source, scope_idx)
                     .single()
-                    .is_some_and(|head_type| knowledge.has_type_role(head_type, TypeRole::Ring))
+                    .is_some_and(|head_type| {
+                        knowledge.has_type_role(head_type, TypeRole::Ring)
+                            || knowledge
+                                .is_subtype(head_type, &ObjectName::new("InexactFieldFamily"))
+                    })
                     .then_some(variables)
             })
             .collect::<Vec<_>>();
@@ -219,15 +222,15 @@ impl Analysis {
     /// symbols and are left out, so callers see exactly the names an author typed.
     pub(crate) fn ring_constructor_symbol_variables<'tree>(
         &self,
-        node: M2Node<'tree>,
+        node: SyntaxNode<'tree>,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
         scope_idx: usize,
-    ) -> Vec<M2Node<'tree>> {
+    ) -> Vec<SyntaxNode<'tree>> {
         if !node.is_space_application() {
             return Vec::new();
         }
-        let Some(head) = node.child_by_field_name("left") else {
+        let Some(head) = node.binary_parts().map(|parts| parts.left) else {
             return Vec::new();
         };
         let Some(variables) = RingGeneratorBinding::constructor_variables(node) else {
@@ -236,7 +239,10 @@ impl Analysis {
         let constructs_a_ring = TypeChecker::new(self, knowledge)
             .type_of(head, source, scope_idx)
             .single()
-            .is_some_and(|head_type| knowledge.has_type_role(head_type, TypeRole::Ring));
+            .is_some_and(|head_type| {
+                knowledge.has_type_role(head_type, TypeRole::Ring)
+                    || knowledge.is_subtype(head_type, &ObjectName::new("InexactFieldFamily"))
+            });
         if !constructs_a_ring {
             return Vec::new();
         }
@@ -250,17 +256,51 @@ impl Analysis {
             .collect()
     }
 
-    fn ring_source_symbol<'tree>(&self, expression: M2Node<'tree>) -> Option<&'tree str> {
+    fn ring_source_symbol<'tree>(&self, expression: SyntaxNode<'tree>) -> Option<&'tree str> {
         let expression = parenthesized_value(expression).unwrap_or(expression);
         if let Some(name) = symbol_node_text(expression) {
             return Some(name);
         }
         if expression.has_binary_operator::<Token![/]>() {
             return expression
-                .child_by_field_name("left")
+                .binary_parts()
+                .map(|parts| parts.left)
                 .and_then(symbol_node_text);
         }
         None
+    }
+
+    /// Whether an indexed access selects a generator recorded by a ring constructor.
+    pub(super) fn is_indexed_ring_generator(
+        &self,
+        node: SyntaxNode<'_>,
+        source: &(impl SourceNavigation + ?Sized),
+    ) -> bool {
+        if !node.has_binary_operator::<Token![_]>() {
+            return false;
+        }
+        let Some(parts) = node.binary_parts() else {
+            return false;
+        };
+        let Some(base) = parenthesized_value(parts.left).filter(|base| base.is::<Symbol>()) else {
+            return false;
+        };
+        let Some(index) = IndexKey::from_node(parts.right) else {
+            return false;
+        };
+        let position = source.position_for_node(base);
+        self.get_binding_from_scope(
+            base.text(),
+            self.find_scope_at(position).unwrap_or(0),
+            position,
+        )
+        .and_then(|binding| binding.state.indexed_element_type.as_ref())
+        .is_some_and(|elements| {
+            elements
+                .entries
+                .iter()
+                .any(|(selection, _)| selection.contains(&index))
+        })
     }
 
     fn register_ring_generator(
@@ -269,7 +309,7 @@ impl Analysis {
         generator_name: &str,
         kind: RingGeneratorKind,
         indices: Option<IndexSelection>,
-        node: M2Node,
+        node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
     ) {
         match kind {
@@ -306,7 +346,7 @@ impl Analysis {
     fn register_dynamic_global(
         &mut self,
         name: &str,
-        node: M2Node,
+        node: SyntaxNode,
         type_name: ObjectName,
         indexed_element_type: Option<IndexedGeneratorTypes>,
         source: &(impl SourceNavigation + ?Sized),
@@ -356,24 +396,28 @@ impl Analysis {
         } else {
             (self.add_binding(fact), 0)
         };
+        let is_ring_generator = enrichment.indexed_element_type.is_none();
         self.enrich_binding_state(binding_id, state_index, enrichment);
+        self.registry.bindings[binding_id.0 as usize].states[state_index].is_ring_generator =
+            is_ring_generator;
     }
 }
 
 impl<'tree> RingGeneratorBinding<'tree> {
-    fn constructor_variables(application: M2Node<'tree>) -> Option<M2Node<'tree>> {
-        let argument = parenthesized_value(application.child_by_field_name("right")?)?;
+    fn constructor_variables(application: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
+        let argument = parenthesized_value(application.binary_parts().map(|parts| parts.right)?)?;
         let is_constructor_argument =
-            |node: &M2Node<'tree>| node.is::<Array>() || node.is::<List>();
+            |node: &SyntaxNode<'tree>| node.is::<Array>() || node.is::<List>();
         if is_constructor_argument(&argument) {
             return Some(argument);
         }
         argument
-            .child_by_field_name("left")
+            .binary_parts()
+            .map(|parts| parts.left)
             .filter(is_constructor_argument)
     }
 
-    fn collect(container: M2Node<'tree>) -> Vec<Self> {
+    fn collect(container: SyntaxNode<'tree>) -> Vec<Self> {
         let elements = container.collection_elements().collect::<Vec<_>>();
         let variable_base = elements
             .iter()
@@ -416,16 +460,17 @@ impl<'tree> RingGeneratorBinding<'tree> {
         bindings
     }
 
-    fn option_value(node: M2Node<'tree>, key: &str) -> Option<M2Node<'tree>> {
+    fn option_value(node: SyntaxNode<'tree>, key: &str) -> Option<SyntaxNode<'tree>> {
         if !node.is_option_assignment() {
             return None;
         }
-        node.child_by_field_name("left")
+        node.binary_parts()
+            .map(|parts| parts.left)
             .filter(|left| left.is::<Symbol>() && left.text() == key)?;
-        node.child_by_field_name("right")
+        node.binary_parts().map(|parts| parts.right)
     }
 
-    fn base_name(node: M2Node<'tree>) -> Option<String> {
+    fn base_name(node: SyntaxNode<'tree>) -> Option<String> {
         if node.is::<Symbol>() {
             Some(node.text().to_string())
         } else {
@@ -433,7 +478,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
         }
     }
 
-    fn collect_spec(node: M2Node<'tree>, bindings: &mut Vec<RingGeneratorBinding<'tree>>) {
+    fn collect_spec(node: SyntaxNode<'tree>, bindings: &mut Vec<RingGeneratorBinding<'tree>>) {
         let Some(node) = parenthesized_value(node) else {
             return;
         };
@@ -452,7 +497,8 @@ impl<'tree> RingGeneratorBinding<'tree> {
 
         if node.has_binary_operator::<Token![_]>() {
             if let Some(base) = node
-                .child_by_field_name("left")
+                .binary_parts()
+                .map(|parts| parts.left)
                 .and_then(parenthesized_value)
                 .filter(|base| base.is::<Symbol>())
             {
@@ -463,7 +509,8 @@ impl<'tree> RingGeneratorBinding<'tree> {
                         kind: RingGeneratorKind::IndexedTable,
                         node: base,
                         indices: node
-                            .child_by_field_name("right")
+                            .binary_parts()
+                            .map(|parts| parts.right)
                             .and_then(IndexKey::from_node)
                             .map(IndexSelection::Exact),
                     },
@@ -474,21 +521,25 @@ impl<'tree> RingGeneratorBinding<'tree> {
 
         if node.has_binary_operator::<Token![..]>() || node.has_binary_operator::<Token![..<]>() {
             let left = node
-                .child_by_field_name("left")
+                .binary_parts()
+                .map(|parts| parts.left)
                 .and_then(parenthesized_value);
             let right = node
-                .child_by_field_name("right")
+                .binary_parts()
+                .map(|parts| parts.right)
                 .and_then(parenthesized_value);
             if let (Some(left), Some(right)) = (left, right) {
                 if let (Some(left_base), Some(right_base)) =
                     (Self::indexed_base(left), Self::indexed_base(right))
                 {
                     let indices = left
-                        .child_by_field_name("right")
+                        .binary_parts()
+                        .map(|parts| parts.right)
                         .and_then(IndexKey::from_node)
                         .zip(
                             right
-                                .child_by_field_name("right")
+                                .binary_parts()
+                                .map(|parts| parts.right)
                                 .and_then(IndexKey::from_node),
                         )
                         .map(|(start, end)| IndexSelection::Range {
@@ -536,18 +587,18 @@ impl<'tree> RingGeneratorBinding<'tree> {
         }
     }
 
-    fn indexed_base(node: M2Node<'tree>) -> Option<M2Node<'tree>> {
+    fn indexed_base(node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
         let node = parenthesized_value(node)?;
         node.has_binary_operator::<Token![_]>()
-            .then(|| node.child_by_field_name("left"))
+            .then(|| node.binary_parts().map(|parts| parts.left))
             .flatten()
             .filter(|base| base.is::<Symbol>())
     }
 
     fn symbol_range(
-        range: M2Node<'tree>,
-        left: M2Node<'tree>,
-        right: M2Node<'tree>,
+        range: SyntaxNode<'tree>,
+        left: SyntaxNode<'tree>,
+        right: SyntaxNode<'tree>,
     ) -> Option<Vec<String>> {
         if !left.is::<Symbol>() || !right.is::<Symbol>() {
             return None;
@@ -660,7 +711,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
 
     fn resolved_ring_element_type(
         &self,
-        ring: M2Node<'_>,
+        ring: SyntaxNode<'_>,
         source: &(impl SourceNavigation + ?Sized),
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -710,7 +761,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
 
     fn expression_introduces_ring_identity(
         &self,
-        expression: M2Node<'_>,
+        expression: SyntaxNode<'_>,
         source: &(impl SourceNavigation + ?Sized),
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -724,7 +775,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         let introduces_identity =
             expression.is_space_application() || expression.has_binary_operator::<Token![/]>();
         let operand = introduces_identity
-            .then(|| expression.child_by_field_name("left"))
+            .then(|| expression.binary_parts().map(|parts| parts.left))
             .flatten();
         operand.is_some_and(|operand| {
             self.type_of(operand, source, scope_idx)

@@ -121,6 +121,31 @@ where
             "exit" => self.session_end.end(),
             _ => {}
         }
-        Box::pin(self.inner.call(request))
+        let mut timing = crate::telemetry::Timing::start(
+            "rpc",
+            serde_json::json!({
+                "method": request.method(), "request_id": request.id(),
+                "uri": request.params().and_then(|params| params.pointer("/textDocument/uri")),
+                "version": request.params().and_then(|params| params.pointer("/textDocument/version")),
+                "status": "cancelled",
+            }),
+        );
+        let future = self.inner.call(request);
+        Box::pin(async move {
+            let response = future.await;
+            timing.record("status", "completed");
+            match &response {
+                Ok(Some(response)) => {
+                    if let Some(error) = response.error() {
+                        timing.error(
+                            serde_json::json!({"code": error.code, "message": error.message}),
+                        );
+                    }
+                }
+                Err(_) => timing.error(serde_json::json!({"kind": "transport"})),
+                _ => {}
+            }
+            response
+        })
     }
 }

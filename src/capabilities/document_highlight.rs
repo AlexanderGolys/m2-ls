@@ -4,7 +4,7 @@ use m2_syn::nodes::{ExprFor as ForLoop, ExprLambda as LambdaExpression, ExprWhil
 
 use crate::capabilities::navigation::{reference_ranges_resolved, unbound_reference_ranges};
 use crate::document::DocumentSnapshot;
-use crate::node_metadata::M2Node;
+use crate::node_metadata::SyntaxNode;
 use crate::object_registry::ObjectName;
 use crate::source::SourceNavigation;
 use crate::typesystem::TypeKnowledge;
@@ -31,6 +31,9 @@ pub fn document_highlights(
     {
         return None;
     }
+    if let Some(highlights) = package_reference_highlights(document, position, builtins) {
+        return Some(highlights);
+    }
     if let Some(highlights) = symbol_reference_highlights(document, position) {
         return Some(highlights);
     }
@@ -46,6 +49,96 @@ pub fn document_highlights(
     keyword_sequence_highlights(document, position)
 }
 
+/// Package-name arguments refer to packages even before they are loaded.
+/// Ordinary strings and locally shadowed symbols do not share that identity.
+fn package_reference_highlights(
+    document: &DocumentSnapshot,
+    position: Position,
+    knowledge: &(impl TypeKnowledge + ?Sized),
+) -> Option<Vec<DocumentHighlight>> {
+    let name = document
+        .package_mentions()
+        .iter()
+        .find(|mention| mention.contains(position))
+        .map(|mention| mention.name(document.text()))
+        .or_else(|| {
+            let (name, _) = document.symbol_occurrence_at(position)?;
+            let is_package = document.source_binding_at(name, position).map_or_else(
+                || {
+                    document
+                        .package_mentions()
+                        .iter()
+                        .any(|mention| mention.name(document.text()) == name)
+                        || knowledge
+                            .get_record(&ObjectName::new(name))
+                            .is_some_and(|record| {
+                                knowledge.has_type_role(
+                                    &record.class,
+                                    crate::typesystem::TypeRole::Package,
+                                )
+                            })
+                },
+                |binding| {
+                    binding.state.presentation_kind == tower_lsp::lsp_types::SymbolKind::NAMESPACE
+                },
+            );
+            is_package.then_some(name)
+        })?;
+    let mut ranges = document
+        .package_mentions()
+        .iter()
+        .filter(|mention| mention.name(document.text()) == name)
+        .map(|mention| mention.range())
+        .collect::<Vec<_>>();
+    ranges.extend(
+        document
+            .root_node()
+            .binding_references()
+            .filter(|node| node.text() == name)
+            .filter(|node| {
+                document
+                    .source_binding_at(name, document.position_for_node(*node))
+                    .is_none_or(|binding| {
+                        binding.state.presentation_kind
+                            == tower_lsp::lsp_types::SymbolKind::NAMESPACE
+                    })
+            })
+            .map(|node| document.range_for_node(node)),
+    );
+    ranges.extend(
+        document
+            .symbol_mentions()
+            .iter()
+            .filter(|mention| mention.name(document.text()) == name)
+            .filter(|mention| {
+                document.mention_symbol(mention).is_none_or(|binding| {
+                    binding.state.presentation_kind == tower_lsp::lsp_types::SymbolKind::NAMESPACE
+                })
+            })
+            .map(|mention| mention.range()),
+    );
+    ranges.sort_by_key(|range| (range.start, range.end));
+    ranges.dedup();
+    (!ranges.is_empty()).then(|| {
+        ranges
+            .into_iter()
+            .map(|range| {
+                let declaration = document
+                    .source_binding_at(name, range.start)
+                    .is_some_and(|binding| binding.range == range);
+                DocumentHighlight {
+                    range,
+                    kind: Some(if declaration {
+                        DocumentHighlightKind::WRITE
+                    } else {
+                        DocumentHighlightKind::READ
+                    }),
+                }
+            })
+            .collect()
+    })
+}
+
 /// The position of the character before the semicolon under the cursor, so
 /// resting on the `;` of `x := y;` highlights what resting on `y` would.
 fn position_preceding_semicolon(
@@ -54,7 +147,7 @@ fn position_preceding_semicolon(
 ) -> Option<Position> {
     let semicolon = document
         .node_at_position_minimal(position)
-        .filter(M2Node::is_semicolon)?;
+        .filter(SyntaxNode::is_semicolon)?;
     let start = document.range_for_node(semicolon).start;
     let preceding_character = start.character.checked_sub(1)?;
     Some(Position::new(start.line, preceding_character))
@@ -148,10 +241,9 @@ fn control_transfer_highlights(
         | crate::analysis::ControlTransferTarget::DoLoop(loop_statement) => {
             statement_keyword_tokens(loop_statement)
         }
-        crate::analysis::ControlTransferTarget::Function(function) => function
-            .child_by_field_name("operator")
-            .into_iter()
-            .collect(),
+        crate::analysis::ControlTransferTarget::Function(function) => {
+            function.operator_node().into_iter().collect()
+        }
     };
     extend_control_transfer_nodes(&mut nodes, owner, document, knowledge);
 
@@ -167,7 +259,7 @@ fn control_owner_highlights(
     let mut current = cursor;
     loop {
         if current.is::<LambdaExpression>() {
-            let operator = current.child_by_field_name("operator")?;
+            let operator = current.operator_node()?;
             if operator.contains(cursor) {
                 let mut nodes = vec![operator];
                 extend_control_transfer_nodes(&mut nodes, current, document, knowledge);
@@ -188,8 +280,8 @@ fn control_owner_highlights(
 }
 
 fn extend_control_transfer_nodes<'tree>(
-    nodes: &mut Vec<M2Node<'tree>>,
-    owner: M2Node<'tree>,
+    nodes: &mut Vec<SyntaxNode<'tree>>,
+    owner: SyntaxNode<'tree>,
     document: &'tree DocumentSnapshot,
     knowledge: &(impl TypeKnowledge + ?Sized),
 ) {
@@ -207,7 +299,7 @@ fn extend_control_transfer_nodes<'tree>(
 }
 
 fn highlights_for_nodes(
-    mut nodes: Vec<M2Node<'_>>,
+    mut nodes: Vec<SyntaxNode<'_>>,
     document: &DocumentSnapshot,
 ) -> Vec<DocumentHighlight> {
     nodes.sort_by_key(|node| (node.start_byte(), node.end_byte()));
@@ -222,8 +314,8 @@ fn highlights_for_nodes(
         .collect()
 }
 
-fn enclosing_control_transfer(node: M2Node<'_>) -> Option<M2Node<'_>> {
-    node.enclosing_node(M2Node::is_control_transfer)
+fn enclosing_control_transfer(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    node.enclosing_node(SyntaxNode::is_control_transfer)
 }
 
 /// Highlight the keyword sequence of the compound statement under the cursor:
@@ -253,22 +345,22 @@ fn keyword_sequence_highlights(
     )
 }
 
-fn enclosing_keyword_statement(node: M2Node<'_>) -> Option<M2Node<'_>> {
-    node.enclosing_node(M2Node::is_keyword_statement)
+fn enclosing_keyword_statement(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    node.enclosing_node(SyntaxNode::is_keyword_statement)
 }
 
 /// Collect the keyword tokens of a compound statement: its own leading keyword
 /// plus the leading keyword of each direct clause child. Nested statements are
 /// not descended into — they own their own sequence.
-fn statement_keyword_tokens(statement: M2Node<'_>) -> Vec<M2Node<'_>> {
+fn statement_keyword_tokens(statement: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
     if statement.is_keyword_statement() {
         let mut keywords = statement
             .children()
-            .filter(M2Node::is_keyword_token)
+            .filter(SyntaxNode::is_keyword_token)
             .collect::<Vec<_>>();
         for child in statement.named_children() {
             if child.is_keyword_clause() {
-                keywords.extend(child.children().filter(M2Node::is_keyword_token));
+                keywords.extend(child.children().filter(SyntaxNode::is_keyword_token));
             }
         }
         return keywords;
@@ -378,6 +470,58 @@ mod tests {
     fn highlights_wikilink_documentation_mentions_with_code_references() {
         let text = "x := 1\n-- use [[x]]\ny := x\n";
         assert_eq!(highlighted_words(text, 1, 9), vec!["x", "x", "x"],);
+    }
+
+    #[test]
+    fn package_strings_highlight_package_references_without_strings_or_shadowed_locals() {
+        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let text = concat!(
+            "needsPackage \"Graphs\"\n",
+            "loadPackage \"Graphs\"\n",
+            "Graphs\n",
+            "ordinary = \"Graphs\"\n",
+            "f = Graphs -> Graphs\n",
+        );
+        let document = DocumentSnapshot::from_text(text.into(), &builtins).unwrap();
+        for (line, character) in [(0, 14), (1, 13), (2, 0)] {
+            let highlights =
+                document_highlights(&document, pos!(line, character), &builtins).unwrap();
+            assert_eq!(
+                highlights
+                    .iter()
+                    .map(|highlight| highlight.range.start.line)
+                    .collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+            for highlight in highlights {
+                let bytes = document.bytes_for_range(highlight.range).unwrap();
+                assert_eq!(&text[bytes], "Graphs");
+                assert_eq!(highlight.kind, Some(DocumentHighlightKind::READ));
+            }
+        }
+    }
+
+    #[test]
+    fn package_declaration_is_a_write_and_package_strings_use_utf16_ranges() {
+        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let text = "newPackage \"Pkg\"\nneedsPackage \"Pkg\"\nPkg\n";
+        let document = DocumentSnapshot::from_text(text.into(), &builtins).unwrap();
+        let highlights = document_highlights(&document, pos!(1, 14), &builtins).unwrap();
+        assert_eq!(highlights.len(), 3);
+        assert_eq!(highlights[0].kind, Some(DocumentHighlightKind::WRITE));
+        assert_eq!(highlights[1].kind, Some(DocumentHighlightKind::READ));
+
+        let text = "prefix = \"😀\"; needsPackage \"ΠPkg\"\nloadPackage ///ΠPkg///\n";
+        let document = DocumentSnapshot::from_text(text.into(), &builtins).unwrap();
+        let position = document.position_for_byte(text.find("ΠPkg").unwrap());
+        let highlights = document_highlights(&document, position, &builtins).unwrap();
+        assert_eq!(highlights.len(), 2);
+        for highlight in highlights {
+            assert_eq!(
+                &text[document.bytes_for_range(highlight.range).unwrap()],
+                "ΠPkg"
+            );
+        }
     }
 
     #[test]

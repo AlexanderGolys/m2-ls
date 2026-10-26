@@ -378,11 +378,12 @@ dependencies = [
 
 [[package]]
 name = "m2-ls"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "dashmap",
  "m2-syn",
  "ropey",
+ "self_cell",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -391,20 +392,17 @@ dependencies = [
  "tower",
  "tower-lsp",
  "tree-sitter",
- "tree-sitter-macaulay2",
  "tree-sitter-md",
 ]
 
 [[package]]
 name = "m2-syn"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44690998a7a2db8a46e09d6dcd48ac1c2447adf71a7dfd4678dc15eeb5aca471"
+checksum = "c5b61ed4ac59d35a8eaeb778c1e5d6f8af7df3212799f6500908bff1e6a17be2"
 dependencies = [
  "m2-syn-macros",
  "these-macros-should-be-illegal",
- "tree-sitter",
- "tree-sitter-macaulay2",
 ]
 
 [[package]]
@@ -576,6 +574,12 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "self_cell"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ab42ca02749e120097e328d91d415325bdf43b1c72c4c8badf37375fe40a813"
 
 [[package]]
 name = "serde"
@@ -927,16 +931,6 @@ name = "tree-sitter-language"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca0d1bf6fdd806e43ae5198f82f527056d359def39e54e67a0f478ac09dac081"
-
-[[package]]
-name = "tree-sitter-macaulay2"
-version = "6.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab54399a4af15d2644bb9d68d2832365c9eebf2e1c03aa308c379a0e243367d1"
-dependencies = [
- "cc",
- "tree-sitter",
-]
 
 [[package]]
 name = "tree-sitter-md"

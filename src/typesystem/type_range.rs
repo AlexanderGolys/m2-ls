@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::object_registry::{ObjectName, TypeId, TypeStore};
 
-use super::SubtypeEvidence;
+use super::{SubtypeEvidence, TypeRole};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TypeKey(Arc<str>);
@@ -131,6 +131,15 @@ impl TypeRange {
 
     pub fn unknown() -> Self {
         Self::upward("Thing")
+    }
+
+    /// Whether the range says nothing about the value: it reaches up to
+    /// `Thing`, which every value is.
+    pub fn is_unknown(&self) -> bool {
+        let top = TypeRole::Thing.object_name();
+        self.generators
+            .iter()
+            .any(|generator| *generator.name() == top)
     }
 
     pub fn single(&self) -> Option<&ObjectName> {

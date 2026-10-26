@@ -25,20 +25,32 @@
 //! literal `@`. Keys, `SeeAlso` and `Subnodes` entries, `SourceCode` methods,
 //! input and output types, and `Code` sections are Macaulay2 expressions
 //! evaluated in the package too. `Example` lines are code run in the session
-//! that builds the documentation, which has loaded the package.
+//! that builds the documentation, which has loaded the package. `Usage` lines
+//! and `CannedExample`s are code SimpleDoc only shows; their tokens are marked
+//! like those of the code it evaluates.
 
 use std::ops::Range;
 
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 use tower_lsp::lsp_types::Range as TextRange;
 
+/// The TeX command `TEX` turns into a hyperlink, `\url{…}`.
+const TEX_URL_COMMAND: &str = "\\url{";
+/// Source spelling of the same command inside a quoted M2 string.
+const TEX_QUOTED_URL_COMMAND: &str = "\\\\url{";
+
+/// The delimiters of TeX mathematics, display before inline, as KaTeX reads
+/// them in Macaulay2's documentation.
+const TEX_MATH_DELIMITERS: [(&str, &str); 4] =
+    [("$$", "$$"), ("\\[", "\\]"), ("\\(", "\\)"), ("$", "$")];
+
 use super::{
     hypertext::HypertextMarkdown, DocumentationCollector, DocumentationFaultKind, DocumentationKey,
     DocumentationMarkup, DocumentationMarkupKind, DocumentationNode, DocumentedSubject,
-    NodeMarkdown,
+    EvaluatedExpression, NodeMarkdown, TextStyle,
 };
-use crate::node_metadata::M2Node;
-use crate::package_index::Macaulay2Conventions;
+use crate::macaulay2::Macaulay2Conventions;
+use crate::node_metadata::SyntaxNode;
 use crate::source::{ByteRange, SourceNavigation};
 use crate::source_package::CodeFragment;
 
@@ -239,11 +251,16 @@ struct PageReading {
     has_usage: bool,
     /// The first `Inputs` or `Outputs` keyword, which needs a `Usage`.
     described_items: Option<TextRange>,
+    /// The positions in the document's markup of the marks of the page's
+    /// `Usage` lines.
+    usage_markup: Range<usize>,
+    /// The names the page's `Inputs` and `Outputs` give what they describe.
+    item_names: Vec<String>,
 }
 
 impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// Read the SimpleDoc string at `body` passed to `call`.
-    pub(super) fn read_simple_doc(&mut self, call: M2Node<'_>, body: ByteRange) {
+    pub(super) fn read_simple_doc(&mut self, call: SyntaxNode<'_>, body: ByteRange) {
         let lines = SimpleDocLine::read_all(self.source.text(), body.clone());
         let sections = self.sections(&lines, SectionContext::Page);
         let nodes = sections
@@ -252,7 +269,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             .copied()
             .collect::<Vec<_>>();
         if nodes.is_empty() {
-            let callee = call.child_by_field_name("left").map_or_else(
+            let callee = call.binary_parts().map(|parts| parts.left).map_or_else(
                 || self.source.range_for_node(call),
                 |callee| self.source.range_for_node(callee),
             );
@@ -353,6 +370,18 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         if let (Some(items), false) = (page.described_items, page.has_usage) {
             self.fault(items, DocumentationFaultKind::UsageRequired);
         }
+        // A `Usage` line writes the inputs by the names the items give them.
+        let source = self.source;
+        for markup in &mut self.documentation.markup[page.usage_markup.clone()] {
+            if markup.kind == DocumentationMarkupKind::Name
+                && page
+                    .item_names
+                    .iter()
+                    .any(|name| *name == source.text()[markup.bytes.clone()])
+            {
+                markup.kind = DocumentationMarkupKind::ItemName;
+            }
+        }
         self.documentation.nodes.push(DocumentationNode {
             range,
             keys: page.keys,
@@ -375,9 +404,11 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 for line in section.nonblank() {
                     let bytes = line.text.clone();
                     let range = self.source.range_for_bytes(bytes.clone());
-                    if let Some(subject) =
-                        self.evaluate_simple_doc_expression(bytes, DocumentedSubject::of_expression)
-                    {
+                    if let Some(subject) = self.evaluate_simple_doc_expression(
+                        bytes,
+                        EvaluatedExpression::Key,
+                        DocumentedSubject::of_expression,
+                    ) {
                         page.keys.push(DocumentationKey { range, subject });
                     }
                 }
@@ -408,6 +439,10 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                         );
                     }
                     page.markdown.headline = Some(text.to_string());
+                    self.documentation.markup.push(DocumentationMarkup {
+                        bytes: first.text.clone(),
+                        kind: DocumentationMarkupKind::Styled(TextStyle::Strong),
+                    });
                 } else {
                     page.markdown.description.push(format!("#### {text}"));
                 }
@@ -418,20 +453,25 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                     self.empty_section(keyword, keyword_range, "at least one indented line");
                     return;
                 }
-                page.markdown.usage.extend(
-                    section
-                        .nonblank()
-                        .map(|line| self.source.text()[line.text.clone()].to_string()),
-                );
+                let first_mark = self.documentation.markup.len();
+                for line in section.nonblank() {
+                    self.mark_shown_code(line.text.clone());
+                    page.markdown
+                        .usage
+                        .push(self.source.text()[line.text.clone()].to_string());
+                }
+                // A `Synopsis` may hold several `Usage` sections.
+                let start = if page.usage_markup.is_empty() {
+                    first_mark
+                } else {
+                    page.usage_markup.start
+                };
+                page.usage_markup = start..self.documentation.markup.len();
             }
             Inputs | Outputs => {
                 page.described_items.get_or_insert(keyword_range);
-                let items = self.items(section);
-                if keyword == Inputs {
-                    page.markdown.inputs.extend(items);
-                } else {
-                    page.markdown.outputs.extend(items);
-                }
+                page.item_names.extend(self.item_names(section));
+                self.read_items(section, keyword, &mut page.markdown);
             }
             Consequences => {
                 for item in self.sections(section.content, SectionContext::Consequences) {
@@ -465,6 +505,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 for line in section.nonblank() {
                     if let Some(rendered) = self.evaluate_simple_doc_expression(
                         line.text.clone(),
+                        EvaluatedExpression::Key,
                         HypertextMarkdown::link_text,
                     ) {
                         page.markdown.see_also.push(rendered);
@@ -477,12 +518,20 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             }
             SourceCode => {
                 for line in section.nonblank() {
-                    self.evaluate_simple_doc_expression(line.text.clone(), |_| ());
+                    self.evaluate_simple_doc_expression(
+                        line.text.clone(),
+                        EvaluatedExpression::Value,
+                        |_| (),
+                    );
                 }
             }
             BaseFunction => {
                 if let Some(line) = section.nonblank().next() {
-                    self.evaluate_simple_doc_expression(line.text.clone(), |_| ());
+                    self.evaluate_simple_doc_expression(
+                        line.text.clone(),
+                        EvaluatedExpression::Value,
+                        |_| (),
+                    );
                 }
             }
             Citation | ExampleFiles => {}
@@ -498,6 +547,13 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         let keyword = self
             .keyword(part)
             .expect("an accepted section starts with a keyword");
+        if let (Example | CannedExample, Some(first), Some(last)) =
+            (keyword, part.content.first(), part.content.last())
+        {
+            self.documentation
+                .example_ranges
+                .push(first.text.start..last.text.end);
+        }
         match keyword {
             Example => {
                 let fragments = part
@@ -506,20 +562,33 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                     .collect::<Vec<_>>();
                 if !fragments.is_empty() {
                     page.markdown.description.push(NodeMarkdown::fenced_code(
-                        "m2",
+                        Macaulay2Conventions::MARKDOWN_CODE_LANGUAGE,
                         &self.reassemble(part.content),
                     ));
                 }
                 page.examples.extend(fragments);
             }
-            CannedExample => page.markdown.description.push(NodeMarkdown::fenced_code(
-                "m2",
-                &self.reassemble(part.content),
-            )),
-            Pre => page.markdown.description.push(NodeMarkdown::fenced_code(
-                "",
-                &self.reassemble(part.content),
-            )),
+            CannedExample => {
+                for line in part.nonblank() {
+                    self.mark_shown_code(line.text.clone());
+                }
+                page.markdown.description.push(NodeMarkdown::fenced_code(
+                    Macaulay2Conventions::MARKDOWN_CODE_LANGUAGE,
+                    &self.reassemble(part.content),
+                ));
+            }
+            Pre => {
+                for line in part.nonblank() {
+                    self.documentation.markup.push(DocumentationMarkup {
+                        bytes: line.text.clone(),
+                        kind: DocumentationMarkupKind::Styled(TextStyle::Monospace),
+                    });
+                }
+                page.markdown.description.push(NodeMarkdown::fenced_code(
+                    "",
+                    &self.reassemble(part.content),
+                ));
+            }
             Text => {
                 let paragraphs = self.markup(part.content);
                 page.markdown.description.extend(paragraphs);
@@ -537,6 +606,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 };
                 if let Some(rendered) = self.evaluate_simple_doc_expression(
                     first.text.start..last.text.end,
+                    EvaluatedExpression::Value,
                     HypertextMarkdown::render,
                 ) {
                     page.markdown.description.push(rendered);
@@ -562,13 +632,39 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         );
     }
 
-    /// The `Inputs` or `Outputs` items of `section`, as Markdown list items.
-    /// An item's first line names it and its type around one `:` or `=>`,
-    /// optionally followed by `-- short description`; the lines indented below
-    /// describe it. The type is an expression; so is the name before `=>`,
-    /// which names an optional argument.
-    fn items(&mut self, section: &Section<'_>) -> Vec<String> {
-        let mut items = Vec::new();
+    /// The names the items of `section`, an `Inputs` or `Outputs` section,
+    /// give what they describe: the `n` of `n:ZZ`.
+    fn item_names(&self, section: &Section<'_>) -> Vec<String> {
+        SimpleDocLine::split_by_indent(section.content)
+            .into_iter()
+            .filter_map(|range| {
+                let line = &section.content[range.start];
+                let item_line = ItemLine {
+                    text: &self.source.text()[line.text.clone()],
+                    origin: line.text.start,
+                };
+                let [(separator_start, ":")] = item_line.separators()[..] else {
+                    return None;
+                };
+                let name = item_line.trimmed(0..separator_start);
+                (!name.is_empty()).then(|| self.source.text()[name].to_string())
+            })
+            .collect()
+    }
+
+    /// Read the items of `section`, an `Inputs` or `Outputs` section as
+    /// `keyword` says, into the parameters, options, or returns of
+    /// `markdown`, as Markdown list items. An item's first line names it and
+    /// its type around one `:` or `=>`, optionally followed by `-- short
+    /// description`; the lines indented below describe it. The type is an
+    /// expression; so is the name before `=>`, which names an optional
+    /// argument.
+    fn read_items(
+        &mut self,
+        section: &Section<'_>,
+        keyword: SimpleDocKeyword,
+        markdown: &mut NodeMarkdown,
+    ) {
         for range in SimpleDocLine::split_by_indent(section.content) {
             let line = &section.content[range.start];
             let item_line = ItemLine {
@@ -588,38 +684,44 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             let (type_end, abbreviation) = item_line.short_description(rest_start);
             let type_bytes = item_line.trimmed(rest_start..type_end);
 
+            let is_option = separator == "=>";
             let name = if name_bytes.is_empty() {
                 None
-            } else if separator == "=>" {
-                self.evaluate_simple_doc_expression(name_bytes, HypertextMarkdown::link_text)
+            } else if is_option {
+                self.evaluate_simple_doc_expression(
+                    name_bytes,
+                    EvaluatedExpression::Value,
+                    HypertextMarkdown::link_text,
+                )
             } else {
-                Some(format!("`{}`", &self.source.text()[name_bytes]))
+                self.documentation.markup.push(DocumentationMarkup {
+                    bytes: name_bytes.clone(),
+                    kind: DocumentationMarkupKind::ItemName,
+                });
+                Some(self.source.text()[name_bytes].to_string())
             };
             let item_type = if type_bytes.is_empty() {
                 None
             } else {
-                self.evaluate_simple_doc_expression(type_bytes, HypertextMarkdown::link_text)
+                self.evaluate_simple_doc_expression(
+                    type_bytes,
+                    EvaluatedExpression::Value,
+                    HypertextMarkdown::link_text,
+                )
             };
             let description = self
                 .markup(&section.content[range.start + 1..range.end])
                 .join(" ");
-            let summary = [abbreviation, description]
-                .into_iter()
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join("; ");
-            let head = match (name, item_type) {
-                (Some(name), Some(item_type)) => format!("{name}, {item_type}"),
-                (Some(only), None) | (None, Some(only)) => only,
-                (None, None) => String::new(),
-            };
-            items.push(if summary.is_empty() {
-                head
-            } else {
-                format!("{head} — {summary}")
-            });
+            let item = NodeMarkdown::item(
+                name.as_deref(),
+                [item_type.unwrap_or_default(), abbreviation, description],
+            );
+            match (keyword, is_option) {
+                (SimpleDocKeyword::Inputs, true) => markdown.options.push(item),
+                (SimpleDocKeyword::Inputs, false) => markdown.inputs.push(item),
+                _ => markdown.outputs.push(item),
+            }
         }
-        items
     }
 
     /// The paragraphs of a text section as Markdown. Its lines group into
@@ -629,7 +731,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         let Some(first) = lines.first() else {
             return Vec::new();
         };
-        if &self.source.text()[first.text.clone()] == SimpleDocKeyword::Tree.to_string() {
+        if self.source.text()[first.text.clone()] == SimpleDocKeyword::Tree.to_string() {
             return vec![self.menu(&lines[1..]).join("\n")];
         }
         let mut paragraphs = Vec::new();
@@ -687,8 +789,9 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         for segment in segments {
             match segment {
                 TextSegment::Prose(range) => {
+                    let prose = self.render_tex(bytes.start + range.start..bytes.start + range.end);
                     let mut previous_was_space = false;
-                    for character in text[range].replace("\\@", "@").chars() {
+                    for character in prose.replace("\\@", "@").chars() {
                         if character.is_whitespace() {
                             if !previous_was_space {
                                 markdown.push(' ');
@@ -704,13 +807,186 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                     let start = bytes.start + range.start;
                     let end = bytes.start + range.end;
                     let rendered = self
-                        .evaluate_simple_doc_expression(start..end, HypertextMarkdown::render)
+                        .evaluate_simple_doc_expression(
+                            start..end,
+                            EvaluatedExpression::Value,
+                            HypertextMarkdown::render,
+                        )
                         .unwrap_or_else(|| format!("`{}`", &self.source.text()[start..end]));
                     markdown.push_str(&rendered);
                 }
             }
         }
         markdown.trim().to_string()
+    }
+
+    /// The SimpleDoc prose at `bytes`, text before or between `@…@`
+    /// expressions, as Markdown, with the TeX markup `TEX` converts in it:
+    /// `{\bf …}`, `{\em …}`, `{\it …}`, `{\tt …}`, and `\url{…}`, whose
+    /// delimiters are marked, and the dashes `---` and `--`.
+    pub(super) fn render_tex(&mut self, bytes: ByteRange) -> String {
+        self.render_styled_tex(bytes, None)
+    }
+
+    /// The prose at `bytes` as [`Self::render_tex`] renders it, inside a
+    /// group of `style`, if any: its plain text is marked in the style,
+    /// run by run, around the markup nested in it.
+    fn render_styled_tex(&mut self, bytes: ByteRange, style: Option<TextStyle>) -> String {
+        let source = self.source;
+        let text = &source.text()[bytes.clone()];
+        let mut markdown = String::new();
+        let mut offset = 0;
+        let mut run_start = bytes.start;
+        while offset < text.len() {
+            let rest = &text[offset..];
+            let start = bytes.start + offset;
+            let markup = if let Some(length) = Self::math_length(rest) {
+                Some((length, rest[..length].to_string(), Vec::new()))
+            } else if let Some((opening, close)) = [TEX_URL_COMMAND, TEX_QUOTED_URL_COMMAND]
+                .iter()
+                .find_map(|command| {
+                    rest.starts_with(command)
+                        .then(|| Self::closing_brace(&rest[command.len() - 1..]))
+                        .flatten()
+                        .map(|close| (command.len(), command.len() - 1 + close))
+                })
+            {
+                Some((
+                    close + 1,
+                    format!("<{}>", &rest[opening..close]),
+                    vec![
+                        (start..start + opening, DocumentationMarkupKind::TextMarkup),
+                        (
+                            start + opening..start + close,
+                            DocumentationMarkupKind::Styled(TextStyle::Link),
+                        ),
+                        (
+                            start + close..start + close + 1,
+                            DocumentationMarkupKind::TextMarkup,
+                        ),
+                    ],
+                ))
+            } else if let (Some((tex_style, opening)), Some(close)) =
+                (TexStyle::opening(rest), Self::closing_brace(rest))
+            {
+                self.flush_styled_run(run_start..start, style);
+                self.mark_text_markup(start..start + opening);
+                let content = self.render_styled_tex(
+                    start + opening..start + close,
+                    Some(tex_style.text_style()),
+                );
+                self.mark_text_markup(start + close..start + close + 1);
+                markdown.push_str(&tex_style.markdown(&content));
+                offset += close + 1;
+                run_start = bytes.start + offset;
+                continue;
+            } else {
+                None
+            };
+            if let Some((length, rendered, marks)) = markup {
+                self.flush_styled_run(run_start..start, style);
+                if marks.is_empty() {
+                    self.documentation.markup.push(DocumentationMarkup {
+                        bytes: start..start + length,
+                        kind: DocumentationMarkupKind::Styled(TextStyle::Math),
+                    });
+                }
+                for (bytes, kind) in marks {
+                    self.documentation
+                        .markup
+                        .push(DocumentationMarkup { bytes, kind });
+                }
+                markdown.push_str(&rendered);
+                offset += length;
+                run_start = bytes.start + offset;
+                continue;
+            }
+            let character = rest
+                .chars()
+                .next()
+                .expect("the rest of the text is not empty");
+            markdown.push(character);
+            offset += character.len_utf8();
+        }
+        self.flush_styled_run(run_start..bytes.end, style);
+        Self::typographic_dashes(&markdown)
+    }
+
+    /// Mark the plain text at `bytes` of a group of `style`, if any.
+    fn flush_styled_run(&mut self, bytes: ByteRange, style: Option<TextStyle>) {
+        if let (Some(style), false) = (style, bytes.is_empty()) {
+            self.documentation.markup.push(DocumentationMarkup {
+                bytes,
+                kind: DocumentationMarkupKind::Styled(style),
+            });
+        }
+    }
+
+    /// The length of the TeX mathematics `text` starts with, delimiters
+    /// included: `$$…$$`, `\[…\]`, `\(…\)`, or `$…$`.
+    fn math_length(text: &str) -> Option<usize> {
+        TEX_MATH_DELIMITERS.iter().find_map(|(opening, closing)| {
+            let inner = text.strip_prefix(opening)?;
+            let close = inner.find(closing).filter(|close| *close > 0)?;
+            Some(opening.len() + close + closing.len())
+        })
+    }
+
+    /// The byte offset in `text` of the brace closing the one at its start,
+    /// nested braces balanced.
+    fn closing_brace(text: &str) -> Option<usize> {
+        let mut depth = 0usize;
+        for (offset, character) in text.char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(offset);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// `text` with `---` as an em dash and `--` between word characters as
+    /// an en dash, as `TEX` writes them.
+    fn typographic_dashes(text: &str) -> String {
+        let text = text.replace("---", "—");
+        let characters = text.chars().collect::<Vec<_>>();
+        let mut dashed = String::with_capacity(text.len());
+        let mut index = 0;
+        while index < characters.len() {
+            let is_word = |position: Option<&char>| {
+                position.is_some_and(|character| character.is_alphanumeric() || *character == '_')
+            };
+            if characters[index] == '-'
+                && characters.get(index + 1) == Some(&'-')
+                && is_word(
+                    index
+                        .checked_sub(1)
+                        .and_then(|previous| characters.get(previous)),
+                )
+                && is_word(characters.get(index + 2))
+            {
+                dashed.push('–');
+                index += 2;
+            } else {
+                dashed.push(characters[index]);
+                index += 1;
+            }
+        }
+        dashed
+    }
+
+    /// Mark the delimiter of TeX markup at `bytes`.
+    fn mark_text_markup(&mut self, bytes: ByteRange) {
+        self.documentation.markup.push(DocumentationMarkup {
+            bytes,
+            kind: DocumentationMarkupKind::TextMarkup,
+        });
     }
 
     /// The entries of a `Subnodes` or `Tree` menu as Markdown list items,
@@ -753,8 +1029,12 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         if text.starts_with('@') {
             self.render_text(bytes)
         } else {
-            self.evaluate_simple_doc_expression(bytes, HypertextMarkdown::link_text)
-                .unwrap_or_default()
+            self.evaluate_simple_doc_expression(
+                bytes,
+                EvaluatedExpression::Key,
+                HypertextMarkdown::link_text,
+            )
+            .unwrap_or_default()
         }
     }
 
@@ -776,6 +1056,57 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             .join("\n");
         text.truncate(text.trim_end().len());
         text
+    }
+}
+
+/// A style of the TeX markup `TEX` converts in SimpleDoc prose: `{\tt …}`
+/// and its kin (`convertTexTable` in Core's `hypertext.m2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString)]
+#[non_exhaustive]
+enum TexStyle {
+    #[strum(serialize = "bf")]
+    Bold,
+    #[strum(serialize = "em")]
+    Emphasis,
+    #[strum(serialize = "it")]
+    Italic,
+    #[strum(serialize = "tt")]
+    Typewriter,
+}
+
+impl TexStyle {
+    /// The style of the group `{\xx …}` starting `text`, with the length of
+    /// its opening, the brace, command, and spaces after it.
+    fn opening(text: &str) -> Option<(Self, usize)> {
+        let command = text.strip_prefix("{\\")?;
+        let (command, opening) = command
+            .strip_prefix('\\')
+            .map_or((command, 2), |command| (command, 3));
+        let name_length = command
+            .find(|character: char| !character.is_ascii_alphabetic())
+            .unwrap_or(command.len());
+        let style = command[..name_length].parse().ok()?;
+        let spaces =
+            command[name_length..].len() - command[name_length..].trim_start_matches(' ').len();
+        Some((style, opening + name_length + spaces))
+    }
+
+    /// How the style shows text.
+    fn text_style(self) -> TextStyle {
+        match self {
+            Self::Bold => TextStyle::Strong,
+            Self::Emphasis | Self::Italic => TextStyle::Emphasis,
+            Self::Typewriter => TextStyle::Monospace,
+        }
+    }
+
+    /// `content` in the style, as Markdown.
+    fn markdown(self, content: &str) -> String {
+        match self {
+            Self::Bold => format!("**{content}**"),
+            Self::Emphasis | Self::Italic => format!("*{content}*"),
+            Self::Typewriter => format!("`{content}`"),
+        }
     }
 }
 

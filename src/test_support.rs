@@ -2,7 +2,7 @@
 
 use crate::analysis::Analysis;
 use crate::builtin_index::Record;
-use crate::node_metadata::M2Node;
+use crate::node_metadata::SyntaxNode;
 use crate::object_registry::{ObjectId, ObjectKnowledge, ObjectName, TypeId, TypeStore};
 use crate::source::DocumentSource;
 use crate::typesystem::{PositionedTypeKnowledge, TypeKnowledge};
@@ -43,7 +43,7 @@ impl PositionedTypeKnowledge for NoTypeKnowledge {
 }
 
 /// Analyze one syntax fixture without external object knowledge.
-pub fn analyze(root: M2Node<'_>) -> Analysis {
+pub fn analyze(root: SyntaxNode<'_>) -> Analysis {
     let source = DocumentSource::new(root.text().to_string());
     Analysis::new_with_knowledge(root, None, &source, &NoTypeKnowledge)
 }

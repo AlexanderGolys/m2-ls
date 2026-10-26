@@ -5,17 +5,17 @@
 //! check inspects what its occasion provides and spawns the diagnostics it
 //! finds into the [`DiagnosticSink`], under whichever rules apply.
 
+use crate::node_metadata::TypedSource;
 mod document;
 mod documentation;
 mod installation;
 mod node;
 
-use m2_syn::nodes::SourceFile;
 use tower_lsp::lsp_types::Range as TextRange;
 
 use super::{DiagnosticRule, Finding, M2Diagnostic};
 use crate::analysis::{Analysis, MethodInstallation};
-use crate::node_metadata::{visit_source_nodes, M2Node};
+use crate::node_metadata::{visit_source_nodes, SyntaxNode};
 use crate::object_registry::{ObjectRegistry, ObjectRegistryView};
 use crate::package_documentation::PackageDocumentation;
 use crate::source::{DocumentSource, SourceNavigation};
@@ -25,7 +25,7 @@ use crate::source_package::SourcePackages;
 /// and the source and the type knowledge positioned at the node.
 struct NodeContext<'context, 'tree> {
     analysis: &'context Analysis,
-    node: M2Node<'tree>,
+    node: SyntaxNode<'tree>,
     source: &'context DocumentSource,
     knowledge: &'context ObjectRegistryView<'context>,
 }
@@ -42,7 +42,7 @@ struct InstallationContext<'context> {
 /// source of the document.
 struct DocumentContext<'context, 'tree> {
     analysis: &'context Analysis,
-    root: M2Node<'tree>,
+    root: SyntaxNode<'tree>,
     source: &'context DocumentSource,
 }
 
@@ -52,8 +52,8 @@ struct DocumentContext<'context, 'tree> {
 struct DocumentationContext<'context, 'tree> {
     documentation: &'context PackageDocumentation,
     packages: &'context SourcePackages,
-    root: M2Node<'tree>,
-    syntax: Option<&'context SourceFile>,
+    root: SyntaxNode<'tree>,
+    syntax: Option<&'context TypedSource>,
     source: &'context DocumentSource,
     knowledge: &'context ObjectRegistry,
 }
@@ -74,17 +74,38 @@ impl DiagnosticSink {
 /// Every diagnostic spawned for one analyzed document: on each syntax node in
 /// source order, then on each method installation, then on the whole
 /// document, then on the package documentation it writes.
-pub fn collect(
-    analysis: &Analysis,
-    root: M2Node,
-    syntax: Option<&SourceFile>,
-    source: &DocumentSource,
-    knowledge: &ObjectRegistry,
-    packages: &SourcePackages,
-    documentation: &PackageDocumentation,
-) -> Vec<M2Diagnostic> {
+/// Shared semantic inputs, all derived from the same retained syntax snapshot.
+pub struct DiagnosticInputs<'a> {
+    pub analysis: &'a Analysis,
+    pub root: SyntaxNode<'a>,
+    pub syntax: Option<&'a TypedSource>,
+    pub source: &'a DocumentSource,
+    pub knowledge: &'a ObjectRegistry,
+    pub packages: &'a SourcePackages,
+    pub documentation: &'a PackageDocumentation,
+}
+
+pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
+    let DiagnosticInputs {
+        analysis,
+        root,
+        syntax,
+        source,
+        knowledge,
+        packages,
+        documentation,
+    } = inputs;
+    // A live update re-checks everything from its first changed cell on:
+    // what follows an edit may depend on it, while the findings before it
+    // are kept by the document.
+    let first_change = root.changed_ranges().first().map(|cell| cell.start);
+    let selected =
+        |range: std::ops::Range<usize>| !live || first_change.is_none_or(|start| start < range.end);
     let mut sink = DiagnosticSink::default();
     visit_source_nodes(root, syntax, |node| {
+        if !selected(node.start_byte()..node.end_byte()) {
+            return;
+        }
         let knowledge = knowledge.at(source.position_for_node(node));
         let context = NodeContext {
             analysis,
@@ -95,6 +116,12 @@ pub fn collect(
         node::spawn(&context, &mut sink);
     });
     for installation in analysis.installations() {
+        if !source
+            .bytes_for_range(installation.span)
+            .is_some_and(&selected)
+        {
+            continue;
+        }
         let knowledge = knowledge.at(installation.span.start);
         let context = InstallationContext {
             analysis,
@@ -102,6 +129,9 @@ pub fn collect(
             knowledge: &knowledge,
         };
         installation::spawn(&context, &mut sink);
+    }
+    if live {
+        return sink.diagnostics;
     }
     let context = DocumentContext {
         analysis,

@@ -2,9 +2,9 @@
 
 use std::ops::{Deref, Range};
 
-use tree_sitter::Point;
+use crate::source::SourcePoint as Point;
 
-use crate::node_metadata::M2Node;
+use crate::node_metadata::SyntaxNode;
 use crate::source::{DocumentSource, SourceNavigation};
 
 use super::FormatEdit;
@@ -23,7 +23,7 @@ impl SourceNavigation for LayoutSource {
 }
 
 impl LayoutSource {
-    pub(super) fn new(root: M2Node<'_>) -> Self {
+    pub(super) fn new(root: SyntaxNode<'_>) -> Self {
         let text = root.source_text();
         Self {
             source: DocumentSource::new(text.to_string()),
@@ -31,7 +31,11 @@ impl LayoutSource {
             ends: (0..=text.len()).collect(),
             protected: root
                 .descendants()
-                .filter(|node| node.is_string_literal() || node.is_comment())
+                .filter(|node| {
+                    node.is_string_literal()
+                        || node.is_comment()
+                        || node.is_error() && node.syntax().is_none()
+                })
                 .map(|node| node.start_byte()..node.end_byte())
                 .collect(),
         }
@@ -119,12 +123,12 @@ impl LayoutSource {
 /// Only byte and line coordinates follow the formatter's whitespace edits.
 #[derive(Clone, Copy)]
 pub(super) struct LayoutNode<'a> {
-    syntax: M2Node<'a>,
+    syntax: SyntaxNode<'a>,
     layout: &'a LayoutSource,
 }
 
 impl<'a> Deref for LayoutNode<'a> {
-    type Target = M2Node<'a>;
+    type Target = SyntaxNode<'a>;
 
     fn deref(&self) -> &Self::Target {
         &self.syntax
@@ -132,11 +136,11 @@ impl<'a> Deref for LayoutNode<'a> {
 }
 
 impl<'a> LayoutNode<'a> {
-    pub(super) fn new(syntax: M2Node<'a>, layout: &'a LayoutSource) -> Self {
+    pub(super) fn new(syntax: SyntaxNode<'a>, layout: &'a LayoutSource) -> Self {
         Self { syntax, layout }
     }
 
-    fn wrap(&self, syntax: M2Node<'a>) -> Self {
+    fn wrap(&self, syntax: SyntaxNode<'a>) -> Self {
         Self::new(syntax, self.layout)
     }
 
@@ -176,10 +180,34 @@ impl<'a> LayoutNode<'a> {
         self.syntax.named_child(index).map(|node| self.wrap(node))
     }
 
-    pub(super) fn child_by_field_name(&self, name: &str) -> Option<Self> {
-        self.syntax
-            .child_by_field_name(name)
-            .map(|node| self.wrap(node))
+    pub(super) fn operator_node(&self) -> Option<Self> {
+        self.syntax.operator_node().map(|node| self.wrap(node))
+    }
+    pub(super) fn lambda_body(&self) -> Option<Self> {
+        self.syntax.lambda_body().map(|node| self.wrap(node))
+    }
+    pub(super) fn clause_value(&self) -> Option<Self> {
+        self.syntax.clause_value().map(|node| self.wrap(node))
+    }
+    pub(super) fn listed_value(&self) -> Option<Self> {
+        self.syntax.listed_value().map(|node| self.wrap(node))
+    }
+    pub(super) fn ignored_value(&self) -> Option<Self> {
+        self.syntax.ignored_value().map(|node| self.wrap(node))
+    }
+    pub(super) fn method_installation_head(&self) -> Option<LayoutBinaryParts<'a>> {
+        let parts = self.syntax.method_installation_head()?;
+        Some(LayoutBinaryParts {
+            left: self.wrap(parts.left),
+            right: self.wrap(parts.right),
+        })
+    }
+    pub(super) fn binary_parts(&self) -> Option<LayoutBinaryParts<'a>> {
+        let parts = self.syntax.binary_parts()?;
+        Some(LayoutBinaryParts {
+            left: self.wrap(parts.left),
+            right: self.wrap(parts.right),
+        })
     }
 
     pub(super) fn children(&self) -> impl Iterator<Item = Self> + '_ {
@@ -207,4 +235,9 @@ impl<'a> LayoutNode<'a> {
     pub(super) fn is_option_assignment(&self) -> bool {
         self.syntax.is_option_assignment()
     }
+}
+
+pub(super) struct LayoutBinaryParts<'a> {
+    pub left: LayoutNode<'a>,
+    pub right: LayoutNode<'a>,
 }

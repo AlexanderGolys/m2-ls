@@ -3,9 +3,9 @@
 use super::*;
 
 #[cfg(test)]
-mod cst_compliance_gate {
+mod native_syntax_compliance_gate {
     //! Build gate enforcing the repo rule that the rest of the crate must reach
-    //! the syntax tree only through `M2Node` and m2-syn types, never raw
+    //! the syntax tree only through `SyntaxNode` and m2-syn types, never raw
     //! tree-sitter node names or the raw source buffer. Reading raw code
     //! re-derives parser logic and is banned.
     use std::{
@@ -25,7 +25,10 @@ mod cst_compliance_gate {
             "raw node-type name is private to node_metadata; use a typed predicate",
         ),
         (".utf8_text(", "reads raw bytes; use `node.text()`"),
-        ("tree_sitter::Node", "raw node type; pass `M2Node` instead"),
+        (
+            "tree_sitter::Node",
+            "raw node type; pass `SyntaxNode` instead",
+        ),
         (
             "starts_with('\"')",
             "byte-scanning for string quotes; use `node.string_literal_inner_text()`",
@@ -38,7 +41,10 @@ mod cst_compliance_gate {
             "strip_suffix('\"')",
             "byte-stripping string quotes; use `node.string_literal_inner_text()`",
         ),
-        (".set_language(", "raw parser configuration; use `M2Parser`"),
+        (
+            ".set_language(",
+            "raw parser configuration; use `SyntaxParser`",
+        ),
     ];
 
     fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -72,9 +78,9 @@ mod cst_compliance_gate {
                 if line.trim_start().starts_with("//") {
                     continue;
                 }
-                if line.contains("Parser::new()") && !line.contains("M2Parser::new()") {
+                if line.contains("Parser::new()") && !line.contains("SyntaxParser::new()") {
                     violations.push(format!(
-                        "{}:{}: `Parser::new()` — raw parser construction; use `M2Parser`",
+                        "{}:{}: `Parser::new()` — raw parser construction; use `SyntaxParser`",
                         file.display(),
                         line_number + 1,
                     ));
@@ -93,7 +99,7 @@ mod cst_compliance_gate {
 
         assert!(
             violations.is_empty(),
-            "CST-compliance gate failed; route these through M2Node and m2-syn:\n{}",
+            "Native syntax compliance gate failed; route these through SyntaxNode and m2-syn:\n{}",
             violations.join("\n")
         );
     }
@@ -101,7 +107,7 @@ mod cst_compliance_gate {
 
 #[cfg(test)]
 mod descendants_tests {
-    //! Locks the pre-order DFS contract of `M2Node::descendants`: the contract
+    //! Locks the pre-order DFS contract of `SyntaxNode::descendants`: the contract
     //! every migrated call site relies on (parent before children, source order
     //! across siblings, root yielded exactly once, empty file safe).
     use super::*;
@@ -109,7 +115,7 @@ mod descendants_tests {
 
     #[test]
     fn descendants_visit_parent_before_children_in_source_order() {
-        let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
         let root = parser.parse("f(x, y)\n").expect("fixture should parse");
         let nodes = root.descendants().collect::<Vec<_>>();
 
@@ -136,7 +142,7 @@ mod descendants_tests {
 
     #[test]
     fn descendants_of_empty_file_yields_root_once() {
-        let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
         let root = parser.parse("").expect("fixture should parse");
         assert_eq!(
             root.descendants().count(),
@@ -147,14 +153,14 @@ mod descendants_tests {
 
     #[test]
     fn descendants_count_matches_node_count_of_tree() {
-        // direct check against tree-sitter's own traversal: the total
+        // The total
         // descendant count (root included) must match the recursive child
         // count, so the iterator neither drops nor duplicates any node.
         let text = "x = (a, b)\ny = {1, 2, 3}\n";
-        fn count_via_children(n: M2Node<'_>) -> usize {
+        fn count_via_children(n: SyntaxNode<'_>) -> usize {
             1 + n.children().map(count_via_children).sum::<usize>()
         }
-        let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
         let root = parser.parse(text).expect("fixture should parse");
         assert_eq!(root.descendants().count(), count_via_children(root));
     }
@@ -162,7 +168,7 @@ mod descendants_tests {
     #[test]
     fn grammar_exposes_muted_empty_components_and_naked_sequences() {
         let text = "local if\nstep 1\nfinish\n(x;)\n(,a,,)\na,b\n";
-        let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
         let root = parser.parse(text).expect("fixture should parse");
         let quote = root
             .descendants()
@@ -170,25 +176,25 @@ mod descendants_tests {
             .expect("`local if` is a quote expression");
         assert_eq!(
             quote
-                .child_by_field_name("symbol")
+                .quoted_symbol()
                 .expect("quote has a symbol field")
                 .text(),
             "if"
         );
         assert!(quote
-            .child_by_field_name("specifier")
+            .quote_modifier()
             .expect("quote has a specifier field")
             .is_modifier_token());
 
         assert_eq!(
-            root.descendants().filter(M2Node::is_debug_expr).count(),
+            root.descendants().filter(SyntaxNode::is_debug_expr).count(),
             2,
             "both `step` and `finish` are debug clauses"
         );
 
         let parens = root
             .descendants()
-            .find(M2Node::is_holder)
+            .find(SyntaxNode::is_holder)
             .expect("parenthesized expression is present");
         assert!(parens
             .named_children()
@@ -216,7 +222,7 @@ mod descendants_tests {
 
         let naked = root
             .descendants()
-            .find(M2Node::is_expr_pack)
+            .find(SyntaxNode::is_expr_pack)
             .expect("top-level comma expression is a naked sequence");
         assert_eq!(naked.collection_elements().count(), 2);
     }
@@ -240,7 +246,7 @@ mod application_precedence_tests {
             "(f)[x]/g",
             "(f<|x|>)/g",
         ] {
-            let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+            let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
             let root = parser.parse(source).expect("fixture should parse");
             assert!(!root.has_error(), "invalid fixture {source:?}");
             let division = root
@@ -248,7 +254,8 @@ mod application_precedence_tests {
                 .find(|node| node.binary_operator() == Some("/"))
                 .unwrap_or_else(|| panic!("missing division in {source:?}"));
             let left = division
-                .child_by_field_name("left")
+                .binary_parts()
+                .map(|parts| parts.left)
                 .expect("division has a left operand");
             let left =
                 crate::analysis::parenthesized_value(left).expect("left operand has a value");
@@ -258,7 +265,8 @@ mod application_precedence_tests {
             );
             assert!(
                 division
-                    .child_by_field_name("right")
+                    .binary_parts()
+                    .map(|parts| parts.right)
                     .is_some_and(|right| right.text() == "I" || right.text() == "g"),
                 "division must keep its RHS in {source:?}"
             );
@@ -268,12 +276,12 @@ mod application_precedence_tests {
     #[test]
     fn explicit_argument_grouping_keeps_division_inside_the_call() {
         for source in ["f([x]/g)", "f(<|x|>/g)", "R([x]/I)"] {
-            let mut parser = M2Parser::new().expect("Macaulay2 parser should load");
+            let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
             let root = parser.parse(source).expect("fixture should parse");
             assert!(!root.has_error(), "invalid fixture {source:?}");
             let application = root
                 .descendants()
-                .find(M2Node::is_space_application)
+                .find(SyntaxNode::is_space_application)
                 .expect("fixture contains application");
             assert_eq!(
                 application.text(),
@@ -281,7 +289,8 @@ mod application_precedence_tests {
                 "the call must enclose division in {source:?}"
             );
             let argument = application
-                .child_by_field_name("right")
+                .binary_parts()
+                .map(|parts| parts.right)
                 .expect("call has an argument");
             let argument =
                 crate::analysis::parenthesized_value(argument).expect("argument has a value");
@@ -292,4 +301,48 @@ mod application_precedence_tests {
             );
         }
     }
+}
+
+#[test]
+fn macaulay2_syntax_uses_only_released_native_parser_apis() {
+    use std::{fs, path::Path};
+    fn check(path: &Path) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                check(&path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            if path.ends_with("node_metadata/markdown.rs")
+                || path.ends_with("node_metadata/tests.rs")
+            {
+                continue;
+            }
+            let source = fs::read_to_string(&path).unwrap();
+            for forbidden in [
+                "tree_sitter::",
+                "tree_sitter_macaulay2",
+                "child_by_field_name",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{} contains {forbidden}",
+                    path.display()
+                );
+            }
+        }
+    }
+    check(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+    let manifest = include_str!("../../Cargo.toml");
+    assert!(!manifest.contains("tree-sitter-macaulay2"));
+    assert!(!manifest.contains("[patch."));
+    let dependency = manifest
+        .lines()
+        .find(|line| line.starts_with("m2-syn ="))
+        .unwrap();
+    assert!(!dependency.contains("path") && !dependency.contains("git"));
+    assert!(dependency.contains("default-features = false"));
 }

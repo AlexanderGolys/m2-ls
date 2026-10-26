@@ -10,7 +10,7 @@ use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString, Url};
 use crate::capabilities::formatting::{format_document_with_options, FormatOptions};
 use crate::diagnostics::visible_diagnostics;
 use crate::document::DocumentSnapshot;
-use crate::node_metadata::M2Parser;
+use crate::node_metadata::SyntaxParser;
 use crate::object_registry::ObjectRegistry;
 use crate::package_index::{InitializationFile, Macaulay2Environment};
 use crate::settings::ServerSettings;
@@ -184,7 +184,7 @@ impl Tool {
     }
 
     fn format(options: &Options, settings: &ServerSettings, text: String) -> Result<u8, String> {
-        let mut parser = M2Parser::new().ok_or("could not initialize parser")?;
+        let mut parser = SyntaxParser::new().ok_or("could not initialize parser")?;
         let tree = parser
             .parse_tree(&text, None)
             .ok_or("could not parse source")?;

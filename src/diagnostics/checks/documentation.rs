@@ -20,15 +20,14 @@ use tower_lsp::lsp_types::Position;
 
 use super::{DiagnosticSink, DocumentationContext};
 use crate::diagnostics::{catalog, Finding};
-use crate::node_metadata::M2Node;
+use crate::macaulay2::Macaulay2Conventions;
+use crate::node_metadata::SyntaxNode;
 use crate::object_registry::ObjectName;
 use crate::package_documentation::{
     DocumentOption, DocumentTag, DocumentationFault, DocumentationFaultKind, DocumentationKey,
     DocumentedSubject, SimpleDocKeyword,
 };
-use crate::package_index::{
-    collect_imported_packages_in_tree, collect_loaded_files_in_tree, Macaulay2Conventions,
-};
+use crate::package_index::{collect_imported_packages_in_tree, collect_loaded_files_in_tree};
 use crate::source::SourceNavigation;
 use crate::source_package::PackageDeclaration;
 
@@ -294,7 +293,7 @@ impl<'context> PackageFile<'context> {
             .root
             .binding_references()
             .filter(|symbol| !in_documentation(context.source.position_for_node(*symbol)))
-            .map(|symbol: M2Node<'context>| symbol.text())
+            .map(|symbol: SyntaxNode<'context>| symbol.text())
             .collect();
         let begin_documentation = context
             .root
@@ -373,7 +372,9 @@ fn undocumented_export(
         .chain(context.documentation.undocumented())
         .filter_map(|key| match &key.subject {
             DocumentedSubject::Name(name) => Some(name.name()),
-            DocumentedSubject::Method { .. } | DocumentedSubject::Expression(_) => None,
+            DocumentedSubject::Method { .. }
+            | DocumentedSubject::OptionalArgument { .. }
+            | DocumentedSubject::Expression(_) => None,
         })
         .collect::<HashSet<_>>();
     for declaration in &file.self_contained {

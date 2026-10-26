@@ -1,10 +1,25 @@
 //! Indexed source text and the repository's single position-conversion API.
 
+use std::collections::HashMap;
+
 use tower_lsp::lsp_types::Position;
 use tower_lsp::lsp_types::Range as TextRange;
-use tree_sitter::Point;
+/// A zero-based line and UTF-8 byte column in source text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SourcePoint {
+    pub row: usize,
+    pub column: usize,
+}
 
-use crate::node_metadata::M2Node;
+impl SourcePoint {
+    pub const fn new(row: usize, column: usize) -> Self {
+        Self { row, column }
+    }
+}
+use SourcePoint as Point;
+
+use crate::node_metadata::SyntaxNode;
+use crate::node_metadata::SyntaxSnapshot;
 use crate::util::TextRangeExt;
 
 /// A half-open range of byte offsets into source text.
@@ -53,6 +68,11 @@ impl SymbolMention {
         &text[self.span.bytes()]
     }
 
+    /// Where the mentioned name is written.
+    pub fn span(&self) -> &DocumentSpan {
+        &self.span
+    }
+
     pub fn range(&self) -> TextRange {
         self.span.range()
     }
@@ -67,7 +87,7 @@ impl SymbolMention {
     }
 }
 /// Cached byte ranges for every line's visible content.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LineIndex {
     content_ranges: Vec<ByteRange>,
 }
@@ -76,17 +96,34 @@ struct LineIndex {
 ///
 /// Each cached range excludes the line ending. The source text itself is stored
 /// only once; the ranges are an index into it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DocumentSource {
     text: String,
     line_index: LineIndex,
+    syntax_offsets: HashMap<m2_syn::File, usize>,
 }
 
 impl DocumentSource {
     /// Index one owned source snapshot.
     pub fn new(text: String) -> Self {
         let line_index = LineIndex::new(&text);
-        Self { text, line_index }
+        Self {
+            text,
+            line_index,
+            syntax_offsets: Default::default(),
+        }
+    }
+
+    /// Associates cell-local typed spans with their location in this revision.
+    pub fn register_syntax(&mut self, syntax: &SyntaxSnapshot) {
+        use m2_syn::Spanned;
+        self.syntax_offsets.clear();
+        for cell in syntax.cells() {
+            if let Some(node) = cell.syntax() {
+                self.syntax_offsets
+                    .insert(node.span().file(), cell.document_range().start);
+            }
+        }
     }
 
     /// Replace one byte range and rebuild the line index exactly once.
@@ -98,12 +135,25 @@ impl DocumentSource {
 
 /// Navigation over source text using one cached line index.
 ///
-/// Implementers expose their [`DocumentSource`]; every byte, Tree-sitter point,
+/// Implementers expose their [`DocumentSource`]; every byte, source point,
 /// and LSP UTF-16 conversion is supplied here so capabilities cannot grow
 /// independent conversion formulas.
 pub trait SourceNavigation {
     /// The indexed source snapshot backing this navigator.
     fn source(&self) -> &DocumentSource;
+
+    /// Maps a retained cell's typed range into this document revision.
+    fn syntax_bytes(&self, syntax: &(impl m2_syn::Spanned + ?Sized)) -> Option<ByteRange> {
+        let span = syntax.try_span()?;
+        let range = span.range()?;
+        let offset = self
+            .source()
+            .syntax_offsets
+            .get(&span.file())
+            .copied()
+            .unwrap_or(0);
+        Some(offset + range.start..offset + range.end)
+    }
 
     /// The original source text.
     fn text(&self) -> &str {
@@ -137,7 +187,7 @@ pub trait SourceNavigation {
         (start <= end).then_some(start..end)
     }
 
-    /// Convert a source byte index to a Tree-sitter byte-column point.
+    /// Convert a source byte index to a UTF-8 byte-column point.
     fn point_for_byte(&self, byte_index: usize) -> Point {
         let source = self.source();
         let byte_index = floor_char_boundary(&source.text, byte_index);
@@ -145,7 +195,7 @@ pub trait SourceNavigation {
         Point::new(line_index, byte_index - line.start)
     }
 
-    /// Convert an LSP UTF-16 position to a Tree-sitter byte-column point.
+    /// Convert an LSP UTF-16 position to a UTF-8 byte-column point.
     fn point_for_position(&self, position: Position) -> Option<Point> {
         let byte_index = self.byte_for_position(position)?;
         Some(self.point_for_byte(byte_index))
@@ -163,7 +213,7 @@ pub trait SourceNavigation {
     }
 
     /// Convert one parser node to a dual-coordinate source span.
-    fn span_for_node(&self, node: M2Node<'_>) -> DocumentSpan {
+    fn span_for_node(&self, node: SyntaxNode<'_>) -> DocumentSpan {
         self.span_for_bytes(node.start_byte()..node.end_byte())
     }
 
@@ -173,12 +223,12 @@ pub trait SourceNavigation {
     }
 
     /// Convert one parser node to its LSP UTF-16 range.
-    fn range_for_node(&self, node: M2Node<'_>) -> TextRange {
+    fn range_for_node(&self, node: SyntaxNode<'_>) -> TextRange {
         self.span_for_node(node).range()
     }
 
     /// Convert one parser node's start to an LSP UTF-16 position.
-    fn position_for_node(&self, node: M2Node<'_>) -> Position {
+    fn position_for_node(&self, node: SyntaxNode<'_>) -> Position {
         self.position_for_byte(node.start_byte())
     }
 
@@ -298,6 +348,36 @@ fn utf16_column_to_byte(line: &str, utf16_column: u32) -> usize {
 /// Count the UTF-16 code units in one valid source slice.
 fn utf16_len(text: &str) -> u32 {
     text.encode_utf16().count() as u32
+}
+
+/// Source coordinates paired with the native snapshot supplying typed spans.
+pub struct SyntaxNavigation<'a, S: ?Sized> {
+    original: &'a S,
+    offsets: HashMap<m2_syn::File, usize>,
+}
+
+impl<'a, S: SourceNavigation + ?Sized> SyntaxNavigation<'a, S> {
+    pub fn new(original: &'a S, snapshot: &SyntaxSnapshot) -> Self {
+        use m2_syn::Spanned;
+        let offsets = snapshot
+            .cells()
+            .iter()
+            .filter_map(|cell| Some((cell.syntax()?.span().file(), cell.document_range().start)))
+            .collect();
+        Self { original, offsets }
+    }
+}
+
+impl<S: SourceNavigation + ?Sized> SourceNavigation for SyntaxNavigation<'_, S> {
+    fn source(&self) -> &DocumentSource {
+        self.original.source()
+    }
+    fn syntax_bytes(&self, syntax: &(impl m2_syn::Spanned + ?Sized)) -> Option<ByteRange> {
+        let span = syntax.try_span()?;
+        let range = span.range()?;
+        let offset = self.offsets.get(&span.file()).copied().unwrap_or(0);
+        Some(offset + range.start..offset + range.end)
+    }
 }
 
 #[cfg(test)]

@@ -1,462 +1,306 @@
-//! Typed access to Tree-sitter nodes and traversals.
+//! Borrowed navigation over the single native m2-syn syntax snapshot.
 
-use std::{collections::HashSet, iter};
-
-use m2_syn::nodes::{
-    AngleBarList, Array, Cell, ElseClause, Empty, Expr, ExprCollection as Collection,
-    ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
-    ExprNew as NewStatement, ExprOption as OptionExpression, ExprPack,
-    ExprQuote as QuoteExpression, ExprTry as TryStatement, ExprWhile as WhileLoop, FloatLiteral,
-    IntegerLiteral, List, LoopBody, RawStringLiteral, Sequence, SourceFile, Statement,
-    StringLiteral, Symbol, ThenClause,
-};
-use m2_syn::visit::{self, Visit};
-use m2_syn::{Spanned, Token};
-use tree_sitter::{Node, Point};
-
+use super::cells::SyntaxSnapshot;
+use super::native::Entry;
+use super::syntax_ref::{SyntaxRef, SyntaxType};
+use super::{SyntaxTree, TypedSource};
 use crate::source::ByteRange;
+use crate::source::SourcePoint as Point;
+use m2_syn::nodes::*;
+use m2_syn::Token;
+use std::iter;
 
-/// Snapshot-local identity of one Tree-sitter syntax node.
+/// Identity of a node in an immutable, retained native cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SyntaxNodeId(usize);
+pub struct SyntaxNodeId(Option<super::cells::CellId>, usize);
 
+/// A borrowed typed node and its source-navigation metadata.
 #[derive(Debug, Clone, Copy)]
-pub struct M2Node<'tree> {
-    node: Node<'tree>,
-    source: &'tree str,
+pub struct SyntaxNode<'tree> {
+    tree: &'tree SyntaxTree,
+    cell: Option<usize>,
+    index: usize,
 }
 
-pub trait M2SyntaxKind {
-    fn matches(node: M2Node<'_>) -> bool;
+/// A generated type that can be selected in typed syntax.
+pub trait SyntaxKind: SyntaxType {}
+impl<T: SyntaxType> SyntaxKind for T {}
+
+/// The three parsed operands of an infix expression.
+#[derive(Debug, Clone, Copy)]
+pub struct BinaryParts<'a> {
+    pub left: SyntaxNode<'a>,
+    pub operator: SyntaxNode<'a>,
+    pub right: SyntaxNode<'a>,
 }
 
-/// Every kind below names a *named* grammar node. Two of them — `symbol` and
-/// `list` — are also the spelling of an anonymous keyword token (`symbol x`,
-/// `for i to n list …`), and tree-sitter reports an anonymous token's kind as
-/// its literal text. Matching on the kind string alone would therefore read
-/// those keywords as an identifier or a list expression, so namedness is part
-/// of the match rather than something each caller has to remember.
-macro_rules! syntax_kinds {
-    ($($syntax:ty => $kind:literal),* $(,)?) => {
-        $(
-            impl M2SyntaxKind for $syntax {
-                fn matches(node: M2Node<'_>) -> bool {
-                    node.node.is_named() && node.raw_kind() == $kind
-                }
-            }
-        )*
-    };
-}
-
-syntax_kinds!(
-    AngleBarList => "angle_bar_list",
-    Array => "array",
-    ElseClause => "else_clause",
-    ForLoop => "for_loop",
-    IfStatement => "if_statement",
-    LambdaExpression => "lambda_expression",
-    List => "list",
-    LoopBody => "loop_body",
-    NewStatement => "new_statement",
-    OptionExpression => "option",
-    QuoteExpression => "quote_expression",
-    RawStringLiteral => "raw_string_literal",
-    Sequence => "sequence",
-    SourceFile => "source_file",
-    StringLiteral => "string_literal",
-    Symbol => "symbol",
-    ThenClause => "then_clause",
-    TryStatement => "try_statement",
-    WhileLoop => "while_loop",
-);
-
-impl M2SyntaxKind for FloatLiteral {
-    fn matches(node: M2Node<'_>) -> bool {
-        node.raw_kind() == "float_literal"
-            || (node.raw_kind() == "integer_literal" && node.text().contains('p'))
-    }
-}
-
-impl M2SyntaxKind for IntegerLiteral {
-    fn matches(node: M2Node<'_>) -> bool {
-        node.raw_kind() == "integer_literal" && !node.text().contains('p')
-    }
-}
-
-macro_rules! token_kinds {
-    ($([$($token:tt)*]),* $(,)?) => {
-        $(
-            impl M2SyntaxKind for Token![$($token)*] {
-                fn matches(node: M2Node<'_>) -> bool {
-                    !node.node.is_named()
-                        && node.text() == <Self as m2_syn::Token>::SPELLING
-                }
-            }
-        )*
-    };
-}
-
-token_kinds!(
-    [,], [:=], [;], [TEST], [break], [breakpoint], [catch], [continue], [do], [elapsedTime],
-    [elapsedTiming], [else], [finish], [for], [from], [global], [if], [in], [list], [local], [new],
-    [of], [profile], [return], [shield], [step], [symbol], [then], [threadLocal], [threadVariable],
-    [throw], [time], [timing], [to], [try], [when], [while],
-);
-
-/// Declares the token groups the rest of the crate asks about. A `Token!` type
-/// matches anonymous leaves only, so membership is the whole question and no
-/// group restates the namedness test.
-macro_rules! token_groups {
-    ($(
-        $(#[$group_doc:meta])*
-        $group:ident => [[$($first:tt)*] $(, [$($rest:tt)*])* $(,)?]
-    ),* $(,)?) => {
-        impl M2Node<'_> {
-            $(
-                $(#[$group_doc])*
-                pub fn $group(&self) -> bool {
-                    self.is::<Token![$($first)*]>()
-                        $(|| self.is::<Token![$($rest)*]>())*
-                }
-            )*
-        }
-    };
-}
-
-token_groups!(
-    is_comma => [[,]],
-
-    is_semicolon => [[;]],
-
-    /// An anonymous keyword token (`if`, `then`, `for`, `return`, `time`, ...) —
-    /// the bare keyword leaves, not the named clause/statement nodes that contain
-    /// them. Used for keyword highlighting.
-    is_keyword_token => [
-        [if], [then], [else], [from], [to], [when], [do], [in], [of], [list], [for], [while],
-        [break], [continue], [return], [try], [catch], [throw], [time], [timing], [elapsedTime],
-        [elapsedTiming], [profile], [shield], [TEST], [breakpoint], [finish], [new], [step],
-    ],
-
-    /// An anonymous binding-modifier keyword token (`global`, `local`, `symbol`,
-    /// `threadVariable`, `threadLocal`).
-    is_modifier_token => [[global], [local], [symbol], [threadVariable], [threadLocal]],
-
-    /// The `then`/`else` keyword tokens, which open the clauses an `if` indents.
-    is_then_or_else_keyword => [[then], [else]],
-);
-
-pub fn visit_source_nodes<'tree>(
-    root: M2Node<'tree>,
-    syntax: Option<&SourceFile>,
-    mut visit: impl FnMut(M2Node<'tree>),
-) {
-    if let Some(syntax) = syntax {
-        SyntaxNodeWalker::new(root, visit).visit_source_file(syntax);
-    } else {
-        root.descendants().for_each(&mut visit);
-    }
-}
-
-pub fn visit_expression_nodes<'tree>(
-    root: M2Node<'tree>,
-    syntax: Option<&Expr>,
-    mut visit: impl FnMut(M2Node<'tree>),
-) {
-    if let Some(syntax) = syntax {
-        SyntaxNodeWalker::new(root, visit).visit_expr(syntax);
-    } else {
-        root.descendants().for_each(&mut visit);
-    }
-}
-
-struct SyntaxNodeWalker<'tree, F> {
-    root: M2Node<'tree>,
-    visit: F,
-    seen: HashSet<SyntaxNodeId>,
-}
-
-impl<'tree, F> SyntaxNodeWalker<'tree, F>
-where
-    F: FnMut(M2Node<'tree>),
-{
-    fn new(root: M2Node<'tree>, visit: F) -> Self {
+impl<'tree> SyntaxNode<'tree> {
+    pub(super) fn root_for(tree: &'tree SyntaxTree) -> Self {
         Self {
-            root,
-            visit,
-            seen: HashSet::new(),
+            tree,
+            cell: None,
+            index: 0,
         }
     }
-
-    fn record<Syntax: Spanned + ?Sized>(&mut self, syntax: &Syntax) {
-        if let Some(node) = self.root.descendant_for_syntax(syntax) {
-            if self.seen.insert(node.id()) {
-                (self.visit)(node);
-            }
+    pub fn typed_source(&self) -> &'tree TypedSource {
+        self.tree.syntax()
+    }
+    pub fn changed_ranges(&self) -> Vec<ByteRange> {
+        self.tree.changed_ranges()
+    }
+    pub fn snapshot(&self) -> &'tree SyntaxSnapshot {
+        self.tree.snapshot()
+    }
+    fn entry(&self) -> Option<&'tree Entry> {
+        Some(&self.tree.indexes[self.cell?].entries()[self.index])
+    }
+    fn at(&self, index: usize) -> Self {
+        Self { index, ..*self }
+    }
+    pub fn get<T: SyntaxType>(&self) -> Option<&'tree T> {
+        let cell = self.cell?;
+        let index = *self.entry()?.aliases.get(&T::type_tag())?;
+        self.tree.indexes[cell].resolve(index)?.cast::<T>()
+    }
+    pub fn syntax(&self) -> Option<SyntaxRef<'tree>> {
+        let cell = self.cell?;
+        self.tree.indexes[cell].resolve(self.index)
+    }
+    pub fn related<T: SyntaxType + ?Sized>(&self, syntax: &T) -> Option<Self> {
+        let identity = syntax.syntax_ref().identity()?;
+        let find = |cell: usize| {
+            let index = *self.tree.indexes[cell].identities().get(&identity)?;
+            Some(Self {
+                tree: self.tree,
+                cell: Some(cell),
+                index: self.tree.indexes[cell].entries()[index].canonical,
+            })
+        };
+        self.cell
+            .and_then(find)
+            .or_else(|| (0..self.tree.indexes.len()).find_map(find))
+    }
+    pub fn is<T: SyntaxKind>(&self) -> bool {
+        if self.cell.is_none() {
+            T::type_tag() == SourceFile::type_tag()
+        } else {
+            self.entry()
+                .is_some_and(|entry| entry.aliases.contains_key(&T::type_tag()))
         }
     }
-}
-
-impl<'ast, 'tree, F> Visit<'ast> for SyntaxNodeWalker<'tree, F>
-where
-    F: FnMut(M2Node<'tree>),
-{
-    fn visit_expr(&mut self, node: &'ast Expr) {
-        self.record(node);
-        visit::visit_expr(self, node);
-    }
-
-    fn visit_expr_collection(&mut self, node: &'ast Collection) {
-        self.record(node);
-        visit::visit_expr_collection(self, node);
-    }
-
-    fn visit_symbol(&mut self, node: &'ast Symbol) {
-        self.record(node);
-        visit::visit_symbol(self, node);
-    }
-
-    fn visit_expr_pack(&mut self, node: &'ast ExprPack) {
-        self.record(node);
-        visit::visit_expr_pack(self, node);
-    }
-
-    fn visit_cell(&mut self, node: &'ast Cell) {
-        self.record(node);
-        visit::visit_cell(self, node);
-    }
-
-    fn visit_statement(&mut self, node: &'ast Statement) {
-        self.record(node);
-        visit::visit_statement(self, node);
-    }
-
-    fn visit_empty(&mut self, node: &'ast Empty) {
-        self.record(node);
-        visit::visit_empty(self, node);
-    }
-}
-
-impl<'tree> M2Node<'tree> {
-    pub(super) fn new(node: Node<'tree>, source: &'tree str) -> Self {
-        Self { node, source }
-    }
-
-    pub fn text(&self) -> &'tree str {
-        &self.source[self.node.start_byte()..self.node.end_byte()]
-    }
-
-    /// The complete source snapshot backing this syntax node.
     pub fn source_text(&self) -> &'tree str {
-        self.source
+        self.tree.snapshot().source()
     }
-
-    pub fn is<T: M2SyntaxKind>(&self) -> bool {
-        T::matches(*self)
+    pub fn text(&self) -> &'tree str {
+        &self.source_text()[self.start_byte()..self.end_byte()]
     }
-
+    pub fn start_byte(&self) -> usize {
+        self.cell.map_or(0, |cell| {
+            self.tree.snapshot().cells()[cell].document_range().start + self.entry().unwrap().start
+        })
+    }
+    pub fn end_byte(&self) -> usize {
+        self.cell.map_or(self.source_text().len(), |cell| {
+            (self.tree.snapshot().cells()[cell].document_range().start + self.entry().unwrap().end)
+                .min(self.source_text().len())
+        })
+    }
+    pub fn trimmed_end_byte(&self) -> usize {
+        self.start_byte() + self.text().trim_end().len()
+    }
+    pub fn id(&self) -> SyntaxNodeId {
+        SyntaxNodeId(
+            self.cell.map(|cell| self.tree.indexes[cell].id()),
+            self.index,
+        )
+    }
+    pub fn parent(&self) -> Option<Self> {
+        let cell = self.cell?;
+        Some(
+            self.tree.indexes[cell]
+                .visible_parent(self.index)
+                .map_or(Self::root_for(self.tree), |index| self.at(index)),
+        )
+    }
+    pub fn ancestors(self) -> impl Iterator<Item = Self> {
+        iter::successors(self.parent(), |node| node.parent())
+    }
+    pub fn root(self) -> Self {
+        Self::root_for(self.tree)
+    }
+    pub fn enclosing_node(self, predicate: impl Fn(&Self) -> bool) -> Option<Self> {
+        iter::once(self).chain(self.ancestors()).find(predicate)
+    }
+    pub fn children(&self) -> impl Iterator<Item = Self> + 'tree {
+        let nodes = self.cell.map_or_else(
+            || {
+                (0..self.tree.indexes.len())
+                    .map(|cell| Self {
+                        tree: self.tree,
+                        cell: Some(cell),
+                        index: 0,
+                    })
+                    .collect()
+            },
+            |cell| {
+                self.tree.indexes[cell]
+                    .children(self.index)
+                    .into_iter()
+                    .map(|index| self.at(index))
+                    .collect::<Vec<_>>()
+            },
+        );
+        nodes.into_iter()
+    }
+    pub fn named_children(&self) -> impl Iterator<Item = Self> + 'tree {
+        self.children().filter(|node| !node.is_token())
+    }
+    pub fn child(&self, index: u32) -> Option<Self> {
+        self.children().nth(index as usize)
+    }
+    pub fn named_child(&self, index: u32) -> Option<Self> {
+        self.named_children().nth(index as usize)
+    }
+    pub fn child_count(&self) -> usize {
+        self.children().count()
+    }
+    pub fn descendants(&self) -> impl Iterator<Item = Self> + 'tree {
+        let mut stack = vec![*self];
+        iter::from_fn(move || {
+            let node = stack.pop()?;
+            let children = node.children().collect::<Vec<_>>();
+            stack.extend(children.into_iter().rev());
+            Some(node)
+        })
+    }
+    pub fn contains(&self, other: Self) -> bool {
+        self.start_byte() <= other.start_byte() && other.end_byte() <= self.end_byte()
+    }
+    pub fn syntax_label(&self) -> &'static str {
+        self.entry().map_or("SourceFile", |entry| entry.label)
+    }
+    pub fn is_token(&self) -> bool {
+        self.entry().is_some_and(|entry| {
+            entry.token || entry.boundary.is_some() || entry.aliases.contains_key(&Adj::type_tag())
+        })
+    }
     pub fn is_symbol_like(&self) -> bool {
         self.is::<Symbol>()
-            || self.parent().is_some_and(|parent| {
-                parent.is::<QuoteExpression>()
-                    && parent
-                        .child_by_field_name("token")
-                        .is_some_and(|token| token.id() == self.id())
-            })
     }
-
     pub fn is_literal(&self) -> bool {
-        self.is::<IntegerLiteral>()
-            || self.is::<FloatLiteral>()
-            || self.is::<StringLiteral>()
-            || self.is::<RawStringLiteral>()
+        self.is::<IntegerLiteral>() || self.is::<FloatLiteral>() || self.is_string_literal()
     }
-
     pub fn is_string_literal(&self) -> bool {
         self.is::<StringLiteral>() || self.is::<RawStringLiteral>()
     }
-
     pub fn is_collection_expression(&self) -> bool {
         self.is::<Sequence>()
             || self.is::<List>()
             || self.is::<Array>()
             || self.is::<AngleBarList>()
+            || self.is::<AssignmentList>()
     }
-
     pub fn is_delimited_expression(&self) -> bool {
-        self.is_collection_expression() || self.is_holder()
+        self.is_collection_expression() || self.is_holder() || self.is::<AssignmentList>()
     }
-
     pub fn is_parameter_container(&self) -> bool {
-        self.is::<Sequence>() || self.is::<List>() || self.is_holder()
+        self.is_delimited_expression() || self.is::<ArgumentListContent>()
     }
-
     pub fn is_sequence(&self) -> bool {
         self.is::<Sequence>() || self.is_expr_pack()
     }
-
     pub fn is_expr_pack(&self) -> bool {
-        self.raw_kind() == "naked_sequence"
+        self.is::<ExprPack>() && !self.is_collection_expression()
     }
-
-    /// Whether this node is the symbol `null`.
     pub fn is_null_symbol(&self) -> bool {
         self.is::<Symbol>() && self.text() == "null"
     }
-
     pub fn is_nothing_value(&self) -> bool {
         self.is_muted_statement() || self.is_empty_component()
     }
-
     pub fn is_comment(&self) -> bool {
-        matches!(self.raw_kind(), "line_comment" | "block_comment")
+        self.entry().is_some_and(|entry| entry.comment)
     }
-
     pub fn is_line_comment(&self) -> bool {
-        self.raw_kind() == "line_comment"
+        matches!(self.syntax(), Some(SyntaxRef::Trivia(trivia)) if trivia.kind() == m2_syn::TriviaKind::LineComment)
     }
-
     pub fn is_block_comment(&self) -> bool {
-        self.raw_kind() == "block_comment"
+        matches!(self.syntax(), Some(SyntaxRef::Trivia(trivia)) if trivia.kind() == m2_syn::TriviaKind::BlockComment)
     }
-
-    pub fn is_control_transfer(&self) -> bool {
-        matches!(
-            self.raw_kind(),
-            "return_statement" | "break_statement" | "continue_statement"
-        )
-    }
-
-    pub fn control_transfer_value(&self) -> Option<M2Node<'tree>> {
-        self.named_children()
-            .next()
-            .or_else(|| {
-                let parent = self.parent()?;
-                let left = parent.child_by_field_name("left")?;
-                (parent.is_space_application() && left.id() == self.id())
-                    .then(|| parent.child_by_field_name("right"))
-                    .flatten()
-            })
-            .or_else(|| self.commented_control_transfer_value())
-    }
-
-    fn commented_control_transfer_value(&self) -> Option<M2Node<'tree>> {
-        let error = self.parent().filter(M2Node::is_error)?;
-        if error.start_byte() != self.start_byte() || error.end_byte() != self.end_byte() {
-            return None;
-        }
-
-        let comment = error.next_named_sibling()?;
-        if !comment.is_line_comment() {
-            return None;
-        }
-
-        let mut sibling = comment.next_named_sibling()?;
-        while sibling.is_comment() {
-            sibling = sibling.next_named_sibling()?;
-        }
-        let statement = sibling.is_muted_statement().then_some(sibling)?;
-        let value = statement
-            .named_children()
-            .find(|child| !child.is_comment())?;
-        (value.start_position().row > self.end_position().row).then_some(value)
-    }
-
-    pub fn is_recoverable_control_transfer_error(&self) -> bool {
-        if !self.is_error() {
-            return false;
-        }
-        let mut children = self.named_children();
-        children.next().is_some_and(|transfer| {
-            transfer.is_control_transfer()
-                && children.next().is_none()
-                && transfer.commented_control_transfer_value().is_some()
-        })
-    }
-
-    pub fn is_keyword_statement(&self) -> bool {
-        self.is::<IfStatement>()
-            || self.is::<ForLoop>()
-            || self.is::<WhileLoop>()
-            || self.is::<NewStatement>()
-            || self.is::<TryStatement>()
-    }
-
-    pub fn is_keyword_clause(&self) -> bool {
-        self.is_iteration_range()
-            || self.is::<LoopBody>()
-            || self.is::<ThenClause>()
-            || self.is::<ElseClause>()
-            || self.is_except_clause()
-    }
-
     pub fn is_holder(&self) -> bool {
-        self.raw_kind() == "parenthesized_expression"
+        self.is::<Holder>()
     }
-
     pub fn is_muted_statement(&self) -> bool {
-        self.raw_kind() == "muted"
+        self.is::<Statement>()
+            || self
+                .get::<Cell>()
+                .is_some_and(|cell| cell.semicolon.is_some())
     }
-
     pub fn is_empty_component(&self) -> bool {
-        self.raw_kind() == "empty_component"
+        self.is::<Empty>()
     }
-
     pub fn is_source_cell(&self) -> bool {
-        matches!(self.raw_kind(), "cell" | "muted")
+        self.cell.is_some() && (self.index == 0 || self.is::<Statement>())
     }
-
     pub fn is_iteration_range(&self) -> bool {
-        self.raw_kind() == "iteration_range"
+        self.is::<RangeBoundFrom>() || self.is::<RangeBoundTo>() || self.is::<WhenCondition>()
     }
-
     pub fn is_except_clause(&self) -> bool {
-        self.raw_kind() == "except_clause"
+        matches!(self.get::<TryFallback>(), Some(TryFallback::Except { .. }))
     }
-
     pub fn is_debug_expr(&self) -> bool {
-        self.raw_kind() == "debug_clause"
+        self.is::<ExprDebug>() || self.is::<ExprProfile>()
     }
-
     pub fn is_return_expr(&self) -> bool {
-        self.raw_kind() == "return_statement"
+        self.is::<ExprControlReturn>()
     }
-
     pub fn is_break_expr(&self) -> bool {
-        self.raw_kind() == "break_statement"
+        self.is::<ExprControlBreak>()
     }
-
     pub fn is_continue_expr(&self) -> bool {
-        self.raw_kind() == "continue_statement"
+        self.is::<ExprControlContinue>()
     }
-
+    pub fn is_control_transfer(&self) -> bool {
+        self.is_return_expr() || self.is_break_expr() || self.is_continue_expr()
+    }
     pub fn is_prefix_expr(&self) -> bool {
-        self.raw_kind() == "prefix_expression"
+        self.is::<ExprOpPrefix>()
     }
-
     pub fn is_postfix_expr(&self) -> bool {
-        self.raw_kind() == "postfix_expression"
+        self.is::<ExprOpPostfix>()
     }
-
     pub fn is_binary_expr(&self) -> bool {
-        self.raw_kind() == "binary_expression" && !self.is_adjacent_expr()
+        self.is::<ExprOpBinRegular>() || self.is::<ExprOpBinMember>() || self.is::<ExprOpBinIndex>()
     }
-
-    /// A binary, adjacent (application), prefix, or postfix expression: what
-    /// m2-syn models as `ExprOp`.
     pub fn is_operator_expression(&self) -> bool {
         self.is_binary_expr()
             || self.is_adjacent_expr()
             || self.is_prefix_expr()
             || self.is_postfix_expr()
     }
-
     pub fn is_adjacent_expr(&self) -> bool {
-        self.raw_kind() == "binary_expression"
-            && self
-                .child_by_field_name("operator")
-                .is_some_and(|operator| operator.is_implicit_application())
+        self.is::<ExprOpBinAdj>()
     }
-
+    pub fn is_space_application(&self) -> bool {
+        self.is_adjacent_expr()
+    }
+    pub fn is_implicit_application(&self) -> bool {
+        self.is::<Adj>()
+    }
+    pub fn is_assignment(&self) -> bool {
+        self.is::<ExprAssign>() || self.is::<ExprAssignEvaluated>()
+    }
+    pub fn is_option_assignment(&self) -> bool {
+        self.is::<ExprOption>()
+    }
+    pub fn is_opening_delimiter(&self) -> bool {
+        self.entry()
+            .is_some_and(|entry| entry.boundary == Some(true))
+    }
+    pub fn is_closing_delimiter(&self) -> bool {
+        self.entry()
+            .is_some_and(|entry| entry.boundary == Some(false))
+    }
     pub fn closing_delimiter_width(&self) -> usize {
         if self.is::<AngleBarList>() {
             2
@@ -464,406 +308,475 @@ impl<'tree> M2Node<'tree> {
             1
         }
     }
-
-    fn raw_kind(&self) -> &'tree str {
-        self.node.kind()
+    pub fn is_keyword_statement(&self) -> bool {
+        self.is::<ExprIf>()
+            || self.is::<ExprFor>()
+            || self.is::<ExprWhile>()
+            || self.is::<ExprNew>()
+            || self.is::<ExprTry>()
     }
-
-    /// A human-facing label for the node's grammar kind, for diagnostic messages
-    /// only (e.g. "Missing: )"). This is a display value, never branched on, so it
-    /// stays correct across grammar renames.
-    pub fn syntax_label(&self) -> &'tree str {
-        self.raw_kind()
+    pub fn is_keyword_clause(&self) -> bool {
+        self.is_iteration_range()
+            || self.is::<LoopBody>()
+            || self.is::<ThenClause>()
+            || self.is::<ElseClause>()
+            || self.is_except_clause()
     }
-
-    /// The implicit-application operator: the `SPACE` token tree-sitter inserts
-    /// between a function and its juxtaposed argument (`sin x`, `f(x)`).
-    pub fn is_implicit_application(&self) -> bool {
-        self.raw_kind() == "SPACE"
+    pub fn is_comma(&self) -> bool {
+        self.is::<Token![,]>()
     }
-
-    pub fn has_binary_operator<T: m2_syn::Token>(&self) -> bool {
-        self.binary_operator()
-            .is_some_and(super::matches_token::<T>)
+    pub fn is_semicolon(&self) -> bool {
+        self.is::<Token![;]>()
     }
-
-    /// An opening collection delimiter: `(`, `{`, `[`, or `<|`.
-    pub fn is_opening_delimiter(&self) -> bool {
-        matches!(self.raw_kind(), "(" | "{" | "[" | "<|")
+    pub fn is_keyword_token(&self) -> bool {
+        self.is_token()
+            && !self.is_implicit_application()
+            && self.text().chars().next().is_some_and(char::is_alphabetic)
+            && !self.is_modifier_token()
     }
-
-    /// A closing collection delimiter: `)`, `}`, `]`, or `|>`.
-    pub fn is_closing_delimiter(&self) -> bool {
-        matches!(self.raw_kind(), ")" | "}" | "]" | "|>")
+    pub fn is_modifier_token(&self) -> bool {
+        self.is::<Token![global]>()
+            || self.is::<Token![local]>()
+            || self.is::<Token![symbol]>()
+            || self.is::<Token![threadLocal]>()
+            || self.is::<Token![threadVariable]>()
     }
-}
-
-impl<'tree> M2Node<'tree> {
-    /// The operator token's source text of a binary expression (`:=`, `=>`, ...),
-    /// or `None` if this is not a binary expression. Comparing this *parsed* text
-    /// against operator spellings is reading code, not node-type names, so it is
-    /// safe and rename-stable.
-    pub fn binary_operator(&self) -> Option<&'tree str> {
-        if self.is_adjacent_expr() {
-            return Some("SPACE");
-        }
-        self.child_by_field_name("left")?;
-        self.child_by_field_name("right")?;
-        self.child_by_field_name("operator").map(|operator| {
-            if operator.is_implicit_application() {
-                "SPACE"
-            } else {
-                operator.text()
-            }
-        })
+    pub fn is_then_or_else_keyword(&self) -> bool {
+        self.is::<Token![then]>() || self.is::<Token![else]>()
     }
-
-    /// An assignment expression (`=`, `:=`, `<-`).
-    pub fn is_assignment(&self) -> bool {
-        self.binary_operator().is_some_and(|operator| {
-            super::matches_token::<Token![=]>(operator)
-                || super::matches_token::<Token![:=]>(operator)
-                || super::matches_token::<Token![<-]>(operator)
-        })
+    pub fn parse_error(&self) -> Option<&'tree m2_syn::NativeParseError> {
+        (self.index == 0)
+            .then_some(self.cell?)
+            .and_then(|cell| self.tree.snapshot().cells()[cell].parse_error())
     }
-
-    /// An option assignment (`key => value`).
-    pub fn is_option_assignment(&self) -> bool {
-        self.has_binary_operator::<Token![=>]>()
-    }
-
-    pub fn property_key(&self) -> Option<Self> {
-        let right = self.child_by_field_name("right")?;
-        let operator = self.binary_operator()?;
-        (((super::matches_token::<Token![#]>(operator)
-            || super::matches_token::<Token![#?]>(operator))
-            && right.is_string_literal())
-            || ((super::matches_token::<Token![.]>(operator)
-                || super::matches_token::<Token![.?]>(operator))
-                && right.is_symbol_like()))
-        .then_some(right)
-    }
-
-    /// An implicit application `f x` / `f(x)`: a binary expression whose operator
-    /// is the inserted `SPACE` token.
-    pub fn is_space_application(&self) -> bool {
-        self.is_adjacent_expr()
-    }
-
-    /// The function name of a space application `f x` or `f(x)` whose
-    /// function is a plain symbol.
-    pub fn applied_symbol_name(&self) -> Option<&'tree str> {
-        if !self.is_space_application() {
-            return None;
-        }
-        let function = self.child_by_field_name("left")?;
-        function.is::<Symbol>().then(|| function.text())
-    }
-}
-
-impl<'tree> M2Node<'tree> {
-    /// Whether this node is the `operator` field of its own parent.
-    pub fn is_operator(&self) -> bool {
-        self.parent()
-            .and_then(|parent| parent.child_by_field_name("operator"))
-            .is_some_and(|operator| operator.id() == self.id())
-    }
-
-    /// Whether `other`'s byte span lies within this node's span.
-    pub fn contains(&self, other: M2Node<'_>) -> bool {
-        self.start_byte() <= other.start_byte() && other.end_byte() <= self.end_byte()
-    }
-
-    /// The text *inside* a string literal's delimiters — the value without the
-    /// surrounding `"`/`"` or `///`/`///` — located via the parser's own delimiter
-    /// tokens (first and last child), never by scanning for quote characters.
-    /// Escaped quotes, raw-string `/////`, and `"`-in-comment / `--`-in-string
-    /// nesting are the parser's concern, not ours. Returns `None` for a non-string
-    /// node or a literal missing a delimiter (e.g. an unterminated string).
-    pub fn string_literal_inner_text(&self) -> Option<&'tree str> {
-        self.string_literal_inner_bytes()
-            .map(|bytes| &self.source[bytes])
-    }
-
-    /// The byte span of [`Self::string_literal_inner_text`].
-    pub fn string_literal_inner_bytes(&self) -> Option<ByteRange> {
-        if !self.is_string_literal() {
-            return None;
-        }
-        let child_count = self.node.child_count();
-        if child_count < 2 {
-            return None;
-        }
-        let open = self.node.child(0)?;
-        let close = self.node.child((child_count - 1) as u32)?;
-        let (start, end) = (open.end_byte(), close.start_byte());
-        (start <= end).then_some(start..end)
-    }
-
-    pub fn child_by_field_name(&self, name: &str) -> Option<M2Node<'tree>> {
-        let requested_name = name;
-        let name = match (self.raw_kind(), name) {
-            ("new_statement", "type") => "class",
-            ("structured_binding" | "local_structured_binding", "left") => "binding_pack",
-            ("quote_expression", "symbol") => "token",
-            _ => name,
+    pub fn error_ranges(&self) -> Vec<ByteRange> {
+        use m2_syn::{NativeParseError as Error, Spanned};
+        let Some(cell) = self
+            .cell
+            .filter(|_| self.index == 0)
+            .map(|cell| &self.tree.snapshot().cells()[cell])
+        else {
+            return Vec::new();
         };
-        let source = self.source;
-        self.node
-            .child_by_field_name(name)
-            .map(|node| M2Node::new(node, source))
-            .or_else(|| {
-                (self.raw_kind() == "binary_expression" && requested_name == "left")
-                    .then(|| self.node.child_by_field_name("left_operand"))
-                    .flatten()
-                    .map(|node| M2Node::new(node, source))
+        let mut spans = cell
+            .lexer_diagnostics()
+            .iter()
+            .filter_map(Spanned::try_span)
+            .collect::<Vec<_>>();
+        if let Some(error) = cell.parse_error() {
+            let span = match error {
+                Error::Lex(error) => error.try_span(),
+                Error::Tokenize(error) => error.try_span(),
+                Error::Unexpected { span, .. }
+                | Error::MissingOperand { span, .. }
+                | Error::NewlineInApplication { span }
+                | Error::InvalidAssignmentTarget { span }
+                | Error::InvalidLambdaArguments { span }
+                | Error::Unsupported { span, .. } => Some(span.clone()),
+            };
+            spans.extend(span);
+        }
+        spans
+            .into_iter()
+            .filter_map(|span| span.range())
+            .map(|range| {
+                cell.document_range().start + range.start..cell.document_range().start + range.end
             })
-            .or_else(|| {
-                (self.raw_kind() == "quote_expression" && name == "specifier")
-                    .then(|| self.children().find(M2Node::is_modifier_token))
-                    .flatten()
-            })
-            .or_else(|| {
-                (self.raw_kind() == "except_clause" && name == "value")
-                    .then(|| {
-                        let exception = self.node.child_by_field_name("exception")?;
-                        self.named_children()
-                            .find(|child| child.node.id() != exception.id())
+            .collect()
+    }
+    pub fn is_error(&self) -> bool {
+        self.entry().is_some_and(|entry| entry.error)
+            || self.cell.is_some() && self.index == 0 && self.has_error()
+    }
+    pub fn is_missing(&self) -> bool {
+        self.is_closing_delimiter() && self.start_byte() == self.end_byte()
+    }
+    pub fn has_error(&self) -> bool {
+        self.cell.map_or_else(
+            || {
+                self.tree.snapshot().cells().iter().any(|cell| {
+                    cell.parse_error().is_some() || !cell.lexer_diagnostics().is_empty()
+                })
+            },
+            |cell| {
+                self.tree.snapshot().cells()[cell].parse_error().is_some()
+                    || !self.tree.snapshot().cells()[cell]
+                        .lexer_diagnostics()
+                        .is_empty()
+            },
+        )
+    }
+    pub fn start_position(&self) -> Point {
+        self.tree.point_for_byte(self.start_byte())
+    }
+    pub fn end_position(&self) -> Point {
+        self.tree.point_for_byte(self.end_byte())
+    }
+    pub fn descendant_for_point_range(&self, start: Point, end: Point) -> Option<Self> {
+        let start = self.tree.byte_for_point(start)?;
+        let end = self.tree.byte_for_point(end)?;
+        self.descendants()
+            .filter(|node| {
+                node.start_byte() <= start
+                    && (if start == end {
+                        start < node.end_byte()
+                            || node.start_byte() == node.end_byte() && start == node.start_byte()
+                    } else {
+                        end <= node.end_byte()
                     })
-                    .flatten()
             })
-            .or_else(|| {
-                (self.raw_kind() == "try_statement" && name == "value")
-                    .then(|| self.named_children().next())
-                    .flatten()
+            .min_by_key(|node| {
+                (
+                    node.end_byte() - node.start_byte(),
+                    node.is_implicit_application(),
+                    std::cmp::Reverse(node.ancestors().count()),
+                )
             })
     }
-
-    pub fn parent(&self) -> Option<M2Node<'tree>> {
-        let source = self.source;
-        self.node.parent().map(|node| M2Node::new(node, source))
+    pub fn symbols(&self) -> impl Iterator<Item = Self> + 'tree {
+        self.descendants().filter(Self::is_symbol_like)
     }
-
-    pub fn ancestors(self) -> impl Iterator<Item = M2Node<'tree>> {
-        iter::successors(self.parent(), |node| node.parent())
+    pub fn binding_references(&self) -> impl Iterator<Item = Self> + 'tree {
+        self.symbols().filter(|node| !node.is_member_key())
     }
-
-    pub fn enclosing_node(
-        self,
-        predicate: impl Fn(&M2Node<'tree>) -> bool,
-    ) -> Option<M2Node<'tree>> {
-        iter::once(self)
-            .chain(self.ancestors())
-            .find(|node| predicate(node))
-    }
-
-    pub fn root(self) -> M2Node<'tree> {
-        self.ancestors().last().unwrap_or(self)
-    }
-
-    pub fn children(&self) -> impl Iterator<Item = M2Node<'tree>> + '_ {
-        let source = self.source;
-        let mut cursor = self.node.walk();
-        self.node
-            .children(&mut cursor)
-            .map(|node| M2Node::new(node, source))
-            .collect::<Vec<_>>()
-            .into_iter()
-    }
-
-    pub fn child(&self, index: u32) -> Option<M2Node<'tree>> {
-        let source = self.source;
-        self.node.child(index).map(|node| M2Node::new(node, source))
-    }
-
-    pub fn named_child(&self, index: u32) -> Option<M2Node<'tree>> {
-        let source = self.source;
-        self.node
-            .named_child(index)
-            .map(|node| M2Node::new(node, source))
-    }
-
-    pub fn named_children(&self) -> impl Iterator<Item = M2Node<'tree>> + '_ {
-        let source = self.source;
-        let mut cursor = self.node.walk();
-        self.node
-            .named_children(&mut cursor)
-            .map(|node| M2Node::new(node, source))
-            .collect::<Vec<_>>()
-            .into_iter()
-    }
-
-    fn next_named_sibling(&self) -> Option<M2Node<'tree>> {
-        self.node
-            .next_named_sibling()
-            .map(|node| M2Node::new(node, self.source))
-    }
-
-    /// Return the smallest descendant spanning the requested point range.
-    pub fn descendant_for_point_range(&self, start: Point, end: Point) -> Option<M2Node<'tree>> {
-        let source = self.source;
-        let node = if start == end {
-            let next = Point::new(start.row, start.column.saturating_add(1));
-            self.node
-                .descendant_for_point_range(start, next)
-                .or_else(|| self.node.descendant_for_point_range(start, end))
-        } else {
-            self.node.descendant_for_point_range(start, end)
-        };
-        node.map(|node| M2Node::new(node, source))
-    }
-
-    pub fn descendant_for_syntax<Syntax>(&self, syntax: &Syntax) -> Option<M2Node<'tree>>
-    where
-        Syntax: Spanned + ?Sized,
-    {
-        let (start, end) = super::syntax_byte_range(syntax)?;
-        let source = self.source;
-        let mut node = self
-            .node
-            .descendant_for_byte_range(start, end)
-            .map(|node| M2Node::new(node, source))?;
-        while !node.node.is_named() {
-            node = node.parent()?;
-        }
-        Some(node)
-    }
-
-    /// The semantic element slots of a comma-delimited collection.
-    ///
-    /// The grammar exposes zero-width `empty_component` nodes for empty comma
-    /// slots, so they remain in this iterator and count toward arity. Expressions terminated
-    /// by `;` are wrapped in `muted` and do not contribute a value; comments are
-    /// syntax extras rather than elements, so both are skipped here.
-    pub fn collection_elements(&self) -> impl Iterator<Item = M2Node<'tree>> + '_ {
-        self.named_children()
-            .filter(|child| !child.is_muted_statement() && !child.is_comment())
-    }
-
-    /// The final value directly produced by a grouping/cell node.
-    ///
-    /// A trailing `muted` child means the final expression was silenced and the
-    /// container produces no value node. Earlier muted expressions and comments
-    /// do not obscure a later ordinary value.
-    pub fn final_value_child(&self) -> Option<M2Node<'tree>> {
-        self.named_children()
-            .filter(|child| !child.is_comment())
-            .last()
-            .filter(|child| !child.is_muted_statement())
-    }
-
-    pub fn is_first_collection_element(&self, child: M2Node<'_>) -> bool {
-        self.collection_elements()
-            .next()
-            .is_some_and(|first| first.id() == child.id())
-    }
-
-    /// Whether this comma borders a zero-width empty collection slot. Named
-    /// sibling APIs can step past zero-width nodes, so compare the parser-owned
-    /// slot boundaries with the comma boundaries instead.
-    pub fn comma_borders_empty_slot(&self) -> bool {
-        if !self.is_comma() {
-            return false;
-        }
-        self.parent().is_some_and(|parent| {
-            parent.named_children().any(|sibling| {
-                sibling.is_nothing_value()
-                    && (sibling.start_byte() == self.end_byte()
-                        || sibling.end_byte() == self.start_byte())
-            })
-        })
-    }
-
-    /// Pre-order depth-first traversal of this subtree: the node itself, then
-    /// every descendant in source order. Anonymous tokens (punctuation,
-    /// delimiters, the inserted `SPACE` application operator) are included, so
-    /// callers filter via typed predicates as usual — matching the other walk
-    /// methods above. The iterator borrows `&self` (the cursor holds a
-    /// tree-sitter borrow), but the yielded `M2Node<'tree>` items outlive the
-    /// iterator, like `children()` above.
-    pub fn descendants(&self) -> impl Iterator<Item = M2Node<'tree>> + '_ {
-        let source = self.source;
-        let mut cursor = self.node.walk();
-        let mut reached_root = false;
-        iter::from_fn(move || {
-            if reached_root {
-                return None;
-            }
-            let node = M2Node::new(cursor.node(), source);
-            if !cursor.goto_first_child() && !cursor.goto_next_sibling() {
-                loop {
-                    if !cursor.goto_parent() {
-                        reached_root = true;
-                        break;
-                    }
-                    if cursor.goto_next_sibling() {
-                        break;
-                    }
-                }
-            }
-            Some(node)
-        })
-    }
-
-    pub fn symbols(&self) -> impl Iterator<Item = M2Node<'tree>> + '_ {
-        self.descendants().filter(M2Node::is_symbol_like)
-    }
-
-    /// The symbols under this node that refer to a binding by name: every
-    /// symbol except member keys.
-    pub fn binding_references(&self) -> impl Iterator<Item = M2Node<'tree>> + '_ {
-        self.symbols().filter(|symbol| !symbol.is_member_key())
-    }
-
-    /// Whether this symbol is the key of a member access `x.k` or `x.?k`.
-    /// Macaulay2 reads `x.k` as `x#(global k)`, so the key is the symbol `k`
-    /// itself and never refers to a binding named `k`.
     pub fn is_member_key(&self) -> bool {
         self.is_symbol_like()
             && self
                 .parent()
-                .and_then(|parent| parent.property_key())
+                .and_then(|node| node.property_key())
                 .is_some_and(|key| key.id() == self.id())
     }
-
-    pub fn start_byte(&self) -> usize {
-        self.node.start_byte()
+    pub fn collection_elements(&self) -> impl Iterator<Item = Self> + 'tree {
+        let mut values = Vec::new();
+        for child in self
+            .named_children()
+            .filter(|node| !node.is_muted_statement() && !node.is_comment())
+        {
+            if child.is_expr_pack() {
+                values.extend(child.collection_elements());
+            } else {
+                values.push(child);
+            }
+        }
+        values.into_iter()
+    }
+    pub fn final_value_child(&self) -> Option<Self> {
+        self.named_children()
+            .filter(|node| !node.is_comment())
+            .last()
+            .filter(|node| !node.is_muted_statement())
+    }
+    pub fn is_first_collection_element(&self, child: Self) -> bool {
+        self.collection_elements()
+            .next()
+            .is_some_and(|node| node.id() == child.id())
+    }
+    pub fn comma_borders_empty_slot(&self) -> bool {
+        self.is_comma()
+            && self.parent().is_some_and(|parent| {
+                parent.named_children().any(|node| {
+                    node.is_empty_component()
+                        && (node.start_byte() == self.end_byte()
+                            || node.end_byte() == self.start_byte())
+                })
+            })
+    }
+    pub fn string_literal_inner_bytes(&self) -> Option<ByteRange> {
+        if !self.is_string_literal() {
+            return None;
+        }
+        use m2_syn::Spanned;
+        let (width, content_end) = if let Some(node) = self.get::<StringLiteral>() {
+            (
+                1,
+                node.elements
+                    .last()
+                    .and_then(Spanned::try_span)
+                    .and_then(|span| span.end()),
+            )
+        } else {
+            let node = self.get::<RawStringLiteral>()?;
+            (
+                3,
+                node.elements
+                    .last()
+                    .and_then(Spanned::try_span)
+                    .and_then(|span| span.end()),
+            )
+        };
+        let local_start = self.entry()?.start;
+        let content_end = content_end.unwrap_or(local_start + width);
+        (content_end + width == self.entry()?.end)
+            .then_some(self.start_byte() + width..self.end_byte() - width)
     }
 
-    pub fn end_byte(&self) -> usize {
-        self.node.end_byte()
+    pub fn string_literal_inner_text(&self) -> Option<&'tree str> {
+        Some(&self.source_text()[self.string_literal_inner_bytes()?])
     }
-
-    pub fn trimmed_end_byte(&self) -> usize {
-        self.start_byte() + self.text().trim_end().len()
+    pub fn applied_symbol_name(&self) -> Option<&'tree str> {
+        let call = self.get::<ExprOpBinAdj>()?;
+        let head = self.related(call.left_operand.as_ref())?;
+        head.is::<Symbol>().then(|| head.text())
     }
-
-    pub fn id(&self) -> SyntaxNodeId {
-        SyntaxNodeId(self.node.id())
+    pub fn method_installation_head(&self) -> Option<BinaryParts<'tree>> {
+        let node = self.get::<ExprAssignInstallMethod>()?;
+        Some(BinaryParts {
+            left: self.related(node.method.as_ref())?,
+            operator: self.related(&node.operator)?,
+            right: self.related(node.signature.as_ref())?,
+        })
     }
-
-    pub fn start_position(&self) -> Point {
-        self.node.start_position()
+    pub fn binary_parts(&self) -> Option<BinaryParts<'tree>> {
+        macro_rules! parts {
+            ($node:expr, $left:ident, $operator:ident, $right:ident) => {{
+                let n = $node;
+                Some(BinaryParts {
+                    left: self.related(&n.$left)?,
+                    operator: self.related(&n.$operator)?,
+                    right: self.related(&n.$right)?,
+                })
+            }};
+        }
+        if let Some(n) = self.get::<ExprOpBinAdj>() {
+            return parts!(n, left_operand, operator, right_operand);
+        }
+        if let Some(n) = self.get::<ExprOpBinRegular>() {
+            return parts!(n, left_operand, operator, right_operand);
+        }
+        if let Some(n) = self.get::<ExprOpBinIndex>() {
+            return parts!(n, receiver, operator, index);
+        }
+        if let Some(n) = self.get::<ExprOpBinMember>() {
+            return match n {
+                ExprOpBinMember::Dot(n) => parts!(n, receiver, operator, member),
+                ExprOpBinMember::Optional(n) => parts!(n, receiver, operator, member),
+            };
+        }
+        if let Some(n) = self.get::<ExprOption>() {
+            return parts!(n, key, operator, value);
+        }
+        if let Some(n) = self.get::<ExprAssignEvaluated>() {
+            return parts!(n, evaluated_domain, operator, value);
+        }
+        match self.get::<ExprAssign>()? {
+            ExprAssign::Simple(ExprAssignSimple::Global(n)) => parts!(n, variable, operator, value),
+            ExprAssign::Simple(ExprAssignSimple::Local(n)) => parts!(n, variable, operator, value),
+            ExprAssign::Parallel(ExprAssignParallel::Global(n)) => {
+                parts!(n, argument_list, operator, value)
+            }
+            ExprAssign::Parallel(ExprAssignParallel::Local(n)) => {
+                parts!(n, argument_list, operator, value)
+            }
+            ExprAssign::Evaluated(n) => parts!(n, evaluated_domain, operator, value),
+            ExprAssign::Augmented(n) => parts!(n, target, operator, value),
+            ExprAssign::Op(n) => parts!(n, argument_expr, operator, value_expr),
+            ExprAssign::Install(ExprAssignInstall::Method(n)) => {
+                parts!(n, method, assign_op, function)
+            }
+            ExprAssign::Install(ExprAssignInstall::Op(n)) => {
+                parts!(n, domain_expr, assign_op, function)
+            }
+            ExprAssign::Install(ExprAssignInstall::New(n)) => {
+                parts!(n, new_statement, operator, function)
+            }
+        }
     }
-
-    pub fn end_position(&self) -> Point {
-        self.node.end_position()
+    pub fn binary_operator(&self) -> Option<&'tree str> {
+        let parts = self.binary_parts()?;
+        Some(if self.is_adjacent_expr() {
+            "SPACE"
+        } else {
+            parts.operator.text()
+        })
     }
-
-    pub fn child_count(&self) -> usize {
-        self.node.child_count()
+    pub fn has_binary_operator<T: m2_syn::Token>(&self) -> bool {
+        self.binary_operator()
+            .is_some_and(super::matches_token::<T>)
     }
-
-    pub fn is_error(&self) -> bool {
-        self.node.is_error()
+    pub fn property_key(&self) -> Option<Self> {
+        let parts = self.binary_parts()?;
+        ((self.is::<ExprOpBinMember>() && parts.right.is_symbol_like())
+            || ((self.has_binary_operator::<Token![#]>()
+                || self.has_binary_operator::<Token![#?]>())
+                && parts.right.is_string_literal()))
+        .then_some(parts.right)
     }
-
-    pub fn is_missing(&self) -> bool {
-        self.node.is_missing()
+    pub fn is_operator(&self) -> bool {
+        self.parent().is_some_and(|parent| {
+            parent
+                .binary_parts()
+                .is_some_and(|parts| parts.operator.id() == self.id())
+                || parent
+                    .operator_node()
+                    .is_some_and(|operator| operator.id() == self.id())
+        })
     }
+    pub fn operator_node(&self) -> Option<Self> {
+        if let Some(parts) = self.binary_parts() {
+            return Some(parts.operator);
+        }
+        if let Some(n) = self.get::<ExprOpPrefix>() {
+            return self.related(&n.operator);
+        }
+        if let Some(n) = self.get::<ExprOpPostfix>() {
+            return self.related(&n.operator);
+        }
+        match self.get::<ExprLambda>()? {
+            ExprLambda::Variadic(n) => self.related(&n.operator),
+            ExprLambda::List(n) => self.related(&n.operator),
+        }
+    }
+    pub fn control_transfer_value(&self) -> Option<Self> {
+        if let Some(n) = self.get::<ExprControlReturn>() {
+            return n.value.as_deref().and_then(|v| self.related(v));
+        }
+        if let Some(n) = self.get::<ExprControlBreak>() {
+            return n.value.as_deref().and_then(|v| self.related(v));
+        }
+        self.get::<ExprControlContinue>()?
+            .value
+            .as_deref()
+            .and_then(|v| self.related(v))
+    }
+    pub fn lambda_body(&self) -> Option<Self> {
+        match self.get::<ExprLambda>()? {
+            ExprLambda::Variadic(n) => self.related(n.body.as_ref()),
+            ExprLambda::List(n) => self.related(n.body.as_ref()),
+        }
+    }
+    pub fn lambda_parameters(&self) -> Option<Self> {
+        match self.get::<ExprLambda>()? {
+            ExprLambda::Variadic(n) => self.related(&n.argument),
+            ExprLambda::List(n) => n.arguments.contents.as_ref().and_then(|n| self.related(n)),
+        }
+    }
+    pub fn control_condition(&self) -> Option<Self> {
+        if let Some(n) = self.get::<ExprIf>() {
+            return self.related(n.condition.as_ref());
+        }
+        if let Some(n) = self.get::<ExprWhile>() {
+            return self.related(n.condition.as_ref());
+        }
+        if let Some(n) = self.get::<WhenCondition>() {
+            return self.related(n.condition.as_ref());
+        }
+        None
+    }
+    pub fn clause_value(&self) -> Option<Self> {
+        if let Some(n) = self.get::<ThenClause>() {
+            return self.related(n.expr.as_ref());
+        }
+        if let Some(n) = self.get::<ElseClause>() {
+            return self.related(n.expr.as_ref());
+        }
+        if let Some(n) = self.get::<ExprTry>() {
+            return self.related(n.value.as_ref());
+        }
+        if let Some(n) = self.get::<OfClass>() {
+            return self.related(n.parent.as_ref());
+        }
+        if let Some(n) = self.get::<FromInstance>() {
+            return self.related(n.instance.as_ref());
+        }
+        if let Some(n) = self.get::<RangeBoundFrom>() {
+            return self.related(n.value.as_ref());
+        }
+        if let Some(n) = self.get::<RangeBoundTo>() {
+            return self.related(n.value.as_ref());
+        }
+        if let Some(TryFallback::Except(n)) = self.get::<TryFallback>() {
+            return self.related(n.value.as_ref());
+        }
+        if self.is_control_transfer() {
+            return self.control_transfer_value();
+        }
+        macro_rules! optional {
+            ($n:expr) => {
+                $n.value.as_deref().and_then(|n| self.related(n))
+            };
+        }
+        if let Some(n) = self.get::<ExprDebug>() {
+            return match n {
+                ExprDebug::Test(n) => optional!(n),
+                ExprDebug::Step(n) => optional!(n),
+                ExprDebug::Finish(n) => optional!(n),
+                ExprDebug::Shield(n) => optional!(n),
+                ExprDebug::Breakpoint(n) => optional!(n),
+            };
+        }
+        if let Some(n) = self.get::<ExprProfile>() {
+            return match n {
+                ExprProfile::ElapsedTime(n) => self.related(n.value.as_ref()),
+                ExprProfile::ElapsedTiming(n) => self.related(n.value.as_ref()),
+                ExprProfile::Profile(n) => self.related(n.value.as_ref()),
+                ExprProfile::Time(n) => self.related(n.value.as_ref()),
+                ExprProfile::Timing(n) => self.related(n.value.as_ref()),
+            };
+        }
+        None
+    }
+    pub fn unary_operand(&self) -> Option<Self> {
+        if let Some(n) = self.get::<ExprOpPrefix>() {
+            return self.related(n.operand.as_ref());
+        }
+        if let Some(n) = self.get::<ExprOpPostfix>() {
+            return self.related(n.operand.as_ref());
+        }
+        None
+    }
+    pub fn new_class(&self) -> Option<Self> {
+        self.related(self.get::<ExprNew>()?.class.as_ref())
+    }
+    pub fn new_parent_clause(&self) -> Option<Self> {
+        self.related(self.get::<ExprNew>()?.parent_class.as_ref()?)
+    }
+    pub fn new_instance_clause(&self) -> Option<Self> {
+        self.related(self.get::<ExprNew>()?.instance.as_ref()?)
+    }
+    pub fn listed_value(&self) -> Option<Self> {
+        self.related(self.get::<LoopBody>()?.list_step.as_ref()?.expr.as_ref())
+    }
+    pub fn ignored_value(&self) -> Option<Self> {
+        self.related(self.get::<LoopBody>()?.do_step.as_ref()?.statement.as_ref())
+    }
+    pub fn quote_parts(&self) -> Option<(Self, Self)> {
+        macro_rules! parts {
+            ($n:expr) => {
+                Some((self.related(&$n.symbol)?, self.related(&$n.specifier)?))
+            };
+        }
+        match self.get::<ExprQuote>()? {
+            ExprQuote::Symbol(n) => parts!(n),
+            ExprQuote::Global(n) => parts!(n),
+            ExprQuote::Local(n) => parts!(n),
+            ExprQuote::ThreadLocal(n) => parts!(n),
+            ExprQuote::ThreadVariable(n) => parts!(n),
+        }
+    }
+    pub fn quoted_symbol(&self) -> Option<Self> {
+        self.quote_parts().map(|parts| parts.0)
+    }
+    #[cfg(test)]
+    pub fn quote_modifier(&self) -> Option<Self> {
+        self.quote_parts().map(|parts| parts.1)
+    }
+}
 
-    /// Whether this subtree contains a syntax error or missing token.
-    pub fn has_error(&self) -> bool {
-        self.node.has_error()
+pub fn visit_source_nodes<'a>(
+    root: SyntaxNode<'a>,
+    _syntax: Option<&TypedSource>,
+    mut visitor: impl FnMut(SyntaxNode<'a>),
+) {
+    for node in root.descendants() {
+        visitor(node)
+    }
+}
+pub fn visit_expression_nodes<'a>(
+    root: SyntaxNode<'a>,
+    _syntax: Option<&Expr>,
+    mut visitor: impl FnMut(SyntaxNode<'a>),
+) {
+    for node in root.descendants() {
+        visitor(node)
     }
 }
