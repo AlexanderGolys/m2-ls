@@ -1,6 +1,9 @@
 //! In-document highlighting for resolved symbols and compound-statement words.
 
-use m2_syn::nodes::{ExprFor as ForLoop, ExprLambda as LambdaExpression, ExprWhile as WhileLoop};
+use m2_syn::nodes::{
+    ExprFor as ForLoop, ExprLambda as LambdaExpression, ExprWhile as WhileLoop, FromInstance,
+    OfClass,
+};
 
 use crate::capabilities::navigation::{reference_ranges_resolved, unbound_reference_ranges};
 use crate::document::DocumentSnapshot;
@@ -388,8 +391,9 @@ fn enclosing_keyword_statement(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
 }
 
 /// Collect the keyword tokens of a compound statement: its own leading keyword
-/// plus the leading keyword of each direct clause child. Nested statements are
-/// not descended into — they own their own sequence.
+/// plus the leading keyword of each direct clause child, including the `of` and
+/// `from` clauses of `new`. Nested statements are not descended into — they own
+/// their own sequence.
 fn statement_keyword_tokens(statement: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
     if statement.is_keyword_statement() {
         let mut keywords = statement
@@ -397,7 +401,7 @@ fn statement_keyword_tokens(statement: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
             .filter(SyntaxNode::is_keyword_token)
             .collect::<Vec<_>>();
         for child in statement.named_children() {
-            if child.is_keyword_clause() {
+            if child.is_keyword_clause() || child.is::<OfClass>() || child.is::<FromInstance>() {
                 keywords.extend(child.children().filter(SyntaxNode::is_keyword_token));
             }
         }
@@ -469,6 +473,22 @@ mod tests {
         assert_eq!(
             highlighted_words("for i from 1 to 10 do g i\n", 0, 7),
             vec!["for", "from", "to", "do"]
+        );
+    }
+
+    #[test]
+    fn highlights_new_of_from_keywords_from_any_keyword() {
+        let text = "new T of S from x\n";
+        for character in [0, 6, 11] {
+            assert_eq!(
+                highlighted_words(text, 0, character),
+                vec!["new", "of", "from"],
+                "cursor at column {character} should highlight the new-keyword sequence",
+            );
+        }
+        assert_eq!(
+            highlighted_words("new T from x\n", 0, 7),
+            vec!["new", "from"]
         );
     }
 
