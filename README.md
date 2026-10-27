@@ -158,6 +158,7 @@ modifiers, so themes can inherit the standard type's styling.
 | Other functions, scripted functors (`id`, `Ext`), commands and manipulators (`exit`, `endl`) | `function` | According to `defaultLibrary` policy |
 | File values (`stdio`) | `variable` | |
 | Ring generators | `variable` | `algebraic` |
+| Installation domains and codomains (`ZZ`, `List` in `f ZZ := List => ...`) | `typeParameter` | |
 | SimpleDoc section keywords, `document` option names, and links (`TO`, `TOH`, `TO2`) | `decorator` | |
 | TeX delimiters and other hypertext constructors | `macro` | |
 | Styled documentation text | `string` | `strong`, `emphasis`, `monospace`, `link`, or `math` |

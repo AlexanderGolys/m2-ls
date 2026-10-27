@@ -489,7 +489,7 @@ async fn diverging_error_branches_do_not_widen_inferred_types() {
 }
 
 #[tokio::test]
-async fn method_codomains_are_annotations_and_all_known_types_are_configurable() {
+async fn method_codomains_use_type_annotations_and_all_known_types_are_configurable() {
     let source = concat!(
         "p = method(TypicalValue => List)\n",
         "p(ZZ) := Array => x -> [x]\n",
@@ -499,7 +499,7 @@ async fn method_codomains_are_annotations_and_all_known_types_are_configurable()
     let tokens = semantic_tokens(&mut session).await;
     assert_eq!(
         token_at(&tokens, source, "Array", 0).0,
-        session.semantic_token_type("decorator")
+        session.semantic_token_type("typeParameter")
     );
 
     session.set_expression_type_hints(false).await;
@@ -716,7 +716,7 @@ async fn registered_source_roles_drive_semantic_tokens_through_the_server() {
 
     for (needle, expected_role, description) in [
         ("ZZ", "typeParameter", "method domain"),
-        ("Array", "decorator", "method codomain"),
+        ("Array", "typeParameter", "method codomain"),
         ("Strategy", "enumMember", "option key"),
         ("name", "property", "quoted member key"),
         ("\"key\"", "property", "lookup key"),

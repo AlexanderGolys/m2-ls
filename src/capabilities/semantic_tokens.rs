@@ -2322,8 +2322,8 @@ p(ZZ) := Array => x -> [x]
 
         assert_eq!(
             token_type_at(&tokens, 1, 9),
-            Some(M2SemanticTokenType::Annotation as u32),
-            "the explicit Array codomain is an annotation, not an option field"
+            Some(M2SemanticTokenType::TypeAnnotation as u32),
+            "the explicit Array codomain uses the same type annotation as the domain"
         );
         assert_eq!(
             token_type_at(&tokens, 1, 2),

@@ -132,16 +132,16 @@ pub enum M2SemanticTokenType {
     Method = SemanticTokenType::METHOD,
     /// The modifier keywords `local`, `global`, `symbol` and their kin.
     QuoteModifier = SemanticTokenType::MODIFIER,
-    /// A domain an installation is made on, the `ZZ` of `f ZZ := …`. Sent
-    /// as `typeParameter`.
+    /// A domain or codomain of an installation: the `ZZ` and `List` of
+    /// `f ZZ := List => …`. Sent as `typeParameter`.
     TypeAnnotation = SemanticTokenType::TYPE_PARAMETER,
     /// Markup around documentation text: a TeX delimiter, the `{\tt` and
     /// `}` of `{\tt x}`, or a hypertext constructor such as `TT` or `PARA`.
     /// The text it styles stays a [`String`](Self::String) carrying the
     /// style's modifier.
     Macro = SemanticTokenType::MACRO,
-    /// An annotation: the codomain an installation states, a SimpleDoc
-    /// section keyword such as `Key` or `Description`, or a link to another
+    /// A documentation annotation: a SimpleDoc section keyword such as
+    /// `Key` or `Description`, or a link to another
     /// documentation page, `TO`, `TOH` or `TO2`. Sent as `decorator`.
     Annotation = SemanticTokenType::DECORATOR,
     Regexp = SemanticTokenType::REGEXP,
@@ -510,10 +510,7 @@ fn source_role_semantic_token(
                 .with_modifier(M2SemanticTokenModifier::Algebraic)
                 .with_modifier(M2SemanticTokenModifier::Declaration)
         }
-        SourceSemanticRole::CodomainAnnotation => {
-            M2SemanticToken::new(M2SemanticTokenType::Annotation)
-        }
-        SourceSemanticRole::MethodTypeParameter => {
+        SourceSemanticRole::CodomainAnnotation | SourceSemanticRole::MethodTypeParameter => {
             M2SemanticToken::new(M2SemanticTokenType::TypeAnnotation)
         }
         SourceSemanticRole::OptionKey if is_unquoted_symbol => {
