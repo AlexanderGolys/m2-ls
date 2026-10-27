@@ -24,7 +24,6 @@ macro_rules! pos_max {
 
 pub trait TextRangeExt {
     fn contains_position(&self, position: Position) -> bool;
-    fn is_inside(&self, outer: TextRange) -> bool;
 }
 
 impl TextRangeExt for TextRange {
@@ -39,15 +38,6 @@ impl TextRangeExt for TextRange {
             return false;
         }
         true
-    }
-
-    fn is_inside(&self, outer: TextRange) -> bool {
-        let starts_inside = self.start.line > outer.start.line
-            || (self.start.line == outer.start.line
-                && self.start.character >= outer.start.character);
-        let ends_inside = self.end.line < outer.end.line
-            || (self.end.line == outer.end.line && self.end.character <= outer.end.character);
-        starts_inside && ends_inside && *self != outer
     }
 }
 

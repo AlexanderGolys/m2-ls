@@ -297,6 +297,47 @@ EXPLICIT_INSTALL_REQUIRED {
         severity: ERROR,
     }
 
+    /// Reassignment of a protected indexed symbol, regardless of whether its
+    /// current value is mutable.
+    ///
+    /// ```m2
+    /// ZZ = 7
+    /// ```
+PROTECTED_ASSIGNMENT {
+        code: "E13",
+        name: "protected-assignment",
+        severity: ERROR,
+    }
+
+    /// A subscript past the variables of a ring the program writes out,
+    /// which Macaulay2 rejects; over a polynomial ring it writes out,
+    /// subscripts go on into that ring's variables.
+    ///
+    /// ```m2
+    /// S = RR_53[x]
+    /// S_1
+    /// ```
+RING_INDEX_OUT_OF_BOUNDS {
+        code: "E14",
+        name: "ring-index-out-of-bounds",
+        severity: ERROR,
+    }
+
+    /// A lookup by name of a variable a ring the program writes out does
+    /// not have, by a string or an indexed variable. A ring element is
+    /// promoted when its name is missing, which may succeed, so it is not
+    /// reported.
+    ///
+    /// ```m2
+    /// A = QQ[x, y_1]
+    /// "y"_A
+    /// ```
+RING_VARIABLE_NOT_FOUND {
+        code: "E15",
+        name: "ring-variable-not-found",
+        severity: ERROR,
+    }
+
     /// A parallel assignment whose right side has a type that cannot supply
     /// several values.
     ///

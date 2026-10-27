@@ -72,6 +72,15 @@ const METHOD_FUNCTION_CLASSES: [&str; 4] = [
 /// `Command` when evaluated alone, a `Manipulator` when printed to a file.
 const COMMAND_CLASSES: [&str; 2] = ["Command", "Manipulator"];
 
+/// The function every algebraic object answers: a class is algebraic when
+/// `ring` is installed on it, as on `Ideal`, `Module`, `Matrix` or a
+/// package's `CoherentSheaf`, so its values live over a ring.
+const RING_OF_FUNCTION: &str = "ring";
+
+/// The class of numbers, which `ring` also answers but which read as plain
+/// values rather than algebraic objects.
+const NUMBER_CLASS: &str = "Number";
+
 /// Indexed facts needed specifically for semantic-token classification.
 ///
 /// This is separate from [`TypeKnowledge`] because syntax/type analysis should
@@ -183,9 +192,14 @@ pub enum M2SemanticTokenModifier {
     /// string a `doc` call reads as SimpleDoc, an attached documentation
     /// comment, and the code they embed.
     Documentation = SemanticTokenModifier::DOCUMENTATION,
-    /// A generator introduced by an algebraic constructor, such as the `x`
-    /// of `QQ[x]`.
+    /// An algebraic object that is not itself a type: a generator such as
+    /// the `x` of `QQ[x]`, or a value whose class `ring` is installed on,
+    /// such as an ideal, a module or a matrix. Rings are types and keep
+    /// [`Type`](M2SemanticTokenType::Type).
     Algebraic = SemanticTokenModifier::new("algebraic"),
+    /// An operator selecting a part of its left operand rather than computing
+    /// from both: the `_` of `S_1`, `.` and `.?`, and binary `#` and `#?`.
+    Access = SemanticTokenModifier::new("access"),
     /// Bold documentation text: `{\bf …}`, `BOLD`, a heading.
     Strong = SemanticTokenModifier::new("strong"),
     /// Italic documentation text: `{\em …}`, `{\it …}`, `EM`, `ITALIC`.
@@ -342,6 +356,12 @@ impl M2SemanticToken {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceSemanticRole {
     RingGenerator,
+    /// A literal promoted into a ring by subscript, `3_R` or `1.5_RR`: one
+    /// number, its ring part of how it is written.
+    RingLiteral,
+    /// An inexact field of a written precision, `RR_53` or `CC_100`: one
+    /// ring, like the `RR` it is drawn from.
+    PrecisionField,
     /// A ring generator where a constructor declares it: the `x`, `y_1` and
     /// `z_0 .. z_2` of `QQ[x, y_1, z_0 .. z_2]`, quoted or not.
     RingGeneratorDeclaration,
@@ -354,7 +374,12 @@ pub enum SourceSemanticRole {
     /// installation's typical value.
     CodomainAnnotation,
     OptionKey,
+    /// What an access selects by name or position: the `key` of `H.key`,
+    /// the `0` of `L_0` or `L#0`.
     PropertyKey,
+    /// The operator of an access, the `_` of `L_0` or the `.` of `H.key`:
+    /// it joins what is selected to what it is selected from.
+    AccessOperator,
     NamespaceArgument,
     /// The name a quote yields as a `Symbol` rather than evaluating —
     /// `symbol f`, `global f`, `local f`, `threadVariable f`, `threadLocal f`.
@@ -510,6 +535,8 @@ fn source_role_semantic_token(
                 .with_modifier(M2SemanticTokenModifier::Algebraic)
                 .with_modifier(M2SemanticTokenModifier::Declaration)
         }
+        SourceSemanticRole::RingLiteral => M2SemanticToken::new(M2SemanticTokenType::Number),
+        SourceSemanticRole::PrecisionField => M2SemanticToken::new(M2SemanticTokenType::Type),
         SourceSemanticRole::CodomainAnnotation | SourceSemanticRole::MethodTypeParameter => {
             M2SemanticToken::new(M2SemanticTokenType::TypeAnnotation)
         }
@@ -519,6 +546,8 @@ fn source_role_semantic_token(
         SourceSemanticRole::OptionKey => M2SemanticToken::new(M2SemanticTokenType::Property)
             .with_modifier(M2SemanticTokenModifier::Option),
         SourceSemanticRole::PropertyKey => M2SemanticToken::new(M2SemanticTokenType::Property),
+        SourceSemanticRole::AccessOperator => M2SemanticToken::new(M2SemanticTokenType::Operator)
+            .with_modifier(M2SemanticTokenModifier::Access),
         SourceSemanticRole::QuotedSymbol => M2SemanticToken::new(M2SemanticTokenType::Symbol),
         SourceSemanticRole::NamespaceArgument => {
             M2SemanticToken::new(M2SemanticTokenType::Namespace)
@@ -678,6 +707,11 @@ pub fn semantic_token_for_static_type_from_knowledge(
         M2SemanticTokenType::Variable
     } else if subtype_of("Symbol") && !subtype_of("Keyword") && !subtype_of("Operator") {
         M2SemanticTokenType::Symbol
+    } else if !subtype_of(NUMBER_CLASS) && lives_over_a_ring(knowledge, &type_name) {
+        return Some(
+            M2SemanticToken::new(M2SemanticTokenType::Variable)
+                .with_modifier(M2SemanticTokenModifier::Algebraic),
+        );
     } else {
         return None;
     };
@@ -691,6 +725,26 @@ pub fn semantic_token_for_static_type_from_knowledge(
         None
     };
     Some(token)
+}
+
+/// Whether `ring` is installed on `class` or one of its ancestors.
+fn lives_over_a_ring(knowledge: &(impl TypeKnowledge + ?Sized), class: &ObjectName) -> bool {
+    let Some(class) = knowledge.resolve_type_id(class) else {
+        return false;
+    };
+    knowledge
+        .get_record(&ObjectName::new(RING_OF_FUNCTION))
+        .and_then(Record::callable)
+        .is_some_and(|ring| {
+            ring.methods
+                .iter()
+                .any(|method| match method.domain.as_slice() {
+                    [domain] => knowledge
+                        .type_id(domain)
+                        .is_some_and(|domain| knowledge.is_subtype_id(&class, &domain)),
+                    _ => false,
+                })
+        })
 }
 
 fn record_is_type_like(record: &Record) -> bool {

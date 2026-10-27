@@ -597,6 +597,83 @@ async fn unknown_condition_types_remain_possible_booleans() {
 }
 
 #[tokio::test]
+async fn protected_assignments_follow_symbol_protection_and_local_scope() {
+    let source = concat!(
+        "allowableThreads = 7\n",
+        "ZZ = 7\n",
+        "(allowableThreads, (ZZ, QQ)) = (7, (8, 9))\n",
+        "f = ZZ -> (ZZ = 7)\n",
+        "g = () -> (ZZ := 1; ZZ = 7)\n",
+        "h = () -> (ZZ = 7)\n",
+        "alias = ZZ\n",
+        "alias = 7\n",
+        "ZZ#cache = 7\n",
+        "dim ZZ := x -> 0\n",
+        "ZZ := 1\n",
+        "ZZ = 7\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    assert_eq!(diagnostic_lines(&session, "E13"), vec![1, 2, 2, 5]);
+    for diagnostic in session.diagnostics().iter().filter(|d| d["code"] == "E13") {
+        assert_eq!(diagnostic["severity"], 1);
+        assert_eq!(diagnostic["source"], "protected-assignment");
+    }
+
+    let tokens = semantic_tokens(&mut session).await;
+    let readonly = session.semantic_token_modifier("readonly");
+    assert_eq!(
+        token_at(&tokens, source, "allowableThreads", 0).1 & readonly,
+        0
+    );
+    assert_ne!(token_at(&tokens, source, "ZZ", 0).1 & readonly, 0);
+    assert_eq!(token_at(&tokens, source, "alias", 0).1 & readonly, 0);
+    assert_eq!(token_at(&tokens, source, "ZZ", 11).1 & readonly, 0);
+
+    replace_and_assert_diagnostic(&mut session, "ZZ = 7\n", "E13", true).await;
+    replace_and_assert_diagnostic(&mut session, "ZZ += 1\n", "E13", true).await;
+    replace_and_assert_diagnostic(&mut session, "allowableThreads = 7\n", "E13", false).await;
+    replace_and_assert_diagnostic(&mut session, "allowableThreads += 1\n", "E13", false).await;
+    replace_and_assert_diagnostic(&mut session, "f = ZZ -> (ZZ += 1)\n", "E13", false).await;
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn primary_code_analyzes_definitions_without_the_prelude() {
+    let mut session = DocumentSession::open("ZZ = 7\n").await;
+    assert_eq!(diagnostic_lines(&session, "E13"), vec![0]);
+
+    let source = "ZZ = 7\n-- m2-ls: primaryCode\nallowable\n";
+    session.replace(source).await;
+    assert!(diagnostic_lines(&session, "E13").is_empty());
+    let tokens = semantic_tokens(&mut session).await;
+    let readonly = session.semantic_token_modifier("readonly");
+    assert_eq!(token_at(&tokens, source, "ZZ", 0).1 & readonly, 0);
+    assert_eq!(hover_type_at(&mut session, 0, 0).await, "ZZ");
+
+    let completions = session
+        .request(
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": session.uri()},
+                "position": {"line": 2, "character": 9}
+            }),
+        )
+        .await;
+    let items = completions
+        .as_array()
+        .or_else(|| completions["items"].as_array());
+    assert!(items.is_none_or(|items| !items.iter().any(|item| item["label"] == "allowableThreads")));
+
+    session.replace("ZZ = 7\n").await;
+    assert_eq!(diagnostic_lines(&session, "E13"), vec![0]);
+    session
+        .replace("-- m2-ls: primaryCode\nneedsPackage \"Core\"\nZZ = 7\n")
+        .await;
+    assert!(diagnostic_lines(&session, "E13").is_empty());
+    session.shutdown().await;
+}
+
+#[tokio::test]
 async fn compiled_function_aliases_keep_compiled_but_not_binding_protection() {
     let source = "f = scan\nf\nscan\nscan = f\nscan\n";
     let mut session = DocumentSession::open(source).await;
@@ -3640,4 +3717,79 @@ async fn documentation_markup_marks_delimiters_links_and_option_keys() {
     assert_ne!(example_modifiers & example, 0);
 
     session.shutdown().await;
+}
+
+/// Ring variables the program determines reach the client as inline values,
+/// subscripts past a written ring's variables as `E14` errors, and lookups
+/// of names it lacks as `E15` errors.
+#[tokio::test]
+async fn ring_subscripts_evaluate_to_inline_values_and_bound_errors() {
+    let mut session = DocumentSession::open(concat!(
+        "R = RR_7\n",
+        "S = R[x_0..y_2, z, w_(1,1)]\n",
+        "S_6\n",
+        "T = S[t]\n",
+        "(T_1, T_9)\n",
+        "U = R[u]\n",
+        "U_1\n",
+        "P = RR[p, q_1]\n",
+        "(\"q_1\"_P, \"q\"_P)\n",
+    ))
+    .await;
+    let values = session
+        .request(
+            "textDocument/inlineValue",
+            json!({
+                "textDocument": {"uri": session.uri()},
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 100, "character": 0}
+                },
+                "context": {
+                    "frameId": 0,
+                    "stoppedLocation": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 0}
+                    }
+                }
+            }),
+        )
+        .await;
+    let values = values
+        .as_array()
+        .unwrap_or_else(|| panic!("expected inline values, got {values}"))
+        .iter()
+        .map(|value| {
+            (
+                value["range"]["start"]["line"].as_u64().unwrap_or_default(),
+                value["text"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        vec![
+            (2, "S_6 = z".to_string()),
+            (4, "T_1 = x_0".to_string()),
+            (8, "\"q_1\"_P = q_1".to_string()),
+        ]
+    );
+
+    assert_eq!(diagnostic_lines(&session, "E14"), vec![4, 6]);
+    assert_eq!(diagnostic_lines(&session, "E15"), vec![8]);
+    let messages = session
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| diagnostic["code"] == "E14")
+        .map(|diagnostic| {
+            diagnostic["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        messages[0].starts_with("index 9 out of bounds 0 .. 8"),
+        "unexpected message: {messages:?}"
+    );
 }

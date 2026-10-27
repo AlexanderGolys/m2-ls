@@ -9,7 +9,7 @@ use m2_syn::Token;
 use super::{DiagnosticSink, NodeContext};
 use crate::analysis::{
     assigned_lambda, parenthesized_value, CallableHeadKind, ControlTransferTarget,
-    MethodCodomainEdit, MethodHead, OptionDeclaration, TypeChecker,
+    MethodCodomainEdit, MethodHead, OptionDeclaration, RingVariableError, TypeChecker,
 };
 use crate::diagnostics::rewrites::{
     ambiguous_float_member_access_rewrite, coalescence_rewrite, simplification_of, Coalescence,
@@ -28,6 +28,8 @@ pub(super) fn spawn(context: &NodeContext, sink: &mut DiagnosticSink) {
     multiple_assignment_targets(context, sink);
     colon_equal_part_assignment(context, sink);
     parallel_assignment(context, sink);
+    protected_assignment(context, sink);
+    ring_variable_selection(context, sink);
     option_key_convention(context, sink);
     prefer_coalescence(context, sink);
     ring_variable_naming(context, sink);
@@ -175,6 +177,97 @@ fn is_installation_target(context: &NodeContext, target: SyntaxNode) -> bool {
         .analysis
         .installation_shape(target, position, context.knowledge)
         .is_some_and(|(_, operands)| operands.iter().all(|operand| !operand.is_literal()))
+}
+
+fn protected_assignment(context: &NodeContext, sink: &mut DiagnosticSink) {
+    if context.primary_code {
+        return;
+    }
+    let node = context.node;
+    if !(node.has_binary_operator::<Token![=]>() || node.is::<m2_syn::nodes::ExprAssignAugmented>())
+        || !node.is_assignment()
+        || context
+            .analysis
+            .installation_for(node, context.source)
+            .is_some()
+    {
+        return;
+    }
+    if let Some(parts) = node.binary_parts() {
+        protected_assignment_target(context, parts.left, sink);
+    }
+}
+
+/// Checks only names being rebound; an indexed or member target changes a
+/// value, and an installation changes a method table rather than its binding.
+fn protected_assignment_target(
+    context: &NodeContext,
+    target: SyntaxNode,
+    sink: &mut DiagnosticSink,
+) {
+    let Some(target) = parenthesized_value(target) else {
+        return;
+    };
+    if target.is_collection_expression() {
+        for element in target.collection_elements() {
+            protected_assignment_target(context, element, sink);
+        }
+        return;
+    }
+    if !target.is::<Symbol>() {
+        return;
+    }
+    let name = target.text();
+    let range = context.source.range_for_node(target);
+    if context
+        .analysis
+        .assigned_binding_at(range)
+        .or_else(|| context.analysis.get_binding_at(name, range.start))
+        .is_some_and(|binding| binding.is_local())
+    {
+        return;
+    }
+    if context
+        .knowledge
+        .get_record(&ObjectName::new(name))
+        .is_some_and(|record| record.protected)
+    {
+        sink.spawn(
+            &catalog::PROTECTED_ASSIGNMENT,
+            Finding::new(range, format!("Cannot assign to protected symbol `{name}`")),
+        );
+    }
+}
+
+/// An expression selecting a variable a ring the program writes out does
+/// not have: a subscript `R_i` past its variables, or a lookup `"v"_R` of a
+/// name none of them has.
+fn ring_variable_selection(context: &NodeContext, sink: &mut DiagnosticSink) {
+    let Some(Err(error)) =
+        context
+            .analysis
+            .selected_ring_variable(context.node, context.source, context.knowledge)
+    else {
+        return;
+    };
+    let (rule, hint) = match &error {
+        RingVariableError::IndexOutOfBounds(out_of_bounds) => (
+            &catalog::RING_INDEX_OUT_OF_BOUNDS,
+            match out_of_bounds.variable_count {
+                1 => "this ring has 1 variable".to_string(),
+                count => format!("this ring has {count} variables"),
+            } + ", counting those of a polynomial coefficient ring",
+        ),
+        RingVariableError::NotFound { .. } => (
+            &catalog::RING_VARIABLE_NOT_FOUND,
+            "lookups by name find only the ring's variables, as its subscripts select them"
+                .to_string(),
+        ),
+    };
+    sink.spawn(
+        rule,
+        Finding::new(context.node_range(), format!("{error}; {hint}")),
+    );
 }
 
 fn colon_equal_part_assignment(context: &NodeContext, sink: &mut DiagnosticSink) {

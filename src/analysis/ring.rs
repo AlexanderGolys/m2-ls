@@ -2,9 +2,11 @@
 
 use m2_syn::nodes::{Array, ExprNew as NewStatement, FloatLiteral, IntegerLiteral, Symbol};
 use m2_syn::Token;
+use std::fmt::{self, Display, Formatter};
 
 use crate::node_metadata::visit_expression_nodes;
 
+use super::known_value::KnownValue;
 use super::typechecker::{OperatorTypeQuery, TypeChecker};
 use super::*;
 
@@ -23,6 +25,23 @@ const INDEXED_VARIABLE_TABLE: &str = "IndexedVariableTable";
 
 /// The class of an index nothing wrote, `x_5` of `x_2 = 4`.
 const INDEXED_VARIABLE: &str = "IndexedVariable";
+
+/// The class of `RR` and `CC`, whose subscript `RR_53` is the field of that
+/// precision.
+const INEXACT_FIELD_FAMILY: &str = "InexactFieldFamily";
+
+/// The field class each inexact field family subscripts into, `RR_53` a
+/// `RealField`. `RRi` and `CCi` subscript into classes private to `Core`,
+/// which source cannot name, so they read as the [`INEXACT_FIELD`] above.
+const PRECISION_FIELD_CLASSES: [(&str, &str); 2] = [("RR", "RealField"), ("CC", "ComplexField")];
+
+/// The public class of every field an inexact field family subscripts into.
+const INEXACT_FIELD: &str = "InexactField";
+
+/// The ring classes whose subscripts select variables. A ring of no class
+/// at or above them, as `RR_53` or `GF 8`, has none, so it adds none to a
+/// polynomial ring over it either.
+const VARIABLE_RING_CLASSES: [&str; 2] = ["PolynomialRing", "QuotientRing"];
 
 /// Runtime binding shape produced for a ring generator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +119,19 @@ impl IndexedVariableTypes {
         let unwritten = InferredType::exact(INDEXED_VARIABLE);
         possible.map_or(unwritten.clone(), |types| types | unwritten)
     }
+
+    /// The types an index no literal spells may read, the ring `A` of
+    /// `x_A`: no literal write covers it, so it reads a bare
+    /// `IndexedVariable` or what a write to an index known only at run time
+    /// stored.
+    fn read_nonliteral_type(&self) -> InferredType {
+        self.writes
+            .iter()
+            .filter(|write| write.selection == IndexSelection::Unknown)
+            .fold(InferredType::exact(INDEXED_VARIABLE), |types, write| {
+                types | InferredType::exact_from_id(write.value_type.clone())
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,19 +140,52 @@ enum IndexKey {
     String(String),
     List(Vec<IndexKey>),
     Sequence(Vec<IndexKey>),
+    /// A symbol evaluating to itself, `E` of `x_E`.
+    Symbol(ObjectName),
+    /// An indexed variable of such a symbol, `E_F` of `x_(E_F)`.
+    IndexedVariable {
+        base: ObjectName,
+        index: Box<IndexKey>,
+    },
 }
 
+/// Whether a symbol node evaluates to itself where an index spells it, so
+/// the index is the key it spells: `E` of `x_E` when nothing binds `E`.
+type BareSymbols<'resolver> = &'resolver dyn Fn(SyntaxNode<'_>) -> bool;
+
 impl IndexKey {
-    fn from_node(node: SyntaxNode<'_>) -> Option<Self> {
+    /// The key a literal index spells, with no symbol in it.
+    fn literal(node: SyntaxNode<'_>) -> Option<Self> {
+        Self::from_node(node, &|_| false)
+    }
+
+    /// The key the index `node` spells: a literal, or symbols that
+    /// `bare_symbols` says evaluate to themselves and indexed variables of
+    /// them.
+    fn from_node(node: SyntaxNode<'_>, bare_symbols: BareSymbols<'_>) -> Option<Self> {
         let node = parenthesized_value(node)?;
         if node.is::<IntegerLiteral>() {
             return node.text().parse().ok().map(Self::Integer);
         }
         if node.is_prefix_expr() && node.operator_node()?.text() == "-" {
-            let Self::Integer(value) = Self::from_node(node.unary_operand()?)? else {
+            let Self::Integer(value) = Self::from_node(node.unary_operand()?, bare_symbols)? else {
                 return None;
             };
             return value.checked_neg().map(Self::Integer);
+        }
+        if node.is::<Symbol>() {
+            return bare_symbols(node).then(|| Self::Symbol(ObjectName::new(node.text())));
+        }
+        if node.has_binary_operator::<Token![_]>() {
+            let parts = node.binary_parts()?;
+            let base = parenthesized_value(parts.left)?;
+            return (base.is::<Symbol>() && bare_symbols(base))
+                .then(|| Self::from_node(parts.right, bare_symbols))
+                .flatten()
+                .map(|index| Self::IndexedVariable {
+                    base: ObjectName::new(base.text()),
+                    index: Box::new(index),
+                });
         }
         if let Some(text) = node.string_literal_inner_text() {
             // Escaped strings require evaluation; do not compare their raw spelling.
@@ -129,7 +194,7 @@ impl IndexKey {
         if node.is::<List>() || node.is::<Sequence>() {
             let items = node
                 .collection_elements()
-                .map(Self::from_node)
+                .map(|element| Self::from_node(element, bare_symbols))
                 .collect::<Option<Vec<_>>>()?;
             return Some(if node.is::<List>() {
                 Self::List(items)
@@ -167,6 +232,103 @@ impl IndexKey {
             _ => false,
         }
     }
+
+    /// How many keys the range from `self` to `end` spans: integers count up,
+    /// and sequences and lists span the box of their components, so a
+    /// descending component spans nothing. `None` for a range this analysis
+    /// does not enumerate, as one of strings.
+    fn span_len(&self, end: &Self, exclusive: bool) -> Option<usize> {
+        match (self, end) {
+            (Self::Integer(start), Self::Integer(end)) => {
+                let len = end
+                    .checked_sub(*start)?
+                    .checked_add(i64::from(!exclusive))?;
+                Some(usize::try_from(len).unwrap_or(0))
+            }
+            (Self::List(starts), Self::List(ends))
+            | (Self::Sequence(starts), Self::Sequence(ends))
+                if starts.len() == ends.len() =>
+            {
+                starts
+                    .iter()
+                    .zip(ends)
+                    .try_fold(1_usize, |len, (start, end)| {
+                        len.checked_mul(start.span_len(end, exclusive)?)
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    /// The `n`th key of the range from `self` to `end`, in the order
+    /// Macaulay2 expands it: the last component of a box varies fastest.
+    fn span_nth(&self, end: &Self, exclusive: bool, n: usize) -> Option<Self> {
+        if n >= self.span_len(end, exclusive)? {
+            return None;
+        }
+        match (self, end) {
+            (Self::Integer(start), Self::Integer(_)) => {
+                start.checked_add(i64::try_from(n).ok()?).map(Self::Integer)
+            }
+            (Self::List(starts), Self::List(ends))
+            | (Self::Sequence(starts), Self::Sequence(ends)) => {
+                let mut rest = n;
+                let mut components = starts
+                    .iter()
+                    .zip(ends)
+                    .rev()
+                    .map(|(start, end)| {
+                        let len = start.span_len(end, exclusive)?;
+                        let component = start.span_nth(end, exclusive, rest % len);
+                        rest /= len;
+                        component
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                components.reverse();
+                Some(if matches!(self, Self::List(_)) {
+                    Self::List(components)
+                } else {
+                    Self::Sequence(components)
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The key as Macaulay2 prints it: `(1,1)`, `{1, 2}`, `E_F`, and a string
+/// without quotes.
+impl Display for IndexKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let join = |keys: &[Self], separator| {
+            keys.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(separator)
+        };
+        match self {
+            Self::Integer(value) => write!(f, "{value}"),
+            Self::String(text) => f.write_str(text),
+            Self::List(keys) => write!(f, "{{{}}}", join(keys, ", ")),
+            Self::Sequence(keys) => write!(f, "({})", join(keys, ",")),
+            Self::Symbol(name) => f.write_str(name.name()),
+            Self::IndexedVariable { base, index } => {
+                write!(f, "{}_{}", base.name(), index.subscript())
+            }
+        }
+    }
+}
+
+impl IndexKey {
+    /// The key as it follows `_` in a printed indexed variable, parenthesized
+    /// unless atomic: `x_(-1)`, `x_(E_F)`.
+    fn subscript(&self) -> String {
+        match self {
+            Self::Integer(value) if *value < 0 => format!("({self})"),
+            Self::IndexedVariable { .. } => format!("({self})"),
+            _ => self.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +355,303 @@ impl IndexSelection {
             } => key.in_range(start, end, *exclusive),
             Self::Unknown => false,
         }
+    }
+
+    /// How many indices the selection names; `None` when that is not known.
+    fn key_count(&self) -> Option<usize> {
+        match self {
+            Self::Exact(_) => Some(1),
+            Self::Range {
+                start,
+                end,
+                exclusive,
+            } => start.span_len(end, *exclusive),
+            Self::Unknown => None,
+        }
+    }
+
+    /// The `n`th index the selection names, in Macaulay2's expansion order.
+    fn key_at(&self, n: usize) -> Option<IndexKey> {
+        match self {
+            Self::Exact(index) => (n == 0).then(|| index.clone()),
+            Self::Range {
+                start,
+                end,
+                exclusive,
+            } => start.span_nth(end, *exclusive, n),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// One variable of a ring as Macaulay2 prints it: `z`, `x_0`, `w_(1,1)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingVariable {
+    base: ObjectName,
+    index: Option<IndexKey>,
+}
+
+impl Display for RingVariable {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match &self.index {
+            Some(index) => write!(f, "{}_{}", self.base.name(), index.subscript()),
+            None => f.write_str(self.base.name()),
+        }
+    }
+}
+
+impl From<&RingGeneratorBinding<'_>> for RingGenerator {
+    fn from(binding: &RingGeneratorBinding<'_>) -> Self {
+        Self {
+            name: ObjectName::new(&binding.name),
+            kind: binding.kind,
+            indices: binding.indices.clone(),
+        }
+    }
+}
+
+impl RingGenerator {
+    /// How many variables the generator declares: one for a plain name, each
+    /// index of its selection for an indexed family; `None` when unknown.
+    fn variable_count(&self) -> Option<usize> {
+        match self.kind {
+            RingGeneratorKind::Direct => Some(1),
+            RingGeneratorKind::IndexedTable => self.indices.as_ref()?.key_count(),
+        }
+    }
+
+    /// The `n`th variable the generator declares.
+    fn variable(&self, n: usize) -> Option<RingVariable> {
+        let index = match self.kind {
+            RingGeneratorKind::Direct => (n == 0).then_some(None)?,
+            RingGeneratorKind::IndexedTable => Some(self.indices.as_ref()?.key_at(n)?),
+        };
+        Some(RingVariable {
+            base: self.name.clone(),
+            index,
+        })
+    }
+}
+
+/// A ring the program writes out, as far as its subscripts `R_i` reach:
+/// which variables they select. Built from source alone, never from a type —
+/// a `PolynomialRing` in general has variables no analysis can name, while
+/// `QQ[x]` has exactly `x` over `QQ`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RingValue {
+    /// A ring whose subscripts select no variables and which adds none to a
+    /// ring over it: `QQ`, `ZZ`, `RR_53`, `GF 8`.
+    Basic,
+    /// `coefficient_ring[variables]`, the coefficient ring `None` when the
+    /// program does not determine it statically.
+    Polynomial {
+        coefficient_ring: Option<Box<RingValue>>,
+        variables: Vec<RingGenerator>,
+    },
+    /// `ring / ideal`, whose subscripts select the images of those of `ring`.
+    Quotient(Box<RingValue>),
+}
+
+impl RingValue {
+    /// The variables the subscripts select, in order: a polynomial ring's
+    /// own, then down its tower those of its coefficient ring, `R_1` of
+    /// `R = QQ[a][b]` being `a`. `None` when subscripts select no variables.
+    fn variables(&self) -> Option<RingVariables<'_>> {
+        match self {
+            Self::Basic => None,
+            Self::Polynomial {
+                coefficient_ring,
+                variables,
+            } => {
+                let mut tower = RingVariables {
+                    generators: variables.iter().collect(),
+                    complete: true,
+                };
+                match coefficient_ring.as_deref().map(Self::variables) {
+                    Some(Some(coefficient_variables)) => {
+                        tower.generators.extend(coefficient_variables.generators);
+                        tower.complete = coefficient_variables.complete;
+                    }
+                    Some(None) => {}
+                    None => tower.complete = false,
+                }
+                Some(tower)
+            }
+            Self::Quotient(ring) => ring.variables(),
+        }
+    }
+
+    /// The variable `R_index` selects, or why Macaulay2 rejects the index;
+    /// `None` when that is not known.
+    pub fn subscript(&self, index: i64) -> Option<Result<RingVariable, RingIndexOutOfBounds>> {
+        self.variables()?.get(index)
+    }
+
+    /// The variable named `name` among all those the subscripts select, as
+    /// Macaulay2 indexes them by their printed names.
+    fn search(&self, name: &VariableName) -> VariableSearch {
+        let Some(variables) = self.variables() else {
+            return VariableSearch::Absent;
+        };
+        for generator in variables.generators {
+            let Some(count) = generator.variable_count() else {
+                return VariableSearch::Undetermined;
+            };
+            if !name.0.starts_with(generator.name.name()) {
+                continue;
+            }
+            if let Some(variable) = (0..count)
+                .filter_map(|n| generator.variable(n))
+                .find(|variable| variable.to_string() == name.0)
+            {
+                return VariableSearch::Found(variable);
+            }
+        }
+        if variables.complete {
+            VariableSearch::Absent
+        } else {
+            VariableSearch::Undetermined
+        }
+    }
+}
+
+/// A subscript `R_index` past the variables of `R`, which Macaulay2 rejects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingIndexOutOfBounds {
+    pub index: i64,
+    pub variable_count: usize,
+}
+
+/// Macaulay2's own message: `index 2 out of bounds 0 .. 1`.
+impl Display for RingIndexOutOfBounds {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let last = i128::try_from(self.variable_count).map_or(i128::MAX, |count| count - 1);
+        write!(f, "index {} out of bounds 0 .. {last}", self.index)
+    }
+}
+
+/// A ring variable's name as Macaulay2 prints it, `x_1`: what `"x_1"_R`,
+/// `x_1_R` and `S_0_R` look the variable up by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariableName(String);
+
+impl Display for VariableName {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// What the left operand of `v_R` is, which picks the method Macaulay2
+/// looks the variable `v` up in `R` with, and what it does without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VariableLookup {
+    /// `String _ Ring`, `"x"_R`.
+    String,
+    /// `Symbol _ Ring`, `x_R` with `x` unbound — or bound by a package the
+    /// analysis does not see, so a failed lookup is never claimed.
+    Symbol,
+    /// `IndexedVariable _ Ring`, `x_1_R`.
+    IndexedVariable,
+    /// `RingElement _ Ring`, `x_1_B_R`: a variable of another ring, looked
+    /// up by its name or else promoted, which may succeed.
+    RingElement,
+}
+
+impl VariableLookup {
+    /// Macaulay2's error when `R` has no variable of the name, where that
+    /// certainly ends the lookup.
+    fn failure(self) -> Option<&'static str> {
+        match self {
+            Self::String => Some("variable not found in ring"),
+            Self::IndexedVariable => Some("indexed variable not found in ring"),
+            Self::Symbol | Self::RingElement => None,
+        }
+    }
+}
+
+/// Why Macaulay2 rejects an expression selecting a variable of a ring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RingVariableError {
+    /// A subscript `R_i` past the variables of `R`.
+    IndexOutOfBounds(RingIndexOutOfBounds),
+    /// A lookup `v_R` of a name no variable of `R` has.
+    NotFound {
+        name: VariableName,
+        failure: &'static str,
+    },
+}
+
+/// Macaulay2's own message, with the name a lookup missed.
+impl Display for RingVariableError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IndexOutOfBounds(out_of_bounds) => out_of_bounds.fmt(f),
+            Self::NotFound { name, failure } => write!(f, "{failure}: `{name}`"),
+        }
+    }
+}
+
+/// A variable of a ring the program writes out, as an expression selects
+/// it: `S_6`, `"x"_A`, `x_1_A`. `ring` is the operand naming the ring.
+#[derive(Debug, Clone)]
+pub struct SelectedRingVariable<'tree> {
+    pub ring: SyntaxNode<'tree>,
+    pub variable: RingVariable,
+}
+
+/// Whether a ring has a variable of some name.
+enum VariableSearch {
+    Found(RingVariable),
+    Absent,
+    Undetermined,
+}
+
+/// The variables the subscripts of a ring select, in order. Where part of
+/// its tower is not known, only a prefix is: `complete` tells whether
+/// `generators` ends where the ring's variables do.
+struct RingVariables<'ring> {
+    generators: Vec<&'ring RingGenerator>,
+    complete: bool,
+}
+
+impl RingVariables<'_> {
+    /// How many variables the ring has; `None` unless all are known.
+    fn count(&self) -> Option<usize> {
+        self.complete.then_some(())?;
+        self.generators
+            .iter()
+            .try_fold(0_usize, |count, generator| {
+                count.checked_add(generator.variable_count()?)
+            })
+    }
+
+    /// The variable `R_index` selects, a negative index counting from the
+    /// end, or the bounds it breaks; `None` when that is not known.
+    fn get(&self, index: i64) -> Option<Result<RingVariable, RingIndexOutOfBounds>> {
+        let out_of_bounds = |variable_count| RingIndexOutOfBounds {
+            index,
+            variable_count,
+        };
+        let mut offset = if index < 0 {
+            let count = self.count()?;
+            match usize::try_from(index.unsigned_abs()) {
+                Ok(distance) if distance <= count => count - distance,
+                _ => return Some(Err(out_of_bounds(count))),
+            }
+        } else {
+            usize::try_from(index).ok()?
+        };
+        for generator in &self.generators {
+            let count = generator.variable_count()?;
+            if offset < count {
+                return generator.variable(offset).map(Ok);
+            }
+            offset -= count;
+        }
+        Some(Err(out_of_bounds(self.count()?)))
     }
 }
 
@@ -236,14 +695,31 @@ impl Analysis {
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) {
         let (expression, syntax) = expression;
+        // Generators rebound to a quotient are registered at the ring's own
+        // target range, so its state is resolved before they take that key.
+        let ring_state = self
+            .registry
+            .binding_states_by_range
+            .get(&source_range_key(source.range_for_node(rebind_node)))
+            .copied();
         let mut nodes = Vec::new();
         visit_expression_nodes(expression, syntax, |node| nodes.push(node));
         let mut specs = nodes
             .into_iter()
             .filter_map(|node| self.ring_constructor_variables(node, source, knowledge, scope_idx))
-            .map(|variables| (variables, RingGeneratorBinding::collect(variables)))
+            .map(|variables| {
+                (
+                    variables,
+                    RingGeneratorBinding::collect(variables, &|symbol| {
+                        self.is_bare_symbol(symbol, source, knowledge)
+                    }),
+                )
+            })
             .collect::<Vec<_>>();
-        specs.extend(RingGeneratorBinding::variable_option(expression));
+        specs.extend(RingGeneratorBinding::variable_option(
+            expression,
+            &|symbol| self.is_bare_symbol(symbol, source, knowledge),
+        ));
 
         let mut generators = Vec::new();
         for (spec, bindings) in specs {
@@ -251,11 +727,7 @@ impl Analysis {
                 .ring_generator_specs
                 .push(source.range_for_node(spec));
             for generator in bindings {
-                generators.push(RingGenerator {
-                    name: ObjectName::new(&generator.name),
-                    kind: generator.kind,
-                    indices: generator.indices.clone(),
-                });
+                generators.push(RingGenerator::from(&generator));
                 self.register_ring_generator(
                     ring_name,
                     &generator.name,
@@ -287,6 +759,301 @@ impl Analysis {
         self.registry
             .ring_generators
             .insert(ObjectName::new(ring_name), generators);
+
+        let value = self.ring_value(expression, source, knowledge, scope_idx);
+        if let Some(state) = ring_state.and_then(|id| {
+            self.registry
+                .bindings
+                .get_mut(id.binding.0 as usize)?
+                .states
+                .get_mut(id.state)
+        }) {
+            state.known_value = value.map(KnownValue::Ring);
+        }
+    }
+
+    /// The variable of a ring the program writes out that `expression`
+    /// selects, or why Macaulay2 rejects it: a subscript `S_6` by a literal
+    /// index, `z` after `S = RR_7[x_0..y_2, z, w_(1,1)]`, or a lookup by
+    /// name `"x"_A`, `x_1_A`, `S_0_A`. `None` when the program does not
+    /// determine either.
+    pub fn selected_ring_variable<'tree>(
+        &self,
+        expression: SyntaxNode<'tree>,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Option<Result<SelectedRingVariable<'tree>, RingVariableError>> {
+        let expression = parenthesized_value(expression)?;
+        let parts = expression
+            .binary_parts()
+            .filter(|_| expression.has_binary_operator::<Token![_]>())?;
+        self.subscript_selection(parts.left, parts.right, source, knowledge)
+    }
+
+    /// What `left _ right` selects: a variable of the written ring `left` by
+    /// the literal index `right`, or of the written ring `right` by the name
+    /// `left` gives.
+    pub(super) fn subscript_selection<'tree>(
+        &self,
+        left: SyntaxNode<'tree>,
+        right: SyntaxNode<'tree>,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Option<Result<SelectedRingVariable<'tree>, RingVariableError>> {
+        if let Some(ring) = self.written_ring(left, source) {
+            let IndexKey::Integer(index) = IndexKey::literal(right)? else {
+                return None;
+            };
+            return Some(
+                ring.subscript(index)?
+                    .map(|variable| SelectedRingVariable {
+                        ring: left,
+                        variable,
+                    })
+                    .map_err(RingVariableError::IndexOutOfBounds),
+            );
+        }
+        let ring = self.written_ring(right, source)?;
+        let (name, lookup) = self.variable_name(left, source, knowledge)?;
+        match ring.search(&name) {
+            VariableSearch::Found(variable) => Some(Ok(SelectedRingVariable {
+                ring: right,
+                variable,
+            })),
+            VariableSearch::Absent => lookup
+                .failure()
+                .map(|failure| Err(RingVariableError::NotFound { name, failure })),
+            VariableSearch::Undetermined => None,
+        }
+    }
+
+    /// Whether `left _ right` reads an unindexed ring variable `left` at
+    /// the index `right`, which Macaulay2 answers with the indexed variable
+    /// of its name: `x_1` for `A_0_1` when `A_0` is `x`, or for `x_1` when
+    /// `x` holds a ring generator.
+    pub(super) fn indexes_ring_variable(
+        &self,
+        left: SyntaxNode<'_>,
+        right: SyntaxNode<'_>,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> bool {
+        let bare_symbols = |symbol: SyntaxNode<'_>| self.is_bare_symbol(symbol, source, knowledge);
+        IndexKey::from_node(right, &bare_symbols).is_some()
+            && match parenthesized_value(left) {
+                Some(symbol) if symbol.is::<Symbol>() => {
+                    let position = source.position_for_node(symbol);
+                    let scope_idx = self.find_scope_at(position).unwrap_or(0);
+                    self.get_binding_from_scope(symbol.text(), scope_idx, position)
+                        .is_some_and(|binding| {
+                            binding.state.is_ring_generator
+                                && binding.state.indexed_element_type.is_none()
+                        })
+                }
+                _ => matches!(
+                    self.selected_ring_variable(left, source, knowledge),
+                    Some(Ok(selected)) if selected.variable.index.is_none()
+                ),
+            }
+    }
+
+    /// Whether `symbol` evaluates to itself: nothing the analysis sees binds
+    /// it and no builtin object has its name, so as an index it is the key
+    /// it spells, `E` of `x_E`.
+    fn is_bare_symbol(
+        &self,
+        symbol: SyntaxNode<'_>,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> bool {
+        let position = source.position_for_node(symbol);
+        let scope_idx = self.find_scope_at(position).unwrap_or(0);
+        symbol.is::<Symbol>()
+            && self
+                .get_binding_from_scope(symbol.text(), scope_idx, position)
+                .is_none()
+            && TypeChecker::new(self, knowledge)
+                .type_of(symbol, source, scope_idx)
+                .single()
+                .is_some_and(|class| *class == TypeRole::Symbol.object_name())
+    }
+
+    /// The ring `ring` names when its binding holds one the program writes
+    /// out.
+    fn written_ring(
+        &self,
+        ring: SyntaxNode<'_>,
+        source: &(impl SourceNavigation + ?Sized),
+    ) -> Option<&RingValue> {
+        let ring = parenthesized_value(ring)?;
+        let name = ring.is::<Symbol>().then(|| ring.text())?;
+        let position = source.position_for_node(ring);
+        let binding =
+            self.get_binding_from_scope(name, self.find_scope_at(position).unwrap_or(0), position)?;
+        match &binding.state.known_value {
+            Some(KnownValue::Ring(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The name the left operand of a lookup `v_R` gives, with the method
+    /// Macaulay2 dispatches it to: a string, a symbol not holding an indexed
+    /// variable table (whose `x_R` reads the table at the key `R`), a
+    /// selected ring variable, or such a name indexed by a literal.
+    fn variable_name(
+        &self,
+        expression: SyntaxNode<'_>,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Option<(VariableName, VariableLookup)> {
+        let expression = parenthesized_value(expression)?;
+        if let Some(text) = expression.string_literal_inner_text() {
+            // Escaped strings require evaluation; do not compare their raw spelling.
+            return (!text.contains('\\'))
+                .then(|| (VariableName(text.to_string()), VariableLookup::String));
+        }
+        if expression.is::<Symbol>() {
+            let position = source.position_for_node(expression);
+            let scope_idx = self.find_scope_at(position).unwrap_or(0);
+            let lookup = match self.get_binding_from_scope(expression.text(), scope_idx, position) {
+                None => VariableLookup::Symbol,
+                Some(binding) if binding.state.indexed_element_type.is_some() => return None,
+                Some(binding) if binding.state.is_ring_generator => VariableLookup::RingElement,
+                Some(_) => return None,
+            };
+            return Some((VariableName(expression.text().to_string()), lookup));
+        }
+        if let Some(Ok(selected)) = self.selected_ring_variable(expression, source, knowledge) {
+            return Some((
+                VariableName(selected.variable.to_string()),
+                VariableLookup::RingElement,
+            ));
+        }
+        let parts = expression
+            .binary_parts()
+            .filter(|_| expression.has_binary_operator::<Token![_]>())?;
+        let bare_symbols = |symbol: SyntaxNode<'_>| self.is_bare_symbol(symbol, source, knowledge);
+        let index = IndexKey::from_node(parts.right, &bare_symbols)?;
+        let (base, lookup) = self.indexed_variable_base(parts.left, &index, source, knowledge)?;
+        Some((
+            VariableName(format!("{base}_{}", index.subscript())),
+            lookup,
+        ))
+    }
+
+    /// The name `base` gives an indexed variable `base_index`, with what the
+    /// indexed variable is: a symbol unbound, holding an indexed variable
+    /// table — whose index a ring constructor may have made a ring element —
+    /// or holding a ring generator, or a selected unindexed ring variable.
+    fn indexed_variable_base(
+        &self,
+        base: SyntaxNode<'_>,
+        index: &IndexKey,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Option<(VariableName, VariableLookup)> {
+        let base = parenthesized_value(base)?;
+        if base.is::<Symbol>() {
+            let position = source.position_for_node(base);
+            let scope_idx = self.find_scope_at(position).unwrap_or(0);
+            let lookup = match self.get_binding_from_scope(base.text(), scope_idx, position) {
+                None => VariableLookup::IndexedVariable,
+                Some(binding) => match &binding.state.indexed_element_type {
+                    Some(table) => match table.write_at(index) {
+                        None => VariableLookup::IndexedVariable,
+                        Some(write) if write.writer == IndexedWriter::RingConstructor => {
+                            VariableLookup::RingElement
+                        }
+                        Some(_) => return None,
+                    },
+                    None if binding.state.is_ring_generator => VariableLookup::IndexedVariable,
+                    None => return None,
+                },
+            };
+            return Some((VariableName(base.text().to_string()), lookup));
+        }
+        match self.selected_ring_variable(base, source, knowledge)? {
+            Ok(selected) if selected.variable.index.is_none() => Some((
+                VariableName(selected.variable.base.name().to_string()),
+                VariableLookup::IndexedVariable,
+            )),
+            _ => None,
+        }
+    }
+
+    /// The ring `expression` evaluates to when the program writes it out: a
+    /// constructor over its coefficient ring, a quotient, a named ring
+    /// holding one, or a ring certainly adding no variables.
+    fn ring_value(
+        &self,
+        expression: SyntaxNode,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+        scope_idx: usize,
+    ) -> Option<RingValue> {
+        let expression = parenthesized_value(expression)?;
+        if let Some(variables) =
+            self.ring_constructor_variables(expression, source, knowledge, scope_idx)
+        {
+            let coefficient_ring = expression.binary_parts()?.left;
+            return Some(RingValue::Polynomial {
+                coefficient_ring: self
+                    .ring_value(coefficient_ring, source, knowledge, scope_idx)
+                    .map(Box::new),
+                variables: RingGeneratorBinding::collect(variables, &|symbol| {
+                    self.is_bare_symbol(symbol, source, knowledge)
+                })
+                .iter()
+                .map(RingGenerator::from)
+                .collect(),
+            });
+        }
+        if expression.has_binary_operator::<Token![/]>() {
+            let quotiented = expression.binary_parts()?.left;
+            return self
+                .ring_value(quotiented, source, knowledge, scope_idx)
+                .map(|ring| RingValue::Quotient(Box::new(ring)));
+        }
+        self.written_ring(expression, source).cloned().or_else(|| {
+            self.is_basic_ring(expression, source, knowledge, scope_idx)
+                .then_some(RingValue::Basic)
+        })
+    }
+
+    /// Whether `ring` is certainly a ring of a class with no variables to
+    /// select: every class its type admits is a ring neither polynomial nor
+    /// quotient, as `RealField` of `RR_53`, exactly `Ring` of `QQ`, or the
+    /// family `RR` standing for its default field. A bound such as `↑Ring`
+    /// admits polynomial rings, so it is not.
+    fn is_basic_ring(
+        &self,
+        ring: SyntaxNode,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+        scope_idx: usize,
+    ) -> bool {
+        let ring_type = TypeChecker::new(self, knowledge).type_of(ring, source, scope_idx);
+        let variable_classes = VARIABLE_RING_CLASSES.map(ObjectName::new);
+        let is_ring = |class: &ObjectName| {
+            knowledge.has_type_role(class, TypeRole::Ring)
+                || knowledge.is_subtype(class, &ObjectName::new(INEXACT_FIELD_FAMILY))
+        };
+        let mut exact = ring_type.exact_points().peekable();
+        let mut bounds = ring_type.upward_generators().peekable();
+        (exact.peek().is_some() || bounds.peek().is_some())
+            && exact.all(|class| {
+                is_ring(class)
+                    && !variable_classes
+                        .iter()
+                        .any(|variable_class| knowledge.is_subtype(class, variable_class))
+            })
+            && bounds.all(|bound| {
+                is_ring(bound)
+                    && !variable_classes.iter().any(|variable_class| {
+                        knowledge.is_subtype(bound, variable_class)
+                            || knowledge.is_subtype(variable_class, bound)
+                    })
+            })
     }
 
     /// The variables a ring constructor spells out as plain symbols — `QQ[x, y]`
@@ -304,13 +1071,13 @@ impl Analysis {
         else {
             return Vec::new();
         };
-        RingGeneratorBinding::collect(variables)
-            .into_iter()
-            .filter(|binding| {
-                binding.kind == RingGeneratorKind::Direct && binding.node.is::<Symbol>()
-            })
-            .map(|binding| binding.node)
-            .collect()
+        RingGeneratorBinding::collect(variables, &|symbol| {
+            self.is_bare_symbol(symbol, source, knowledge)
+        })
+        .into_iter()
+        .filter(|binding| binding.kind == RingGeneratorKind::Direct && binding.node.is::<Symbol>())
+        .map(|binding| binding.node)
+        .collect()
     }
 
     /// The variable list of `node` when it constructs a ring, the `[x, y]` of
@@ -332,7 +1099,7 @@ impl Analysis {
             .single()
             .is_some_and(|head_type| {
                 knowledge.has_type_role(head_type, TypeRole::Ring)
-                    || knowledge.is_subtype(head_type, &ObjectName::new("InexactFieldFamily"))
+                    || knowledge.is_subtype(head_type, &ObjectName::new(INEXACT_FIELD_FAMILY))
             })
             .then_some(variables)
     }
@@ -358,7 +1125,9 @@ impl Analysis {
             return;
         }
         self.registry.ring_generator_specs.push(range);
-        for generator in RingGeneratorBinding::collect(variables) {
+        for generator in RingGeneratorBinding::collect(variables, &|symbol| {
+            self.is_bare_symbol(symbol, source, knowledge)
+        }) {
             self.register_ring_generator(
                 ANONYMOUS_RING_ELEMENT,
                 &generator.name,
@@ -415,7 +1184,7 @@ impl Analysis {
         }
         let parts = node.binary_parts()?;
         let base = RingGeneratorBinding::name_node(parts.left)?;
-        let index = IndexKey::from_node(parts.right)?;
+        let index = IndexKey::literal(parts.right)?;
         let position = source.position_for_node(base);
         let binding = self.get_binding_from_scope(
             base.text(),
@@ -429,6 +1198,79 @@ impl Analysis {
             .write_at(&index)
             .is_some_and(|write| write.writer == IndexedWriter::RingConstructor)
             .then_some((binding.binding_id, index))
+    }
+
+    /// The role of a subscript that is one object spelled with `_`, the same
+    /// kind of object as one of its parts, so it reads as a single token:
+    /// `3_R`, a number promoted into the ring `R`; `RR_53`, the real field of
+    /// that precision. Subscripts selecting something else, as `R_0` selects
+    /// a generator, keep their parts; see [`Self::selector_role`].
+    pub(super) fn constant_subscript_role(
+        &self,
+        node: SyntaxNode<'_>,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Option<SourceSemanticRole> {
+        if !node.has_binary_operator::<Token![_]>() {
+            return None;
+        }
+        let parts = node.binary_parts()?;
+        if parts.left.is::<IntegerLiteral>() || parts.left.is::<FloatLiteral>() {
+            let ring = self.operand_type(
+                node,
+                parts.right.is::<Symbol>().then_some(parts.right)?,
+                source,
+                knowledge,
+            )?;
+            return (knowledge.has_type_role(&ring, TypeRole::Ring)
+                || knowledge.is_subtype(&ring, &ObjectName::new(INEXACT_FIELD_FAMILY)))
+            .then_some(SourceSemanticRole::RingLiteral);
+        }
+        if !parts.left.is::<Symbol>() || !parts.right.is::<IntegerLiteral>() {
+            return None;
+        }
+        let base = self.operand_type(node, parts.left, source, knowledge)?;
+        knowledge
+            .is_subtype(&base, &ObjectName::new(INEXACT_FIELD_FAMILY))
+            .then_some(SourceSemanticRole::PrecisionField)
+    }
+
+    /// The role of the literal an access `node` selects with, named by what
+    /// it selects: a generator for `R_0` on a ring `R`, otherwise a member,
+    /// the `0` of `L_0` or `L#0`.
+    pub(super) fn selector_role(
+        &self,
+        node: SyntaxNode<'_>,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> SourceSemanticRole {
+        let selects_generator = node.has_binary_operator::<Token![_]>()
+            && node
+                .binary_parts()
+                .and_then(|parts| self.operand_type(node, parts.left, source, knowledge))
+                .is_some_and(|base| knowledge.has_type_role(&base, TypeRole::Ring));
+        if selects_generator {
+            self.ring_generator_role(source.range_for_node(node))
+        } else {
+            SourceSemanticRole::PropertyKey
+        }
+    }
+
+    /// The one type inferred for `operand` of the expression `node`.
+    fn operand_type(
+        &self,
+        node: SyntaxNode<'_>,
+        operand: SyntaxNode<'_>,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Option<ObjectName> {
+        let scope_idx = self
+            .find_scope_at(source.position_for_node(node))
+            .unwrap_or(0);
+        TypeChecker::new(self, knowledge)
+            .type_of(operand, source, scope_idx)
+            .single()
+            .cloned()
     }
 
     /// The source of the indexed generator `node` names, from its name on:
@@ -570,7 +1412,7 @@ impl Analysis {
             .and_then(|binding| binding.state.indexed_element_type.clone())
             .unwrap_or_default();
         writes.writes.push(IndexedWrite {
-            selection: IndexKey::from_node(parts.right)
+            selection: IndexKey::literal(parts.right)
                 .map_or(IndexSelection::Unknown, IndexSelection::Exact),
             value_type,
             writer: IndexedWriter::Assignment,
@@ -658,7 +1500,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
             .filter(is_constructor_argument)
     }
 
-    fn collect(container: SyntaxNode<'tree>) -> Vec<Self> {
+    fn collect(container: SyntaxNode<'tree>, bare_symbols: BareSymbols<'_>) -> Vec<Self> {
         let elements = container.collection_elements().collect::<Vec<_>>();
         let variable_base = elements
             .iter()
@@ -690,12 +1532,12 @@ impl<'tree> RingGeneratorBinding<'tree> {
                             },
                         );
                     } else {
-                        Self::collect_spec(variables, &mut bindings);
+                        Self::collect_spec(variables, &mut bindings, bare_symbols);
                     }
                 }
                 continue;
             }
-            Self::collect_spec(element, &mut bindings);
+            Self::collect_spec(element, &mut bindings, bare_symbols);
         }
 
         bindings
@@ -722,7 +1564,10 @@ impl<'tree> RingGeneratorBinding<'tree> {
     /// The generators named by the `Variable` option of the outermost call
     /// of `expression`, the `g` of `GF(8, Variable => g)`, with that option's
     /// value.
-    fn variable_option(expression: SyntaxNode<'tree>) -> Option<(SyntaxNode<'tree>, Vec<Self>)> {
+    fn variable_option(
+        expression: SyntaxNode<'tree>,
+        bare_symbols: BareSymbols<'_>,
+    ) -> Option<(SyntaxNode<'tree>, Vec<Self>)> {
         let application = parenthesized_value(expression)?;
         if !application.is_space_application() {
             return None;
@@ -732,7 +1577,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
             .collection_elements()
             .find_map(|argument| Self::option_value(argument, VARIABLE_OPTION))?;
         let mut bindings = Vec::new();
-        Self::collect_spec(value, &mut bindings);
+        Self::collect_spec(value, &mut bindings, bare_symbols);
         Some((value, bindings))
     }
 
@@ -753,7 +1598,11 @@ impl<'tree> RingGeneratorBinding<'tree> {
             .filter(|argument| argument.string_literal_inner_text().is_some())
     }
 
-    fn collect_spec(node: SyntaxNode<'tree>, bindings: &mut Vec<RingGeneratorBinding<'tree>>) {
+    fn collect_spec(
+        node: SyntaxNode<'tree>,
+        bindings: &mut Vec<RingGeneratorBinding<'tree>>,
+        bare_symbols: BareSymbols<'_>,
+    ) {
         let Some(node) = parenthesized_value(node) else {
             return;
         };
@@ -798,8 +1647,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
                         node: base,
                         indices: node
                             .binary_parts()
-                            .map(|parts| parts.right)
-                            .and_then(IndexKey::from_node)
+                            .and_then(|parts| IndexKey::from_node(parts.right, bare_symbols))
                             .map(IndexSelection::Exact),
                     },
                 );
@@ -822,13 +1670,11 @@ impl<'tree> RingGeneratorBinding<'tree> {
                 {
                     let indices = left
                         .binary_parts()
-                        .map(|parts| parts.right)
-                        .and_then(IndexKey::from_node)
+                        .and_then(|parts| IndexKey::from_node(parts.right, bare_symbols))
                         .zip(
                             right
                                 .binary_parts()
-                                .map(|parts| parts.right)
-                                .and_then(IndexKey::from_node),
+                                .and_then(|parts| IndexKey::from_node(parts.right, bare_symbols)),
                         )
                         .map(|(start, end)| IndexSelection::Range {
                             start,
@@ -873,7 +1719,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
 
         if node.is_collection_expression() {
             for element in node.collection_elements() {
-                Self::collect_spec(element, bindings);
+                Self::collect_spec(element, bindings, bare_symbols);
             }
         }
     }
@@ -928,7 +1774,8 @@ impl<'tree> RingGeneratorBinding<'tree> {
 }
 
 impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge> {
-    /// Infer the ring-specific indexed-variable and quotient operator cases.
+    /// Infer the ring-specific indexed-variable, precision-field, and quotient
+    /// operator cases.
     pub fn ring_operator_type(
         &self,
         query: OperatorTypeQuery<'_>,
@@ -937,6 +1784,19 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<InferredType> {
         let promoted_value = parenthesized_value(query.left)?;
+        // `InexactFieldFamily _ ZZ` is the only subscript of a family, so
+        // `RR_p` is the real field of precision `p` whatever `p` is.
+        if matches_token::<Token![_]>(query.operator)
+            && knowledge.is_subtype(left_name, &ObjectName::new(INEXACT_FIELD_FAMILY))
+        {
+            let family = symbol_node_text(promoted_value);
+            let field = PRECISION_FIELD_CLASSES
+                .iter()
+                .find(|(name, _)| family == Some(*name))
+                .map_or(INEXACT_FIELD, |(_, field)| field);
+            return Some(InferredType::exact(field));
+        }
+
         if matches_token::<Token![_]>(query.operator)
             && (promoted_value.is::<IntegerLiteral>() || promoted_value.is::<FloatLiteral>())
         {
@@ -967,8 +1827,14 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
                 )
                 .and_then(|binding| binding.state.indexed_element_type.as_ref())
             {
-                if let Some(index) = query.right.and_then(IndexKey::from_node) {
+                if let Some(index) = query.right.and_then(IndexKey::literal) {
                     return Some(elements.read_type(&index));
+                }
+                if query
+                    .right
+                    .is_some_and(|key| self.written_ring(key, source).is_some())
+                {
+                    return Some(elements.read_nonliteral_type());
                 }
                 return Some(
                     elements.writes.iter().fold(
@@ -994,7 +1860,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         None
     }
 
-    fn resolved_ring_element_type(
+    pub(super) fn resolved_ring_element_type(
         &self,
         ring: SyntaxNode<'_>,
         source: &(impl SourceNavigation + ?Sized),
@@ -1065,7 +1931,10 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         operand.is_some_and(|operand| {
             self.type_of(operand, source, scope_idx)
                 .single()
-                .is_some_and(|type_name| knowledge.has_type_role(type_name, TypeRole::Ring))
+                .is_some_and(|type_name| {
+                    knowledge.has_type_role(type_name, TypeRole::Ring)
+                        || knowledge.is_subtype(type_name, &ObjectName::new(INEXACT_FIELD_FAMILY))
+                })
         })
     }
 }
@@ -1121,6 +1990,239 @@ mod tests {
         }
     }
 
+    /// Check what each subscript `(line, access)` of `source` evaluates to:
+    /// the variable as Macaulay2 prints it, Macaulay2's error prefixed by
+    /// `error: `, or `None` when the program does not determine it.
+    fn assert_ring_subscripts(source: &str, probes: &[(u32, &str, Option<&str>)]) {
+        let document = document(source);
+        assert!(
+            !document.root_node().has_error(),
+            "invalid fixture: {source}"
+        );
+        for (line, access, expected) in probes {
+            let node = document
+                .root_node()
+                .descendants()
+                .find(|node| {
+                    node.text() == *access && document.position_for_node(*node).line == *line
+                })
+                .unwrap_or_else(|| panic!("missing probe {access:?} on line {line}: {source}"));
+            let evaluated = document
+                .analysis()
+                .selected_ring_variable(node, &document, document.object_registry())
+                .map(|selected| match selected {
+                    Ok(selected) => selected.variable.to_string(),
+                    Err(error) => format!("error: {error}"),
+                });
+            assert_eq!(
+                evaluated.as_deref(),
+                *expected,
+                "wrong value of {access:?} on line {line}: {source}"
+            );
+        }
+    }
+
+    /// Expected values and errors are those of Macaulay2 1.26.05.
+    #[test]
+    fn subscripts_select_ring_variables_in_constructor_order() {
+        assert_ring_subscripts(
+            "R = RR_7\nS = R[x_0..y_2, z, w_(1,1)]\nS_0\nS_5\nS_6\nS_7\nS_8\nS_(-1)\nS_(-9)\n",
+            &[
+                (2, "S_0", Some("x_0")),
+                (3, "S_5", Some("y_2")),
+                (4, "S_6", Some("z")),
+                (5, "S_7", Some("w_(1,1)")),
+                (6, "S_8", Some("error: index 8 out of bounds 0 .. 7")),
+                (7, "S_(-1)", Some("w_(1,1)")),
+                (8, "S_(-9)", Some("error: index -9 out of bounds 0 .. 7")),
+            ],
+        );
+        assert_ring_subscripts(
+            "X = QQ[x_(0,0)..x_(1,2), c_3..c_1, a..c]\nX_4\nX_6\nX_8\nW = QQ[Variables => 2]\nW_1\n",
+            &[
+                (1, "X_4", Some("x_(1,1)")),
+                (2, "X_6", Some("a")),
+                (3, "X_8", Some("c")),
+                (5, "W_1", Some("p_1")),
+            ],
+        );
+    }
+
+    /// Over a polynomial ring the program writes out, subscripts go on into
+    /// its variables; over any other ring they end with the ring's own.
+    #[test]
+    fn subscripts_reach_into_written_coefficient_rings_only() {
+        assert_ring_subscripts(
+            "R = QQ[a]\nS = R[x]\nS_1\nS_2\nM = S/ideal(x^2)\nM_1\nM_(-1)\nZ = QQ[y_1..y_2][t]\nZ_2\n",
+            &[
+                (2, "S_1", Some("a")),
+                (3, "S_2", Some("error: index 2 out of bounds 0 .. 1")),
+                (5, "M_1", Some("a")),
+                (6, "M_(-1)", Some("a")),
+                (8, "Z_2", Some("y_2")),
+            ],
+        );
+        assert_ring_subscripts(
+            "F = RR_7\nT = F[x]\nT_0\nT_1\nB = GF(8, Variable => g)[y]\nB_1\nP = (ZZ/101)[u]\nP_1\n",
+            &[
+                (2, "T_0", Some("x")),
+                (3, "T_1", Some("error: index 1 out of bounds 0 .. 0")),
+                (5, "B_1", Some("error: index 1 out of bounds 0 .. 0")),
+                (7, "P_1", Some("error: index 1 out of bounds 0 .. 0")),
+            ],
+        );
+    }
+
+    /// A subscript reads the ring its name holds there; past the variables
+    /// the program determines, nothing is claimed, neither variable nor error.
+    #[test]
+    fn subscripts_follow_reassignment_and_stop_at_undetermined_variables() {
+        assert_ring_subscripts(
+            "S = QQ[a]\nS_0\nS = QQ[b]\nS_0\ni = random 10\nU = QQ[u, v_i]\nU_0\nU_1\nU_(-1)\nf = R -> (V = R[t]; V_1)\nF = ZZ/101\nF_0\n",
+            &[
+                (1, "S_0", Some("a")),
+                (3, "S_0", Some("b")),
+                (6, "U_0", Some("u")),
+                (7, "U_1", None),
+                (8, "U_(-1)", None),
+                (9, "V_1", None),
+                (11, "F_0", None),
+            ],
+        );
+    }
+
+    /// `v_R` looks the variable `v` names up in `R` by its printed name,
+    /// unless `v` holds an indexed variable table, whose `x_R` reads the
+    /// table at the key `R`. Values and classes are those of Macaulay2.
+    #[test]
+    fn lookups_by_name_select_variables_of_the_target_ring() {
+        let setup = "A = RR[x, y_1, x_1]\nB = RR[x, y_2]";
+        let probes = [
+            ("x", None, "B"),
+            ("x_B", Some("x"), "B"),
+            ("x_A", Some("x"), "A"),
+            ("x_1", None, "IndexedVariable"),
+            ("x_1_A", Some("x_1"), "A"),
+            ("y", None, "IndexedVariableTable"),
+            ("y_1", None, "A"),
+            ("y_2", None, "B"),
+            ("A_0_B", Some("x"), "B"),
+            ("B_0_A", Some("x"), "A"),
+        ];
+        assert_types(
+            setup,
+            &probes.map(|(expression, _, class)| (expression, class)),
+        );
+        let source = format!(
+            "{setup}\n{}\n",
+            probes.map(|(expression, _, _)| expression).join("\n")
+        );
+        assert_ring_subscripts(
+            &source,
+            &probes
+                .iter()
+                .enumerate()
+                .map(|(offset, (expression, value, _))| (offset as u32 + 2, *expression, *value))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Names come from strings, indexed variables, and selected variables
+    /// indexed again: `"x"_A_1` is the indexed variable `x_1`, which `_A`
+    /// looks up. `x_A` reads the table `x` at the key `A`.
+    #[test]
+    fn lookup_names_compose_through_strings_indices_and_selections() {
+        let setup = "A = RR[x, y_1, x_1, x_3]\nB = RR[x_1, y_2, x_2]";
+        let probes = [
+            ("x_A", None, "IndexedVariable"),
+            ("x_1_B_A", Some("x_1"), "A"),
+            ("x_1_A", Some("x_1"), "A"),
+            ("\"x\"_A_1", None, "IndexedVariable"),
+            ("\"x\"_A_1_A", Some("x_1"), "A"),
+            ("\"x_1\"_A", Some("x_1"), "A"),
+            ("A_0_1", None, "IndexedVariable"),
+            ("A_0_1_A", Some("x_1"), "A"),
+            ("x_3_A", Some("x_3"), "A"),
+        ];
+        assert_types(
+            setup,
+            &probes.map(|(expression, _, class)| (expression, class)),
+        );
+        let source = format!(
+            "{setup}\n{}\n",
+            probes.map(|(expression, _, _)| expression).join("\n")
+        );
+        assert_ring_subscripts(
+            &source,
+            &probes
+                .iter()
+                .enumerate()
+                .map(|(offset, (expression, value, _))| (offset as u32 + 2, *expression, *value))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// An index may be a symbol evaluating to itself, or an indexed variable
+    /// of one, printed in parentheses: `x_(E_F)`.
+    #[test]
+    fn symbolic_indices_name_variables_as_macaulay2_prints_them() {
+        let setup = "R = RR[x_(E_F), x]";
+        let probes = [
+            ("x", None, "R"),
+            ("x_(E_F)", None, "IndexedVariable"),
+            ("\"x_(E_F)\"_R", Some("x_(E_F)"), "R"),
+            ("x_R_(E_F)", None, "IndexedVariable"),
+            ("x_R_(E_F)_R", Some("x_(E_F)"), "R"),
+            ("x_(E_F)_R", Some("x_(E_F)"), "R"),
+            ("R_0", Some("x_(E_F)"), "R"),
+            ("R_1", Some("x"), "R"),
+        ];
+        assert_types(
+            setup,
+            &probes.map(|(expression, _, class)| (expression, class)),
+        );
+        let source = format!(
+            "{setup}\n{}\n",
+            probes.map(|(expression, _, _)| expression).join("\n")
+        );
+        assert_ring_subscripts(
+            &source,
+            &probes
+                .iter()
+                .enumerate()
+                .map(|(offset, (expression, value, _))| (offset as u32 + 1, *expression, *value))
+                .collect::<Vec<_>>(),
+        );
+        assert_ring_subscripts("E = 2\nS = RR[y_E]\nS_0\n", &[(2, "S_0", None)]);
+    }
+
+    /// A missing name is an error for a string or an indexed variable; a
+    /// ring element is promoted instead, and a bare symbol may be bound
+    /// where the analysis does not see, so neither is claimed. Lookups
+    /// search the whole tower, as subscripts do.
+    #[test]
+    fn lookups_report_missing_names_only_where_macaulay2_must_fail() {
+        assert_ring_subscripts(
+            "A = RR[x, y_1, x_1, x_3]\nB = RR[x_1, y_2, x_2]\n\"y\"_A\n\"x_3\"_B\ny_1_B\nx_2_A\nq_A\n",
+            &[
+                (2, "\"y\"_A", Some("error: variable not found in ring: `y`")),
+                (3, "\"x_3\"_B", Some("error: variable not found in ring: `x_3`")),
+                (4, "y_1_B", None),
+                (5, "x_2_A", None),
+                (6, "q_A", None),
+            ],
+        );
+        assert_ring_subscripts(
+            "K = QQ[k, m_1]\nS = K[b]\nQ = S/ideal(b^2)\nk_S\n\"m_1\"_Q\nS_1_K\n\"b\"_K\n",
+            &[
+                (3, "k_S", Some("k")),
+                (4, "\"m_1\"_Q", Some("m_1")),
+                (5, "S_1_K", Some("k")),
+                (6, "\"b\"_K", Some("error: variable not found in ring: `b`")),
+            ],
+        );
+    }
+
     #[test]
     fn polynomial_constructors_recognize_coefficient_rings_and_spacing() {
         for constructor in [
@@ -1143,6 +2245,29 @@ mod tests {
         ] {
             assert_types(
                 &format!("R = {constructor}"),
+                &[("R", "PolynomialRing"), ("x", "R")],
+            );
+        }
+    }
+
+    #[test]
+    fn inexact_field_families_subscript_into_fields_of_that_precision() {
+        assert_types(
+            "p = 100",
+            &[
+                ("RR_53", "RealField"),
+                ("RR_p", "RealField"),
+                ("CC_53", "ComplexField"),
+                ("CC_p", "ComplexField"),
+                ("RRi_53", "InexactField"),
+                ("RRi_p", "InexactField"),
+                ("CCi_53", "InexactField"),
+                ("CCi_p", "InexactField"),
+            ],
+        );
+        for field in ["RR_53", "CC_p", "RRi_(2*p)", "CCi_p"] {
+            assert_types(
+                &format!("p = 100\nR = {field}[x]"),
                 &[("R", "PolynomialRing"), ("x", "R")],
             );
         }

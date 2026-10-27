@@ -201,7 +201,7 @@ impl<'a> SemanticTokenEmitter<'a> {
         };
         let source_bytes = source_token.span.bytes();
         let inside =
-            |(start, end): (usize, usize)| source_bytes.start <= start && end <= source_bytes.end;
+            |bytes: ByteRange| source_bytes.start <= bytes.start && bytes.end <= source_bytes.end;
 
         let mut spans = sessions
             .iter()
@@ -220,7 +220,7 @@ impl<'a> SemanticTokenEmitter<'a> {
             self.document
                 .documentation_snippets()
                 .iter()
-                .filter(|snippet| inside(snippet.byte_span()))
+                .filter(|snippet| inside(snippet.span()))
                 .map(|snippet| documentation_snippet_semantic_span(self.document, snippet)),
         );
         let is_documentation = self.has_context(&source_bytes);
@@ -362,9 +362,8 @@ fn documentation_snippet_semantic_span(
     document: &DocumentSnapshot,
     snippet: &DocumentationSnippet,
 ) -> SemanticSpan {
-    let (start_byte, end_byte) = snippet.byte_span();
     SemanticSpan {
-        source: document.span_for_bytes(start_byte..end_byte),
+        source: document.span_for_bytes(snippet.span()),
         token: M2SemanticToken::new(M2SemanticTokenType::Property),
     }
 }
@@ -494,7 +493,10 @@ where
                 .unwrap_or_else(|| M2SemanticToken::new(M2SemanticTokenType::Symbol));
             let Some(token) = self
                 .apply_library_policy(named, Some(package.name.name()))
-                .with_binding_protection(export.access == ExportAccess::Protected)
+                .with_binding_protection(
+                    !self.document.properties().primary_code
+                        && export.access == ExportAccess::Protected,
+                )
                 .within_string()
             else {
                 continue;
@@ -624,6 +626,9 @@ where
     /// Whether package exports or indexed facts protect this global binding.
     /// An explicit export in the document takes precedence over indexed names.
     fn is_protected_global(&self, name: &str, position: Position) -> bool {
+        if self.document.properties().primary_code {
+            return false;
+        }
         self.document
             .packages()
             .declarations()
@@ -1858,36 +1863,45 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         assert!(tokens.iter().all(|token| token.length > 0));
     }
 
+    /// A value is algebraic when `ring` is installed on its class: ideals,
+    /// modules, matrices and ring elements are, numbers and lists are not,
+    /// and a ring stays a type without the modifier.
     #[test]
-    fn algebraic_values_use_general_standard_roles_without_type_modifiers() {
+    fn values_living_over_a_ring_are_algebraic_and_rings_stay_types() {
         let text = concat!(
             "R = QQ[x,y]\n",
             "I = ideal(x^2,y)\n",
             "Q = R/I\n",
             "M = Q^2\n",
             "x\n",
+            "A = matrix {{x}}\n",
+            "f = x^2\n",
+            "n = 3\n",
+            "L = {1}\n",
         );
         let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
+        let algebraic = M2SemanticTokenModifier::Algebraic.bit();
 
-        for (line, token_type) in [
-            (0, M2SemanticTokenType::Type),
-            (1, M2SemanticTokenType::Variable),
-            (2, M2SemanticTokenType::Type),
-            (3, M2SemanticTokenType::Variable),
-            (4, M2SemanticTokenType::Variable),
+        for (line, token_type, modifiers) in [
+            (0, M2SemanticTokenType::Type, 0),
+            (1, M2SemanticTokenType::Variable, algebraic),
+            (2, M2SemanticTokenType::Type, 0),
+            (3, M2SemanticTokenType::Variable, algebraic),
+            (4, M2SemanticTokenType::Variable, algebraic),
+            (5, M2SemanticTokenType::Variable, algebraic),
+            (6, M2SemanticTokenType::Variable, algebraic),
+            (7, M2SemanticTokenType::Variable, 0),
+            (8, M2SemanticTokenType::Variable, 0),
         ] {
             let token = token_at(&tokens, line, 0)
-                .unwrap_or_else(|| panic!("line {line} should carry an algebraic token"));
+                .unwrap_or_else(|| panic!("line {line} should be highlighted"));
             assert_eq!(token.token_type, token_type as u32, "line {line}");
             assert_eq!(
                 token.token_modifiers_bitset & !DECLARATION_MODIFIER,
-                if line == 4 {
-                    M2SemanticTokenModifier::Algebraic.bit()
-                } else {
-                    0
-                }
+                modifiers,
+                "line {line}"
             );
         }
     }
@@ -1958,6 +1972,45 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             token_at(&standard_tokens, 1, 0).map(|token| token.token_type),
             Some(M2SemanticTokenType::Variable as u32)
         );
+    }
+
+    /// A subscript spelling one object of the kind of one of its parts reads
+    /// as one token: `3_R` a number, `RR_53` a ring. An access keeps its
+    /// parts: the base its own colour, the operator an accessor, a literal
+    /// selector what it selects, a generator of `R` in `R_0`, a member in
+    /// `L_0` and `L#0`.
+    #[test]
+    fn constant_subscripts_are_single_tokens_and_accesses_keep_their_parts() {
+        let text = "R = QQ[x, y]\n3_R + R_0\nRR_53\nL = {1, 2}\nL_0\nR_i\nL#0\n";
+        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let document = document(text, &builtins);
+        let tokens = collect_tokens(&document, &builtins, false);
+        let generator = M2SemanticTokenModifier::Algebraic.bit();
+        let access = M2SemanticTokenModifier::Access.bit();
+
+        for (line, column, length, token_type) in [
+            (1, 0, 3, M2SemanticTokenType::Number),
+            (2, 0, 5, M2SemanticTokenType::Type),
+        ] {
+            let token = token_at(&tokens, line, column).expect("subscript is highlighted");
+            assert_eq!(token.length, length, "{line}:{column} is one token");
+            assert_eq!(token.token_type, token_type as u32, "{line}:{column}");
+        }
+        for (line, column, token_type, modifiers) in [
+            (1, 6, M2SemanticTokenType::Type, 0),
+            (1, 7, M2SemanticTokenType::Operator, access),
+            (1, 8, M2SemanticTokenType::Variable, generator),
+            (4, 1, M2SemanticTokenType::Operator, access),
+            (4, 2, M2SemanticTokenType::Property, 0),
+            (5, 1, M2SemanticTokenType::Operator, access),
+            (6, 1, M2SemanticTokenType::Operator, access),
+            (6, 2, M2SemanticTokenType::Property, 0),
+        ] {
+            let token = token_at(&tokens, line, column).expect("access part is highlighted");
+            assert_eq!(token.length, 1, "{line}:{column} is one part");
+            assert_eq!(token.token_type, token_type as u32, "{line}:{column}");
+            assert_eq!(token.token_modifiers_bitset, modifiers, "{line}:{column}");
+        }
     }
 
     #[test]

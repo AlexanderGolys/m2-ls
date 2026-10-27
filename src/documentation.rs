@@ -85,12 +85,12 @@ impl DocumentationBlock {
 /// documentation string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentationSnippet {
-    bytes: ByteRange,
+    pub bytes: ByteRange,
 }
 
 impl DocumentationSnippet {
-    pub fn byte_span(&self) -> (usize, usize) {
-        (self.bytes.start, self.bytes.end)
+    pub fn span(&self) -> ByteRange {
+        self.bytes.clone()
     }
 }
 
@@ -200,8 +200,10 @@ pub fn collect_documentation(
     index
         .references
         .dedup_by_key(|reference| reference.byte_span());
-    index.snippets.sort_by_key(DocumentationSnippet::byte_span);
-    index.snippets.dedup_by_key(|snippet| snippet.byte_span());
+    index
+        .snippets
+        .sort_by_key(|snippet| (snippet.bytes.start, snippet.bytes.end));
+    index.snippets.dedup_by_key(|snippet| snippet.span());
     index
 }
 

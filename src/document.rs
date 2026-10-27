@@ -24,6 +24,7 @@ use tower_lsp::lsp_types::{Position, Range as TextRange, TextDocumentContentChan
 /// requests.
 #[derive(Debug)]
 pub struct DocumentSnapshot {
+    properties: FileProperties,
     source: DocumentSource,
     tree: SyntaxTree,
     analysis: Analysis,
@@ -39,6 +40,30 @@ pub struct DocumentSnapshot {
     package_sessions: OnceLock<Vec<PackageSession>>,
     previous_sessions: Mutex<Vec<PackageSession>>,
     session_knowledge: ObjectRegistry,
+}
+
+/// File-wide analysis properties declared in source comments.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileProperties {
+    /// Implementation code starts without the session's preloaded packages.
+    pub primary_code: bool,
+}
+
+impl FileProperties {
+    fn collect(root: SyntaxNode<'_>) -> Self {
+        Self {
+            primary_code: root
+                .descendants()
+                .filter(SyntaxNode::is_line_comment)
+                .any(|comment| {
+                    comment
+                        .text()
+                        .strip_prefix("--")
+                        .and_then(|body| body.trim_start().strip_prefix("m2-ls:"))
+                        .is_some_and(|body| body.trim() == "primaryCode")
+                }),
+        }
+    }
 }
 
 /// Code run in a separate session that loaded its package — a TEST block,
@@ -124,8 +149,14 @@ impl DocumentSnapshot {
         source.register_syntax(tree.snapshot());
         let typed_ast = Some(tree.syntax());
         let root = tree.root(source.text());
+        let properties = FileProperties::collect(root);
         let imported_packages = collect_imported_packages_in_tree(root, typed_ast, &source);
-        let knowledge = knowledge_provider.with_imports(&imported_packages);
+        let baseline = if properties.primary_code {
+            knowledge_provider.without_prelude()
+        } else {
+            knowledge_provider.clone()
+        };
+        let knowledge = baseline.with_imports(&imported_packages);
         let analysis_timing = crate::telemetry::Timing::start(
             "document.analysis",
             serde_json::json!({"source_bytes": source.text().len(), "full": full}),
@@ -146,6 +177,7 @@ impl DocumentSnapshot {
         );
         let diagnostics = diagnostics::collect(
             diagnostics::DiagnosticInputs {
+                primary_code: properties.primary_code,
                 analysis: &analysis,
                 root,
                 syntax: typed_ast,
@@ -199,6 +231,7 @@ impl DocumentSnapshot {
             .collect();
         drop(documentation_timing);
         let mut snapshot = Self {
+            properties,
             source,
             tree,
             analysis,
@@ -278,6 +311,10 @@ impl DocumentSnapshot {
         );
         let tree = SyntaxParser::new()?.parse_tree(source.text(), Some(&self.tree))?;
         drop(parsing);
+        if FileProperties::collect(tree.root(source.text())) != self.properties {
+            *self = Self::analyze(source, tree, knowledge_provider, Vec::new(), true);
+            return Some(());
+        }
         let unchanged_prefix = source
             .text()
             .bytes()
@@ -314,6 +351,10 @@ impl DocumentSnapshot {
 
     pub fn object_registry(&self) -> &ObjectRegistry {
         &self.object_registry
+    }
+
+    pub fn properties(&self) -> FileProperties {
+        self.properties
     }
 
     pub fn analysis(&self) -> &Analysis {

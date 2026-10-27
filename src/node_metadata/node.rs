@@ -601,6 +601,14 @@ impl<'tree> SyntaxNode<'tree> {
         self.binary_operator()
             .is_some_and(super::matches_token::<T>)
     }
+    /// Whether the expression selects a part of its left operand instead of
+    /// computing from both: `x_i`, `x.k`, `x.?k`, `x#i` or `x#?k`.
+    pub fn is_access(&self) -> bool {
+        self.is::<ExprOpBinMember>()
+            || self.is::<ExprOpBinIndex>()
+            || self.has_binary_operator::<Token![_]>()
+            || self.has_binary_operator::<Token![#?]>()
+    }
     pub fn property_key(&self) -> Option<Self> {
         let parts = self.binary_parts()?;
         ((self.is::<ExprOpBinMember>() && parts.right.is_symbol_like())

@@ -24,6 +24,7 @@ use crate::source_package::SourcePackages;
 /// What the node occasion provides: the node, the analysis of its document,
 /// and the source and the type knowledge positioned at the node.
 struct NodeContext<'context, 'tree> {
+    primary_code: bool,
     analysis: &'context Analysis,
     node: SyntaxNode<'tree>,
     source: &'context DocumentSource,
@@ -76,6 +77,7 @@ impl DiagnosticSink {
 /// document, then on the package documentation it writes.
 /// Shared semantic inputs, all derived from the same retained syntax snapshot.
 pub struct DiagnosticInputs<'a> {
+    pub primary_code: bool,
     pub analysis: &'a Analysis,
     pub root: SyntaxNode<'a>,
     pub syntax: Option<&'a TypedSource>,
@@ -87,6 +89,7 @@ pub struct DiagnosticInputs<'a> {
 
 pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
     let DiagnosticInputs {
+        primary_code,
         analysis,
         root,
         syntax,
@@ -108,6 +111,7 @@ pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
         }
         let knowledge = knowledge.at(source.position_for_node(node));
         let context = NodeContext {
+            primary_code,
             analysis,
             node,
             source,

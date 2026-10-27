@@ -2,8 +2,11 @@
 
 use crate::node_metadata::TypedSource;
 mod first_pass;
+mod known_value;
 mod ring;
 mod typechecker;
+
+pub use ring::RingVariableError;
 
 use m2_syn::nodes::{
     ElseClause, Expr, ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
@@ -519,12 +522,11 @@ pub struct BindingInfo {
 }
 
 impl BindingInfo {
-    /// Whether the binding is a local of a function or block: a parameter,
-    /// or a name declared with `:=` inside one. A name assigned with `=`
+    /// Whether the binding is a local of a file, function or block: a parameter,
+    /// or a name declared with `:=`. A name assigned with `=`
     /// inside a function, with no such local in scope, is the global.
     pub fn is_local(&self) -> bool {
-        self.role == BindingRole::Parameter
-            || (self.scope_idx != 0 && !self.introduced_by_assignment)
+        self.role == BindingRole::Parameter || !self.introduced_by_assignment
     }
 }
 
@@ -535,6 +537,9 @@ pub struct BindingStateInfo {
     pub inferred_type: Option<InferredType>,
     pub object_id: Option<CallableObjectId>,
     pub indexed_element_type: Option<ring::IndexedVariableTypes>,
+    /// The value the state certainly holds, where the program determines
+    /// more of it than its type: the ring `QQ[x, y]` of `S = QQ[x, y]`.
+    pub known_value: Option<known_value::KnownValue>,
     pub is_ring_generator: bool,
     pub source_type: Option<TypeId>,
     pub value_range: Option<TextRange>,
@@ -609,6 +614,7 @@ fn is_value_cell(node: SyntaxNode<'_>) -> bool {
 }
 
 /// Canonical per-snapshot store of symbols, bindings, scopes, and their indexes.
+#[warn(missing_docs)]
 #[derive(Debug, Default)]
 struct SemanticRegistry {
     scopes: ScopeTree,
@@ -691,6 +697,7 @@ impl OutputReference {
 }
 
 #[derive(Debug, Clone)]
+#[warn(missing_docs)]
 struct BindingEnrichment {
     presentation_kind: SymbolKind,
     inferred_type: Option<InferredType>,
@@ -760,6 +767,19 @@ impl Analysis {
     pub fn get_binding_at(&self, name: &str, pos: Position) -> Option<BindingView<'_>> {
         let scope_idx = self.find_scope_at(pos)?;
         self.get_binding_from_scope(name, scope_idx, pos)
+    }
+
+    /// The binding actually written by a declaration or assignment target.
+    /// Uses the retained target identity so later declarations in an enclosing
+    /// scope cannot change which symbol an earlier assignment writes.
+    pub fn assigned_binding_at(&self, target: TextRange) -> Option<BindingView<'_>> {
+        let id = self
+            .registry
+            .binding_states_by_range
+            .get(&source_range_key(target))?;
+        let binding = self.binding(id.binding)?;
+        let state = binding.states.get(id.state)?;
+        Some(BindingView { binding, state })
     }
 
     pub fn visible_source_binding_at(
@@ -1259,7 +1279,47 @@ impl Analysis {
                     });
                 continue;
             }
+            if let Some(role) = self.constant_subscript_role(node, source, &knowledge) {
+                covered_until = node.end_byte();
+                self.registry
+                    .source_semantic_tokens
+                    .push(SourceSemanticToken {
+                        source_role: Some(role),
+                        span: source.span_for_node(node),
+                        syntax_token_type: None,
+                        is_symbol: false,
+                        is_unquoted_symbol: false,
+                        is_expression_symbol: false,
+                        is_condition_value: false,
+                    });
+                continue;
+            }
+            if node.is_access() {
+                self.register_access_roles(node, source, &knowledge);
+            }
             self.record_source_semantic_token(node, source, &knowledge);
+        }
+    }
+
+    /// An access keeps its parts: its operator reads as an accessor and a
+    /// literal selector as what it selects, `S_1` a generator of `S`, `L_0`
+    /// a member of `L`.
+    fn register_access_roles(
+        &mut self,
+        node: SyntaxNode,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) {
+        let Some(parts) = node.binary_parts() else {
+            return;
+        };
+        self.register_source_semantic_role(
+            source.range_for_node(parts.operator),
+            SourceSemanticRole::AccessOperator,
+        );
+        if parts.right.is::<IntegerLiteral>() {
+            let role = self.selector_role(node, source, knowledge);
+            self.register_source_semantic_role(source.range_for_node(parts.right), role);
         }
     }
 
@@ -2048,6 +2108,7 @@ impl Analysis {
             inferred_type: None,
             object_id: None,
             indexed_element_type: None,
+            known_value: None,
             is_ring_generator: false,
             source_type: None,
             value_range: fact.value,
@@ -2090,6 +2151,7 @@ impl Analysis {
             inferred_type: None,
             object_id: None,
             indexed_element_type: None,
+            known_value: None,
             is_ring_generator: false,
             source_type: None,
             value_range: fact.value,

@@ -60,6 +60,7 @@ use capabilities::formatting::{
 };
 use capabilities::hover::hover_response;
 use capabilities::inlay_hints::{inlay_hint_provider_capability, inlay_hints_response};
+use capabilities::inline_values::{inline_value_provider_capability, inline_values_response};
 use capabilities::navigation::{
     document_link_request, document_links_response, global_reference_ranges,
     goto_declaration_response, goto_definition_response, goto_implementation_response,
@@ -544,6 +545,7 @@ impl LanguageServer for Backend {
                 document_highlight_provider: document_highlight_provider_capability(),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 inlay_hint_provider: inlay_hint_provider_capability(),
+                inline_value_provider: inline_value_provider_capability(),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
@@ -770,6 +772,21 @@ impl LanguageServer for Backend {
                 ));
             }
             hints
+        }))
+    }
+
+    async fn inline_value(&self, params: InlineValueParams) -> Result<Option<Vec<InlineValue>>> {
+        let uri = &params.text_document.uri;
+        Ok(self.with_scoped_document(uri, |document, knowledge| {
+            let mut values = inline_values_response(document, params.range, knowledge);
+            for session in document.package_sessions() {
+                values.extend(inline_values_response(
+                    &session.snapshot,
+                    params.range,
+                    session.snapshot.object_registry(),
+                ));
+            }
+            values
         }))
     }
 

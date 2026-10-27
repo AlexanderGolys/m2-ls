@@ -172,6 +172,8 @@ modifiers, so themes can inherit the standard type's styling.
 | Other functions, scripted functors (`id`, `Ext`), commands and manipulators (`exit`, `endl`) | `function` | According to `defaultLibrary` policy |
 | File values (`stdio`) | `variable` | |
 | Ring generators | `variable` | `algebraic` |
+| Access operators (`_` of `S_1`, `.`, `.?`, binary `#`, `#?`) | `operator` | `access` |
+| Literal selectors (`0` of `L_0` or `L#0`) | `property` | |
 | Installation domains and codomains (`ZZ`, `List` in `f ZZ := List => ...`) | `typeParameter` | |
 | SimpleDoc section keywords, `document` option names, and links (`TO`, `TOH`, `TO2`) | `decorator` | |
 | TeX delimiters and other hypertext constructors | `macro` | |
@@ -191,6 +193,11 @@ highlight name. The standard base groups continue to apply.
 
 Ring generators include `x` and `y` in `RR[x, y]`, or the whole `x_1` in
 `QQ[x_0 .. x_2]`. The indexed table `x` itself does not carry `algebraic`.
+
+A subscript spelling one object of the kind of one of its parts is a single
+token: `1_S` is a `number`, `RR_53` a `type`. Other accesses keep their parts:
+in `S_1` the ring `S` stays a `type`, the `_` is an `access` operator, and the
+`1` is the generator it selects.
 
 The runtime class decides `method` versus `function`, independently of the
 call syntax or documented signatures. An installation head keeps its normal
@@ -222,6 +229,15 @@ reassignment, independently of whether the value itself is mutable. Local
 aliases of protected globals and names listed by `exportMutable` remain
 unmarked. Protection and compiled implementation are independent modifiers,
 and both remain available under `semanticTokens.standardOnly`.
+Assigning to a protected indexed symbol reports the `protected-assignment`
+error (`E13`); assigning to a local that shadows it remains allowed.
+
+For files implementing the library itself, such as Core, add the file property
+`-- m2-ls: primaryCode` in a line comment. These files start without prelude
+imports and allow definitions of protected symbols, without `readonly`
+highlighting. Explicit package imports still take effect in source order.
+Removing the property restores normal session analysis. TEST blocks and
+documentation examples continue to use their separate session environments.
 
 The `option` modifier applies to keys only. Values retain their ordinary
 classification; for example, `Strategy => Linear` marks `Strategy` as an

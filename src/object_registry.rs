@@ -186,6 +186,15 @@ impl ObjectRegistry {
         registry
     }
 
+    /// An implementation source starts before the session's automatic imports.
+    /// Catalog identities remain available for explicit package loads.
+    pub fn without_prelude(&self) -> Self {
+        Self {
+            catalog: Arc::clone(&self.catalog),
+            packages: Vec::new(),
+        }
+    }
+
     #[cfg(test)]
     pub fn with_source_imports(&self, text: &str) -> Self {
         self.with_imports(&collect_imported_packages(text))

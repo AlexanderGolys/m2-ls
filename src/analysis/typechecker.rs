@@ -1,5 +1,6 @@
 //! Transient static type inference for a completed semantic snapshot.
 
+use crate::builtin_index::CallableInfo;
 use crate::node_metadata::TypedSource;
 use std::cell::RefCell;
 use std::ops::Deref;
@@ -337,17 +338,18 @@ where
 }
 
 fn assignment_value(node: &Assignment) -> &Expr {
+    use Assignment::*;
     match node {
-        Assignment::Simple(SimpleBinding::Global(node)) => &node.value,
-        Assignment::Simple(SimpleBinding::Local(node)) => &node.value,
-        Assignment::Parallel(ParallelAssignment::Global(node)) => &node.value,
-        Assignment::Parallel(ParallelAssignment::Local(node)) => &node.value,
-        Assignment::Evaluated(EvaluatedAssignment { value, .. }) => value,
-        Assignment::Augmented(node) => &node.value,
-        Assignment::Install(Installation::Method(node)) => &node.function,
-        Assignment::Install(Installation::Op(node)) => &node.function,
-        Assignment::Install(Installation::New(node)) => &node.function,
-        Assignment::Op(OperatorAssignment { value_expr, .. }) => value_expr,
+        Simple(SimpleBinding::Global(node)) => &node.value,
+        Simple(SimpleBinding::Local(node)) => &node.value,
+        Parallel(ParallelAssignment::Global(node)) => &node.value,
+        Parallel(ParallelAssignment::Local(node)) => &node.value,
+        Evaluated(EvaluatedAssignment { value, .. }) => value,
+        Augmented(node) => &node.value,
+        Install(Installation::Method(node)) => &node.function,
+        Install(Installation::Op(node)) => &node.function,
+        Install(Installation::New(node)) => &node.function,
+        Op(OperatorAssignment { value_expr, .. }) => value_expr,
     }
 }
 
@@ -802,6 +804,23 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<InferredType> {
         let left = left?;
+        if let Some(subscript) = right.filter(|_| matches_token::<Token![_]>(operator)) {
+            if let Some(Ok(selected)) = self.subscript_selection(left, subscript, source, knowledge)
+            {
+                return self
+                    .resolved_ring_element_type(
+                        selected.ring,
+                        source,
+                        scope_idx,
+                        knowledge,
+                        &mut HashSet::new(),
+                    )
+                    .map(InferredType::exact_from_id);
+            }
+            if self.indexes_ring_variable(left, subscript, source, knowledge) {
+                return Some(InferredType::exact("IndexedVariable"));
+            }
+        }
         let left_type = self.type_of(left, source, scope_idx);
         let left_name = left_type.single()?;
 
@@ -1127,7 +1146,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
 
     fn external_dispatch_domains(
         &self,
-        callable: &crate::builtin_index::CallableInfo,
+        callable: &CallableInfo,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Vec<ResolvedDispatchDomain> {
         callable
@@ -1152,7 +1171,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
 
     fn external_candidates_return_type(
         &self,
-        callable: &crate::builtin_index::CallableInfo,
+        callable: &CallableInfo,
         candidates: &[usize],
         position: Position,
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -1599,23 +1618,21 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         )
     }
 }
-
 fn is_comparison_operator(operator: &str) -> bool {
     [
-        token_spelling::<Token![==]>(),
-        token_spelling::<Token![===]>(),
-        token_spelling::<Token![!=]>(),
-        token_spelling::<Token![=!=]>(),
-        token_spelling::<Token![<]>(),
-        token_spelling::<Token![<=]>(),
-        token_spelling::<Token![>]>(),
-        token_spelling::<Token![>=]>(),
+        <Token![==] as Token>::SPELLING,
+        <Token![!=] as Token>::SPELLING,
+        <Token![=!=] as Token>::SPELLING,
+        <Token![<] as Token>::SPELLING,
+        <Token![<=] as Token>::SPELLING,
+        <Token![>] as Token>::SPELLING,
+        <Token![>=] as Token>::SPELLING,
     ]
     .contains(&operator)
 }
 
 fn effective_external_candidate_indices(
-    callable: &crate::builtin_index::CallableInfo,
+    callable: &CallableInfo,
     candidates: &[usize],
 ) -> Vec<usize> {
     let mut selected = Vec::new();
