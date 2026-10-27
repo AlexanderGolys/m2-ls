@@ -241,7 +241,8 @@ impl ObjectRegistry {
         names
     }
 
-    #[cfg(test)]
+    /// Packages preloaded by a normal session, as recorded by the library index.
+    /// Explicit package loads in a document do not change this list.
     pub fn default_loaded(&self) -> &[String] {
         &self.catalog.default_loaded
     }

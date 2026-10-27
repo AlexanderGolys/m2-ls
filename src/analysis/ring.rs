@@ -8,6 +8,22 @@ use crate::node_metadata::visit_expression_nodes;
 use super::typechecker::{OperatorTypeQuery, TypeChecker};
 use super::*;
 
+/// The option of a field constructor such as `GF` naming its generator.
+const VARIABLE_OPTION: &str = "Variable";
+
+/// The function returning the symbol a string names, `getSymbol "x"`.
+const GET_SYMBOL_FUNCTION: &str = "getSymbol";
+
+/// The class of a generator whose ring has no name yet, as `x` of a bare
+/// `QQ[x]`: an element of an anonymous polynomial ring.
+const ANONYMOUS_RING_ELEMENT: &str = "RingElement";
+
+/// The class of `x` once an index of it is written, `x_2 = 4` or `QQ[x_2]`.
+const INDEXED_VARIABLE_TABLE: &str = "IndexedVariableTable";
+
+/// The class of an index nothing wrote, `x_5` of `x_2 = 4`.
+const INDEXED_VARIABLE: &str = "IndexedVariable";
+
 /// Runtime binding shape produced for a ring generator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RingGeneratorKind {
@@ -32,11 +48,58 @@ pub struct RingGenerator {
     indices: Option<IndexSelection>,
 }
 
-/// Source-ordered writes to an indexed variable table. Ranges stay compact even
-/// when their Cartesian product contains many generators.
+/// Source-ordered writes to an indexed variable table, `x` once `x_2 = 4` or
+/// `QQ[x_0 .. x_3]` has run. Each index reads as the latest write to it, and
+/// an index nothing wrote is a bare `IndexedVariable`. Ranges stay compact
+/// even when their Cartesian product contains many generators.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct IndexedGeneratorTypes {
-    entries: Vec<(IndexSelection, ObjectName)>,
+pub struct IndexedVariableTypes {
+    writes: Vec<IndexedWrite>,
+}
+
+/// One write to indices of a table: what they hold from then on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexedWrite {
+    selection: IndexSelection,
+    value_type: ObjectName,
+    writer: IndexedWriter,
+}
+
+/// What wrote an index of an indexed variable table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+enum IndexedWriter {
+    /// A ring constructor naming it a generator, `QQ[x_2]`.
+    RingConstructor,
+    /// An assignment to it, `x_2 = 4`.
+    Assignment,
+}
+
+impl IndexedVariableTypes {
+    /// The write `index` certainly reads: the latest one covering it.
+    fn write_at(&self, index: &IndexKey) -> Option<&IndexedWrite> {
+        self.writes
+            .iter()
+            .rev()
+            .find(|write| write.selection.contains(index))
+    }
+
+    /// The types `index` may read: what the write it certainly reads stored,
+    /// a bare `IndexedVariable` without one, together with what every later
+    /// write to an index known only at run time stored.
+    fn read_type(&self, index: &IndexKey) -> InferredType {
+        let mut possible = None;
+        for write in self.writes.iter().rev() {
+            let written = InferredType::exact_from_id(write.value_type.clone());
+            if write.selection == IndexSelection::Unknown {
+                possible = Some(possible.map_or(written.clone(), |types| types | written));
+            } else if write.selection.contains(index) {
+                return possible.map_or(written.clone(), |types| types | written);
+            }
+        }
+        let unwritten = InferredType::exact(INDEXED_VARIABLE);
+        possible.map_or(unwritten.clone(), |types| types | unwritten)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +177,9 @@ enum IndexSelection {
         end: IndexKey,
         exclusive: bool,
     },
+    /// An index known only at run time, the `i` of `x_i = i` in a loop: it
+    /// may be any index, so it never certainly contains one.
+    Unknown,
 }
 
 impl IndexSelection {
@@ -125,6 +191,7 @@ impl IndexSelection {
                 end,
                 exclusive,
             } => key.in_range(start, end, *exclusive),
+            Self::Unknown => false,
         }
     }
 }
@@ -142,6 +209,20 @@ impl RingSemantics {
             .is_some_and(|type_name| knowledge.has_type_role(type_name, TypeRole::Ring))
             .then(|| ObjectName::new("RingElement"))
     }
+
+    /// Whether a value of type `inferred` may be a ring: one of its points is
+    /// a ring, or one of its upper bounds is a ring or lies above `Ring`, as
+    /// the `Thing` of an expression inference could not type.
+    pub fn may_be_ring(inferred: &InferredType, knowledge: &(impl TypeKnowledge + ?Sized)) -> bool {
+        let ring = TypeRole::Ring.object_name();
+        inferred
+            .exact_points()
+            .any(|point| knowledge.has_type_role(point, TypeRole::Ring))
+            || inferred.upward_generators().any(|generator| {
+                knowledge.has_type_role(generator, TypeRole::Ring)
+                    || knowledge.is_subtype(&ring, generator)
+            })
+    }
 }
 
 impl Analysis {
@@ -157,27 +238,19 @@ impl Analysis {
         let (expression, syntax) = expression;
         let mut nodes = Vec::new();
         visit_expression_nodes(expression, syntax, |node| nodes.push(node));
-        let containers = nodes
+        let mut specs = nodes
             .into_iter()
-            .filter(|node| node.is_space_application())
-            .filter_map(|node| {
-                let head = node.binary_parts().map(|parts| parts.left)?;
-                let variables = RingGeneratorBinding::constructor_variables(node)?;
-                TypeChecker::new(self, knowledge)
-                    .type_of(head, source, scope_idx)
-                    .single()
-                    .is_some_and(|head_type| {
-                        knowledge.has_type_role(head_type, TypeRole::Ring)
-                            || knowledge
-                                .is_subtype(head_type, &ObjectName::new("InexactFieldFamily"))
-                    })
-                    .then_some(variables)
-            })
+            .filter_map(|node| self.ring_constructor_variables(node, source, knowledge, scope_idx))
+            .map(|variables| (variables, RingGeneratorBinding::collect(variables)))
             .collect::<Vec<_>>();
+        specs.extend(RingGeneratorBinding::variable_option(expression));
 
         let mut generators = Vec::new();
-        for container in containers {
-            for generator in RingGeneratorBinding::collect(container) {
+        for (spec, bindings) in specs {
+            self.registry
+                .ring_generator_specs
+                .push(source.range_for_node(spec));
+            for generator in bindings {
                 generators.push(RingGenerator {
                     name: ObjectName::new(&generator.name),
                     kind: generator.kind,
@@ -227,26 +300,10 @@ impl Analysis {
         knowledge: &(impl TypeKnowledge + ?Sized),
         scope_idx: usize,
     ) -> Vec<SyntaxNode<'tree>> {
-        if !node.is_space_application() {
-            return Vec::new();
-        }
-        let Some(head) = node.binary_parts().map(|parts| parts.left) else {
+        let Some(variables) = self.ring_constructor_variables(node, source, knowledge, scope_idx)
+        else {
             return Vec::new();
         };
-        let Some(variables) = RingGeneratorBinding::constructor_variables(node) else {
-            return Vec::new();
-        };
-        let constructs_a_ring = TypeChecker::new(self, knowledge)
-            .type_of(head, source, scope_idx)
-            .single()
-            .is_some_and(|head_type| {
-                knowledge.has_type_role(head_type, TypeRole::Ring)
-                    || knowledge.is_subtype(head_type, &ObjectName::new("InexactFieldFamily"))
-            });
-        if !constructs_a_ring {
-            return Vec::new();
-        }
-
         RingGeneratorBinding::collect(variables)
             .into_iter()
             .filter(|binding| {
@@ -254,6 +311,72 @@ impl Analysis {
             })
             .map(|binding| binding.node)
             .collect()
+    }
+
+    /// The variable list of `node` when it constructs a ring, the `[x, y]` of
+    /// `QQ[x, y]`: an application of a ring or a family of inexact fields.
+    fn ring_constructor_variables<'tree>(
+        &self,
+        node: SyntaxNode<'tree>,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+        scope_idx: usize,
+    ) -> Option<SyntaxNode<'tree>> {
+        if !node.is_space_application() {
+            return None;
+        }
+        let head = node.binary_parts()?.left;
+        let variables = RingGeneratorBinding::constructor_variables(node)?;
+        TypeChecker::new(self, knowledge)
+            .type_of(head, source, scope_idx)
+            .single()
+            .is_some_and(|head_type| {
+                knowledge.has_type_role(head_type, TypeRole::Ring)
+                    || knowledge.is_subtype(head_type, &ObjectName::new("InexactFieldFamily"))
+            })
+            .then_some(variables)
+    }
+
+    /// Bind the generators of the ring constructor `node` when no ring
+    /// assignment around it has: Macaulay2 assigns them as soon as the
+    /// constructor runs, `QQ[x]` alone making `x` an element of that ring.
+    pub fn bind_anonymous_ring_generators(
+        &mut self,
+        node: SyntaxNode,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) {
+        let scope_idx = self
+            .find_scope_at(source.position_for_node(node))
+            .unwrap_or(0);
+        let Some(variables) = self.ring_constructor_variables(node, source, knowledge, scope_idx)
+        else {
+            return;
+        };
+        let range = source.range_for_node(variables);
+        if self.registry.ring_generator_specs.contains(&range) {
+            return;
+        }
+        self.registry.ring_generator_specs.push(range);
+        for generator in RingGeneratorBinding::collect(variables) {
+            self.register_ring_generator(
+                ANONYMOUS_RING_ELEMENT,
+                &generator.name,
+                generator.kind,
+                generator.indices,
+                generator.node,
+                source,
+            );
+        }
+    }
+
+    /// Whether `range` lies in source declaring ring generators: the variable
+    /// list of a ring constructor, or the `Variable` option of a field.
+    pub(super) fn declares_ring_generators(&self, range: TextRange) -> bool {
+        self.registry
+            .ring_generator_specs
+            .iter()
+            .any(|spec| spec.start <= range.start && range.end <= spec.end)
     }
 
     fn ring_source_symbol<'tree>(&self, expression: SyntaxNode<'tree>) -> Option<&'tree str> {
@@ -276,31 +399,96 @@ impl Analysis {
         node: SyntaxNode<'_>,
         source: &(impl SourceNavigation + ?Sized),
     ) -> bool {
+        self.indexed_ring_generator(node, source).is_some()
+    }
+
+    /// The generator an indexed access `z_k` selects, as the binding of its
+    /// table and the literal index: the latest write to that index must be a
+    /// ring constructor's.
+    fn indexed_ring_generator(
+        &self,
+        node: SyntaxNode<'_>,
+        source: &(impl SourceNavigation + ?Sized),
+    ) -> Option<(BindingId, IndexKey)> {
         if !node.has_binary_operator::<Token![_]>() {
-            return false;
+            return None;
         }
-        let Some(parts) = node.binary_parts() else {
-            return false;
-        };
-        let Some(base) = parenthesized_value(parts.left).filter(|base| base.is::<Symbol>()) else {
-            return false;
-        };
-        let Some(index) = IndexKey::from_node(parts.right) else {
-            return false;
-        };
+        let parts = node.binary_parts()?;
+        let base = RingGeneratorBinding::name_node(parts.left)?;
+        let index = IndexKey::from_node(parts.right)?;
         let position = source.position_for_node(base);
-        self.get_binding_from_scope(
+        let binding = self.get_binding_from_scope(
             base.text(),
             self.find_scope_at(position).unwrap_or(0),
             position,
-        )
-        .and_then(|binding| binding.state.indexed_element_type.as_ref())
-        .is_some_and(|elements| {
-            elements
-                .entries
-                .iter()
-                .any(|(selection, _)| selection.contains(&index))
-        })
+        )?;
+        binding
+            .state
+            .indexed_element_type
+            .as_ref()?
+            .write_at(&index)
+            .is_some_and(|write| write.writer == IndexedWriter::RingConstructor)
+            .then_some((binding.binding_id, index))
+    }
+
+    /// The source of the indexed generator `node` names, from its name on:
+    /// `z_0`, also in `symbol z_0`, whose quote is no part of the name.
+    pub(super) fn indexed_ring_generator_bytes(node: SyntaxNode<'_>) -> ByteRange {
+        let start = node
+            .binary_parts()
+            .and_then(|parts| RingGeneratorBinding::name_node(parts.left))
+            .map_or(node.start_byte(), |base| base.start_byte());
+        start..node.end_byte()
+    }
+
+    /// The places naming the generator the indexed access at `position`
+    /// selects, `z_1` of `QQ[z_0 .. z_2]`: every access to that index of the
+    /// table, and the constructor variables declaring it where no access
+    /// spells it out, as `z_0 .. z_2` declares `z_1`. `None` when `position`
+    /// is not on an indexed generator.
+    pub fn indexed_ring_generator_references(
+        &self,
+        root: SyntaxNode<'_>,
+        position: Position,
+        source: &(impl SourceNavigation + ?Sized),
+        include_declaration: bool,
+    ) -> Option<Vec<TextRange>> {
+        let point = source.point_for_position(position)?;
+        let generator = root
+            .descendant_for_point_range(point, point)?
+            .enclosing_node(|node| self.is_indexed_ring_generator(*node, source))
+            .and_then(|node| self.indexed_ring_generator(node, source))?;
+        let mut ranges = root
+            .descendants()
+            .filter(|node| self.indexed_ring_generator(*node, source).as_ref() == Some(&generator))
+            .map(|node| source.range_for_bytes(Self::indexed_ring_generator_bytes(node)))
+            .collect::<Vec<_>>();
+        let (binding_id, index) = generator;
+        let declarations = self.registry.bindings[binding_id.0 as usize]
+            .states
+            .iter()
+            .filter(|state| {
+                state.indexed_element_type.as_ref().is_some_and(|elements| {
+                    elements.writes.last().is_some_and(|write| {
+                        write.writer == IndexedWriter::RingConstructor
+                            && write.selection.contains(&index)
+                    })
+                })
+            })
+            .map(|state| state.span)
+            .filter(|span| {
+                !ranges
+                    .iter()
+                    .any(|range| range.start < span.end && span.start < range.end)
+            })
+            .collect::<Vec<_>>();
+        ranges.extend(declarations);
+        if !include_declaration {
+            ranges.retain(|range| !self.declares_ring_generators(*range));
+        }
+        ranges.sort_by_key(|range| (range.start, range.end));
+        ranges.dedup();
+        Some(ranges)
     }
 
     fn register_ring_generator(
@@ -329,13 +517,17 @@ impl Analysis {
                     .get_binding_from_scope(generator_name, 0, source.range_for_node(node).end)
                     .and_then(|binding| binding.state.indexed_element_type.clone())
                     .unwrap_or_default();
-                if let Some(indices) = indices {
-                    elements.entries.push((indices, ObjectName::new(ring_name)));
+                if let Some(selection) = indices {
+                    elements.writes.push(IndexedWrite {
+                        selection,
+                        value_type: ObjectName::new(ring_name),
+                        writer: IndexedWriter::RingConstructor,
+                    });
                 }
                 self.register_dynamic_global(
                     generator_name,
                     node,
-                    ObjectName::new("IndexedVariableTable"),
+                    ObjectName::new(INDEXED_VARIABLE_TABLE),
                     Some(elements),
                     source,
                 );
@@ -343,12 +535,61 @@ impl Analysis {
         }
     }
 
+    /// Record the assignment `target = value` to an indexed variable,
+    /// `x_2 = 4`: it makes `x` an `IndexedVariableTable` remembering that
+    /// index holds a `value_type`. Only a table, or a name nothing binds, is
+    /// written so; Macaulay2 dispatches `x_2 = v` on the class of any other
+    /// value of `x`.
+    pub fn register_indexed_assignment(
+        &mut self,
+        target: SyntaxNode,
+        value_type: ObjectName,
+        source: &(impl SourceNavigation + ?Sized),
+    ) {
+        let Some(parts) = target
+            .binary_parts()
+            .filter(|_| target.has_binary_operator::<Token![_]>())
+        else {
+            return;
+        };
+        let Some(base) = RingGeneratorBinding::name_node(parts.left) else {
+            return;
+        };
+        let position = source.position_for_node(target);
+        let visible = self.get_binding_from_scope(
+            base.text(),
+            self.find_scope_at(position).unwrap_or(0),
+            position,
+        );
+        if visible.is_some_and(|binding| {
+            binding.scope_idx != 0 || binding.state.indexed_element_type.is_none()
+        }) {
+            return;
+        }
+        let mut writes = visible
+            .and_then(|binding| binding.state.indexed_element_type.clone())
+            .unwrap_or_default();
+        writes.writes.push(IndexedWrite {
+            selection: IndexKey::from_node(parts.right)
+                .map_or(IndexSelection::Unknown, IndexSelection::Exact),
+            value_type,
+            writer: IndexedWriter::Assignment,
+        });
+        self.register_dynamic_global(
+            base.text(),
+            target,
+            ObjectName::new(INDEXED_VARIABLE_TABLE),
+            Some(writes),
+            source,
+        );
+    }
+
     fn register_dynamic_global(
         &mut self,
         name: &str,
         node: SyntaxNode,
         type_name: ObjectName,
-        indexed_element_type: Option<IndexedGeneratorTypes>,
+        indexed_element_type: Option<IndexedVariableTypes>,
         source: &(impl SourceNavigation + ?Sized),
     ) {
         let position = source.position_for_node(node);
@@ -478,10 +719,59 @@ impl<'tree> RingGeneratorBinding<'tree> {
         }
     }
 
+    /// The generators named by the `Variable` option of the outermost call
+    /// of `expression`, the `g` of `GF(8, Variable => g)`, with that option's
+    /// value.
+    fn variable_option(expression: SyntaxNode<'tree>) -> Option<(SyntaxNode<'tree>, Vec<Self>)> {
+        let application = parenthesized_value(expression)?;
+        if !application.is_space_application() {
+            return None;
+        }
+        let arguments = parenthesized_value(application.binary_parts()?.right)?;
+        let value = arguments
+            .collection_elements()
+            .find_map(|argument| Self::option_value(argument, VARIABLE_OPTION))?;
+        let mut bindings = Vec::new();
+        Self::collect_spec(value, &mut bindings);
+        Some((value, bindings))
+    }
+
+    /// The name `node` gives a generator, unquoted: `x`, `symbol x`,
+    /// `local x`, or `(x)`.
+    fn name_node(node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
+        let node = parenthesized_value(node)?;
+        Some(node.quoted_symbol().unwrap_or(node)).filter(|node| node.is::<Symbol>())
+    }
+
+    /// The string of `getSymbol "x"`, which names the symbol `x`.
+    fn get_symbol_argument(node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
+        let parts = node
+            .binary_parts()
+            .filter(|_| node.is_space_application())?;
+        (parts.left.is::<Symbol>() && parts.left.text() == GET_SYMBOL_FUNCTION).then_some(())?;
+        parenthesized_value(parts.right)
+            .filter(|argument| argument.string_literal_inner_text().is_some())
+    }
+
     fn collect_spec(node: SyntaxNode<'tree>, bindings: &mut Vec<RingGeneratorBinding<'tree>>) {
         let Some(node) = parenthesized_value(node) else {
             return;
         };
+        if let Some(argument) = Self::get_symbol_argument(node) {
+            if let Some(name) = argument.string_literal_inner_text() {
+                Self::push(
+                    bindings,
+                    RingGeneratorBinding {
+                        name: name.to_string(),
+                        kind: RingGeneratorKind::Direct,
+                        node: argument,
+                        indices: None,
+                    },
+                );
+            }
+            return;
+        }
+        let node = Self::name_node(node).unwrap_or(node);
         if node.is::<Symbol>() {
             Self::push(
                 bindings,
@@ -498,9 +788,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
         if node.has_binary_operator::<Token![_]>() {
             if let Some(base) = node
                 .binary_parts()
-                .map(|parts| parts.left)
-                .and_then(parenthesized_value)
-                .filter(|base| base.is::<Symbol>())
+                .and_then(|parts| Self::name_node(parts.left))
             {
                 Self::push(
                     bindings,
@@ -563,7 +851,10 @@ impl<'tree> RingGeneratorBinding<'tree> {
                     return;
                 }
 
-                if let Some(names) = Self::symbol_range(node, left, right) {
+                if let Some(names) = Self::name_node(left)
+                    .zip(Self::name_node(right))
+                    .and_then(|(left, right)| Self::symbol_range(node, left, right))
+                {
                     for name in names {
                         Self::push(
                             bindings,
@@ -592,7 +883,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
         node.has_binary_operator::<Token![_]>()
             .then(|| node.binary_parts().map(|parts| parts.left))
             .flatten()
-            .filter(|base| base.is::<Symbol>())
+            .and_then(Self::name_node)
     }
 
     fn symbol_range(
@@ -666,7 +957,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         }
 
         if matches_token::<Token![_]>(query.operator)
-            && left_name.as_ref() == "IndexedVariableTable"
+            && left_name.as_ref() == INDEXED_VARIABLE_TABLE
         {
             if let Some(elements) = self
                 .get_binding_from_scope(
@@ -677,24 +968,18 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
                 .and_then(|binding| binding.state.indexed_element_type.as_ref())
             {
                 if let Some(index) = query.right.and_then(IndexKey::from_node) {
-                    return Some(
-                        elements
-                            .entries
-                            .iter()
-                            .rev()
-                            .find(|(selection, _)| selection.contains(&index))
-                            .map_or_else(
-                                || InferredType::exact("IndexedVariable"),
-                                |(_, ring)| InferredType::exact_from_id(ring.clone()),
-                            ),
-                    );
+                    return Some(elements.read_type(&index));
                 }
-                return Some(elements.entries.iter().fold(
-                    InferredType::exact("IndexedVariable"),
-                    |types, (_, ring)| types | InferredType::exact_from_id(ring.clone()),
-                ));
+                return Some(
+                    elements.writes.iter().fold(
+                        InferredType::exact(INDEXED_VARIABLE),
+                        |types, write| {
+                            types | InferredType::exact_from_id(write.value_type.clone())
+                        },
+                    ),
+                );
             }
-            return Some(InferredType::exact("IndexedVariable"));
+            return Some(InferredType::exact(INDEXED_VARIABLE));
         }
 
         if matches_token::<Token![/]>(query.operator)
@@ -1073,6 +1358,37 @@ mod tests {
         ] {
             assert_types(&format!("R = {constructor}"), &probes);
         }
+    }
+
+    /// Macaulay2 v1.26.05: reading `x_2` leaves `x` a `Symbol`; writing an
+    /// index, by assignment or a ring constructor, makes `x` a table whose
+    /// indices read as their latest write and whose other indices are bare
+    /// `IndexedVariable`s.
+    #[test]
+    fn indexed_writes_turn_the_base_into_a_table_of_per_index_types() {
+        assert_types("a = x_2", &[("x", "Symbol"), ("x_2", "IndexedVariable")]);
+        assert_types(
+            "x_2 = 4",
+            &[
+                ("x", "IndexedVariableTable"),
+                ("x_2", "ZZ"),
+                ("x_5", "IndexedVariable"),
+            ],
+        );
+        assert_types(
+            "x_2 = 4\nx_3 = \"three\"",
+            &[("x_2", "ZZ"), ("x_3", "String")],
+        );
+        assert_types(
+            "R = QQ[y_0..y_2]\ny_1 = 7",
+            &[
+                ("y", "IndexedVariableTable"),
+                ("y_0", "R"),
+                ("y_1", "ZZ"),
+                ("y_9", "IndexedVariable"),
+            ],
+        );
+        assert_types("x_2 = 4\nx = 3", &[("x", "ZZ")]);
     }
 
     #[test]

@@ -798,6 +798,24 @@ impl LanguageServer for Backend {
                 Some(document) => document,
                 None => return Ok(None),
             };
+            // An indexed generator `z_1` is its own variable, whose
+            // references stay with the file that declares its ring.
+            if let Some(ranges) = document.analysis().indexed_ring_generator_references(
+                document.root_node(),
+                position,
+                document.value(),
+                include_declaration,
+            ) {
+                return Ok(Some(
+                    ranges
+                        .into_iter()
+                        .map(|range| Location {
+                            uri: uri.clone(),
+                            range,
+                        })
+                        .collect(),
+                ));
+            }
             match self.reference_target_at(document.value(), uri, position) {
                 None | Some(ReferenceTarget::Local) => {
                     // A local binding's references never leave its source.

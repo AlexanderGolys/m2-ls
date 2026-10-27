@@ -537,6 +537,19 @@ impl DocumentSession {
             .await;
     }
 
+    /// Apply semantic-token settings and wait for the client refresh request.
+    pub(crate) async fn set_semantic_token_settings(&mut self, settings: Value) {
+        self.server
+            .notify(
+                "workspace/didChangeConfiguration",
+                json!({"settings": {"m2-ls": {"semanticTokens": settings}}}),
+            )
+            .await;
+        self.server
+            .wait_for_server_request("workspace/semanticTokens/refresh")
+            .await;
+    }
+
     pub(crate) async fn set_expression_type_hints(&mut self, enabled: bool) {
         self.set_inlay_hint_settings(json!({ "expressionTypes": enabled }))
             .await;

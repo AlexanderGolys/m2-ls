@@ -131,8 +131,13 @@ Every setting is optional and applies without a restart. Send them under the
 | `inlayHints.calls` | `lineEnds` | Call results shown without `expressionTypes`: `off`, `lineEnds` (calls ending a line of a longer expression, like a chain broken across lines), or `every`. |
 | `inlayHints.unknownTypes` | `false` | Also shows hints that say nothing, of values only known to be a `Thing`. |
 | `semanticTokens.standardOnly` | `false` | Drops the custom semantic token modifiers. Token types are always LSP-standard. |
+| `semanticTokens.defaultLibrary` | `"CompiledFunction"` | Selects which bindings carry `defaultLibrary`; accepts a policy name or an array of package names. |
 | `sources.enabled` | `true` | Lets navigation enter the Macaulay2 library source. |
 | `sources.paths` | `[]` | Extra places to find it: an `M2` executable, an installation prefix (a build tree's `usr-dist` included), or a directory to add to Macaulay2's `path`. |
+
+Method call inference respects single-argument sequence dispatch and left
+folding for binary methods. `T05` (`call-domain-mismatch`) warns when no known
+method domain can accept the argument types; uncertain matches remain valid.
 
 A comment can also silence rules in the source itself, for the whole file or
 for the next line; the quick fixes of every diagnostic write these for you.
@@ -149,14 +154,14 @@ modifiers, so themes can inherit the standard type's styling.
 
 | Construct | Standard type | Additional modifiers |
 | --- | --- | --- |
-| Method functions (`det`, `source`, anything made by `method()`) | `method` | |
-| Other functions, scripted functors (`id`, `Ext`) | `function` | `defaultLibrary` for compiled `Core` functions |
-| Commands and manipulators (`exit`, `endl`) | `function` | `command` |
+| Method functions (`det`, `source`, anything made by `method()`) | `method` | According to `defaultLibrary` policy |
+| Other functions, scripted functors (`id`, `Ext`), commands and manipulators (`exit`, `endl`) | `function` | According to `defaultLibrary` policy |
+| File values (`stdio`) | `variable` | |
 | Ring generators | `variable` | `algebraic` |
 | SimpleDoc section keywords, `document` option names, and links (`TO`, `TOH`, `TO2`) | `decorator` | |
 | TeX delimiters and other hypertext constructors | `macro` | |
 | Styled documentation text | `string` | `strong`, `emphasis`, `monospace`, `link`, or `math` |
-| Options named by a key or link, the `Limit` of `[f, Limit]` | `property`, or `enumMember` for a protected symbol | `option` |
+| Option keys, including the `Limit` of `[f, Limit]` in documentation | `property`, or `enumMember` for a protected symbol | `option` |
 
 Documentation calls, their tags and values, attached documentation comments,
 and embedded code carry the standard `documentation` modifier. Examples,
@@ -165,18 +170,48 @@ carry `test`. Embedded code keeps its normal token types. These contexts are
 emitted even when the client also uses syntax highlighting.
 
 In Neovim, each modifier has a separate highlight group, such as
-`@lsp.typemod.function.command`, `@lsp.typemod.macro.monospace`, or
+`@lsp.typemod.function.readonly`, `@lsp.typemod.string.monospace`, or
 `@lsp.typemod.variable.algebraic`. Multiple modifiers do not form a nested
 highlight name. The standard base groups continue to apply.
 
 Ring generators include `x` and `y` in `RR[x, y]`, or the whole `x_1` in
 `QQ[x_0 .. x_2]`. The indexed table `x` itself does not carry `algebraic`.
 
-Globals a package exports with `exportMutable` carry the custom modifier
-`mutable` on top of the token of what they name, in the export list and
-wherever the code uses them, so they are set apart even when they are plain
-variables. Library globals are mutable when their index record is not
-`protected`.
+The runtime class decides `method` versus `function`, independently of the
+call syntax or documented signatures. An installation head keeps its normal
+type and adds `declaration`: the `det` in `det Matrix := ...` is still a
+`method`. Symbolic heads such as `+` retain their operator type.
+
+`semanticTokens.defaultLibrary` chooses the meaning of the standard
+`defaultLibrary` modifier. Policy names are case-sensitive:
+
+| Value | Marked bindings |
+| --- | --- |
+| `"CompiledFunction"` (default) | Values of class `CompiledFunction` or a subtype, including aliases in any package or local scope. |
+| `"Compiled"` | Also includes `CompiledFunctionClosure` and its subtypes, such as compiled method dispatchers. |
+| `"Core"` | Globals defined in `Core`, of any runtime class. |
+| `"Prelude"` | Globals from the preloaded packages recorded by the library index. Extra packages loaded in a document do not extend this set. |
+| `["Core", "Graphs"]` | Globals defined in the listed packages, including source packages in the workspace. |
+| `"AllPackages"` | Globals defined in any visible indexed or source package. |
+| `"None"` or `[]` | No bindings. |
+
+Package policies follow the binding's defining package. Assigning a Core
+function to a local variable keeps its compiled runtime class but gives the
+local no Core membership. A compiled method dispatcher can have implementations
+written in Macaulay2. Changes to the policy trigger a semantic-token refresh
+without restarting the server.
+
+The standard `readonly` modifier marks protected bindings known from the
+library index or a package's `export` list. It describes protection against
+reassignment, independently of whether the value itself is mutable. Local
+aliases of protected globals and names listed by `exportMutable` remain
+unmarked. Protection and compiled implementation are independent modifiers,
+and both remain available under `semanticTokens.standardOnly`.
+
+The `option` modifier applies to keys only. Values retain their ordinary
+classification; for example, `Strategy => Linear` marks `Strategy` as an
+option key and leaves `Linear` as a symbol. Names without a known binding use
+plain variable tokens, without a separate unresolved modifier.
 
 Formatting defaults are defined in [`FormattingSettings::default()`](src/settings.rs);
 omitted settings use those values.

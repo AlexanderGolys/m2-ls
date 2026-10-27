@@ -16,6 +16,7 @@ use m2_syn::nodes::{
 use m2_syn::visit::{self, Visit};
 use m2_syn::Token;
 
+use super::ring::RingSemantics;
 use super::*;
 use crate::node_metadata::SyntaxNodeId;
 use crate::object_registry::TypeStore;
@@ -227,10 +228,12 @@ impl Analysis {
             );
         }
 
-        if let (Some(right), Some(type_name), Some(ring_name)) =
-            (right, type_name, single_symbol_assignment_target(left))
-        {
-            if knowledge.has_type_role(type_name, TypeRole::Ring) {
+        if let (Some(right), Some(inferred_type), Some(ring_name)) = (
+            right,
+            inferred_type.as_ref(),
+            single_symbol_assignment_target(left),
+        ) {
+            if RingSemantics::may_be_ring(inferred_type, &knowledge) {
                 self.collect_ring_generator_bindings(
                     ring_name,
                     (right, syntax.map(assignment_value)),
@@ -240,6 +243,13 @@ impl Analysis {
                     &knowledge,
                 );
             }
+        }
+
+        if matches_token::<Token![=]>(operator.text()) {
+            let value_type = type_name
+                .cloned()
+                .unwrap_or_else(|| TypeRole::Thing.object_name());
+            self.register_indexed_assignment(left, value_type, source);
         }
 
         self.record_assignment_fact(node, left, right, scope_idx, installation_id, source);
@@ -316,6 +326,11 @@ where
         if let Some(call) = self.root.related(node) {
             self.record_install_method_call(call);
             self.analysis.enrich_package_declaration(call, self.source);
+            let knowledge = self
+                .knowledge_provider
+                .at_position(self.source.position_for_node(call));
+            self.analysis
+                .bind_anonymous_ring_generators(call, self.source, &knowledge);
         }
         visit::visit_expr_op_bin_adj(self, node);
     }
@@ -1059,7 +1074,42 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         position: Position,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<InferredType> {
-        let callable = knowledge.get_record(callable)?.callable()?;
+        let record = knowledge.get_record(callable)?;
+        let callable_info = record.callable()?;
+        if knowledge.has_type_role(&record.class, TypeRole::MethodFunctionBinary)
+            && argument_types.len() > 2
+        {
+            // The catalog includes the generic Sequence wrapper without a
+            // codomain. An annotated Sequence method overrides its binary fold.
+            let sequence = [InferredType::exact("Sequence")];
+            let signatures = self.external_dispatch_domains(callable_info, knowledge);
+            let candidates =
+                self.dispatch_candidate_indices(&signatures, &sequence, position, knowledge);
+            let candidates = effective_external_candidate_indices(callable_info, &candidates);
+            if candidates
+                .iter()
+                .any(|index| callable_info.methods[*index].codomain.is_some())
+            {
+                return Some(self.external_candidates_return_type(
+                    callable_info,
+                    &candidates,
+                    position,
+                    knowledge,
+                ));
+            }
+            let mut result = argument_types[0].clone();
+            for argument in &argument_types[1..] {
+                result = self.resolve_external_call_return_type(
+                    callable,
+                    &[result, argument.clone()],
+                    _options,
+                    position,
+                    knowledge,
+                )?;
+            }
+            return Some(result);
+        }
+        let callable = callable_info;
         let signatures = self.external_dispatch_domains(callable, knowledge);
         let candidates =
             self.dispatch_candidate_indices(&signatures, argument_types, position, knowledge);
@@ -1128,7 +1178,13 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> CallStaticFacts {
-        self.infer_call_facts_for_callable(node, source, scope_idx, None, knowledge)
+        let callable = node
+            .parent()
+            .filter(|parent| parent.is_space_application())
+            .and_then(|parent| parent.binary_parts())
+            .filter(|parts| parts.right.id() == node.id())
+            .and_then(|parts| symbol_node_text(parts.left));
+        self.infer_call_facts_for_callable(node, source, scope_idx, callable, knowledge)
     }
 
     fn infer_call_facts_for_callable(
@@ -1177,6 +1233,161 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         }
     }
 
+    /// Reports only calls whose known domains are disjoint from every possible
+    /// argument type. Missing type or signature facts leave the call unchecked.
+    pub fn call_has_disjoint_domain(
+        &self,
+        node: SyntaxNode,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> bool {
+        if !node.is_space_application() {
+            return false;
+        }
+        let Some(parts) = node.binary_parts() else {
+            return false;
+        };
+        let Some(name) = symbol_node_text(parts.left) else {
+            return false;
+        };
+        if self
+            .analysis
+            .is_method_installation_callable(parts.left, source)
+        {
+            return false;
+        }
+        let position = source.position_for_node(node);
+        let scope = self.find_scope_at(position).unwrap_or(0);
+        let function = self.local_function_at(name, scope, position, knowledge);
+        let indexed_name = ObjectName::new(name);
+        let record = if let Some(function) = function {
+            if !function.is_method_function() {
+                return false;
+            }
+            function
+                .indexed_callable
+                .as_ref()
+                .and_then(|name| knowledge.get_record(name))
+        } else {
+            if self
+                .visible_source_binding_from_scope(name, scope, position, knowledge)
+                .is_some()
+            {
+                return false;
+            }
+            knowledge.get_record(&indexed_name)
+        };
+        if function.is_none()
+            && !record
+                .and_then(|record| record.callable())
+                .is_some_and(|callable| callable.is_method_function())
+        {
+            return false;
+        }
+        let facts =
+            self.infer_call_facts_for_callable(parts.right, source, scope, Some(name), knowledge);
+        let binary = function
+            .is_some_and(|function| function.runtime_class == Some(TypeRole::MethodFunctionBinary))
+            || record.is_some_and(|record| {
+                knowledge.has_type_role(&record.class, TypeRole::MethodFunctionBinary)
+            });
+        if binary && facts.argument_types.len() > 2 {
+            let sequence = [InferredType::exact("Sequence")];
+            if function.is_some_and(|function| {
+                !self
+                    .local_call_candidate_installations(function, &sequence, position, knowledge)
+                    .is_empty()
+            }) {
+                return false;
+            }
+            if let Some(callable) = record.and_then(|record| record.callable()) {
+                let signatures = self.external_dispatch_domains(callable, knowledge);
+                if self
+                    .dispatch_candidate_indices(&signatures, &sequence, position, knowledge)
+                    .iter()
+                    .any(|index| callable.methods[*index].codomain.is_some())
+                {
+                    return false;
+                }
+            }
+            let mut result = facts.argument_types[0].clone();
+            for argument in &facts.argument_types[1..] {
+                let pair = [result, argument.clone()];
+                if self.method_domain_is_disjoint(function, record, &pair, position, knowledge) {
+                    return true;
+                }
+                result = if let Some(function) = function {
+                    self.resolve_local_call_return_type(function, &pair, position, knowledge)
+                } else {
+                    self.resolve_external_call_return_type(
+                        &indexed_name,
+                        &pair,
+                        &facts.literal_options,
+                        position,
+                        knowledge,
+                    )
+                }
+                .unwrap_or_else(InferredType::unknown);
+            }
+            return false;
+        }
+        self.method_domain_is_disjoint(function, record, &facts.argument_types, position, knowledge)
+    }
+
+    fn method_domain_is_disjoint(
+        &self,
+        function: Option<&FunctionInfo>,
+        record: Option<&crate::builtin_index::Record>,
+        arguments: &[InferredType],
+        position: Position,
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> bool {
+        let Some(products) = self.inferred_dispatch_products(arguments, position, knowledge) else {
+            return false;
+        };
+        if products.is_empty() {
+            return false;
+        }
+        let mut has_domains = false;
+        if let Some(function) = function {
+            let installations = self
+                .analysis
+                .method_installations_for_at(function, position);
+            has_domains |= !installations.is_empty();
+            if installations.iter().any(|installation| {
+                installation
+                    .method
+                    .domain
+                    .iter()
+                    .any(|name| self.resolve_type_id_at(name, position, knowledge).is_none())
+            }) || !self
+                .local_call_candidate_installations(function, arguments, position, knowledge)
+                .is_empty()
+            {
+                return false;
+            }
+        }
+        if let Some(callable) = record.and_then(|record| record.callable()) {
+            has_domains |= !callable.methods.is_empty();
+            let signatures = self.external_dispatch_domains(callable, knowledge);
+            // Dispatch by an object rather than its class requires value facts
+            // that a nominal argument type alone cannot rule out.
+            if signatures.iter().any(|signature| {
+                signature.slots.len() == arguments.len()
+                    && signature
+                        .slots
+                        .iter()
+                        .any(|slot| matches!(slot, DispatchIdentity::Object(_)))
+            }) || !self
+                .dispatch_candidate_indices(&signatures, arguments, position, knowledge)
+                .is_empty()
+            {
+                return false;
+            }
+        }
+        has_domains
+    }
+
     fn callable_receives_sequence(
         &self,
         name: &str,
@@ -1184,11 +1395,9 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         position: Position,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> bool {
-        let local_dispatch = self
-            .local_function_at(name, scope_idx, position, knowledge)
-            .and_then(|function| function.dispatch);
-        if local_dispatch == Some(Dispatch::Variadic) {
-            return true;
+        if let Some(function) = self.local_function_at(name, scope_idx, position, knowledge) {
+            return function.dispatch == Some(Dispatch::Variadic)
+                || function.runtime_class == Some(TypeRole::MethodFunctionSingle);
         }
 
         knowledge
@@ -1204,9 +1413,53 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         position: Position,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<InferredType> {
+        if function.runtime_class == Some(TypeRole::MethodFunctionBinary)
+            && argument_types.len() > 2
+        {
+            let sequence = [InferredType::exact("Sequence")];
+            if !self
+                .local_call_candidate_installations(function, &sequence, position, knowledge)
+                .is_empty()
+            {
+                return self
+                    .resolve_local_call_return_type(function, &sequence, position, knowledge);
+            }
+            if let Some(indexed_callable) = &function.indexed_callable {
+                // Catalog Sequence specializations take precedence over the
+                // generic fold when no source specialization replaces them.
+                if function.installations.is_empty() {
+                    return self.resolve_external_call_return_type(
+                        indexed_callable,
+                        argument_types,
+                        &[],
+                        position,
+                        knowledge,
+                    );
+                }
+            }
+            let mut result = argument_types[0].clone();
+            for argument in &argument_types[1..] {
+                result = self.resolve_local_call_return_type(
+                    function,
+                    &[result, argument.clone()],
+                    position,
+                    knowledge,
+                )?;
+            }
+            return Some(result);
+        }
         let candidates =
             self.local_call_candidate_installations(function, argument_types, position, knowledge);
         if candidates.is_empty() {
+            if let Some(callable) = &function.indexed_callable {
+                return self.resolve_external_call_return_type(
+                    callable,
+                    argument_types,
+                    &[],
+                    position,
+                    knowledge,
+                );
+            }
             function
                 .typical_value
                 .clone()

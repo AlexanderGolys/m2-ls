@@ -34,6 +34,9 @@ pub fn document_highlights(
     if let Some(highlights) = package_reference_highlights(document, position, builtins) {
         return Some(highlights);
     }
+    if let Some(highlights) = indexed_ring_generator_highlights(document, position) {
+        return Some(highlights);
+    }
     if let Some(highlights) = symbol_reference_highlights(document, position) {
         return Some(highlights);
     }
@@ -137,6 +140,41 @@ fn package_reference_highlights(
             })
             .collect()
     })
+}
+
+/// Highlight the generator an indexed access such as `z_1` selects: its
+/// declaration in the ring constructor, written to, and every access to the
+/// same index, read.
+fn indexed_ring_generator_highlights(
+    document: &DocumentSnapshot,
+    position: Position,
+) -> Option<Vec<DocumentHighlight>> {
+    let analysis = document.analysis();
+    let references = analysis.indexed_ring_generator_references(
+        document.root_node(),
+        position,
+        document,
+        true,
+    )?;
+    let declarations = analysis.indexed_ring_generator_references(
+        document.root_node(),
+        position,
+        document,
+        false,
+    )?;
+    Some(
+        references
+            .into_iter()
+            .map(|range| DocumentHighlight {
+                range,
+                kind: Some(if declarations.contains(&range) {
+                    DocumentHighlightKind::READ
+                } else {
+                    DocumentHighlightKind::WRITE
+                }),
+            })
+            .collect(),
+    )
 }
 
 /// The position of the character before the semicolon under the cursor, so

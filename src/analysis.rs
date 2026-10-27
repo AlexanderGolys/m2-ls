@@ -28,7 +28,7 @@ use crate::object_registry::ObjectName;
 use crate::object_registry::{ObjectId, OperatorForm, TypeData, TypeId};
 use crate::package_index::{declared_package_name, PackageLoadingOption};
 use crate::semantic_token::{syntax_semantic_token_type, SourceSemanticRole, SourceSemanticToken};
-use crate::source::SourceNavigation;
+use crate::source::{ByteRange, SourceNavigation};
 use crate::typesystem::{
     InferredType, LiteralOption, PositionedTypeKnowledge, SubtypeEvidence, Type, TypeKnowledge,
     TypeRole,
@@ -475,6 +475,8 @@ pub struct FunctionInfo {
     pub typical_value: Option<ObjectName>,
     pub installations: Vec<MethodInstallationId>,
     pub dispatch: Option<Dispatch>,
+    runtime_class: Option<TypeRole>,
+    indexed_callable: Option<ObjectName>,
     kind: LocalFunctionKind,
 }
 
@@ -532,7 +534,7 @@ pub struct BindingStateInfo {
     pub presentation_kind: SymbolKind,
     pub inferred_type: Option<InferredType>,
     pub object_id: Option<CallableObjectId>,
-    pub indexed_element_type: Option<ring::IndexedGeneratorTypes>,
+    pub indexed_element_type: Option<ring::IndexedVariableTypes>,
     pub is_ring_generator: bool,
     pub source_type: Option<TypeId>,
     pub value_range: Option<TextRange>,
@@ -625,6 +627,9 @@ struct SemanticRegistry {
     source_semantic_tokens: Vec<SourceSemanticToken>,
     source_types: SourceTypeFacts,
     ring_generators: HashMap<ObjectName, Vec<ring::RingGenerator>>,
+    /// Where ring generators are declared, in the order their bindings were
+    /// made: each bound constructor's variable list and `Variable` option.
+    ring_generator_specs: Vec<TextRange>,
 }
 
 #[derive(Clone, Copy)]
@@ -690,7 +695,7 @@ struct BindingEnrichment {
     presentation_kind: SymbolKind,
     inferred_type: Option<InferredType>,
     object_id: Option<CallableObjectId>,
-    indexed_element_type: Option<ring::IndexedGeneratorTypes>,
+    indexed_element_type: Option<ring::IndexedVariableTypes>,
     parent_type: Option<TypeId>,
 }
 
@@ -1232,12 +1237,21 @@ impl Analysis {
             let knowledge = knowledge_provider.at_position(source.position_for_node(node));
             if self.is_indexed_ring_generator(node, source) {
                 covered_until = node.end_byte();
+                if let Some(base) = node
+                    .binary_parts()
+                    .and_then(|parts| parenthesized_value(parts.left))
+                {
+                    if let Some((_, quote)) = base.quote_parts() {
+                        self.record_source_semantic_token(quote, source, &knowledge);
+                    }
+                }
+                let span = source.span_for_bytes(Self::indexed_ring_generator_bytes(node));
                 self.registry
                     .source_semantic_tokens
                     .push(SourceSemanticToken {
-                        span: source.span_for_node(node),
+                        source_role: Some(self.ring_generator_role(span.range())),
+                        span,
                         syntax_token_type: None,
-                        source_role: Some(SourceSemanticRole::RingGenerator),
                         is_symbol: false,
                         is_unquoted_symbol: false,
                         is_expression_symbol: false,
@@ -1267,22 +1281,11 @@ impl Analysis {
         }
     }
 
-    fn register_option_roles(
-        &mut self,
-        left: SyntaxNode,
-        right: Option<SyntaxNode>,
-        source: &(impl SourceNavigation + ?Sized),
-    ) {
+    fn register_option_key(&mut self, key: SyntaxNode, source: &(impl SourceNavigation + ?Sized)) {
         self.register_source_semantic_role(
-            source.range_for_node(left),
+            source.range_for_node(key),
             SourceSemanticRole::OptionKey,
         );
-        if let (Some(key), Some(right)) = (symbol_node_text(left).map(ObjectName::new), right) {
-            self.register_source_semantic_role(
-                source.range_for_node(right),
-                SourceSemanticRole::OptionValue(key),
-            );
-        }
     }
 
     fn record_namespace_role(
@@ -1352,21 +1355,22 @@ impl Analysis {
         }
 
         let span = source.span_for_node(node);
-        let source_role = self
-            .registry
-            .pending_source_semantic_roles
-            .iter()
-            .find(|(range, _)| *range == span.range())
-            .map(|(_, role)| role.clone())
+        let is_ring_generator = is_symbol
+            && self
+                .visible_source_binding_at(node.text(), span.range().start, knowledge)
+                .is_some_and(|binding| binding.state.is_ring_generator);
+        let generator_role = is_ring_generator.then(|| self.ring_generator_role(span.range()));
+        let source_role = generator_role
+            .clone()
+            .filter(|role| *role == SourceSemanticRole::RingGeneratorDeclaration)
             .or_else(|| {
-                let binding = is_symbol.then(|| {
-                    self.visible_source_binding_at(node.text(), span.range().start, knowledge)
-                })??;
-                binding
-                    .state
-                    .is_ring_generator
-                    .then_some(SourceSemanticRole::RingGenerator)
-            });
+                self.registry
+                    .pending_source_semantic_roles
+                    .iter()
+                    .find(|(range, _)| *range == span.range())
+                    .map(|(_, role)| role.clone())
+            })
+            .or(generator_role);
         self.registry
             .source_semantic_tokens
             .push(SourceSemanticToken {
@@ -1378,6 +1382,16 @@ impl Analysis {
                 is_expression_symbol: is_expression_symbol(node),
                 is_condition_value: is_condition_value(node),
             });
+    }
+
+    /// The role of a ring generator written at `range`: declared there when
+    /// it lies in a constructor's variables, otherwise referred to.
+    fn ring_generator_role(&self, range: TextRange) -> SourceSemanticRole {
+        if self.declares_ring_generators(range) {
+            SourceSemanticRole::RingGeneratorDeclaration
+        } else {
+            SourceSemanticRole::RingGenerator
+        }
     }
 
     fn record_assignment_fact(
@@ -2302,7 +2316,8 @@ impl Analysis {
             {
                 return Some(object_id);
             }
-            let callable = knowledge.object(&indexed_id)?.callable()?;
+            let record = knowledge.object(&indexed_id)?;
+            let callable = record.callable()?;
             let function = FunctionInfo {
                 typical_value: callable
                     .typical_value
@@ -2311,6 +2326,13 @@ impl Analysis {
                     .cloned(),
                 installations: Vec::new(),
                 dispatch: None,
+                runtime_class: [
+                    TypeRole::MethodFunctionSingle,
+                    TypeRole::MethodFunctionBinary,
+                ]
+                .into_iter()
+                .find(|role| knowledge.has_type_role(&record.class, *role)),
+                indexed_callable: Some(record.name.clone()),
                 kind: match callable.kind {
                     CallableKind::MethodFunction => LocalFunctionKind::Method(
                         Self::catalog_method_options(knowledge.object(&indexed_id)?, knowledge),
@@ -2331,12 +2353,16 @@ impl Analysis {
                 typical_value: declaration.typical_value(),
                 installations: Vec::new(),
                 dispatch: None,
+                runtime_class: Some(declaration.runtime_class()),
+                indexed_callable: None,
                 kind: LocalFunctionKind::Method(declaration.options()),
             })
         } else if value.is::<LambdaExpression>() {
             Some(FunctionInfo {
                 typical_value: None,
                 installations: Vec::new(),
+                runtime_class: None,
+                indexed_callable: None,
                 dispatch: self.registry.scopes.function_dispatch(value, source),
                 kind: LocalFunctionKind::Plain,
             })
@@ -2571,6 +2597,8 @@ impl Analysis {
                         typical_value: None,
                         installations: Vec::new(),
                         dispatch: None,
+                        runtime_class: None,
+                        indexed_callable: None,
                         kind: LocalFunctionKind::Plain,
                     });
                 function.installations.push(installation.id);
@@ -2605,11 +2633,7 @@ where
         let Some(left) = expression.binary_parts().map(|parts| parts.left) else {
             return;
         };
-        self.analysis.register_option_roles(
-            left,
-            expression.binary_parts().map(|parts| parts.right),
-            self.source,
-        );
+        self.analysis.register_option_key(left, self.source);
     }
 
     fn register_property(&mut self, node: &(impl crate::node_metadata::SyntaxType + ?Sized)) {

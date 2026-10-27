@@ -130,13 +130,49 @@ pub struct InlayHintSettings {
 ///
 /// The legend offers standard token types and both standard and custom
 /// modifiers. Changes take effect through a semantic-token refresh.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct SemanticTokenSettings {
     /// Only LSP-standard modifiers: the Macaulay2-specific ones, such as
-    /// `command` or `algebraic`, are dropped. Token types are always
+    /// `option` or `algebraic`, are dropped. Token types are always
     /// standard. Default `false`.
     pub standard_only: bool,
+    /// Which values receive `defaultLibrary`: a named policy or a list of
+    /// defining packages. Default `"CompiledFunction"`.
+    pub default_library: DefaultLibrarySetting,
+}
+
+/// Selects `defaultLibrary` by runtime implementation or defining package.
+/// JSON accepts a policy string or an array such as `["Core", "Graphs"]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum DefaultLibrarySetting {
+    Mode(DefaultLibraryMode),
+    Packages(Vec<String>),
+}
+
+impl Default for DefaultLibrarySetting {
+    fn default() -> Self {
+        Self::Mode(DefaultLibraryMode::CompiledFunction)
+    }
+}
+
+/// Named policies for `semanticTokens.defaultLibrary`. Package policies apply
+/// to package globals; local aliases keep their own binding's package origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum DefaultLibraryMode {
+    /// `CompiledFunction` values, including aliases, from any package.
+    CompiledFunction,
+    /// `CompiledFunction` and `CompiledFunctionClosure`, including subtypes.
+    Compiled,
+    /// Bindings defined in `Core`.
+    Core,
+    /// Bindings from the library index's preloaded packages.
+    Prelude,
+    /// Globals defined in any indexed or source package.
+    AllPackages,
+    /// Disable the modifier.
+    None,
 }
 
 /// `sources.*`: where navigation finds the Macaulay2 library sources.
@@ -171,7 +207,7 @@ impl Default for FormattingSettings {
             soft_line_width: Some(78),
             hard_line_width: Some(90),
             control_flow_layout: ControlFlowLayout::default(),
-            compact_factor_operators: false,
+            compact_factor_operators: true,
             break_after_semicolon: false,
         }
     }
@@ -343,6 +379,10 @@ mod tests {
         assert_eq!(settings.formatting, FormattingSettings::default());
         assert_eq!(settings.inlay_hints, InlayHintSettings::default());
         assert!(!settings.semantic_tokens.standard_only);
+        assert_eq!(
+            settings.semantic_tokens.default_library,
+            DefaultLibrarySetting::Mode(DefaultLibraryMode::CompiledFunction)
+        );
         assert_eq!(valid_settings(Value::Null), settings);
     }
 
@@ -398,6 +438,42 @@ mod tests {
             }
         );
         assert!(settings.semantic_tokens.standard_only);
+    }
+
+    #[test]
+    fn default_library_accepts_named_policies_or_package_lists() {
+        for (name, mode) in [
+            ("CompiledFunction", DefaultLibraryMode::CompiledFunction),
+            ("Compiled", DefaultLibraryMode::Compiled),
+            ("Core", DefaultLibraryMode::Core),
+            ("Prelude", DefaultLibraryMode::Prelude),
+            ("AllPackages", DefaultLibraryMode::AllPackages),
+            ("None", DefaultLibraryMode::None),
+        ] {
+            let settings =
+                valid_settings(serde_json::json!({"semanticTokens": {"defaultLibrary": name}}));
+            assert_eq!(
+                settings.semantic_tokens.default_library,
+                DefaultLibrarySetting::Mode(mode)
+            );
+        }
+        for packages in [vec!["Core", "Graphs"], vec![]] {
+            let settings =
+                valid_settings(serde_json::json!({"semanticTokens": {"defaultLibrary": packages}}));
+            assert_eq!(
+                settings.semantic_tokens.default_library,
+                DefaultLibrarySetting::Packages(packages.into_iter().map(str::to_string).collect())
+            );
+        }
+        let parsed = ServerSettings::from_value(&serde_json::json!({
+            "semanticTokens": {"defaultLibrary": "unknown", "standardOnly": true}
+        }));
+        assert_eq!(
+            parsed.settings.semantic_tokens.default_library,
+            DefaultLibrarySetting::default()
+        );
+        assert!(parsed.settings.semantic_tokens.standard_only);
+        assert_eq!(parsed.problems.len(), 1);
     }
 
     #[test]

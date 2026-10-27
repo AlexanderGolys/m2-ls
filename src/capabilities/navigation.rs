@@ -1114,16 +1114,32 @@ mod tests {
                 name == "shared"
             }
 
-            fn semantic_token_type(
+            fn semantic_token(
                 &self,
                 _name: &str,
                 _exclude: &Url,
-            ) -> Option<crate::semantic_token::M2SemanticTokenType> {
+            ) -> Option<crate::semantic_token::M2SemanticToken> {
                 None
             }
 
-            fn is_mutable_export(&self, _name: &str) -> bool {
+            fn is_protected_export(&self, _name: &str) -> bool {
                 false
+            }
+
+            fn defining_package(
+                &self,
+                _name: &str,
+                _exclude: &Url,
+            ) -> Option<crate::object_registry::ObjectName> {
+                None
+            }
+
+            fn package_at(
+                &self,
+                _uri: &Url,
+                _position: Position,
+            ) -> Option<crate::object_registry::ObjectName> {
+                None
             }
         }
 

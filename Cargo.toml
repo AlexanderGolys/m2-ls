@@ -26,3 +26,4 @@ tree-sitter-md = { version = "0.5.3", features = ["parser"] }
 ropey = "1.6.1"
 serde_path_to_error = "0.1"
 strum = { version = "0.28.0", features = ["derive"] }
+these-macros-should-be-illegal = "0.12.0"

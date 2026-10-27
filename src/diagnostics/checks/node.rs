@@ -37,6 +37,7 @@ pub(super) fn spawn(context: &NodeContext, sink: &mut DiagnosticSink) {
     explicit_install_required(context, sink);
     condition_type(context, sink);
     install_codomain(context, sink);
+    call_domain(context, sink);
 }
 
 fn syntax_error(context: &NodeContext, sink: &mut DiagnosticSink) {
@@ -676,6 +677,22 @@ fn install_codomain(context: &NodeContext, sink: &mut DiagnosticSink) {
             ),
         ),
         (MethodCodomainEdit::Replace, None) => {}
+    }
+}
+
+fn call_domain(context: &NodeContext, sink: &mut DiagnosticSink) {
+    if TypeChecker::new(context.analysis, context.knowledge).call_has_disjoint_domain(
+        context.node,
+        context.source,
+        context.knowledge,
+    ) {
+        sink.spawn(
+            &catalog::CALL_DOMAIN_MISMATCH,
+            Finding::new(
+                context.node_range(),
+                "No known method domain matches these argument types",
+            ),
+        );
     }
 }
 

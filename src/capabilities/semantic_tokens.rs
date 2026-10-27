@@ -6,14 +6,14 @@ use std::collections::BinaryHeap;
 use crate::analysis::BindingView;
 use crate::document::{DocumentSnapshot, PackageSession};
 use crate::documentation::DocumentationSnippet;
-use crate::object_registry::ObjectRegistry;
+use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry};
 use crate::package_documentation::{DocumentationMarkupKind, TextStyle};
 use crate::semantic_token::{
-    classify_source_semantic_token, local_symbol_semantic_token, M2SemanticToken,
-    M2SemanticTokenModifier, M2SemanticTokenType, SemanticTokenKnowledge, SourceSemanticToken,
-    SourceSemanticTokenContext,
+    classify_source_semantic_token, local_symbol_semantic_token, CompiledCallableKind,
+    M2SemanticToken, M2SemanticTokenModifier, M2SemanticTokenType, SemanticTokenKnowledge,
+    SourceSemanticToken, SourceSemanticTokenContext,
 };
-use crate::settings::SemanticTokenSettings;
+use crate::settings::{DefaultLibraryMode, DefaultLibrarySetting, SemanticTokenSettings};
 use crate::source::{ByteRange, DocumentSpan, SourceNavigation, SymbolMention};
 use crate::source_package::{CodeFragment, ExportAccess};
 use crate::workspace_index::{WorkspaceDefinitionKnowledge, WorkspaceIndex, WorkspaceView};
@@ -32,6 +32,7 @@ pub fn collect_semantic_tokens(
         document,
         builtins,
         workspace_index: &WorkspaceView::Document(workspace_index),
+        settings,
         uri,
     };
     let session_workspace = WorkspaceView::PackageSession(workspace_index);
@@ -44,6 +45,7 @@ pub fn collect_semantic_tokens(
                 document: &session.snapshot,
                 builtins: session.snapshot.object_registry(),
                 workspace_index: &session_workspace,
+                settings,
                 uri,
             },
         })
@@ -232,7 +234,7 @@ impl<'a> SemanticTokenEmitter<'a> {
         });
 
         let emit_base = !augments_syntax_tokens
-            || base_type.emit_with_syntax_highlighting()
+            || base_type.emit_alongside_syntax_highlighting()
             || is_documentation;
         let mut boundaries = vec![source_bytes.start, source_bytes.end];
         for span in &spans {
@@ -371,6 +373,7 @@ struct SemanticTokenClassifier<'a, W: ?Sized> {
     document: &'a DocumentSnapshot,
     builtins: &'a ObjectRegistry,
     workspace_index: &'a W,
+    settings: &'a SemanticTokenSettings,
     uri: &'a Url,
 }
 
@@ -378,45 +381,123 @@ impl<W> SemanticTokenClassifier<'_, W>
 where
     W: WorkspaceDefinitionKnowledge + ?Sized,
 {
+    /// Apply the current library policy to runtime facts and the binding's
+    /// defining package. Package origin belongs to the binding; assigning a
+    /// Core value to a local does not make that local part of Core.
+    fn apply_library_policy(
+        &self,
+        token: M2SemanticToken,
+        package: Option<&str>,
+    ) -> M2SemanticToken {
+        let selected = match &self.settings.default_library {
+            DefaultLibrarySetting::Mode(mode) => match mode {
+                DefaultLibraryMode::CompiledFunction => {
+                    token.compiled_callable == Some(CompiledCallableKind::Function)
+                }
+                DefaultLibraryMode::Compiled => token.compiled_callable.is_some(),
+                DefaultLibraryMode::Core => package == Some("Core"),
+                DefaultLibraryMode::Prelude => package.is_some_and(|package| {
+                    self.builtins
+                        .default_loaded()
+                        .iter()
+                        .any(|preloaded| preloaded == package)
+                }),
+                DefaultLibraryMode::AllPackages => package.is_some(),
+                DefaultLibraryMode::None => false,
+            },
+            DefaultLibrarySetting::Packages(packages) => {
+                package.is_some_and(|package| packages.iter().any(|selected| selected == package))
+            }
+        };
+        token.with_modifier_state(M2SemanticTokenModifier::DefaultLibrary, selected)
+    }
+
+    /// Resolve the package owning this occurrence's binding in the same order
+    /// as token classification: source bindings, indexed globals, then workspace
+    /// definitions. Function parameters and locals have no package origin.
+    fn symbol_package(
+        &self,
+        name: &str,
+        position: Position,
+        binding: Option<&BindingView<'_>>,
+    ) -> Option<ObjectName> {
+        if matches!(
+            &self.settings.default_library,
+            DefaultLibrarySetting::Mode(
+                DefaultLibraryMode::CompiledFunction
+                    | DefaultLibraryMode::Compiled
+                    | DefaultLibraryMode::None
+            )
+        ) {
+            return None;
+        }
+        if let Some(binding) = binding {
+            if binding.is_local() {
+                return None;
+            }
+            return self
+                .document
+                .packages()
+                .declaration_at(binding.range.start)
+                .map(|package| package.name.clone())
+                .or_else(|| {
+                    self.workspace_index
+                        .package_at(self.uri, binding.range.start)
+                });
+        }
+        let knowledge = self.builtins.at(position);
+        knowledge
+            .get_record(&ObjectName::new(name))
+            .and_then(|record| knowledge.package_name(&record.package))
+            .map(ObjectName::new)
+            .or_else(|| self.workspace_index.defining_package(name, self.uri))
+    }
+
     /// The token of what the name `mention` writes names: the binding it
     /// resolves to, an indexed object, or a workspace definition.
     fn mention_token(&self, mention: &SymbolMention) -> Option<M2SemanticToken> {
         let name = mention.name(self.document.text());
         let knowledge = self.builtins.at(mention.range().start);
-        self.document
-            .mention_symbol(mention)
+        let binding = self.document.mention_symbol(mention);
+        let names_local = binding.as_ref().is_some_and(|binding| binding.is_local());
+        let package = self.symbol_package(name, mention.range().start, binding.as_ref());
+        binding
             .map(|binding| local_symbol_semantic_token(&binding, &knowledge))
             .or_else(|| knowledge.semantic_token(name))
-            .or_else(|| {
-                self.workspace_index
-                    .semantic_token_type(name, self.uri)
-                    .map(M2SemanticToken::new)
+            .or_else(|| self.workspace_index.semantic_token(name, self.uri))
+            .map(|token| {
+                self.apply_library_policy(
+                    token.with_binding_protection(
+                        !names_local && self.is_protected_global(name, mention.range().start),
+                    ),
+                    package.as_ref().map(ObjectName::name),
+                )
             })
     }
 
     /// The names export strings list, as the objects their definitions
     /// name, including declarations that follow the export list and
     /// exported synonyms. A name defined nowhere is the symbol the export
-    /// creates. A name `exportMutable` lists is marked mutable, which sets
-    /// it apart even when it names a plain variable.
+    /// creates. Protected exports carry `readonly`; `exportMutable` names
+    /// keep their ordinary token type without a protection modifier.
     fn export_spans(&self) -> Vec<SemanticSpan> {
         let mut spans = Vec::new();
-        for export in self
+        for (package, export) in self
             .document
             .packages()
             .declarations()
             .iter()
-            .flat_map(|package| &package.exports)
+            .flat_map(|package| package.exports.iter().map(move |export| (package, export)))
         {
             let named = self
                 .mention_token(&export.definition_mention)
                 .unwrap_or_else(|| M2SemanticToken::new(M2SemanticTokenType::Symbol));
-            let token = match export.access {
-                ExportAccess::Mutable => named.with_modifier(M2SemanticTokenModifier::Mutable),
-                _ => match named.within_string() {
-                    Some(token) => token,
-                    None => continue,
-                },
+            let Some(token) = self
+                .apply_library_policy(named, Some(package.name.name()))
+                .with_binding_protection(export.access == ExportAccess::Protected)
+                .within_string()
+            else {
+                continue;
             };
             spans.push(SemanticSpan {
                 source: export.definition_mention.span().clone(),
@@ -452,10 +533,21 @@ where
                     DocumentationMarkupKind::LinkConstructor => {
                         M2SemanticToken::new(M2SemanticTokenType::Annotation)
                     }
-                    DocumentationMarkupKind::OptionName => M2SemanticToken::option_name(
-                        &self.document.text()[markup.bytes.clone()],
-                        &self.builtins.at(source.range().start),
-                    ),
+                    DocumentationMarkupKind::OptionName => {
+                        let name = &self.document.text()[markup.bytes.clone()];
+                        let binding = self
+                            .document
+                            .mention_symbol(&SymbolMention::new(source.clone()));
+                        let package =
+                            self.symbol_package(name, source.range().start, binding.as_ref());
+                        self.apply_library_policy(
+                            M2SemanticToken::option_name(
+                                name,
+                                &self.builtins.at(source.range().start),
+                            ),
+                            package.as_ref().map(ObjectName::name),
+                        )
+                    }
                     DocumentationMarkupKind::Styled(style) => {
                         M2SemanticToken::new(M2SemanticTokenType::String).with_modifier(match style
                         {
@@ -498,17 +590,27 @@ where
         let emit_syntax = !augments_syntax_tokens
             || source_token
                 .syntax_token_type
-                .is_some_and(M2SemanticTokenType::emit_with_syntax_highlighting);
+                .is_some_and(M2SemanticTokenType::emit_alongside_syntax_highlighting);
         let names_local = binding
             .as_ref()
             .is_some_and(|(binding, _)| binding.is_local());
+        let package = source_token
+            .is_symbol
+            .then(|| {
+                self.symbol_package(
+                    source_text,
+                    position,
+                    binding.as_ref().map(|(binding, _)| binding),
+                )
+            })
+            .flatten();
         self.classify(source_token, binding, emit_syntax)
+            .map(|token| self.apply_library_policy(token, package.as_ref().map(ObjectName::name)))
             .map(|token| {
-                if source_token.is_symbol
-                    && !names_local
-                    && self.is_mutable_global(source_text, position)
-                {
-                    token.with_modifier(M2SemanticTokenModifier::Mutable)
+                if source_token.is_symbol {
+                    token.with_binding_protection(
+                        !names_local && self.is_protected_global(source_text, position),
+                    )
                 } else {
                     token
                 }
@@ -519,18 +621,22 @@ where
             })
     }
 
-    /// Whether the global `name`, written at `position`, is one some package
-    /// exports with `exportMutable`: the document's own, one of the
-    /// workspace, or an indexed one.
-    fn is_mutable_global(&self, name: &str, position: Position) -> bool {
+    /// Whether package exports or indexed facts protect this global binding.
+    /// An explicit export in the document takes precedence over indexed names.
+    fn is_protected_global(&self, name: &str, position: Position) -> bool {
         self.document
             .packages()
             .declarations()
             .iter()
             .flat_map(|package| &package.exports)
-            .any(|export| export.access == ExportAccess::Mutable && export.name.name() == name)
-            || self.workspace_index.is_mutable_export(name)
-            || self.builtins.at(position).is_mutable_global(name)
+            .find(|export| export.name.name() == name)
+            .map_or_else(
+                || {
+                    self.workspace_index.is_protected_export(name)
+                        || self.builtins.at(position).is_protected_global(name)
+                },
+                |export| export.access == ExportAccess::Protected,
+            )
     }
 
     fn classify(
@@ -542,18 +648,14 @@ where
         let source_text = &self.document.text()[source_token.span.bytes()];
         let position = source_token.span.range().start;
         let knowledge = self.builtins.at(position);
-        let is_bound = binding.is_some();
         let token = classify_source_semantic_token(
             SourceSemanticTokenContext {
                 source_text,
                 source_token,
                 binding: binding.as_ref().map(|(binding, _)| binding),
                 is_declaration: binding.is_some_and(|(_, is_declaration)| is_declaration),
-                workspace_token_type: (!source_token.is_condition_value)
-                    .then(|| {
-                        self.workspace_index
-                            .semantic_token_type(source_text, self.uri)
-                    })
+                workspace_token: (!source_token.is_condition_value)
+                    .then(|| self.workspace_index.semantic_token(source_text, self.uri))
                     .flatten(),
                 emit_syntax,
             },
@@ -569,13 +671,11 @@ where
                     M2SemanticTokenType::Function | M2SemanticTokenType::Method
                 ) =>
             {
-                Some(if is_bound {
-                    M2SemanticToken::new(M2SemanticTokenType::Variable)
-                } else {
-                    M2SemanticToken::unresolved()
-                })
+                Some(M2SemanticToken::new(M2SemanticTokenType::Variable))
             }
-            None if source_token.is_expression_symbol => Some(M2SemanticToken::unresolved()),
+            None if source_token.is_expression_symbol => {
+                Some(M2SemanticToken::new(M2SemanticTokenType::Variable))
+            }
             token => token,
         }
     }
@@ -591,15 +691,14 @@ mod tests {
         local_symbol_semantic_token, M2SemanticToken, M2SemanticTokenModifier,
         M2SemanticTokenModifiers, M2SemanticTokenType,
     };
+    use crate::typesystem::TypeKnowledge;
     use crate::workspace_index::WorkspaceIndex;
     use strum::IntoEnumIterator;
 
     const OPTION_MODIFIER: u32 = M2SemanticTokenModifier::Option.bit();
-    const FILE_MODIFIER: u32 = M2SemanticTokenModifier::File.bit();
     const DECLARATION_MODIFIER: u32 = M2SemanticTokenModifier::Declaration.bit();
     const DEFAULT_LIBRARY_MODIFIER: u32 = M2SemanticTokenModifier::DefaultLibrary.bit();
-    const MUTABLE_MODIFIER: u32 = M2SemanticTokenModifier::Mutable.bit();
-    const UNRESOLVED_MODIFIER: u32 = M2SemanticTokenModifier::Unresolved.bit();
+    const READONLY_MODIFIER: u32 = M2SemanticTokenModifier::Readonly.bit();
 
     fn document(text: &str, builtins: &ObjectRegistry) -> DocumentSnapshot {
         DocumentSnapshot::from_text(text.to_string(), builtins).expect("fixture should parse")
@@ -625,10 +724,10 @@ mod tests {
         let tokens = collect_tokens(&document, &builtins, false);
 
         for (line, keyword, expected) in [
-            (0, "symbol", M2SemanticTokenType::Modifier),
-            (1, "global", M2SemanticTokenType::Modifier),
-            (2, "symbol", M2SemanticTokenType::Modifier),
-            (3, "symbol", M2SemanticTokenType::Modifier),
+            (0, "symbol", M2SemanticTokenType::QuoteModifier),
+            (1, "global", M2SemanticTokenType::QuoteModifier),
+            (2, "symbol", M2SemanticTokenType::QuoteModifier),
+            (3, "symbol", M2SemanticTokenType::QuoteModifier),
             (4, "list", M2SemanticTokenType::Keyword),
         ] {
             let source_line = text.lines().nth(line).expect("fixture line");
@@ -769,7 +868,7 @@ mod tests {
         workspace_index.index_file(&main_uri, "TokenStream = new Type of List\n", &builtins);
         // Excluding main.m2 leaves no other definition, so nothing is contributed.
         assert!(workspace_index
-            .semantic_token_type("TokenStream", &main_uri)
+            .semantic_token("TokenStream", &main_uri)
             .is_none());
     }
 
@@ -832,7 +931,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 .map(|token| token.token_type)
                 .collect::<Vec<_>>(),
             vec![
-                M2SemanticTokenType::DomainType as u32,
+                M2SemanticTokenType::TypeAnnotation as u32,
                 M2SemanticTokenType::Operator as u32,
                 M2SemanticTokenType::Parameter as u32,
                 M2SemanticTokenType::Operator as u32,
@@ -869,7 +968,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 M2SemanticTokenType::Number as u32,
                 M2SemanticTokenType::Keyword as u32,
                 M2SemanticTokenType::String as u32,
-                M2SemanticTokenType::Modifier as u32,
+                M2SemanticTokenType::QuoteModifier as u32,
                 // `y` in `local y` — quoted, so a symbol rather than a value.
                 M2SemanticTokenType::Symbol as u32,
             ]
@@ -1002,7 +1101,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 .map(|token| token.token_type)
                 .collect::<Vec<_>>(),
             [[
-                M2SemanticTokenType::Modifier as u32,
+                M2SemanticTokenType::QuoteModifier as u32,
                 M2SemanticTokenType::Symbol as u32,
             ]; 5]
                 .concat()
@@ -1188,7 +1287,6 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         for line in [1, 3] {
             let token = token_at(&tokens, line, 0).expect("package reference is highlighted");
             assert_eq!(token.token_type, M2SemanticTokenType::Namespace as u32);
-            assert_eq!(token.token_modifiers_bitset & UNRESOLVED_MODIFIER, 0);
         }
     }
 
@@ -1283,7 +1381,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     }
 
     #[test]
-    fn globals_exported_mutable_are_marked_mutable_wherever_they_are_used() {
+    fn only_protected_globals_are_marked_readonly() {
         let text = concat!(
             "newPackage \"Pkg\"\n",
             "exportMutable {\"counter\"}\n",
@@ -1292,6 +1390,10 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             "shadow = counter -> counter\n",
             "debugLevel = 2\n",
             "protectedName\n",
+            "export {\"fixed\"}\n",
+            "fixed = 1\n",
+            "shadowFixed = fixed -> fixed\n",
+            "fixed\n",
         );
         let builtins = ObjectRegistry::load(concat!(
             "{\"kind\":\"symbol\",\"name\":\"debugLevel\",\"protected\":false}\n",
@@ -1299,34 +1401,41 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         ));
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
-        let is_mutable = |line: u32, column: u32| {
+        let is_readonly = |line: u32, column: u32| {
             token_at(&tokens, line, column)
                 .unwrap_or_else(|| panic!("a token at {line}:{column}"))
                 .token_modifiers_bitset
-                & MUTABLE_MODIFIER
+                & READONLY_MODIFIER
                 != 0
         };
 
-        assert!(is_mutable(2, 0), "its definition");
-        assert!(is_mutable(3, 13), "an assignment in a function");
-        assert!(is_mutable(3, 23), "a use");
-        assert!(!is_mutable(4, 9), "a parameter of the same name is local");
-        assert!(!is_mutable(4, 20), "a use of that parameter");
-        assert!(is_mutable(5, 0), "an unprotected library global");
-        assert!(!is_mutable(6, 0), "a protected library global");
+        assert!(!is_readonly(2, 0), "its definition");
+        assert!(!is_readonly(3, 13), "an assignment in a function");
+        assert!(!is_readonly(3, 23), "a use");
+        assert!(!is_readonly(4, 9), "a parameter of the same name is local");
+        assert!(!is_readonly(4, 20), "a use of that parameter");
+        assert!(!is_readonly(5, 0), "an unprotected library global");
+        assert!(is_readonly(6, 0), "a protected library global");
+        assert!(is_readonly(8, 0), "a protected export's definition");
+        assert!(is_readonly(10, 0), "a protected export's reference");
+        assert!(
+            !is_readonly(9, 14),
+            "a parameter shadowing a protected export"
+        );
+        assert!(!is_readonly(9, 23), "the shadowing parameter's reference");
 
         let index = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
         let indexed = DocumentSnapshot::from_text("debugLevel = 1\nideal 1\n".into(), &index)
             .expect("fixture should parse");
         let tokens = collect_tokens(&indexed, &index, false);
         let modifiers = |line| token_at(&tokens, line, 0).unwrap().token_modifiers_bitset;
-        assert_ne!(
-            modifiers(0) & MUTABLE_MODIFIER,
+        assert_eq!(
+            modifiers(0) & READONLY_MODIFIER,
             0,
             "Core's debugLevel is mutable"
         );
-        assert_eq!(
-            modifiers(1) & MUTABLE_MODIFIER,
+        assert_ne!(
+            modifiers(1) & READONLY_MODIFIER,
             0,
             "Core's ideal is protected"
         );
@@ -1364,16 +1473,17 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 assert_eq!(token.length, name.len() as u32);
                 assert_eq!(token.token_modifiers_bitset & DECLARATION_MODIFIER, 0);
             }
-            // `exportMutable` names read as what they name, marked mutable.
-            for (name, role) in [
-                ("counter", M2SemanticTokenType::Variable),
-                ("hook", M2SemanticTokenType::Function),
-            ] {
-                let column = text.lines().nth(2).unwrap().find(name).unwrap() as u32;
-                let token = token_at(&tokens, 2, column).unwrap();
-                assert_eq!(token.token_type, role as u32, "{name}");
-                assert_ne!(token.token_modifiers_bitset & MUTABLE_MODIFIER, 0, "{name}");
-            }
+            // Plain mutable variables keep the surrounding string's style;
+            // callable exports retain their function type without `readonly`.
+            let counter_column = text.lines().nth(2).unwrap().find("counter").unwrap() as u32;
+            assert_eq!(
+                token_type_at(&tokens, 2, counter_column),
+                (!augments_syntax).then_some(M2SemanticTokenType::String as u32)
+            );
+            let hook_column = text.lines().nth(2).unwrap().find("hook").unwrap() as u32;
+            let hook = token_at(&tokens, 2, hook_column).unwrap();
+            assert_eq!(hook.token_type, M2SemanticTokenType::Function as u32);
+            assert_eq!(hook.token_modifiers_bitset & READONLY_MODIFIER, 0);
             assert_eq!(
                 token_type_at(&tokens, 7, 0),
                 Some(M2SemanticTokenType::Function as u32)
@@ -1499,7 +1609,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     }
 
     #[test]
-    fn commands_are_functions_with_the_command_modifier() {
+    fn commands_are_functions() {
         let text = "saveClearAll := clearAll\nclearAll = new Command from { () -> () }\nprotect symbol clearAll";
         let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
         let document = document(text, &builtins);
@@ -1508,12 +1618,10 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         assert_eq!(
             tokens
                 .iter()
-                .filter(|token| token.token_modifiers_bitset
-                    & M2SemanticTokenModifier::Command.bit()
-                    != 0)
+                .filter(|token| token.token_type == M2SemanticTokenType::Function as u32)
                 .count(),
-            3,
-            "direct, aliased, and locally rebound Command values are commands"
+            4,
+            "direct, aliased, and rebound commands plus protect are functions"
         );
         let quoted = token_at(&tokens, 2, 15).expect("the quoted clearAll is highlighted");
         assert_eq!(
@@ -1523,17 +1631,17 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         );
         let original = token_at(&tokens, 0, 16).expect("indexed clearAll is highlighted");
         assert_eq!(original.token_type, M2SemanticTokenType::Function as u32);
-        assert_eq!(
-            original.token_modifiers_bitset,
-            M2SemanticTokenModifier::Command.bit()
-        );
+        assert_eq!(original.token_modifiers_bitset, READONLY_MODIFIER);
         let protect = token_at(&tokens, 2, 0).expect("protect is highlighted");
         assert_eq!(protect.token_type, M2SemanticTokenType::Function as u32);
-        assert_eq!(protect.token_modifiers_bitset, DEFAULT_LIBRARY_MODIFIER);
+        assert_eq!(
+            protect.token_modifiers_bitset,
+            DEFAULT_LIBRARY_MODIFIER | READONLY_MODIFIER
+        );
     }
 
     #[test]
-    fn manipulators_are_functions_with_the_command_modifier() {
+    fn manipulators_are_functions() {
         let text = "endl";
         let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
         let document = document(text, &builtins);
@@ -1541,10 +1649,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         let token = token_at(&tokens, 0, 0).expect("endl should have a semantic token");
 
         assert_eq!(token.token_type, M2SemanticTokenType::Function as u32);
-        assert_eq!(
-            token.token_modifiers_bitset,
-            M2SemanticTokenModifier::Command.bit()
-        );
+        assert_eq!(token.token_modifiers_bitset, READONLY_MODIFIER);
     }
 
     #[test]
@@ -1558,7 +1663,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     }
 
     #[test]
-    fn semantic_tokens_preserve_the_file_modifier_without_provenance() {
+    fn files_are_ordinary_variables() {
         let text = "stdio";
         let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
         let document = document(text, &builtins);
@@ -1566,8 +1671,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         let token = token_at(&tokens, 0, 0).expect("stdio should have a semantic token");
 
         assert_eq!(token.token_type, M2SemanticTokenType::Variable as u32);
-        assert_eq!(token.token_modifiers_bitset & FILE_MODIFIER, FILE_MODIFIER);
-        assert_eq!(token.token_modifiers_bitset, FILE_MODIFIER);
+        assert_eq!(token.token_modifiers_bitset, READONLY_MODIFIER);
     }
 
     #[test]
@@ -1579,7 +1683,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
 
         let indexed = token_at(&tokens, 0, 0).expect("indexed true should be highlighted");
         assert_eq!(indexed.token_type, M2SemanticTokenType::Variable as u32);
-        assert_eq!(indexed.token_modifiers_bitset, 0);
+        assert_eq!(indexed.token_modifiers_bitset, READONLY_MODIFIER);
 
         let declaration = token_at(&tokens, 1, 0).expect("local declaration should be highlighted");
         assert_eq!(declaration.token_modifiers_bitset, DECLARATION_MODIFIER);
@@ -1629,7 +1733,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         );
         let token = token_at(&tokens, 0, 0).expect("unassigned pkgFn should be highlighted");
         assert_eq!(token.token_type, M2SemanticTokenType::Variable as u32);
-        assert_eq!(token.token_modifiers_bitset, UNRESOLVED_MODIFIER);
+        assert_eq!(token.token_modifiers_bitset, 0);
     }
 
     #[test]
@@ -1671,7 +1775,6 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             .expect("toString should have builtin metadata");
 
         assert_eq!(token.token_type, M2SemanticTokenType::Method);
-        assert!(!token.modifiers.contains(M2SemanticTokenModifier::File));
     }
 
     #[test]
@@ -1696,8 +1799,8 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     }
 
     #[test]
-    fn option_keys_keep_only_the_option_modifier() {
-        let text = "f(x, Strategy => 4, custom => 7)";
+    fn option_keys_keep_option_and_binding_protection_modifiers() {
+        let text = "f(x, Strategy => Linear, custom => 7)";
         let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
@@ -1708,7 +1811,10 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             text.find("Strategy").expect("fixture contains Strategy") as u32,
         )
         .expect("builtin option key is highlighted");
-        assert_eq!(builtin.token_modifiers_bitset, OPTION_MODIFIER);
+        assert_eq!(
+            builtin.token_modifiers_bitset,
+            OPTION_MODIFIER | READONLY_MODIFIER
+        );
 
         let custom = token_at(
             &tokens,
@@ -1717,6 +1823,10 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         )
         .expect("custom option key is highlighted");
         assert_eq!(custom.token_modifiers_bitset, OPTION_MODIFIER);
+        let value = token_at(&tokens, 0, text.find("Linear").unwrap() as u32)
+            .expect("the option value retains its normal token");
+        assert_eq!(value.token_type, M2SemanticTokenType::Symbol as u32);
+        assert_eq!(value.token_modifiers_bitset, READONLY_MODIFIER);
     }
 
     #[test]
@@ -1836,6 +1946,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             &Url::parse("file:///fixture.m2").unwrap(),
             &SemanticTokenSettings {
                 standard_only: true,
+                ..SemanticTokenSettings::default()
             },
             false,
         );
@@ -2047,24 +2158,30 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         for line in 0..=2 {
             let token = token_at(&tokens, line, 0).expect("type name should be highlighted");
             assert_eq!(token.token_type, M2SemanticTokenType::Type as u32);
-            assert_eq!(token.token_modifiers_bitset, 0);
+            assert_eq!(token.token_modifiers_bitset, READONLY_MODIFIER);
         }
     }
 
     #[test]
     fn legend_lists_every_variant_in_declaration_order() {
         let legend = M2SemanticToken::legend();
+        for removed in ["file", "command", "unresolved", "mutable"] {
+            assert!(!legend
+                .token_modifiers
+                .iter()
+                .any(|modifier| modifier.as_str() == removed));
+        }
 
         assert_eq!(
             legend.token_types,
             M2SemanticTokenType::iter()
-                .map(M2SemanticTokenType::lsp_type)
+                .map(|token_type| token_type.lsp_type())
                 .collect::<Vec<_>>()
         );
         assert_eq!(
             legend.token_modifiers,
             M2SemanticTokenModifier::iter()
-                .map(M2SemanticTokenModifier::lsp_modifier)
+                .map(|modifier| modifier.lsp_modifier())
                 .collect::<Vec<_>>()
         );
         for (index, token_type) in M2SemanticTokenType::iter().enumerate() {
@@ -2079,20 +2196,19 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     fn standard_only_sends_only_standard_modifiers() {
         let standard_only = SemanticTokenSettings {
             standard_only: true,
+            ..SemanticTokenSettings::default()
         };
         let legend = M2SemanticToken::legend();
         let token = M2SemanticToken::new(M2SemanticTokenType::Function)
-            .with_modifier(M2SemanticTokenModifier::Command)
+            .with_modifier(M2SemanticTokenModifier::Option)
             .with_modifier(M2SemanticTokenModifier::DefaultLibrary)
-            .with_modifier(M2SemanticTokenModifier::Unresolved);
+            .with_modifier(M2SemanticTokenModifier::Readonly);
 
         assert_eq!(
             token.encode(&SemanticTokenSettings::default()),
             (
                 M2SemanticTokenType::Function as u32,
-                DEFAULT_LIBRARY_MODIFIER
-                    | UNRESOLVED_MODIFIER
-                    | M2SemanticTokenModifier::Command.bit()
+                DEFAULT_LIBRARY_MODIFIER | READONLY_MODIFIER | OPTION_MODIFIER
             )
         );
         let (token_type, modifiers) = token.encode(&standard_only);
@@ -2101,8 +2217,9 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             SemanticTokenType::FUNCTION
         );
         assert_eq!(
-            modifiers, DEFAULT_LIBRARY_MODIFIER,
-            "command and unresolved are not standard"
+            modifiers,
+            DEFAULT_LIBRARY_MODIFIER | READONLY_MODIFIER,
+            "option is custom, defaultLibrary and readonly are standard"
         );
         let (symbol_type, _) =
             M2SemanticToken::new(M2SemanticTokenType::Symbol).encode(&standard_only);
@@ -2119,7 +2236,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     }
 
     #[test]
-    fn only_primary_core_compiled_functions_are_default_library() {
+    fn compiled_runtime_facts_are_retained_regardless_of_package() {
         let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
         let mut compiled_functions = 0;
 
@@ -2128,38 +2245,31 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             let token = builtins
                 .get_semantic_token(name)
                 .unwrap_or_else(|| panic!("{name} should have semantic metadata"));
-            let is_core_compiled_function = record.class.name() == "CompiledFunction"
-                && builtins
-                    .object(&record.package)
-                    .is_some_and(|package| package.name.name() == "Core");
-
-            if is_core_compiled_function {
+            let is_compiled = ["CompiledFunction", "CompiledFunctionClosure"]
+                .into_iter()
+                .any(|parent| {
+                    builtins.is_subtype(
+                        &record.class,
+                        &crate::object_registry::ObjectName::new(parent),
+                    )
+                });
+            assert_eq!(token.compiled_callable.is_some(), is_compiled, "{name}");
+            assert_eq!(
+                token.modifiers.contains(M2SemanticTokenModifier::Readonly),
+                record.protected,
+                "{name}"
+            );
+            if is_compiled {
                 compiled_functions += 1;
-                assert_eq!(token.token_type, M2SemanticTokenType::Function);
-                assert_eq!(
-                    token.modifiers,
-                    M2SemanticTokenModifiers::default()
-                        .with(M2SemanticTokenModifier::DefaultLibrary),
-                    "{name}"
-                );
-            } else {
-                assert!(
-                    !token
-                        .modifiers
-                        .contains(M2SemanticTokenModifier::DefaultLibrary),
-                    "{name}"
-                );
             }
         }
-
         assert!(compiled_functions > 0);
     }
 
     #[test]
     fn library_callables_are_classified_by_runtime_class() {
         let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
-        let command = M2SemanticToken::new(M2SemanticTokenType::Function)
-            .with_modifier(M2SemanticTokenModifier::Command);
+        let command = M2SemanticToken::new(M2SemanticTokenType::Function);
         for (name, expected) in [
             ("source", M2SemanticToken::new(M2SemanticTokenType::Method)),
             ("flatten", M2SemanticToken::new(M2SemanticTokenType::Method)),
@@ -2172,7 +2282,13 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             ("exit", command),
             ("endl", command),
         ] {
-            assert_eq!(builtins.get_semantic_token(name), Some(expected), "{name}");
+            assert_eq!(
+                builtins
+                    .get_semantic_token(name)
+                    .map(|token| token.token_type),
+                Some(expected.token_type),
+                "{name}"
+            );
         }
     }
 
@@ -2185,7 +2301,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         let tokens = collect_tokens(&document, &builtins, false);
         let token_types: Vec<u32> = tokens.iter().map(|t| t.token_type).collect();
 
-        let type_param = M2SemanticTokenType::DomainType as u32;
+        let type_param = M2SemanticTokenType::TypeAnnotation as u32;
         assert!(
             token_types.contains(&type_param),
             "Ring in method installation should be TypeParameter, got {:?}",
@@ -2211,7 +2327,7 @@ p(ZZ) := Array => x -> [x]
         );
         assert_eq!(
             token_type_at(&tokens, 1, 2),
-            Some(M2SemanticTokenType::DomainType as u32),
+            Some(M2SemanticTokenType::TypeAnnotation as u32),
             "the domain stays a type parameter"
         );
     }

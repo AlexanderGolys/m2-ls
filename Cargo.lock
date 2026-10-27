@@ -388,6 +388,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "strum",
+ "these-macros-should-be-illegal 0.12.0",
  "tokio",
  "tower",
  "tower-lsp",
@@ -397,19 +398,19 @@ dependencies = [
 
 [[package]]
 name = "m2-syn"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5b61ed4ac59d35a8eaeb778c1e5d6f8af7df3212799f6500908bff1e6a17be2"
+checksum = "d3e29bf26e6a8c64d4343c3db817c2f90113bddc42b29e963ea29eec93749e11"
 dependencies = [
  "m2-syn-macros",
- "these-macros-should-be-illegal",
+ "these-macros-should-be-illegal 0.7.0",
 ]
 
 [[package]]
 name = "m2-syn-macros"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b62b977467b3d98db573e897f30f71000af589650c1c3fe098ad64bcda9e3b5"
+checksum = "939a88314c8b96d83958f19158fa9630c3f46a2dd50b748c1c8d99da694b09cd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -767,6 +768,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "these-macros-should-be-illegal"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42ca525b4ee3eb9563aa9c386b37461fffb1ff905a8ebae6aff597c1a88167d7"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
 ]
 
 [[package]]

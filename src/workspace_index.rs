@@ -25,7 +25,9 @@ use crate::document::DocumentSnapshot;
 use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::package_documentation::DocumentedSubject;
 use crate::package_index::collect_loaded_files_in_tree;
-use crate::semantic_token::{local_symbol_semantic_token, M2SemanticTokenType};
+use crate::semantic_token::{
+    local_symbol_semantic_token, M2SemanticToken, M2SemanticTokenModifier, M2SemanticTokenType,
+};
 use crate::source::SourceNavigation;
 use crate::source_package::{ExportAccess, PackageDeclaration, PackageExport};
 
@@ -33,7 +35,7 @@ use crate::source_package::{ExportAccess, PackageDeclaration, PackageExport};
 struct DefLocation {
     uri: Url,
     range: TextRange,
-    semantic_token_type: M2SemanticTokenType,
+    semantic_token: M2SemanticToken,
     is_declaration: bool,
     /// The statement defining the name, as written, when it is more than
     /// the name.
@@ -166,10 +168,15 @@ pub trait WorkspaceDefinitionKnowledge {
     fn definitions(&self, name: &str, exclude: &Url) -> Vec<Location>;
     fn type_definitions(&self, name: &str, exclude: &Url) -> Vec<Location>;
     fn is_defined(&self, name: &str, exclude: &Url) -> bool;
-    fn semantic_token_type(&self, name: &str, exclude: &Url) -> Option<M2SemanticTokenType>;
-    /// Whether a package of the workspace exports `name` with
-    /// `exportMutable`, so the sessions loading it may assign it.
-    fn is_mutable_export(&self, name: &str) -> bool;
+    fn semantic_token(&self, name: &str, exclude: &Url) -> Option<M2SemanticToken>;
+    /// Whether a package of the workspace exports `name` as protected from
+    /// assignment by the sessions loading it.
+    fn is_protected_export(&self, name: &str) -> bool;
+    /// The defining package of the visible global, including exported synonyms.
+    fn defining_package(&self, name: &str, exclude: &Url) -> Option<ObjectName>;
+    /// The package owning global definitions at a source position, including
+    /// files loaded by a package whose own source declares no package section.
+    fn package_at(&self, uri: &Url, position: Position) -> Option<ObjectName>;
 }
 
 impl<T: WorkspaceDefinitionKnowledge + ?Sized> WorkspaceDefinitionKnowledge for Arc<T> {
@@ -189,12 +196,20 @@ impl<T: WorkspaceDefinitionKnowledge + ?Sized> WorkspaceDefinitionKnowledge for 
         self.as_ref().is_defined(name, exclude)
     }
 
-    fn semantic_token_type(&self, name: &str, exclude: &Url) -> Option<M2SemanticTokenType> {
-        self.as_ref().semantic_token_type(name, exclude)
+    fn semantic_token(&self, name: &str, exclude: &Url) -> Option<M2SemanticToken> {
+        self.as_ref().semantic_token(name, exclude)
     }
 
-    fn is_mutable_export(&self, name: &str) -> bool {
-        self.as_ref().is_mutable_export(name)
+    fn is_protected_export(&self, name: &str) -> bool {
+        self.as_ref().is_protected_export(name)
+    }
+
+    fn defining_package(&self, name: &str, exclude: &Url) -> Option<ObjectName> {
+        self.as_ref().defining_package(name, exclude)
+    }
+
+    fn package_at(&self, uri: &Url, position: Position) -> Option<ObjectName> {
+        self.as_ref().package_at(uri, position)
     }
 }
 
@@ -653,15 +668,26 @@ impl WorkspaceIndex {
 
     /// The token type of the global `name` as `viewer` sees it; an exported
     /// name defined nowhere is the symbol the export creates.
-    fn semantic_token_type_for(
+    fn semantic_token_for(
         &self,
         name: &str,
         viewer: WorkspaceViewer<'_>,
-    ) -> Option<M2SemanticTokenType> {
+    ) -> Option<M2SemanticToken> {
         self.visible_definition(name, viewer)
-            .map(|definition| definition.semantic_token_type)
+            .map(|definition| definition.semantic_token)
             .or_else(|| {
-                (!self.exports_named(name).is_empty()).then_some(M2SemanticTokenType::Symbol)
+                (!self.exports_named(name).is_empty())
+                    .then(|| M2SemanticToken::new(M2SemanticTokenType::Symbol))
+            })
+    }
+
+    fn defining_package_for(&self, name: &str, viewer: WorkspaceViewer<'_>) -> Option<ObjectName> {
+        self.visible_definition(name, viewer)
+            .and_then(|definition| self.package_at(&definition.uri, definition.range.start))
+            .or_else(|| {
+                self.exports_named(name)
+                    .first()
+                    .map(|export| export.package.clone())
             })
     }
 
@@ -797,7 +823,7 @@ impl WorkspaceDefinitionKnowledge for WorkspaceIndex {
 
     fn type_definitions(&self, name: &str, exclude: &Url) -> Vec<Location> {
         self.locations(name, WorkspaceViewer::Document(exclude), |location| {
-            location.semantic_token_type == M2SemanticTokenType::Type
+            location.semantic_token.token_type == M2SemanticTokenType::Type
         })
     }
 
@@ -805,14 +831,22 @@ impl WorkspaceDefinitionKnowledge for WorkspaceIndex {
         !self.definitions(name, exclude).is_empty()
     }
 
-    fn semantic_token_type(&self, name: &str, exclude: &Url) -> Option<M2SemanticTokenType> {
-        self.semantic_token_type_for(name, WorkspaceViewer::Document(exclude))
+    fn semantic_token(&self, name: &str, exclude: &Url) -> Option<M2SemanticToken> {
+        self.semantic_token_for(name, WorkspaceViewer::Document(exclude))
     }
 
-    fn is_mutable_export(&self, name: &str) -> bool {
+    fn is_protected_export(&self, name: &str) -> bool {
         self.exports_named(name)
             .iter()
-            .any(|indexed| indexed.export.access == ExportAccess::Mutable)
+            .any(|indexed| indexed.export.access == ExportAccess::Protected)
+    }
+
+    fn defining_package(&self, name: &str, exclude: &Url) -> Option<ObjectName> {
+        self.defining_package_for(name, WorkspaceViewer::Document(exclude))
+    }
+
+    fn package_at(&self, uri: &Url, position: Position) -> Option<ObjectName> {
+        WorkspaceIndex::package_at(self, uri, position)
     }
 }
 
@@ -843,7 +877,7 @@ impl WorkspaceDefinitionKnowledge for WorkspaceView<'_> {
     fn type_definitions(&self, name: &str, exclude: &Url) -> Vec<Location> {
         let (index, viewer) = self.viewer(exclude);
         index.locations(name, viewer, |location| {
-            location.semantic_token_type == M2SemanticTokenType::Type
+            location.semantic_token.token_type == M2SemanticTokenType::Type
         })
     }
 
@@ -851,14 +885,25 @@ impl WorkspaceDefinitionKnowledge for WorkspaceView<'_> {
         !self.definitions(name, exclude).is_empty()
     }
 
-    fn semantic_token_type(&self, name: &str, exclude: &Url) -> Option<M2SemanticTokenType> {
+    fn semantic_token(&self, name: &str, exclude: &Url) -> Option<M2SemanticToken> {
         let (index, viewer) = self.viewer(exclude);
-        index.semantic_token_type_for(name, viewer)
+        index.semantic_token_for(name, viewer)
     }
 
-    fn is_mutable_export(&self, name: &str) -> bool {
+    fn is_protected_export(&self, name: &str) -> bool {
         match self {
-            Self::Document(index) | Self::PackageSession(index) => index.is_mutable_export(name),
+            Self::Document(index) | Self::PackageSession(index) => index.is_protected_export(name),
+        }
+    }
+
+    fn defining_package(&self, name: &str, exclude: &Url) -> Option<ObjectName> {
+        let (index, viewer) = self.viewer(exclude);
+        index.defining_package_for(name, viewer)
+    }
+
+    fn package_at(&self, uri: &Url, position: Position) -> Option<ObjectName> {
+        match self {
+            Self::Document(index) | Self::PackageSession(index) => index.package_at(uri, position),
         }
     }
 }
@@ -969,10 +1014,15 @@ fn top_level_definitions(uri: &Url, snapshot: &DocumentSnapshot) -> Vec<(ObjectN
         .binding_states()
         .filter(|binding| binding.state.scope_idx == 0)
         .map(|binding| {
+            let token = local_symbol_semantic_token(&binding, &knowledge);
             let definition = DefLocation {
                 uri: uri.clone(),
                 range: binding.state.span,
-                semantic_token_type: local_symbol_semantic_token(&binding, &knowledge).token_type,
+                semantic_token: if binding.state.is_ring_generator {
+                    token.with_modifier(M2SemanticTokenModifier::Algebraic)
+                } else {
+                    token
+                },
                 is_declaration: binding.state.span == binding.range,
                 code: snapshot.declaration_code(binding).map(str::to_string),
             };
@@ -1116,7 +1166,9 @@ mod tests {
         );
 
         assert_eq!(
-            index.semantic_token_type("Greeting", &reference),
+            index
+                .semantic_token("Greeting", &reference)
+                .map(|token| token.token_type),
             Some(M2SemanticTokenType::Type)
         );
     }
@@ -1154,7 +1206,9 @@ mod tests {
             "an export without a definition is defined by the export"
         );
         assert_eq!(
-            index.semantic_token_type("Flag", &script),
+            index
+                .semantic_token("Flag", &script)
+                .map(|token| token.token_type),
             Some(M2SemanticTokenType::Symbol)
         );
         assert_eq!(index.definitions("after", &script).len(), 1);

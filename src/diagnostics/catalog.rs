@@ -346,6 +346,19 @@ INSTALL_CODOMAIN_MISMATCH {
         severity: WARNING,
     }
 
+    /// A method call whose argument types cannot match any known domain.
+    ///
+    /// ```m2
+    /// f = method()
+    /// f ZZ := n -> n
+    /// f "text"
+    /// ```
+CALL_DOMAIN_MISMATCH {
+        code: "T05",
+        name: "call-domain-mismatch",
+        severity: WARNING,
+    }
+
     /// A SimpleDoc keyword or `document` option that does not exist where it
     /// is written. In SimpleDoc, a content line indented no deeper than the
     /// keyword above it reads as a keyword too; `document` has no

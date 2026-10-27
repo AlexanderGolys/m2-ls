@@ -185,7 +185,9 @@ fn workspace_symbol_hover<W>(name: &str, uri: &Url, workspace: &W) -> Option<Hov
 where
     W: WorkspaceDefinitionKnowledge + WorkspaceDocumentationKnowledge + ?Sized,
 {
-    let token_type = workspace.semantic_token_type(name, uri);
+    let token_type = workspace
+        .semantic_token(name, uri)
+        .map(|token| token.token_type);
     let documentation = workspace.documentation(name);
     if token_type.is_none() && documentation.is_none() {
         return None;

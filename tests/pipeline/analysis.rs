@@ -181,23 +181,141 @@ fn token_at(
 }
 
 #[tokio::test]
-async fn unassigned_symbols_are_unresolved_until_their_binding() {
+async fn unassigned_symbols_use_plain_variable_tokens_until_their_binding() {
     let source = "a = b\nZZ[a, b, c]\nb = c\n";
     let mut session = DocumentSession::open(source).await;
     let tokens = semantic_tokens(&mut session).await;
     let variable = session.semantic_token_type("variable");
-    let unresolved = (variable, session.semantic_token_modifier("unresolved"));
+    let unassigned = (variable, 0);
+    let algebraic = session.semantic_token_modifier("algebraic");
+    let generator = (variable, algebraic);
+    let declared_generator = (
+        variable,
+        algebraic | session.semantic_token_modifier("declaration"),
+    );
 
     for occurrence in [0, 1] {
         assert_eq!(token_at(&tokens, source, "a", occurrence).0, variable);
     }
-    for occurrence in [0, 1] {
-        assert_eq!(token_at(&tokens, source, "b", occurrence), unresolved);
-    }
+    // A bare constructor binds its generators, as Macaulay2 assigns them
+    // when the constructor runs; before it they are unbound.
+    assert_eq!(token_at(&tokens, source, "b", 0), unassigned);
+    assert_eq!(token_at(&tokens, source, "b", 1), declared_generator);
     assert_eq!(token_at(&tokens, source, "b", 2).0, variable);
-    for occurrence in [0, 1] {
-        assert_eq!(token_at(&tokens, source, "c", occurrence), unresolved);
+    assert_eq!(token_at(&tokens, source, "c", 0), declared_generator);
+    assert_eq!(token_at(&tokens, source, "c", 1), generator);
+
+    session.shutdown().await;
+}
+
+/// Every constructor form Macaulay2 binds generators through, verified
+/// against M2 v1.26.05: `class` of each generator is its ring.
+#[tokio::test]
+async fn every_ring_constructor_form_binds_algebraic_generators() {
+    let source = concat!(
+        "RR[x, y_1, z_0 .. z_2]\n",
+        "x + y_1 + z_0 + z_1 + z_2\n",
+        "D = QQ[eps]/ideal(eps^2)\n",
+        "G = QQ[hor] ** QQ[ver]\n",
+        "F = GF(8, Variable => gen)\n",
+        "A = QQ[symbol pp, local qq]\n",
+        "B = QQ[getSymbol \"mm\"]\n",
+        "J = QQ[symbol w_0 .. symbol w_2]\n",
+        "eps + hor + ver + gen + pp + qq + mm + w_1\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let tokens = semantic_tokens(&mut session).await;
+    let variable = session.semantic_token_type("variable");
+    let algebraic = session.semantic_token_modifier("algebraic");
+    let generator = (variable, algebraic);
+    let declared_generator = (
+        variable,
+        algebraic | session.semantic_token_modifier("declaration"),
+    );
+
+    for (name, occurrence) in [
+        ("x", 0),
+        ("y_1", 0),
+        ("z_0", 0),
+        ("z_2", 0),
+        ("eps", 0),
+        ("hor", 0),
+        ("ver", 0),
+        ("gen", 0),
+        ("pp", 0),
+        ("qq", 0),
+        ("w_0", 0),
+        ("w_2", 0),
+    ] {
+        assert_eq!(
+            token_at(&tokens, source, name, occurrence),
+            declared_generator,
+            "{name} is declared where the constructor names it"
+        );
     }
+    for (name, occurrence) in [
+        ("x", 1),
+        ("y_1", 1),
+        ("z_0", 1),
+        ("z_1", 0),
+        ("z_2", 1),
+        ("eps", 1),
+        ("eps", 2),
+        ("hor", 1),
+        ("ver", 1),
+        ("gen", 1),
+        ("pp", 1),
+        ("qq", 1),
+        ("mm", 1),
+        ("w_1", 0),
+    ] {
+        assert_eq!(
+            token_at(&tokens, source, name, occurrence),
+            generator,
+            "{name} occurrence {occurrence} refers to a generator"
+        );
+    }
+
+    session.shutdown().await;
+}
+
+/// `z_1` of `z_0 .. z_2` is a variable of its own: its references are the
+/// range declaring it and the accesses to that index, not the other `z_i`.
+#[tokio::test]
+async fn indexed_generators_are_referenced_one_index_at_a_time() {
+    let source = "R = RR[x, y_1, z_0 .. z_2]\nf = z_0 + z_1 + z_2 + z_1\n";
+    let mut session = DocumentSession::open(source).await;
+    let uri = session.uri().to_string();
+    let references_at = |needle: &'static str, occurrence| {
+        json!({
+            "textDocument": {"uri": uri},
+            "position": position(source, needle, occurrence),
+            "context": {"includeDeclaration": true}
+        })
+    };
+    let starts = |result: &Value| {
+        response_array(result)
+            .iter()
+            .map(|location| {
+                let start = &location["range"]["start"];
+                (
+                    start["line"].as_u64().unwrap(),
+                    start["character"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let middle = references_at("z_1", 0);
+    let middle = session.request("textDocument/references", middle).await;
+    assert_eq!(
+        starts(&middle),
+        [(0, 15), (1, 10), (1, 22)],
+        "the range declares z_1: {middle}"
+    );
+    let endpoint = references_at("z_0", 1);
+    let endpoint = session.request("textDocument/references", endpoint).await;
+    assert_eq!(starts(&endpoint), [(0, 15), (1, 4)], "{endpoint}");
 
     session.shutdown().await;
 }
@@ -424,18 +542,15 @@ async fn control_flow_conditions_require_booleans_without_function_coloring() {
         DocumentSession::open_with_related(source, "i = value -> value\nj = value -> value\n")
             .await;
     let tokens = semantic_tokens(&mut session).await;
-    let unresolved = (
-        session.semantic_token_type("variable"),
-        session.semantic_token_modifier("unresolved"),
-    );
+    let unassigned = (session.semantic_token_type("variable"), 0);
 
-    assert_eq!(token_at(&tokens, source, "i", 1), unresolved);
-    assert_eq!(token_at(&tokens, source, "i == 0", 0), unresolved);
+    assert_eq!(token_at(&tokens, source, "i", 1), unassigned);
+    assert_eq!(token_at(&tokens, source, "i == 0", 0), unassigned);
     assert_eq!(
         token_at(&tokens, source, "i(0)", 0).0,
         session.semantic_token_type("function")
     );
-    assert_eq!(token_at(&tokens, source, "j", 0), unresolved);
+    assert_eq!(token_at(&tokens, source, "j", 0), unassigned);
     assert_eq!(
         token_at(&tokens, source, "callable", 1).0,
         session.semantic_token_type("variable")
@@ -482,29 +597,106 @@ async fn unknown_condition_types_remain_possible_booleans() {
 }
 
 #[tokio::test]
-async fn only_original_core_compiled_functions_are_default_library() {
+async fn compiled_function_aliases_keep_compiled_but_not_binding_protection() {
     let source = "f = scan\nf\nscan\nscan = f\nscan\n";
     let mut session = DocumentSession::open(source).await;
     let tokens = semantic_tokens(&mut session).await;
     let function = session.semantic_token_type("function");
     let default_library = session.semantic_token_modifier("defaultLibrary");
+    let readonly = session.semantic_token_modifier("readonly");
 
     for occurrence in [0, 1] {
         let (token_type, modifiers) = token_at(&tokens, source, "scan", occurrence);
         assert_eq!(token_type, function);
-        assert_eq!(modifiers, default_library);
+        assert_ne!(modifiers & default_library, 0);
     }
     for occurrence in [2, 3] {
         let (token_type, modifiers) = token_at(&tokens, source, "scan", occurrence);
         assert_eq!(token_type, function);
-        assert_eq!(modifiers & default_library, 0);
+        assert_ne!(modifiers & default_library, 0);
     }
     for occurrence in 0..=2 {
         let (token_type, modifiers) = token_at(&tokens, source, "f", occurrence);
         assert_eq!(token_type, function);
-        assert_eq!(modifiers & default_library, 0);
+        assert_ne!(modifiers & default_library, 0);
+        assert_eq!(modifiers & readonly, 0, "a local alias is assignable");
     }
 
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn default_library_policies_refresh_without_reopening_the_document() {
+    let source = concat!(
+        "needsPackage \"Graphs\"\n",
+        "needsPackage \"UserPkg\"\n",
+        "alias = scan\n",
+        "alias\nscan\ndet\ndoc\ngcd\nZZ\nDigraph\nhelper\n",
+        "newPackage \"LocalPkg\"\n",
+        "ownFn = value -> value\nownFn\n",
+        "endPackage \"LocalPkg\"\n",
+    );
+    let related = concat!(
+        "newPackage \"UserPkg\"\n",
+        "export {\"helper\"}\n",
+        "helper = value -> value\n",
+        "endPackage \"UserPkg\"\n",
+    );
+    let mut session = DocumentSession::open_with_related(source, related).await;
+    let modifier = session.semantic_token_modifier("defaultLibrary");
+    let names = [
+        ("alias", 1),
+        ("scan", 1),
+        ("det", 0),
+        ("doc", 0),
+        ("gcd", 0),
+        ("ZZ", 0),
+        ("Digraph", 0),
+        ("helper", 0),
+        ("ownFn", 1),
+    ];
+    let default_tokens = semantic_tokens(&mut session).await;
+    let selected = |tokens: &[(u64, u64, u64, u64)]| {
+        names.map(|(name, occurrence)| token_at(tokens, source, name, occurrence).1 & modifier != 0)
+    };
+    assert_eq!(
+        selected(&default_tokens),
+        [true, true, false, false, false, false, false, false, false]
+    );
+    for (policy, expected) in [
+        (
+            json!("Compiled"),
+            [true, true, false, true, false, false, false, false, false],
+        ),
+        (
+            json!("Core"),
+            [false, true, true, false, true, true, false, false, false],
+        ),
+        (
+            json!("Prelude"),
+            [false, true, true, true, true, true, false, false, false],
+        ),
+        (
+            json!(["SimpleDoc", "Graphs", "UserPkg", "LocalPkg"]),
+            [false, false, false, true, false, false, true, true, true],
+        ),
+        (
+            json!("AllPackages"),
+            [false, true, true, true, true, true, true, true, true],
+        ),
+        (json!("None"), [false; 9]),
+        (json!([]), [false; 9]),
+        (
+            json!("CompiledFunction"),
+            [true, true, false, false, false, false, false, false, false],
+        ),
+    ] {
+        session
+            .set_semantic_token_settings(json!({"defaultLibrary": policy}))
+            .await;
+        let tokens = semantic_tokens(&mut session).await;
+        assert_eq!(selected(&tokens), expected, "policy {policy}");
+    }
     session.shutdown().await;
 }
 
@@ -2490,6 +2682,60 @@ async fn core_method_function_single_call_reaches_hover() {
 }
 
 #[tokio::test]
+async fn method_calling_conventions_preserve_domains_and_fold_left() {
+    let mut session = DocumentSession::open("").await;
+    for (source, expected) in [
+        ("R = QQ[x,y]\nresult = ideal(x,y)\nresult\n", "Ideal"),
+        ("f = ideal\nresult = f(12,18)\nresult\n", "Ideal"),
+        ("f = method(Dispatch => Thing)\nf Sequence := List => x -> toList x\nresult = f(1,2,3)\nresult\n", "List"),
+        ("f = method(Dispatch => Thing)\nf ZZ := String => x -> toString x\nresult = f(1)\nresult\n", "String"),
+        ("f = method(Binary => true)\nf(ZZ,ZZ) := List => (x,y) -> {x,y}\nf(List,ZZ) := String => (x,y) -> toString x\nresult = f(1,2,3)\nresult\n", "String"),
+        ("f = method(Binary => true)\nf Sequence := String => x -> toString x\nresult = f(1,2,3)\nresult\n", "String"),
+        ("result = gcd(12,18,24)\nresult\n", "ZZ"),
+        ("f = gcd\nresult = f(12,18,24)\nresult\n", "ZZ"),
+    ] {
+        session.replace(source).await;
+        let line = source.lines().count() as u64 - 1;
+        assert_eq!(hover_type_at(&mut session, line, 0).await, expected, "{source}");
+        assert!(!session.diagnostic_codes().contains(&"T05"), "valid call: {source}\n{:?}", session.diagnostics());
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn disjoint_method_domains_warn_without_rejecting_uncertain_calls() {
+    let mut session = DocumentSession::open("").await;
+    for (source, expected) in [
+        ("f = method()\nf ZZ := x -> x\nf(1,2)\n", true),
+        ("f = method()\nf ZZ := x -> x\nf \"text\"\n", true),
+        ("f = method()\nf ZZ := x -> x\nf mystery()\n", false),
+        (
+            "f = method()\nf ZZ := x -> x\nf(if condition then 1 else \"text\")\n",
+            false,
+        ),
+        ("f = method()\nf UnknownType := x -> x\nf 1\n", false),
+        (
+            "f = method(Dispatch => Thing)\nf ZZ := x -> x\nf(1,2)\n",
+            true,
+        ),
+        (
+            "f = method(Dispatch => Thing)\nf Sequence := x -> x\nf(1,2)\n",
+            false,
+        ),
+        (
+            "f = method(Binary => true)\nf(ZZ,ZZ) := List => (x,y) -> {x,y}\nf(1,2,3)\n",
+            true,
+        ),
+        ("ideal true\n", false),
+        ("binomial(1,2,3)\n", true),
+        ("f = x -> x\nf \"text\"\n", false),
+    ] {
+        replace_and_assert_diagnostic(&mut session, source, "T05", expected).await;
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test]
 async fn scopes_bindings_and_callable_metadata_drive_editor_capabilities() {
     let source = concat!(
         "outside := 1\n",
@@ -2911,7 +3157,6 @@ async fn package_options_load_the_packages_they_list() {
     let mut session = DocumentSession::open(PACKAGE_WITH_OPTIONS).await;
     let tokens = semantic_tokens(&mut session).await;
     let namespace = session.semantic_token_type("namespace");
-    let unresolved = session.semantic_token_modifier("unresolved");
 
     for package in ["Graphs", "Chordal"] {
         assert_eq!(
@@ -2922,8 +3167,8 @@ async fn package_options_load_the_packages_they_list() {
     }
     for loaded in ["Digraph", "ChordalGraph"] {
         assert_eq!(
-            token_at(&tokens, PACKAGE_WITH_OPTIONS, loaded, 0).1 & unresolved,
-            0,
+            token_at(&tokens, PACKAGE_WITH_OPTIONS, loaded, 0).0,
+            session.semantic_token_type("type"),
             "{loaded} is loaded by the option listing its package"
         );
     }
@@ -2934,9 +3179,9 @@ async fn package_options_load_the_packages_they_list() {
     );
     session.replace(&without_options).await;
     let tokens = semantic_tokens(&mut session).await;
-    assert_ne!(
-        token_at(&tokens, &without_options, "Digraph", 0).1 & unresolved,
-        0,
+    assert_eq!(
+        token_at(&tokens, &without_options, "Digraph", 0),
+        (session.semantic_token_type("variable"), 0),
         "without the option the package is not loaded"
     );
 
@@ -2949,15 +3194,17 @@ async fn test_block_code_is_analyzed_as_a_session_that_loaded_the_package() {
 
     let tokens = semantic_tokens(&mut session).await;
     let function = session.semantic_token_type("function");
-    let unresolved = session.semantic_token_modifier("unresolved");
     assert_eq!(
         token_at(&tokens, PACKAGE_WITH_TEST, "double", 2).0,
         function,
         "an exported global is seen in the TEST block"
     );
-    assert_ne!(
-        token_at(&tokens, PACKAGE_WITH_TEST, "helper", 1).1 & unresolved,
-        0,
+    assert_eq!(
+        token_at(&tokens, PACKAGE_WITH_TEST, "helper", 1),
+        (
+            session.semantic_token_type("variable"),
+            session.semantic_token_modifier("test"),
+        ),
         "an unexported global is not"
     );
     assert_eq!(
@@ -3187,9 +3434,14 @@ async fn documentation_strings_highlight_their_code_as_what_it_names() {
         session.semantic_token_type("namespace")
     );
     assert_eq!(token_type("Baz@", 0), session.semantic_token_type("type"));
-    let counter = token_at(&tokens, source, "counter\"", 0);
-    assert_eq!(counter.0, session.semantic_token_type("variable"));
-    assert_ne!(counter.1 & session.semantic_token_modifier("mutable"), 0);
+    let counter = position(source, "counter\"", 0);
+    assert!(
+        !tokens.iter().any(|(line, character, ..)| {
+            Some(*line) == counter["line"].as_u64()
+                && Some(*character) == counter["character"].as_u64()
+        }),
+        "a plain mutable export keeps the surrounding string's highlighting"
+    );
     // A link to no symbol leaves its string uncovered.
     let unknown_link = position(source, "no such page", 0);
     assert!(

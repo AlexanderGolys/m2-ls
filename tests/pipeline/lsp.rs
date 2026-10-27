@@ -1500,7 +1500,7 @@ async fn definition_of_documented_library_method_finds_installed_methods() {
 
 #[tokio::test]
 async fn standard_only_semantic_tokens_apply_live_with_a_refresh() {
-    let source = "clearAll\n";
+    let source = "clearAll\nQQ[x]\n";
     let workspace = TestWorkspace::new(source);
     let mut server = LspProcess::spawn().await;
     let initialized = server.initialize(&workspace.root_uri()).await;
@@ -1515,11 +1515,11 @@ async fn standard_only_semantic_tokens_apply_live_with_a_refresh() {
             .unwrap_or_else(|| panic!("the legend should offer {name}: {legend}")) as u64
     };
     let function_type = type_index("function");
-    let command_modifier = 1u64
+    let algebraic_modifier = 1u64
         << response_array(&legend["tokenModifiers"])
             .iter()
-            .position(|modifier| modifier == "command")
-            .expect("command modifier");
+            .position(|modifier| modifier == "algebraic")
+            .expect("algebraic modifier");
     assert!(!token_types.iter().any(|token_type| token_type == "command"));
 
     let clear_all_type = |tokens: &Value| response_array(&tokens["data"])[3].clone();
@@ -1536,8 +1536,16 @@ async fn standard_only_semantic_tokens_apply_live_with_a_refresh() {
         "the clearAll Command is a function by default"
     );
 
+    assert!(response_array(&tokens["data"])
+        .chunks_exact(5)
+        .any(|token| token[4].as_u64().unwrap() & algebraic_modifier != 0));
+    let readonly_modifier = 1u64
+        << response_array(&legend["tokenModifiers"])
+            .iter()
+            .position(|modifier| modifier == "readonly")
+            .expect("readonly modifier");
     assert_ne!(
-        response_array(&tokens["data"])[4].as_u64().unwrap() & command_modifier,
+        response_array(&tokens["data"])[4].as_u64().unwrap() & readonly_modifier,
         0
     );
 
@@ -1559,8 +1567,11 @@ async fn standard_only_semantic_tokens_apply_live_with_a_refresh() {
         "under standardOnly the same legend carries it as a function"
     );
 
-    assert_eq!(
-        response_array(&tokens["data"])[4].as_u64().unwrap() & command_modifier,
+    assert!(response_array(&tokens["data"])
+        .chunks_exact(5)
+        .all(|token| token[4].as_u64().unwrap() & algebraic_modifier == 0));
+    assert_ne!(
+        response_array(&tokens["data"])[4].as_u64().unwrap() & readonly_modifier,
         0
     );
 
