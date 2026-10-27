@@ -1,15 +1,14 @@
 # Changelog
 
-## Unreleased
+## 2.1.0 - 2026-10-27
 
-- **Breaking:** inlay hint settings are independent keys, each with one name:
+- Inlay hint settings are independent keys, each with one name:
   `afterCall`, `afterLineEnd`, `afterCell`, `duringAssignment`, `argNames`,
   `argTypes`, `afterBrackets`, `afterReturn`, `everywhere`, `showLiteral`,
   `showUpperClosure`, `showThing`, `showNothing`, `showRepeated`, `hideTypes`,
   `hideAfterSemicolon`, `maxLabelLength` and `excludedCalls`. The former
-  `show`, `callForm`, `literalTypes`, `repeatedTypes`, `unknownTypes`,
-  `hiddenTypes`, `expressionTypes`, `allKnownTypes` and `calls` keys are no
-  longer read.
+  `expressionTypes`, `allKnownTypes`, `calls` and `unknownTypes` keys are
+  deprecated and read as their replacements, with a warning.
 - Line-end hints show the last expression complete on every line, so `2 +`
   shows `2` and the line completing it the whole sum.
 - Parameter hints before arguments, `f(x: Number 2)`, from local method
@@ -19,6 +18,17 @@
 - Hints giving the type of the same value are shown once: an assignment's
   hint replaces the cell and line-end hints of its value, and a cell's
   replaces its line-end hint.
+- Rings the program writes out are known values: inline values show what a
+  subscript selects, `S_6 = z`, and new errors report a subscript past a
+  ring's variables (`ring-index-out-of-bounds`, E14) and a lookup of a
+  missing variable by name (`ring-variable-not-found`, E15).
+- Assigning to a protected indexed symbol reports `protected-assignment`
+  (E13). The `-- m2-ls: primaryCode` file property analyses library sources
+  such as Core without prelude imports.
+- Subscripts keep their parts: in `S_1` the ring `S` stays a type, the `_`
+  carries the new `access` modifier, as do `.`, `.?`, binary `#` and `#?`,
+  and the `1` reads as the generator it selects; a literal selector such as
+  the `0` of `L_0` is a property. `1_S` and `RR_53` stay single tokens.
 
 ## 2.0.0 - 2026-10-26
 

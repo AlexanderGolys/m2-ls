@@ -1,6 +1,6 @@
 [package]
 name = "m2-ls"
-version = "2.0.0"
+version = "2.1.0"
 authors = ["Alexander Golys <alexandergolys@gmail.com>"]
 description = "Language server for Macaulay2"
 edition = "2021"
