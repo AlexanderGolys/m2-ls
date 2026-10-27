@@ -6,6 +6,8 @@ use std::fmt::Formatter;
 use std::fmt::{Debug, Display, Result};
 use std::sync::Arc;
 
+use serde::Deserialize;
+
 use crate::builtin_index::{BuiltinIndex, OptionFacts, Record};
 #[cfg(test)]
 use crate::package_index::collect_imported_packages;
@@ -13,7 +15,8 @@ use crate::package_index::PackageImport;
 use tower_lsp::lsp_types::Position;
 
 /// Nominal spelling used to resolve a Macaulay2 object in an environment.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(transparent)]
 pub struct ObjectName(pub String);
 
 impl ObjectName {

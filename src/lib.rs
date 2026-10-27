@@ -295,7 +295,8 @@ impl Backend {
         publish_diagnostics(&self.client, uri, document, &settings.diagnostics, version).await;
     }
 
-    /// Tell the user, not just the log, which settings were ignored and why.
+    /// Tell the user, not just the log, which settings were not read as
+    /// given and why.
     async fn report_setting_problems(&self, problems: &[SettingProblem]) {
         if problems.is_empty() {
             return;
@@ -308,7 +309,7 @@ impl Backend {
         self.client
             .show_message(
                 MessageType::WARNING,
-                format!("m2-ls ignored invalid settings, keeping their defaults: {listed}"),
+                format!("m2-ls settings need attention: {listed}"),
             )
             .await;
     }
@@ -759,12 +760,12 @@ impl LanguageServer for Backend {
         let uri = &params.text_document.uri;
         let options = self.settings.snapshot().inlay_hints;
         Ok(self.with_scoped_document(uri, |document, knowledge| {
-            let mut hints = inlay_hints_response(document, params.range, options, knowledge);
+            let mut hints = inlay_hints_response(document, params.range, &options, knowledge);
             for session in document.package_sessions() {
                 hints.extend(inlay_hints_response(
                     &session.snapshot,
                     params.range,
-                    options,
+                    &options,
                     session.snapshot.object_registry(),
                 ));
             }

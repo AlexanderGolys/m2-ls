@@ -111,7 +111,7 @@ Every setting is optional and applies without a restart. Send them under the
   "m2-ls": {
     "diagnostics": { "disabled": ["unused-binding", "T02"] },
     "formatting": { "indent": 4, "hardLineWidth": 100 },
-    "inlayHints": { "expressionTypes": true }
+    "inlayHints": { "show": ["bindings", "returns", "cells", "calls"] }
   }
 }
 ```
@@ -126,10 +126,14 @@ Every setting is optional and applies without a restart. Send them under the
 | `formatting.controlFlowLayout` | See source | `compact`, `multiline`, or `multilineCompactElse`. |
 | `formatting.compactFactorOperators` | See source | `2*x` instead of `2 * x`. |
 | `formatting.breakAfterSemicolon` | See source | Starts the next statement on a new line. |
-| `inlayHints.expressionTypes` | `false` | Adds argument, subexpression, and call-result types. |
-| `inlayHints.allKnownTypes` | `false` | Also shows types that are obvious from literals. |
-| `inlayHints.calls` | `lineEnds` | Call results shown without `expressionTypes`: `off`, `lineEnds` (calls ending a line of a longer expression, like a chain broken across lines), or `every`. |
+| `inlayHints.show` | `["bindings", "returns", "cells", "lineEnds"]` | Where types are shown: `bindings` (after a name, where its type is first known or changes), `returns` (after a function's returned value), `cells` (after each top-level value Macaulay2 prints, as its `oN : T` line), `calls`, `brackets` (after every closing bracket; one closing call arguments shows the call's result), `lineEnds` (after each line of an expression broken across lines), `arguments`, `subexpressions` (everywhere). |
+| `inlayHints.callForm` | `bracketed` | Which calls `calls` annotates: `bracketed` (`f(x)`, `QQ[x]`) or `all` (also `f x`). |
+| `inlayHints.literalTypes` | `false` | Also shows types a literal states, as in `x = 3`. |
+| `inlayHints.repeatedTypes` | `false` | Also shows types a nearby hint already shows, such as a binding's unchanged type. |
 | `inlayHints.unknownTypes` | `false` | Also shows hints that say nothing, of values only known to be a `Thing`. |
+| `inlayHints.maxLabelLength` | `40` | Cuts longer labels, with the whole type in the tooltip; `0` disables. |
+| `inlayHints.hiddenTypes` | `[]` | Types never shown, e.g. `["ZZ", "String"]`. |
+| `inlayHints.excludedCalls` | `[]` | Functions whose calls and arguments get no hints, e.g. `["print"]`. |
 | `semanticTokens.standardOnly` | `false` | Drops the custom semantic token modifiers. Token types are always LSP-standard. |
 | `semanticTokens.defaultLibrary` | `"CompiledFunction"` | Selects which bindings carry `defaultLibrary`; accepts a policy name or an array of package names. |
 | `sources.enabled` | `true` | Lets navigation enter the Macaulay2 library source. |

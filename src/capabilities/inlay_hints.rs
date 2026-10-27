@@ -1,14 +1,20 @@
 //! Type inlay hints derived from static document analysis.
+//!
+//! Each [`HintAnchor`] the settings show picks the values it annotates, and
+//! one filter shared by all of them drops the hints that would repeat what
+//! the source or a nearby hint already says. Anchors picking the same value
+//! give the same hint at the same place, and it is shown once.
 
 use std::collections::HashMap;
+use std::iter;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use m2_syn::nodes::{ExprLambda as LambdaExpression, ExprNew as NewStatement, Symbol};
 use m2_syn::Token;
 use tower_lsp::lsp_types::{
-    InlayHint, InlayHintKind, InlayHintLabel, InlayHintServerCapabilities, OneOf, Position,
-    Range as TextRange,
+    InlayHint, InlayHintKind, InlayHintLabel, InlayHintServerCapabilities, InlayHintTooltip, OneOf,
+    Position, Range as TextRange,
 };
 
 use crate::document::DocumentSnapshot;
@@ -22,20 +28,54 @@ use crate::util::TextRangeExt;
 
 /// What a call-result hint starts with, before the type the call returns.
 const CALL_RESULT_PREFIX: &str = "-> ";
+/// The type of `null`: Macaulay2 prints nothing for a cell of this value.
+const NOTHING_TYPE: &str = "Nothing";
+/// What ends a label cut short to `maxLabelLength`.
+const TRUNCATION_MARK: char = '…';
 
-/// Which call results get a type hint when expression types are off.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+/// A kind of place types are shown at; `inlayHints.show` lists those shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
-pub enum CallHintPlacement {
-    /// None.
-    Off,
-    /// Those whose call ends its line while the expression around it goes
-    /// on below, as the links of a chain broken across lines.
-    #[default]
+pub enum HintAnchor {
+    /// After a binding's name, where it is first assigned or its type
+    /// changes, unless its value states it.
+    Bindings,
+    /// After the value a function returns.
+    Returns,
+    /// After each top-level expression Macaulay2 prints a value for, as its
+    /// `oN : T` line does: not those ended by `;`, nor those of value `null`.
+    Cells,
+    /// After calls, with the type they return; `callForm` picks which.
+    Calls,
+    /// After each closing bracket; one closing a call's arguments gives the
+    /// type the call returns.
+    Brackets,
+    /// After the largest expression ending a line while an expression around
+    /// it goes on below, as each line of a chain broken across lines.
     LineEnds,
-    /// Every call.
-    Every,
+    /// After each argument of a call.
+    Arguments,
+    /// After every expression.
+    Subexpressions,
+}
+
+impl HintAnchor {
+    /// The anchors shown unless the settings list others.
+    pub const DEFAULT_SHOWN: [Self; 4] =
+        [Self::Bindings, Self::Returns, Self::Cells, Self::LineEnds];
+}
+
+/// Which calls the [`HintAnchor::Calls`] anchor annotates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum CallForm {
+    /// Those whose arguments are in brackets, as in `f(x)` or `QQ[x]`.
+    #[default]
+    Bracketed,
+    /// Also those applied by juxtaposition, as in `f x`.
+    All,
 }
 
 pub fn inlay_hint_provider_capability() -> Option<OneOf<bool, InlayHintServerCapabilities>> {
@@ -45,28 +85,15 @@ pub fn inlay_hint_provider_capability() -> Option<OneOf<bool, InlayHintServerCap
 pub fn inlay_hints_response(
     document: &DocumentSnapshot,
     range: TextRange,
-    options: InlayHintSettings,
+    options: &InlayHintSettings,
     knowledge: &ObjectRegistry,
 ) -> Vec<InlayHint> {
-    let context = HintContext {
-        document,
-        knowledge,
-        options,
-        range,
-        inferred_types: inferred_expression_types(document, knowledge),
-    };
-    let binding_hints = context.binding_type_hints();
-    let mut hints = binding_hints.clone();
-    hints.extend(context.lambda_return_type_hints());
-
-    if options.expression_types || options.all_known_types {
-        hints.extend(context.expression_type_hints(&binding_hints, ExpressionSelection::All));
-    } else if options.calls != CallHintPlacement::Off {
-        hints.extend(
-            context
-                .expression_type_hints(&binding_hints, ExpressionSelection::Calls(options.calls)),
-        );
-    }
+    let context = HintContext::new(document, knowledge, options, range);
+    let mut hints = options
+        .show
+        .iter()
+        .flat_map(|anchor| context.anchored_hints(*anchor))
+        .collect::<Vec<_>>();
     hints.sort_by(|left, right| {
         (
             left.position.line,
@@ -90,26 +117,22 @@ pub fn inlay_hints_response(
     hints
 }
 
-/// The expressions whose types [`HintContext::expression_type_hints`]
-/// shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExpressionSelection {
-    /// Every argument and subexpression.
-    All,
-    /// Only call results, placed as the setting says.
-    Calls(CallHintPlacement),
-}
-
 /// What the hints of one request are computed from: the document, the types
 /// analysis inferred for its expressions, and the settings choosing which
 /// are shown.
 struct HintContext<'request, 'tree> {
     document: &'tree DocumentSnapshot,
     knowledge: &'request ObjectRegistry,
-    options: InlayHintSettings,
+    options: &'request InlayHintSettings,
     /// The part of the document the client asks hints for.
     range: TextRange,
     inferred_types: HashMap<SyntaxNodeId, (SyntaxNode<'tree>, InferredType)>,
+    /// The parts of the document's assignments, whose types binding hints
+    /// show.
+    assignment_parts: AssignmentParts,
+    /// The values assigned to names that state their own type, other than
+    /// functions: nothing in them gets a hint.
+    opaque_self_describing_values: Vec<TextRange>,
 }
 
 fn hint_order(label: &InlayHintLabel) -> bool {
@@ -133,7 +156,167 @@ fn inferred_expression_types<'tree>(
     inferred
 }
 
-impl<'tree> HintContext<'_, 'tree> {
+impl<'request, 'tree> HintContext<'request, 'tree> {
+    fn new(
+        document: &'tree DocumentSnapshot,
+        knowledge: &'request ObjectRegistry,
+        options: &'request InlayHintSettings,
+        range: TextRange,
+    ) -> Self {
+        let mut context = Self {
+            document,
+            knowledge,
+            options,
+            range,
+            inferred_types: inferred_expression_types(document, knowledge),
+            assignment_parts: AssignmentParts::default(),
+            opaque_self_describing_values: Vec::new(),
+        };
+        context.assignment_parts = context.assignment_parts();
+        context.opaque_self_describing_values = context
+            .self_describing_assignment_value_nodes()
+            .into_iter()
+            .filter(|node| !parenthesized_value(*node).is::<LambdaExpression>())
+            .map(|node| document.range_for_node(node))
+            .collect();
+        context
+    }
+
+    /// The hints `anchor` places.
+    fn anchored_hints(&self, anchor: HintAnchor) -> Vec<InlayHint> {
+        let typed = || self.inferred_types.values().map(|(node, _)| *node);
+        match anchor {
+            HintAnchor::Bindings => self.binding_type_hints(),
+            HintAnchor::Returns => self.lambda_return_type_hints(),
+            HintAnchor::Cells => self.value_hints(self.printed_cell_values()),
+            HintAnchor::Calls => self.value_hints(typed().filter(|node| self.is_shown_call(*node))),
+            HintAnchor::Brackets => self.value_hints(
+                typed()
+                    .filter(SyntaxNode::is_delimited_expression)
+                    .map(|brackets| applied_call(brackets).unwrap_or(brackets)),
+            ),
+            HintAnchor::LineEnds => self.value_hints(typed().filter(|node| {
+                self.ends_line_of_longer_expression(*node) && !self.ends_typed_ancestor(*node)
+            })),
+            HintAnchor::Arguments => self.value_hints(
+                typed()
+                    .filter(|node| node.is_space_application() && !self.is_excluded_call(*node))
+                    .flat_map(call_arguments),
+            ),
+            HintAnchor::Subexpressions => self.value_hints(typed()),
+        }
+    }
+
+    /// The hints after each of `values` that the filters keep.
+    fn value_hints(&self, values: impl IntoIterator<Item = SyntaxNode<'tree>>) -> Vec<InlayHint> {
+        values
+            .into_iter()
+            .filter_map(|value| self.value_hint(value))
+            .collect()
+    }
+
+    /// The hint after `value`, of its type, unless the settings leave it
+    /// out; a call result reads `-> T`.
+    fn value_hint(&self, value: SyntaxNode<'tree>) -> Option<InlayHint> {
+        let (_, inferred_type) = self.inferred_types.get(&value.id())?;
+        let value_range = self.document.range_for_node(value);
+        let repeated = || {
+            self.assignment_parts
+                .suppresses(value_range, value.is_space_application())
+        };
+        let stated_by_literal = || {
+            is_self_describing_value(value)
+                || self
+                    .opaque_self_describing_values
+                    .iter()
+                    .any(|opaque| range_contains(*opaque, value_range))
+        };
+        if !range_contains(self.range, value_range)
+            || value.is_muted_statement()
+            || self.is_excluded_call(value)
+            || self.type_is_stated_by_installation(value)
+            || (!self.options.repeated_types && repeated())
+            || (!self.options.literal_types && stated_by_literal())
+        {
+            return None;
+        }
+        let type_name = self.displayed_type(value_range.start, inferred_type)?;
+        Some(self.type_hint(value_range.end, expression_label(value, type_name)))
+    }
+
+    /// The values of the top-level expressions Macaulay2 prints: those not
+    /// ended by `;`, and not known to be `null`.
+    fn printed_cell_values(&self) -> impl Iterator<Item = SyntaxNode<'tree>> + '_ {
+        self.document
+            .root_node()
+            .children()
+            .filter(|cell| !cell.is_muted_statement())
+            .filter_map(|cell| cell.final_value_child())
+            .filter(|value| {
+                self.inferred_types
+                    .get(&value.id())
+                    .is_none_or(|(_, inferred_type)| {
+                        inferred_type
+                            .single()
+                            .is_none_or(|name| name.name() != NOTHING_TYPE)
+                    })
+            })
+    }
+
+    /// Whether `node` is a call [`HintAnchor::Calls`] annotates.
+    fn is_shown_call(&self, node: SyntaxNode<'_>) -> bool {
+        node.is_space_application()
+            && (self.options.call_form == CallForm::All
+                || node
+                    .binary_parts()
+                    .is_some_and(|call| call.right.is_delimited_expression()))
+    }
+
+    /// Whether `node` calls a function the settings exclude.
+    fn is_excluded_call(&self, node: SyntaxNode<'_>) -> bool {
+        node.applied_symbol_name()
+            .is_some_and(|name| self.options.excluded_calls.contains(name))
+    }
+
+    /// Whether a typed expression around `node` ends where it does, and so
+    /// takes a hint placed there.
+    fn ends_typed_ancestor(&self, node: SyntaxNode<'_>) -> bool {
+        node.ancestors()
+            .take_while(|ancestor| ancestor.end_byte() == node.end_byte())
+            .any(|ancestor| self.inferred_types.contains_key(&ancestor.id()))
+    }
+
+    /// A type hint reading `label` at `position`, cut to `maxLabelLength`
+    /// with the whole label in its tooltip.
+    fn type_hint(&self, position: Position, label: String) -> InlayHint {
+        let limit = self
+            .options
+            .max_label_length
+            .filter(|limit| *limit > 0)
+            .map(|limit| limit as usize);
+        let (label, tooltip) = match limit {
+            Some(limit) if label.chars().count() > limit => (
+                label
+                    .chars()
+                    .take(limit - 1)
+                    .chain(iter::once(TRUNCATION_MARK))
+                    .collect::<String>(),
+                Some(InlayHintTooltip::String(label)),
+            ),
+            _ => (label, None),
+        };
+        InlayHint {
+            position,
+            label: InlayHintLabel::from(label),
+            kind: Some(InlayHintKind::TYPE),
+            text_edits: None,
+            tooltip,
+            padding_left: Some(true),
+            padding_right: None,
+            data: None,
+        }
+    }
+
     /// The types functions return, after the value they end with: their
     /// final expression, or what `return` returns.
     fn lambda_return_type_hints(&self) -> Vec<InlayHint> {
@@ -153,17 +336,14 @@ impl<'tree> HintContext<'_, 'tree> {
                     None
                 }
             })
-            .filter(|value| self.options.all_known_types || !is_self_describing_value(*value))
+            .filter(|value| self.options.literal_types || !is_self_describing_value(*value))
             .filter_map(|value| {
                 let value_range = self.document.range_for_node(value);
                 if !self.range.contains_position(value_range.end) {
                     return None;
                 }
                 let type_name = self.inferred_type_label(value)?;
-                Some(type_hint(
-                    value_range.end,
-                    &expression_label(value, type_name),
-                ))
+                Some(self.type_hint(value_range.end, expression_label(value, type_name)))
             })
             .collect()
     }
@@ -179,7 +359,9 @@ impl<'tree> HintContext<'_, 'tree> {
     /// The label of `inferred_type`, the type of a value at `position`; none
     /// for a type that says nothing unless the settings ask for those.
     fn displayed_type(&self, position: Position, inferred_type: &InferredType) -> Option<String> {
-        if inferred_type.is_unknown() && !self.options.unknown_types {
+        if (inferred_type.is_unknown() && !self.options.unknown_types)
+            || self.is_hidden(inferred_type)
+        {
             return None;
         }
         let view = self.knowledge.at(position);
@@ -192,10 +374,19 @@ impl<'tree> HintContext<'_, 'tree> {
             .map(inlay_type_label)
     }
 
+    /// Whether every type `inferred_type` ranges over is one the settings
+    /// hide.
+    fn is_hidden(&self, inferred_type: &InferredType) -> bool {
+        let mut members = inferred_type
+            .exact_points()
+            .chain(inferred_type.upward_generators())
+            .peekable();
+        members.peek().is_some() && members.all(|member| self.options.hidden_types.contains(member))
+    }
+
     /// The types of bindings, after their names: where a binding is first
     /// assigned or its type changes, unless the value states it.
     fn binding_type_hints(&self) -> Vec<InlayHint> {
-        let all_known_types = self.options.all_known_types;
         let assigned_values = self.assigned_values();
         let self_describing_values = self
             .self_describing_assignment_value_nodes()
@@ -224,14 +415,16 @@ impl<'tree> HintContext<'_, 'tree> {
                 };
                 let changed = previous_type.as_ref() != Some(&type_name);
                 previous_type = Some(type_name.clone());
-                if !all_known_types && !changed && assigned.is_none_or(|value| !value.destructured)
+                if !self.options.repeated_types
+                    && !changed
+                    && assigned.is_none_or(|value| !value.destructured)
                 {
                     continue;
                 }
                 let value_range = assigned
                     .map(|value| value.value_range)
                     .or(state.value_range);
-                if !all_known_types
+                if !self.options.literal_types
                     && value_range.is_some_and(|value_range| {
                         self_describing_values.contains(&value_range)
                             && assigned.is_none_or(|value| !value.destructured)
@@ -241,75 +434,12 @@ impl<'tree> HintContext<'_, 'tree> {
                 }
                 let position = state.span.end;
                 if self.range.contains_position(position) {
-                    hints.push(type_hint(position, &type_name));
+                    hints.push(self.type_hint(position, type_name));
                 }
             }
         }
 
         hints
-    }
-
-    /// The types of the expressions `selection` picks, after them; a call
-    /// result reads `-> T`. None repeats a binding hint in `binding_hints`.
-    fn expression_type_hints(
-        &self,
-        binding_hints: &[InlayHint],
-        selection: ExpressionSelection,
-    ) -> Vec<InlayHint> {
-        let all_known_types = self.options.all_known_types;
-        let binding_value_types: Vec<TypeHintIdentity> = binding_hints
-            .iter()
-            .filter(|hint| hint.kind == Some(InlayHintKind::TYPE))
-            .map(|hint| TypeHintIdentity {
-                position: hint.position,
-                label: label_text(&hint.label).to_string(),
-            })
-            .collect();
-        let opaque_self_describing_values = self
-            .self_describing_assignment_value_nodes()
-            .into_iter()
-            .filter(|node| !parenthesized_value(*node).is::<LambdaExpression>())
-            .map(|node| self.document.range_for_node(node))
-            .collect::<Vec<_>>();
-        let assignment_parts = self.assignment_parts();
-        self.inferred_types
-            .values()
-            .filter_map(|(node, inferred_type)| {
-                let node = *node;
-                let expression_range = self.document.range_for_node(node);
-                let is_call = node.is_space_application();
-                let selected = match selection {
-                    ExpressionSelection::All => true,
-                    ExpressionSelection::Calls(CallHintPlacement::Every) => is_call,
-                    ExpressionSelection::Calls(_) => {
-                        is_call && self.ends_line_of_longer_expression(node)
-                    }
-                };
-                if !selected
-                    || !range_contains(self.range, expression_range)
-                    || self.type_is_stated_by_installation(node)
-                    || (!all_known_types
-                        && (assignment_parts.suppresses(expression_range, is_call)
-                            || is_self_describing_value(node)
-                            || opaque_self_describing_values
-                                .iter()
-                                .any(|value_range| range_contains(*value_range, expression_range))))
-                {
-                    return None;
-                }
-                let type_name = self.displayed_type(expression_range.start, inferred_type)?;
-                if binding_value_types.contains(&TypeHintIdentity {
-                    position: expression_range.end,
-                    label: type_name.clone(),
-                }) {
-                    return None;
-                }
-                Some(type_hint(
-                    expression_range.end,
-                    &expression_label(node, type_name),
-                ))
-            })
-            .collect()
     }
 
     /// Whether `node` ends its line — nothing but a comment follows it there —
@@ -463,16 +593,29 @@ fn expression_label(expression: SyntaxNode<'_>, type_name: String) -> String {
     }
 }
 
-fn type_hint(position: Position, type_name: &str) -> InlayHint {
-    InlayHint {
-        position,
-        label: InlayHintLabel::from(type_name.to_string()),
-        kind: Some(InlayHintKind::TYPE),
-        text_edits: None,
-        tooltip: None,
-        padding_left: Some(true),
-        padding_right: None,
-        data: None,
+/// The call `arguments` are the bracketed arguments of.
+fn applied_call(arguments: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    arguments.parent().filter(|call| {
+        call.is_space_application()
+            && call
+                .binary_parts()
+                .is_some_and(|parts| parts.right.id() == arguments.id())
+    })
+}
+
+/// The arguments `call` applies its function to: the elements of a
+/// sequence, else the one value.
+fn call_arguments(call: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
+    let Some(argument) = call
+        .binary_parts()
+        .map(|parts| parenthesized_value(parts.right))
+    else {
+        return Vec::new();
+    };
+    if argument.is_sequence() {
+        argument.collection_elements().collect()
+    } else {
+        vec![argument]
     }
 }
 
@@ -483,12 +626,7 @@ struct AssignedValue {
     destructured: bool,
 }
 
-#[derive(PartialEq, Eq)]
-struct TypeHintIdentity {
-    position: Position,
-    label: String,
-}
-
+#[derive(Default)]
 struct AssignmentParts {
     assignments: Vec<TextRange>,
     targets: Vec<TextRange>,
@@ -562,30 +700,53 @@ fn range_contains(outer: TextRange, inner: TextRange) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::object_registry::ObjectRegistry;
+    use std::collections::HashSet;
 
-    fn hints(text: &str, expression_types: bool) -> Vec<InlayHint> {
-        hints_with(
-            text,
-            InlayHintSettings {
-                expression_types,
-                unknown_types: true,
-                ..InlayHintSettings::default()
-            },
-            &ObjectRegistry::default(),
-        )
+    use super::*;
+    use crate::object_registry::{ObjectName, ObjectRegistry};
+
+    /// The settings showing only `anchors`, with every type that says
+    /// something.
+    fn showing(anchors: &[HintAnchor]) -> InlayHintSettings {
+        InlayHintSettings {
+            show: anchors.iter().copied().collect(),
+            ..InlayHintSettings::default()
+        }
+    }
+
+    fn names(names: &[&str]) -> HashSet<ObjectName> {
+        names.iter().copied().map(ObjectName::new).collect()
     }
 
     fn hints_with(
         text: &str,
-        options: InlayHintSettings,
+        options: &InlayHintSettings,
         registry: &ObjectRegistry,
     ) -> Vec<InlayHint> {
         let document =
             DocumentSnapshot::from_text(text.to_string(), registry).expect("fixture should parse");
         let range = TextRange::new(pos!(), pos!(u32::MAX, 0));
         inlay_hints_response(&document, range, options, registry)
+    }
+
+    /// The default settings' hints of `text`, with those of unknown types,
+    /// and with every subexpression's when `subexpressions` is set.
+    fn hints(text: &str, subexpressions: bool) -> Vec<InlayHint> {
+        let mut options = InlayHintSettings {
+            unknown_types: true,
+            ..InlayHintSettings::default()
+        };
+        if subexpressions {
+            options.show.insert(HintAnchor::Subexpressions);
+        }
+        hints_with(text, &options, &ObjectRegistry::default())
+    }
+
+    /// The hints of `text` under `options`, with the library's types known,
+    /// as their positions and labels.
+    fn library_hints(text: &str, options: &InlayHintSettings) -> Vec<(Position, String)> {
+        let registry = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        placed_labels(&hints_with(text, options, &registry))
     }
 
     /// The labels of `hints` at their positions.
@@ -596,60 +757,170 @@ mod tests {
             .collect()
     }
 
+    fn labels(hints: &[InlayHint]) -> Vec<String> {
+        hints
+            .iter()
+            .map(|hint| label_text(&hint.label).to_string())
+            .collect()
+    }
+
+    fn placed(position: Position, label: &str) -> (Position, String) {
+        (position, label.to_string())
+    }
+
     #[test]
-    fn call_results_show_where_a_longer_expression_breaks_its_line() {
-        let registry = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+    fn line_ends_show_each_line_of_an_expression_broken_across_lines() {
         let source = concat!(
-            "f = L -> (
-",
-            "    if all(L, x -> instance(x, ZZ))
-",
-            "    then 1 else 2
-",
-            "    )
-",
-            "g = L -> if all(L, x -> instance(x, ZZ)) then 1 else 2
-",
+            "f = L -> (\n",
+            "    if all(L, x -> instance(x, ZZ))\n",
+            "    then 1 else 2\n",
+            "    )\n",
+            "g = L -> if all(L, x -> instance(x, ZZ)) then 1 else 2\n",
+            "x = (\n",
+            " 2\n",
+            " +2\n",
+            " )\n",
         );
-        let call_hints = |calls| {
-            placed_labels(&hints_with(
-                source,
-                InlayHintSettings {
-                    calls,
-                    ..InlayHintSettings::default()
-                },
-                &registry,
-            ))
-            .into_iter()
-            .filter(|(_, label)| label == "-> Boolean")
-            .map(|(position, _)| position)
-            .collect::<Vec<_>>()
+
+        // `all(…)` ends line 1 while the `if` goes on, and the `if` ends line
+        // 2 inside the parentheses; on line 4 nothing goes on. Of the sum,
+        // the line ending in `+2` reads the whole `2 +2`.
+        assert_eq!(
+            library_hints(source, &showing(&[HintAnchor::LineEnds])),
+            [
+                placed(pos!(1, 35), "-> Boolean"),
+                placed(pos!(2, 17), "ZZ"),
+                placed(pos!(7, 3), "ZZ"),
+            ]
+        );
+        // The literal ending line 6 states its type.
+        let literal_types = InlayHintSettings {
+            literal_types: true,
+            ..showing(&[HintAnchor::LineEnds])
+        };
+        assert!(library_hints(source, &literal_types).contains(&placed(pos!(6, 2), "ZZ")));
+    }
+
+    #[test]
+    fn cells_show_the_values_macaulay2_prints() {
+        let source = concat!(
+            "instance(3, ZZ)\n",
+            "instance(3, ZZ);\n",
+            "x = instance(3, ZZ)\n",
+            "isPrime 7\n",
+        );
+
+        // Neither a cell ended by `;` nor an assignment, whose binding takes
+        // the hint.
+        assert_eq!(
+            library_hints(source, &showing(&[HintAnchor::Cells])),
+            [
+                placed(pos!(0, 15), "-> Boolean"),
+                placed(pos!(3, 9), "-> Boolean"),
+            ]
+        );
+    }
+
+    #[test]
+    fn calls_in_bracketed_form_leave_out_juxtapositions() {
+        let source = "isPrime 7\ninstance(3, ZZ)\n";
+        let bracketed = showing(&[HintAnchor::Calls]);
+        let all = InlayHintSettings {
+            call_form: CallForm::All,
+            ..bracketed.clone()
         };
 
-        // The lambdas return what `instance` does, after its call.
-        let lambda_returns = vec![pos!(1, 34), pos!(4, 39)];
-        assert_eq!(call_hints(CallHintPlacement::Off), lambda_returns);
-        // `all(…)` ends line 1 while the `if` goes on; on line 4 it does not.
         assert_eq!(
-            call_hints(CallHintPlacement::LineEnds),
-            vec![pos!(1, 34), pos!(1, 35), pos!(4, 39)]
+            library_hints(source, &bracketed),
+            [placed(pos!(1, 15), "-> Boolean")]
         );
         assert_eq!(
-            call_hints(CallHintPlacement::Every),
-            vec![pos!(1, 34), pos!(1, 35), pos!(4, 39), pos!(4, 40)]
+            library_hints(source, &all),
+            [
+                placed(pos!(0, 9), "-> Boolean"),
+                placed(pos!(1, 15), "-> Boolean"),
+            ]
+        );
+    }
+
+    #[test]
+    fn brackets_closing_arguments_show_what_the_call_returns() {
+        assert_eq!(
+            library_hints("{instance(3, ZZ)}\n", &showing(&[HintAnchor::Brackets])),
+            [
+                placed(pos!(0, 16), "-> Boolean"),
+                placed(pos!(0, 17), "List"),
+            ]
+        );
+    }
+
+    #[test]
+    fn arguments_show_each_argument_of_a_call() {
+        // The literal `7` states its type.
+        assert_eq!(
+            library_hints(
+                "instance(isPrime 7, ZZ)\n",
+                &showing(&[HintAnchor::Arguments])
+            ),
+            [
+                placed(pos!(0, 18), "-> Boolean"),
+                placed(pos!(0, 22), "Ring"),
+            ]
+        );
+    }
+
+    #[test]
+    fn excluded_calls_lose_their_hints_and_their_arguments_hints() {
+        let options = InlayHintSettings {
+            call_form: CallForm::All,
+            excluded_calls: names(&["instance"]),
+            ..showing(&[HintAnchor::Calls, HintAnchor::Arguments])
+        };
+
+        assert_eq!(
+            library_hints("instance(isPrime 7, ZZ)\n", &options),
+            [placed(pos!(0, 18), "-> Boolean")]
+        );
+    }
+
+    #[test]
+    fn hidden_types_are_never_shown() {
+        let options = InlayHintSettings {
+            hidden_types: names(&["String"]),
+            ..showing(&[HintAnchor::Bindings])
+        };
+
+        assert_eq!(
+            library_hints("x = isPrime 7\ny = toString 3\n", &options),
+            [placed(pos!(0, 1), "Boolean")]
+        );
+    }
+
+    #[test]
+    fn long_labels_are_cut_with_the_whole_type_in_the_tooltip() {
+        let registry = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let options = InlayHintSettings {
+            max_label_length: Some(4),
+            ..showing(&[HintAnchor::Bindings])
+        };
+        let hints = hints_with("x = isPrime 7\n", &options, &registry);
+
+        assert_eq!(labels(&hints), ["Boo…"]);
+        assert!(
+            matches!(&hints[0].tooltip, Some(InlayHintTooltip::String(whole)) if whole == "Boolean"),
+            "{:?}",
+            hints[0].tooltip
         );
     }
 
     #[test]
     fn types_that_say_nothing_are_shown_only_on_request() {
-        let source = "f = x -> x
-y = f 1
-";
+        let source = "f = x -> x\ny = f 1\n";
         let registry = ObjectRegistry::default();
         let shown = |unknown_types| {
             labels(&hints_with(
                 source,
-                InlayHintSettings {
+                &InlayHintSettings {
                     unknown_types,
                     ..InlayHintSettings::default()
                 },
@@ -659,13 +930,6 @@ y = f 1
 
         assert!(shown(false).is_empty(), "{:?}", shown(false));
         assert!(shown(true).iter().any(|label| label.contains("Thing")));
-    }
-
-    fn labels(hints: &[InlayHint]) -> Vec<String> {
-        hints
-            .iter()
-            .map(|hint| label_text(&hint.label).to_string())
-            .collect()
     }
 
     #[test]
@@ -691,24 +955,15 @@ y = f 1
     }
 
     #[test]
-    fn expression_types_opt_in_adds_sub_expression_hints() {
-        // The maximal readout is opt-in and yields strictly more hints than the
-        // calm default (it annotates sub-expressions too).
+    fn subexpressions_add_hints_inside_expressions() {
         let source = "x = if condition then 1 else 2\n";
         let calm = hints(source, false);
         let verbose = hints(source, true);
         assert!(
             verbose.len() > calm.len(),
-            "opt-in readout should add hints: calm={}, verbose={}",
+            "subexpressions should add hints: calm={}, verbose={}",
             calm.len(),
             verbose.len()
         );
-    }
-
-    #[test]
-    fn calm_default_does_not_annotate_bare_expressions() {
-        // A bare expression statement (not a binding) gets no hint in calm mode.
-        let hints = hints("f 1\n", false);
-        assert!(hints.is_empty(), "got {:?}", labels(&hints));
     }
 }

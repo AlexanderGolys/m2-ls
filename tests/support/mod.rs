@@ -314,9 +314,13 @@ impl LspProcess {
 }
 
 /// The `inlayHints` settings every test server starts with: every inferred
-/// type, so the tests observe all that inference finds.
+/// type, uncut, so the tests observe all that inference finds.
 fn base_inlay_hint_settings() -> Value {
-    json!({ "expressionTypes": true, "unknownTypes": true })
+    json!({
+        "show": ["bindings", "returns", "cells", "lineEnds", "subexpressions"],
+        "unknownTypes": true,
+        "maxLabelLength": null
+    })
 }
 
 /// A unique on-disk workspace removed when its test finishes.
@@ -550,13 +554,18 @@ impl DocumentSession {
             .await;
     }
 
-    pub(crate) async fn set_expression_type_hints(&mut self, enabled: bool) {
-        self.set_inlay_hint_settings(json!({ "expressionTypes": enabled }))
-            .await;
+    /// Show inlay hints at the default places only, not after every
+    /// subexpression.
+    pub(crate) async fn show_default_inlay_hint_anchors(&mut self) {
+        self.set_inlay_hint_settings(
+            json!({ "show": ["bindings", "returns", "cells", "lineEnds"] }),
+        )
+        .await;
     }
 
-    pub(crate) async fn set_all_known_type_hints(&mut self, enabled: bool) {
-        self.set_inlay_hint_settings(json!({ "allKnownTypes": enabled }))
+    /// Also show the types literals state and nearby hints repeat.
+    pub(crate) async fn show_every_known_inlay_hint_type(&mut self) {
+        self.set_inlay_hint_settings(json!({ "literalTypes": true, "repeatedTypes": true }))
             .await;
     }
 

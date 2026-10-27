@@ -502,20 +502,20 @@ async fn method_codomains_use_type_annotations_and_all_known_types_are_configura
         session.semantic_token_type("typeParameter")
     );
 
-    session.set_expression_type_hints(false).await;
+    session.show_default_inlay_hint_anchors().await;
     let calm = inlay_labels_by_line(&mut session).await;
     assert!(
         calm.iter().all(|(line, _)| *line != 2),
         "literal sequences should be trivial by default: {calm:?}"
     );
 
-    session.set_all_known_type_hints(true).await;
+    session.show_every_known_inlay_hint_type().await;
     let complete = inlay_labels_by_line(&mut session).await;
     assert!(
         complete
             .iter()
             .any(|(line, label)| *line == 2 && label == "Sequence"),
-        "allKnownTypes should expose the literal sequence type: {complete:?}"
+        "literalTypes should expose the literal sequence type: {complete:?}"
     );
 
     session.shutdown().await;
@@ -2349,7 +2349,7 @@ async fn inlay_hints_track_values_destructuring_and_reassignments() {
         "constructed = new MutableList from {1, 2}\n",
     );
     let mut session = DocumentSession::open(source).await;
-    session.set_expression_type_hints(false).await;
+    session.show_default_inlay_hint_anchors().await;
     let hints = inlay_hints(&mut session).await;
     assert!(hints.iter().all(|hint| hint["kind"] == 1));
 
@@ -2573,7 +2573,7 @@ async fn lambda_return_values_receive_nontrivial_type_hints() {
         "explicitNothing = x -> (return null;)\n",
     );
     let mut session = DocumentSession::open(source).await;
-    session.set_expression_type_hints(false).await;
+    session.show_default_inlay_hint_anchors().await;
     assert!(
         !session.diagnostic_codes().contains(&"X01"),
         "a line comment must remain whitespace between `return` and its value: {:?}",
@@ -2609,7 +2609,7 @@ async fn lambda_return_values_receive_nontrivial_type_hints() {
 #[tokio::test]
 async fn trivial_parallel_assignments_hint_each_target_occurrence() {
     let mut session = DocumentSession::open("(x, x) := (1, 3)\n").await;
-    session.set_expression_type_hints(false).await;
+    session.show_default_inlay_hint_anchors().await;
     let hints = inlay_hints(&mut session).await;
     let type_hints = hints
         .iter()
@@ -2633,7 +2633,7 @@ async fn trivial_parallel_assignments_hint_each_target_occurrence() {
 #[tokio::test]
 async fn assignment_type_hint_follows_the_binding_target() {
     let mut session = DocumentSession::open("x = y\n").await;
-    session.set_expression_type_hints(false).await;
+    session.show_default_inlay_hint_anchors().await;
     let hints = inlay_hints(&mut session).await;
     let type_hint = hints
         .iter()

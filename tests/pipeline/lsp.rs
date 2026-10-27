@@ -750,7 +750,7 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
                             "compactFactorOperators": false
                         },
                         "inlayHints": {
-                            "expressionTypes": false
+                            "show": ["bindings"]
                         }
                     }
                 }
