@@ -1,23 +1,14 @@
-R7 = RR_7
-R = R7[x_0..z_2, w, a_{1,1}, b_(1,1), c, c_A]
-S = QQ[w, a_{1,1}..b_{2,3}, c_A, x_2, x]
-"c"_R
-"c"_R_A
-"c"_R_A_R
-"c"_R_A_S
-"c_A"_R
-c_R
-symbol c_R
-c_A_R
-c_A
-c
-A
-x
-x_1
-x_2
-x_2_R
-x_2_S
-x_2
-x
-x_S_2
-x_S_2_R
+randomPlanePoints = (delta, R) -> (
+    k := ceiling((-3 + sqrt(9.0 + 8*delta))/2);
+    eps := delta - binomial(k + 1, 2);
+    if k - 2*eps >= 0
+    then minors(k - eps,
+        random(R^(k + 1 - eps), R^{k - 2*eps:-1, eps:-2})
+    )
+    else minors(eps,
+        random(R^{k + 1 - eps:0, 2*eps - k:-1}, R^{eps:-2})
+    )
+);
+K = ZZ/101;
+ideal(gens Ip2 * random(source gens Ip2, R^{-d}))
+res(coker b, DegreeLimit=>0, SyzygyLimit=>60, LengthLimit=>3)

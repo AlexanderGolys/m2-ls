@@ -1,142 +1,51 @@
-R = RR_7
-S = R[x_0..y_2, z, w_(1,1)]
-R_6
-S_6
-S_1
-T = S[x]
-T_0
-T_0_1
-T_0_1_S
-T_0_1_S
-T_0_1_S - 1_S - S_1
-T_0_1_S - 1_S - S_1
-T = S[x,y]
-T_1_1_S - 1_S - S_1
-T_1_1
-gens S
-T = S[x,y,z,w]
-T_1_1_S - 1_S - S_1 - T_2
-T_2
-T_2_S
-T_3
-T_3_1
-w_1
-w_(,1)
-w_(1)
-w_(1,1_T)
-T_3
-T_3_(1,1)
-S_(T_3_(1,1))
-T_3_(1,1)
-T_3_(1,1)_S
-T_1_1_S - 1_S - S_1 - T_2_S * T_2 + T_3_(1,1)_S
-T_1_1_S - 1_S - S_1 - T_2_S * T_2 + T_3_(1,1_ZZ)_S
-T_1_1_S - 1_S - S_1 - T_2_S * T_2 + T_3_(1,1_ZZ)_S
-1_S
-R_6
-T_1_1_S - 1_S - S_1 - T_2_S * T_2 + T_3_(1,1_ZZ)_S
-T_1_1_S - 1_S - S_1 - T_2_S + T_2 + T_3_(1,1_ZZ)_S
-T_1_1_S - 1_S - S_1 - T_2_S + T_3 + T_3_(1,1_ZZ)_S
-T_1_1_S - 1_S - S_1 - T_2_S + T_3 + T_3_(1,1_ZZ)_S
-A_a
-RR[A_a]
-RR[A_(a_b)]
-help matrix
-T_1_1_S - 1_S - S_1 - T_2_S + T_2 + T_3_(1,1_ZZ)_S
-matrix (T_1_1_S - 1_S - S_1 - T_2_S + T_2 + T_3_(1,1_ZZ)_S)
- (T_1_1_S - 1_S - S_1 - T_2_S + T_2 + T_3_(1,1_ZZ)_S, T_1_1_S - 1_S - S_1 - T_2_S - T_2 +
-T_3_(1,1_ZZ)_S)
-matrix ({{T_1_1_S - 1_S - S_1 - T_2_S + T_2 + T_3_(1,1_ZZ)_S, T_1_1_S - 1_S + S_1 - T_2_S
-- T_2 + T_3_(1,1_ZZ)_S}})
-matrix ({{T_1_1_S - 1_S - S_1 - T_2_S + T_2 + T_3_(1,1_ZZ)_S, T_1_1_S - 1_S + S_1 - T_2_S
-- T_2 + T_3_(1,1_ZZ)_S}})**3
-matrix ({{T_1_1_S - 1_S - S_1 - T_2_S + T_2 + T_3_(1,1_ZZ)_S}, {T_1_1_S - 1_S + S_1 -
-T_2_S - T_2 + T_3_(1,1_ZZ)_S}})
-M=oo
-M_0
-M++M
-M**M
-matrix ({{T_1_1_S - 1_S - S_1 - T_2_S}, {+ T_2 + T_3_(1,1_ZZ)_S}, {T_1_1_S - 1_S + S_1},{
-- T_2_S - T_2 + T_3_(1,1_ZZ)_S}})
-matrix ({{T_1_1_S - 1_S - S_1 - T_2_S, T_2 + T_3_(1,1_ZZ)_S}, {T_1_1_S - 1_S + S_1,  -
-T_2_S - T_2 + T_3_(1,1_ZZ)_S}})
-M = oo
-M ** M
-M ++ M
-M ++ transpose M
-M ++ M
-N = oo
-N_0
-N_1
-N_1_1
-class (N_1_1)
-(N_1_1)_T
-N_1_1_T
-N_2*N_1_1_T
-N_2*N_2_2*N_1_1_T
-N_2*N_2_1*N_1_1_T
-N_2*N_2_0*N_1_1_T
-N_2*N_2_3*N_1_1_T
-N_2*N_2_2*N_1_1_T
-M_1*M_1_1*N_1_1_T
-M_1*M_1_1*M_1_1_T
-M*M_1*M_1_1*M_1_1_T
-M^2*M_1*M_1_1*M_1_1_T
-M*M_1*M_1_1*M_1_1_T
-1_T*M*M_1*M_1_1*M_1_1_T
-T_1_T*M*M_1*M_1_1*M_1_1_T
-methods Matrix
-T_1_T*M*M_1*M_1_1*M_1_1_T
-CC_*
-CCi_*
-CCi
-CC_*
-RR_*
-help RR_*
-RR'
-CC'
-CCi'
-M_1
-ideal {x}
-I = oo
-I_0
-I^4
-I_0
-T^5
-oo_2
-T^5_2
-T^5_2_2
-T^5_2
-T^5
-T_6
-[x]_0
-{x}_0
+toJSON := beforeImportValue -> beforeImportValue
+beforeImport = toJSON 1
+needsPackage "JSON"
+packageResult = toJSON 1
+-- [[localValue]] is reused by the function below.
+localValue=1
+double = value -> value + localValue
+result=double(2)
+encoded=toJSON(result)
+conditional = if result == 3 then (
+encoded
+) else null
+ZZ
+toJ
+toJSON := afterImportValue -> afterImportValue
+afterImport = toJSON 1
+reassigned = "a"
+stringUse = reassigned
+reassigned = 1
+integerUse = reassigned
+boundary Module := boundaryParameter -> (
+    (m(class, ring)) boundaryParameter;
+)
+editProbe = 1
 
+orderedActions = if not (orderedLeft == orderedRight) then orderedValue else null
+flattenElse = if flatA then flatOne else (if flatB then flatTwo else (if flatC then flatThree else flatFour))
+flattenThen = if outerCondition then (if innerCondition then innerThen else innerElse) else outerElse
+alreadyFlat = if existingA then existingOne else if existingB then existingTwo else existingThree
+dropElseNull = if readyElse then valueElse else null
+dropBothNull = if member("Flexible", attrStrings) then null else null
+negateSimple = if readySimple then null else valueSimple
+negateBinary = if binaryLeft < binaryRight then null else binaryValue
+negateEquality = if equalLeft == equalRight then null else equalValue
+negateStrict = if strictLeft === strictRight then null else strictValue
+cancelConditionNot = if not negatedReady then null else negatedValue
+ambiguousMember = memberValue.3
+rawGood = "a\nb\tc\""
+rawShort = "a\nb"
+rawUnsupported = "\101\102\103"
+try tryEcho then tryEcho;
+try tryValue then tryResult else null;
+try bareTryValue else null;
+try exceptValue except err do null;
+simplifyEqual = if not (simpleLeft == simpleRight) then simpleValue
+simplifyUnequal = if not (unequalLeft != unequalRight) then unequalThen else unequalElse
+simplifyLess = if not (lessLeft < lessRight) then lessValue
+simplifyDoubleNot = if not not doubleNotValue then doubleNotResult
+keepSimpleIf = if simpleCondition then simpleResult
+rawDelimiter = "a\/\/\/b"
 
-B_0=C
-A_0=B
-A_0_0
-peek A
- A_(0,0)
-D_0 = E
- A_(0,0)=D
- A_(0,0)_0
- A_(0,0)
- A_(0,0)_1
- A_(0,0)_0_1
-E_{0} = F_1
- A_(0,0)_0_{0}
- A_(0,0)_0
- A_(0,0)_0 = E
- A_(0,0)_0_{0}
- A_(0,0)_0_{0}
- A_(0,0)_0_{0} === F_1
-R = ZZ
- A_(0,0)_0_{0} === F_(1_R)
- A_(0,0)_0_{0} === F_(1_R)
- A_(0,0)_0_{0_R} === F_(1_R)
- A_(0,0)_0_{0_R} === F_(1_R)
-S_0 = R
- A_(0,0)_0_{0_R} === F_(1_(S_0))
- A_(0,0)_0_{0_R} === F_(1_(S_0))
- A_(0,0)_0_{0_R} === F_(1_R_(S_0))
