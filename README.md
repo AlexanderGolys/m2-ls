@@ -149,6 +149,11 @@ Every setting is optional and applies without a restart. Send them under the
 | `sources.enabled` | `true` | Lets navigation enter the Macaulay2 library source. |
 | `sources.paths` | `[]` | Extra places to find it: an `M2` executable, an installation prefix (a build tree's `usr-dist` included), or a directory to add to Macaulay2's `path`. |
 
+The 2.0.0 inlay hint keys are deprecated but still read, with a warning:
+`expressionTypes` as `everywhere`, `allKnownTypes` as `everywhere` with
+`showLiteral` and `showRepeated`, `calls` as `afterLineEnd` (`off`,
+`lineEnds`) or `afterCall` (`every`), and `unknownTypes` as `showThing`.
+
 Method call inference respects single-argument sequence dispatch and left
 folding for binary methods. `T05` (`call-domain-mismatch`) warns when no known
 method domain can accept the argument types; uncertain matches remain valid.

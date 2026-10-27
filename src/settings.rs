@@ -10,7 +10,8 @@
 //!
 //! Settings are read leniently: a value that does not deserialize, an unknown
 //! key in a group, or an unknown entry in a list is reported as a
-//! [`SettingProblem`] and dropped, and everything else still applies.
+//! [`SettingProblem`] and dropped, and everything else still applies. A
+//! deprecated key is read as the settings that replaced it, and reported too.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -18,7 +19,7 @@ use std::sync::RwLock;
 use std::{fmt, mem};
 
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use serde_path_to_error::{Path, Segment};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
@@ -303,13 +304,33 @@ pub struct ParsedSettings {
 pub struct SettingProblem {
     /// Where the value sits in the section, e.g. `diagnostics.disabled[1]`.
     path: String,
-    /// Why the value does not deserialize; the default applies instead.
-    reason: String,
+    issue: SettingIssue,
+}
+
+/// What is wrong with a [`SettingProblem`]'s value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+enum SettingIssue {
+    /// It does not deserialize, for this reason; the default applies.
+    Invalid(String),
+    /// Its key is deprecated; it is read as the settings described.
+    Deprecated(&'static str),
 }
 
 impl fmt::Display for SettingProblem {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "`{}`: {}; default kept", self.path, self.reason)
+        match &self.issue {
+            SettingIssue::Invalid(reason) => {
+                write!(formatter, "`{}`: {reason}; default kept", self.path)
+            }
+            SettingIssue::Deprecated(replacement) => {
+                write!(
+                    formatter,
+                    "`{}`: deprecated, read as {replacement}",
+                    self.path
+                )
+            }
+        }
     }
 }
 
@@ -329,7 +350,7 @@ impl ServerSettings {
         if section.is_null() {
             section = Value::Object(Default::default());
         }
-        let mut problems = Vec::new();
+        let mut problems = InlayHintSettings::upgrade_deprecated_keys(&mut section);
         loop {
             match serde_path_to_error::deserialize::<_, Self>(&section) {
                 Ok(settings) => return ParsedSettings { settings, problems },
@@ -341,7 +362,7 @@ impl ServerSettings {
                         } else {
                             "settings".to_string()
                         },
-                        reason: error.into_inner().to_string(),
+                        issue: SettingIssue::Invalid(error.into_inner().to_string()),
                     });
                     if !removed {
                         return ParsedSettings {
@@ -381,6 +402,84 @@ impl ServerSettings {
             }
             _ => false,
         }
+    }
+}
+
+impl InlayHintSettings {
+    /// The group's key in the settings section.
+    const SECTION_KEY: &str = "inlayHints";
+
+    /// Rewrite the keys of the `inlayHints` group in `section` that 2.0.0
+    /// read into the settings replacing them, reporting each as deprecated.
+    /// A replacing setting the client sets itself keeps its value.
+    fn upgrade_deprecated_keys(section: &mut Value) -> Vec<SettingProblem> {
+        let Some(group) = section
+            .get_mut(Self::SECTION_KEY)
+            .and_then(Value::as_object_mut)
+        else {
+            return Vec::new();
+        };
+        let enabled = |value: &Value| *value == Value::Bool(true);
+        [
+            Self::upgrade_deprecated_key(group, "expressionTypes", "`everywhere`", |value| {
+                [("everywhere", Value::Bool(true))]
+                    .into_iter()
+                    .filter(|_| enabled(value))
+                    .collect()
+            }),
+            Self::upgrade_deprecated_key(
+                group,
+                "allKnownTypes",
+                "`everywhere` with `showLiteral` and `showRepeated`",
+                |value| {
+                    ["everywhere", "showLiteral", "showRepeated"]
+                        .into_iter()
+                        .filter(|_| enabled(value))
+                        .map(|key| (key, Value::Bool(true)))
+                        .collect()
+                },
+            ),
+            Self::upgrade_deprecated_key(
+                group,
+                "calls",
+                "`afterLineEnd` or `afterCall`",
+                |value| match value.as_str() {
+                    Some("off") => vec![("afterLineEnd", Value::Bool(false))],
+                    Some("lineEnds") => vec![("afterLineEnd", Value::Bool(true))],
+                    Some("every") => vec![("afterCall", Value::Bool(true))],
+                    _ => Vec::new(),
+                },
+            ),
+            Self::upgrade_deprecated_key(group, "unknownTypes", "`showThing`", |value| {
+                value
+                    .is_boolean()
+                    .then(|| ("showThing", value.clone()))
+                    .into_iter()
+                    .collect()
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Remove the deprecated `key` from `group`, setting what `replacing`
+    /// translates its value into where the client has not, and report it
+    /// as read as `replacement`.
+    fn upgrade_deprecated_key(
+        group: &mut Map<String, Value>,
+        key: &str,
+        replacement: &'static str,
+        replacing: impl FnOnce(&Value) -> Vec<(&'static str, Value)>,
+    ) -> Option<SettingProblem> {
+        let value = group.remove(key)?;
+        for (replacing_key, replacing_value) in replacing(&value) {
+            group.entry(replacing_key).or_insert(replacing_value);
+        }
+        Some(SettingProblem {
+            path: format!("{}.{key}", Self::SECTION_KEY),
+            issue: SettingIssue::Deprecated(replacement),
+        })
     }
 }
 
@@ -526,15 +625,24 @@ mod tests {
     }
 
     #[test]
-    fn inlay_hint_settings_are_read_only_under_their_own_names() {
+    fn deprecated_inlay_hint_keys_are_read_as_their_replacements() {
         let parsed = ServerSettings::from_value(&serde_json::json!({
-            "inlayHints": { "show": ["calls"], "unknownTypes": true, "afterCall": true }
+            "inlayHints": {
+                "allKnownTypes": true,
+                "calls": "off",
+                "unknownTypes": true,
+                "showRepeated": false,
+                "show": ["calls"]
+            }
         }));
 
         assert_eq!(
             parsed.settings.inlay_hints,
             InlayHintSettings {
-                after_call: true,
+                everywhere: true,
+                show_literal: true,
+                after_line_end: false,
+                show_thing: true,
                 ..InlayHintSettings::default()
             }
         );
@@ -543,11 +651,19 @@ mod tests {
             .iter()
             .map(SettingProblem::to_string)
             .collect::<Vec<_>>();
-        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert_eq!(problems.len(), 4, "{problems:?}");
+        assert_eq!(
+            problems
+                .iter()
+                .filter(|problem| problem.contains("deprecated, read as"))
+                .count(),
+            3,
+            "{problems:?}"
+        );
         assert!(
             problems
                 .iter()
-                .all(|problem| problem.contains("unknown field")),
+                .any(|problem| problem.contains("unknown field")),
             "{problems:?}"
         );
     }
