@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.1.1 - 2026-10-27
+
+- Document highlights on `new`, `of` or `from` light up all the keywords of
+  the `new` expression.
+
 ## 2.1.0 - 2026-10-27
 
 - Inlay hint settings are independent keys, each with one name:
