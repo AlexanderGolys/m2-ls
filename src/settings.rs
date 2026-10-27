@@ -136,8 +136,9 @@ pub struct InlayHintSettings {
     /// to is declared for, as `f(Number 2)`, or with `argNames` `f(x: Number
     /// 2)`. Default `false`.
     pub arg_types: bool,
-    /// After each closing bracket; one closing a call's arguments gives the
-    /// type the call returns. Default `false`.
+    /// After each parenthesized value, as `(2)` or `(a + b)`: the type of
+    /// the value it evaluates to. Not after collections such as `(2,)`,
+    /// `()`, `[2]` or `{2}`, nor after a call's arguments. Default `false`.
     pub after_brackets: bool,
     /// After the value a function returns. Default `true`.
     pub after_return: bool,

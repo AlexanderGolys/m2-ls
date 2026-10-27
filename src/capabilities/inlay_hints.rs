@@ -3,10 +3,11 @@
 //! Each kind of place the settings turn on picks the values it annotates,
 //! and one filter shared by all of them drops the hints the settings leave
 //! out, such as those repeating what the source or a nearby hint already
-//! says. Places picking the same value give the same hint at the same
-//! position, and it is shown once.
+//! says. Of the places giving the type of the same value, such as an
+//! assignment, the cell it ends and the line it ends, only one is shown.
 
-use std::collections::HashMap;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::iter;
 
 use m2_syn::nodes::{ExprLambda as LambdaExpression, ExprNew as NewStatement, Symbol};
@@ -31,6 +32,69 @@ const CALL_RESULT_PREFIX: &str = "-> ";
 const NOTHING_TYPE: &str = "Nothing";
 /// What ends a label cut short to `maxLabelLength`.
 const TRUNCATION_MARK: char = '…';
+
+/// The kind of place a hint is put at. Of the hints giving the type of the
+/// same value, the one of the earliest kind is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum HintSource {
+    /// After the name an assignment binds.
+    Assignment,
+    /// After the value a function returns.
+    Return,
+    /// After a parenthesized value.
+    Parenthesized,
+    /// After a call with bracketed arguments.
+    Call,
+    /// After a top-level expression.
+    Cell,
+    /// At the end of a line.
+    LineEnd,
+    /// After any expression.
+    Everywhere,
+    /// Before a call's argument, of the parameter it is passed to.
+    Argument,
+}
+
+/// A hint, with the value it gives the type of, if any, and the kind of
+/// place that put it there.
+struct PlacedHint {
+    /// The range of the value, as [`described_value`] finds it.
+    value: Option<TextRange>,
+    source: HintSource,
+    hint: InlayHint,
+}
+
+impl PlacedHint {
+    /// The hints of `placed`, one for each value: the one of the earliest
+    /// source, so the same type is not shown twice.
+    fn one_per_value(placed: Vec<Self>) -> Vec<InlayHint> {
+        let mut kept = BTreeMap::<(Position, Position), Self>::new();
+        let mut hints = Vec::new();
+        for hint in placed {
+            let Some(value) = hint.value else {
+                hints.push(hint.hint);
+                continue;
+            };
+            match kept.entry((value.start, value.end)) {
+                Entry::Vacant(entry) => {
+                    entry.insert(hint);
+                }
+                Entry::Occupied(mut entry) => {
+                    if hint.precedes(entry.get()) {
+                        entry.insert(hint);
+                    }
+                }
+            }
+        }
+        hints.extend(kept.into_values().map(|placed| placed.hint));
+        hints
+    }
+
+    /// Whether `self` is kept over `other`, a hint of the same value.
+    fn precedes(&self, other: &Self) -> bool {
+        (self.source, label_text(&self.hint.label)) < (other.source, label_text(&other.hint.label))
+    }
+}
 
 /// Where the hint of a value sits, and how it reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +134,9 @@ pub fn inlay_hints_response(
     options: &InlayHintSettings,
     knowledge: &ObjectRegistry,
 ) -> Vec<InlayHint> {
-    let mut hints = HintContext::new(document, knowledge, options, range).placed_hints();
+    let mut hints = PlacedHint::one_per_value(
+        HintContext::new(document, knowledge, options, range).placed_hints(),
+    );
     hints.sort_by(|left, right| {
         (
             left.position.line,
@@ -160,7 +226,7 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
     }
 
     /// The hints of every kind of place the settings turn on.
-    fn placed_hints(&self) -> Vec<InlayHint> {
+    fn placed_hints(&self) -> Vec<PlacedHint> {
         let options = self.options;
         let mut hints = Vec::new();
         if options.during_assignment {
@@ -170,11 +236,16 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
             hints.extend(self.lambda_return_type_hints());
         }
         if options.after_cell {
-            hints.extend(self.value_hints(self.cell_values(), HintPlacement::AfterValue));
+            hints.extend(self.value_hints(
+                self.cell_values(),
+                HintSource::Cell,
+                HintPlacement::AfterValue,
+            ));
         }
         if options.after_call {
             hints.extend(self.value_hints(
                 self.typed_nodes().filter(|node| node.is_bracketed_call()),
+                HintSource::Call,
                 HintPlacement::AfterValue,
             ));
         }
@@ -182,8 +253,8 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
             hints.extend(
                 self.value_hints(
                     self.typed_nodes()
-                        .filter(SyntaxNode::is_delimited_expression)
-                        .map(|brackets| applied_call(brackets).unwrap_or(brackets)),
+                        .filter(|node| node.is_holder() && applied_call(*node).is_none()),
+                    HintSource::Parenthesized,
                     HintPlacement::AfterValue,
                 ),
             );
@@ -192,10 +263,18 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
             hints.extend(self.line_end_hints());
         }
         if options.arg_names || options.arg_types {
-            hints.extend(self.parameter_hints());
+            hints.extend(self.parameter_hints().into_iter().map(|hint| PlacedHint {
+                value: None,
+                source: HintSource::Argument,
+                hint,
+            }));
         }
         if options.everywhere {
-            hints.extend(self.value_hints(self.typed_nodes(), HintPlacement::AfterValue));
+            hints.extend(self.value_hints(
+                self.typed_nodes(),
+                HintSource::Everywhere,
+                HintPlacement::AfterValue,
+            ));
         }
         hints
     }
@@ -210,17 +289,23 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
     fn value_hints(
         &self,
         values: impl IntoIterator<Item = SyntaxNode<'tree>>,
+        source: HintSource,
         placement: HintPlacement,
-    ) -> Vec<InlayHint> {
+    ) -> Vec<PlacedHint> {
         values
             .into_iter()
-            .filter_map(|value| self.value_hint(value, placement))
+            .filter_map(|value| self.value_hint(value, source, placement))
             .collect()
     }
 
     /// The hint of `value` at `placement`, of its type, unless the settings
     /// leave it out.
-    fn value_hint(&self, value: SyntaxNode<'tree>, placement: HintPlacement) -> Option<InlayHint> {
+    fn value_hint(
+        &self,
+        value: SyntaxNode<'tree>,
+        source: HintSource,
+        placement: HintPlacement,
+    ) -> Option<PlacedHint> {
         let (_, inferred_type) = self.inferred_types.get(&value.id())?;
         let value_range = self.document.range_for_node(value);
         let repeated = || {
@@ -246,13 +331,14 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
         }
         let type_name =
             self.displayed_type(value_range.start, inferred_type, TypedSubject::Value)?;
-        Some(match placement {
-            HintPlacement::AfterValue => {
-                self.type_hint(value_range.end, expression_label(value, type_name))
-            }
-            HintPlacement::LineEnd(line_end) => {
-                self.type_hint(line_end, expression_label(value, type_name))
-            }
+        let position = match placement {
+            HintPlacement::AfterValue => value_range.end,
+            HintPlacement::LineEnd(line_end) => line_end,
+        };
+        Some(PlacedHint {
+            value: Some(self.document.range_for_node(described_value(value))),
+            source,
+            hint: self.type_hint(position, expression_label(value, type_name)),
         })
     }
 
@@ -415,7 +501,7 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
     /// on its line: the outermost of those ending last there, unless an
     /// expression starting after it on the line goes on below, as one an
     /// opening bracket starts.
-    fn line_end_hints(&self) -> Vec<InlayHint> {
+    fn line_end_hints(&self) -> Vec<PlacedHint> {
         let line_of = |byte| self.document.position_for_byte(byte).line;
         let mut last_complete = HashMap::<u32, SyntaxNode<'tree>>::new();
         let mut last_continued_start = HashMap::<u32, usize>::new();
@@ -450,6 +536,7 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
                 let line_end = content_ends.get(&line).copied().unwrap_or(value.end_byte());
                 self.value_hint(
                     value,
+                    HintSource::LineEnd,
                     HintPlacement::LineEnd(self.document.position_for_byte(line_end)),
                 )
             })
@@ -522,7 +609,7 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
 
     /// The types functions return, after the value they end with: their
     /// final expression, or what `return` returns.
-    fn lambda_return_type_hints(&self) -> Vec<InlayHint> {
+    fn lambda_return_type_hints(&self) -> Vec<PlacedHint> {
         let analysis = self.document.analysis();
         self.inferred_types
             .values()
@@ -546,7 +633,11 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
                     return None;
                 }
                 let type_name = self.inferred_type_label(value)?;
-                Some(self.type_hint(value_range.end, expression_label(value, type_name)))
+                Some(PlacedHint {
+                    value: Some(self.document.range_for_node(described_value(value))),
+                    source: HintSource::Return,
+                    hint: self.type_hint(value_range.end, expression_label(value, type_name)),
+                })
             })
             .collect()
     }
@@ -603,7 +694,7 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
 
     /// The types of bindings, after their names: where a binding is first
     /// assigned or its type changes, unless the value states it.
-    fn binding_type_hints(&self) -> Vec<InlayHint> {
+    fn binding_type_hints(&self) -> Vec<PlacedHint> {
         let assigned_values = self.assigned_values();
         let self_describing_values = self
             .self_describing_assignment_value_nodes()
@@ -651,7 +742,11 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
                 }
                 let position = state.span.end;
                 if self.range.contains_position(position) {
-                    hints.push(self.type_hint(position, type_name));
+                    hints.push(PlacedHint {
+                        value: assigned.map(|value| value.described_range),
+                        source: HintSource::Assignment,
+                        hint: self.type_hint(position, type_name),
+                    });
                 }
             }
         }
@@ -728,6 +823,7 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
                 values.push(AssignedValue {
                     target_range: self.document.range_for_node(target),
                     value_range: self.document.range_for_node(value),
+                    described_range: self.document.range_for_node(described_value(value)),
                     type_name,
                     destructured,
                 });
@@ -794,6 +890,28 @@ fn is_discarded_by_semicolon(value: SyntaxNode<'_>) -> bool {
         .is_some_and(|ancestor| ancestor.is_muted_statement())
 }
 
+/// The expression whose value `node` evaluates to as written: through an
+/// assignment `x = v` or `x := v` the value `v` it assigns, and through
+/// parentheses `(v)` the value `v` they hold. Hints of the same described
+/// value give the same type.
+fn described_value(mut node: SyntaxNode<'_>) -> SyntaxNode<'_> {
+    loop {
+        let inner = if node.has_binary_operator::<Token![=]>()
+            || node.has_binary_operator::<Token![:=]>()
+        {
+            node.binary_parts().map(|parts| parts.right)
+        } else if node.is_holder() {
+            node.final_value_child()
+        } else {
+            None
+        };
+        match inner {
+            Some(inner) => node = inner,
+            None => return node,
+        }
+    }
+}
+
 /// The call `arguments` are the bracketed arguments of.
 fn applied_call(arguments: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     arguments.parent().filter(|call| {
@@ -823,6 +941,8 @@ fn call_arguments(call: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
 struct AssignedValue {
     target_range: TextRange,
     value_range: TextRange,
+    /// The range of the value [`described_value`] finds in the assigned one.
+    described_range: TextRange,
     type_name: String,
     destructured: bool,
 }
@@ -1136,19 +1256,68 @@ mod tests {
     }
 
     #[test]
-    fn brackets_closing_arguments_show_what_the_call_returns() {
+    fn brackets_show_parenthesized_values_only() {
+        let source = concat!(
+            "(isPrime 7)\n",
+            "f(isPrime 7)\n",
+            "(isPrime 7,)\n",
+            "[isPrime 7]\n",
+            "{isPrime 7}\n",
+        );
+
+        // Neither a call's arguments nor the collections get one.
         assert_eq!(
             library_hints(
-                "{instance(3, ZZ)}\n",
+                source,
                 &InlayHintSettings {
                     after_brackets: true,
                     ..nowhere()
                 }
             ),
+            [placed(pos!(0, 11), "Boolean")]
+        );
+    }
+
+    #[test]
+    fn the_type_of_one_value_is_shown_once() {
+        let everywhere_it_ends = InlayHintSettings {
+            after_cell: true,
+            after_line_end: true,
+            after_call: true,
+            after_brackets: true,
+            show_repeated: true,
+            ..nowhere()
+        };
+        let assigning = InlayHintSettings {
+            during_assignment: true,
+            ..everywhere_it_ends.clone()
+        };
+
+        // The assignment's hint stands for its value's cell, line end,
+        // parentheses and call.
+        assert_eq!(
+            library_hints("x = (instance(3, ZZ))\n", &assigning),
+            [placed(pos!(0, 1), "Boolean")]
+        );
+        assert_eq!(
+            library_hints("x = instance(3, ZZ)\n", &everywhere_it_ends),
+            [placed(pos!(0, 19), "-> Boolean")]
+        );
+        // A ring's presentation is one value, not a function's type.
+        assert_eq!(
+            library_hints(
+                "R = QQ[a]\nS = R[x_0..y_2, z, w_(1,1)]\n",
+                &everywhere_it_ends
+            ),
             [
-                placed(pos!(0, 16), "-> Boolean"),
-                placed(pos!(0, 17), "List"),
+                placed(pos!(0, 9), "-> PolynomialRing"),
+                placed(pos!(1, 27), "-> PolynomialRing"),
             ]
+        );
+        // The cell's hint stands for the line end past its `;`.
+        assert_eq!(
+            library_hints("isPrime 7;\n", &everywhere_it_ends),
+            [placed(pos!(0, 9), "-> Boolean")]
         );
     }
 

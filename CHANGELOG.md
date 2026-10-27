@@ -14,6 +14,11 @@
   shows `2` and the line completing it the whole sum.
 - Parameter hints before arguments, `f(x: Number 2)`, from local method
   installations, local functions and library signatures.
+- `afterBrackets` hints only parenthesized values such as `(2)`, which
+  evaluate to what they hold, not collections or call arguments.
+- Hints giving the type of the same value are shown once: an assignment's
+  hint replaces the cell and line-end hints of its value, and a cell's
+  replaces its line-end hint.
 
 ## 2.0.0 - 2026-10-26
 

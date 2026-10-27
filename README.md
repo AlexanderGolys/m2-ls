@@ -132,7 +132,7 @@ Every setting is optional and applies without a restart. Send them under the
 | `inlayHints.duringAssignment` | `true` | After a name being assigned, where its type is first known or changes. |
 | `inlayHints.argNames` | `false` | Before each argument, the name of the parameter it is passed to, as `f(x: 2)`. |
 | `inlayHints.argTypes` | `false` | Before each argument, the type its parameter is declared for, as `f(Number 2)`; with `argNames`, `f(x: Number 2)`. A domain takes its subtypes, so it is never marked with `↑`. |
-| `inlayHints.afterBrackets` | `false` | After every closing bracket; one closing call arguments shows the call's result. |
+| `inlayHints.afterBrackets` | `false` | After each parenthesized value such as `(2)` or `(a + b)`; not after collections such as `(2,)`, `[2]` or `{2}`, nor after call arguments. |
 | `inlayHints.afterReturn` | `true` | After the value a function returns. |
 | `inlayHints.everywhere` | `false` | After every expression. |
 | `inlayHints.showLiteral` | `false` | Also shows types a literal states, as in `x = 3`. |
