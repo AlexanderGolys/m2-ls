@@ -284,6 +284,14 @@ impl<'tree> SyntaxNode<'tree> {
     pub fn is_space_application(&self) -> bool {
         self.is_adjacent_expr()
     }
+    /// A call whose arguments are bracketed, as `f(x)`, `f()` or `QQ[x]`,
+    /// not one by juxtaposition, as `f x`.
+    pub fn is_bracketed_call(&self) -> bool {
+        self.is_space_application()
+            && self
+                .binary_parts()
+                .is_some_and(|call| call.right.is_delimited_expression())
+    }
     pub fn is_implicit_application(&self) -> bool {
         self.is::<Adj>()
     }
@@ -642,6 +650,27 @@ impl<'tree> SyntaxNode<'tree> {
         match self.get::<ExprLambda>()? {
             ExprLambda::Variadic(n) => self.related(n.body.as_ref()),
             ExprLambda::List(n) => self.related(n.body.as_ref()),
+        }
+    }
+    /// The symbols a lambda binds, in order: `x` of `x -> …`, and `a`, `b`
+    /// of `(a, b) -> …`.
+    pub fn lambda_parameter_symbols(&self) -> Vec<Self> {
+        let Some(lambda) = self.get::<ExprLambda>() else {
+            return Vec::new();
+        };
+        match lambda {
+            ExprLambda::Variadic(n) => self.related(&n.argument).into_iter().collect(),
+            ExprLambda::List(n) => match &n.arguments.contents {
+                None => Vec::new(),
+                Some(ArgumentListContent::Symbol(symbol)) => {
+                    self.related(symbol).into_iter().collect()
+                }
+                Some(ArgumentListContent::Pack(pack)) => pack
+                    .arguments
+                    .iter()
+                    .filter_map(|symbol| self.related(symbol))
+                    .collect(),
+            },
         }
     }
     pub fn lambda_parameters(&self) -> Option<Self> {

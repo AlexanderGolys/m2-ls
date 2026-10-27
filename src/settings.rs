@@ -10,8 +10,7 @@
 //!
 //! Settings are read leniently: a value that does not deserialize, an unknown
 //! key in a group, or an unknown entry in a list is reported as a
-//! [`SettingProblem`] and dropped, and everything else still applies. A key
-//! that newer settings replaced is read as those, and reported too.
+//! [`SettingProblem`] and dropped, and everything else still applies.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -19,12 +18,11 @@ use std::sync::RwLock;
 use std::{fmt, mem};
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use serde_path_to_error::{Path, Segment};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::capabilities::formatting::ControlFlowLayout;
-use crate::capabilities::inlay_hints::{CallForm, HintAnchor};
 use crate::diagnostics::DiagnosticCode;
 use crate::object_registry::ObjectName;
 
@@ -112,30 +110,61 @@ pub struct FormattingSettings {
 
 /// `inlayHints.*`: which inferred types are shown inline, and where.
 ///
-/// `show` picks the places hints are attached to; the other settings drop
-/// the hints that would only repeat what the source says.
+/// Each `after…`, `during…` and `of…` setting places hints at one kind of
+/// place, and each `show…` and `hide…` setting keeps or drops a kind of hint
+/// wherever it is placed; all of them are independent. Two places giving the
+/// same hint at the same position show it once.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct InlayHintSettings {
-    /// The places types are shown at. Default
-    /// `["bindings", "returns", "cells", "lineEnds"]`.
-    pub show: HashSet<HintAnchor>,
-    /// Which calls `calls` annotates: `bracketed` (as in `f(x)`) or `all`
-    /// (also `f x`). Default `bracketed`.
-    pub call_form: CallForm,
+    /// After each call whose arguments are bracketed, as `f(x)`, `f()` or
+    /// `f(x, y)`, but not `f x`: the type it returns. Default `false`.
+    pub after_call: bool,
+    /// At the end of each line: the type of the last expression complete on
+    /// it, as `2` after `2+` and `2+2` after the `2` below it. Default `true`.
+    pub after_line_end: bool,
+    /// After each top-level expression, as Macaulay2's `oN : T` line.
+    /// Default `true`.
+    pub after_cell: bool,
+    /// After a name being assigned, where its type is first known or
+    /// changes. Default `true`.
+    pub during_assignment: bool,
+    /// Before each argument of a call, the name of the parameter it is
+    /// passed to, as `f(x: 2)`. Default `false`.
+    pub arg_names: bool,
+    /// Before each argument of a call, the type the parameter it is passed
+    /// to is declared for, as `f(Number 2)`, or with `argNames` `f(x: Number
+    /// 2)`. Default `false`.
+    pub arg_types: bool,
+    /// After each closing bracket; one closing a call's arguments gives the
+    /// type the call returns. Default `false`.
+    pub after_brackets: bool,
+    /// After the value a function returns. Default `true`.
+    pub after_return: bool,
+    /// After every expression. Default `false`.
+    pub everywhere: bool,
     /// Also the types a literal states, as in `x = 3`. Default `false`.
-    pub literal_types: bool,
-    /// Also the types a nearby hint already shows: a binding's unchanged
-    /// type, and an assignment's beside its binding's. Default `false`.
-    pub repeated_types: bool,
+    pub show_literal: bool,
+    /// Marks a type standing also for its subtypes with `↑`, as `↑Ring`.
+    /// Default `true`.
+    pub show_upper_closure: bool,
     /// Also the hints that say nothing, of values only known to be a
     /// `Thing`. Default `false`.
-    pub unknown_types: bool,
+    pub show_thing: bool,
+    /// Also the hints of values known to be `null`, of type `Nothing`.
+    /// Default `false`.
+    pub show_nothing: bool,
+    /// Also the types a nearby hint already shows: a binding's unchanged
+    /// type, and an assignment's beside its binding's. Default `false`.
+    pub show_repeated: bool,
+    /// Types never shown, e.g. `["ZZ", "String"]`.
+    pub hide_types: HashSet<ObjectName>,
+    /// Drops the hints of values a `;` ends, whose value is discarded.
+    /// Default `false`.
+    pub hide_after_semicolon: bool,
     /// The longest label shown in full; a longer one is cut, its whole type
     /// in the tooltip. `0` or `null` never cuts. Default `40`.
     pub max_label_length: Option<u32>,
-    /// Types never shown, e.g. `["ZZ", "String"]`.
-    pub hidden_types: HashSet<ObjectName>,
     /// Functions whose calls and arguments get no hints, e.g. `["print"]`.
     pub excluded_calls: HashSet<ObjectName>,
 }
@@ -230,13 +259,23 @@ impl Default for FormattingSettings {
 impl Default for InlayHintSettings {
     fn default() -> Self {
         Self {
-            show: HintAnchor::DEFAULT_SHOWN.into_iter().collect(),
-            call_form: CallForm::default(),
-            literal_types: false,
-            repeated_types: false,
-            unknown_types: false,
+            after_call: false,
+            after_line_end: true,
+            after_cell: true,
+            during_assignment: true,
+            arg_names: false,
+            arg_types: false,
+            after_brackets: false,
+            after_return: true,
+            everywhere: false,
+            show_literal: false,
+            show_upper_closure: true,
+            show_thing: false,
+            show_nothing: false,
+            show_repeated: false,
+            hide_types: HashSet::new(),
+            hide_after_semicolon: false,
             max_label_length: Some(40),
-            hidden_types: HashSet::new(),
             excluded_calls: HashSet::new(),
         }
     }
@@ -263,33 +302,13 @@ pub struct ParsedSettings {
 pub struct SettingProblem {
     /// Where the value sits in the section, e.g. `diagnostics.disabled[1]`.
     path: String,
-    issue: SettingIssue,
-}
-
-/// What is wrong with a [`SettingProblem`]'s value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-enum SettingIssue {
-    /// It does not deserialize, for this reason; the default applies.
-    Invalid(String),
-    /// Its key was replaced; it is read as the settings described.
-    Replaced(&'static str),
+    /// Why the value does not deserialize; the default applies instead.
+    reason: String,
 }
 
 impl fmt::Display for SettingProblem {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.issue {
-            SettingIssue::Invalid(reason) => {
-                write!(formatter, "`{}`: {reason}; default kept", self.path)
-            }
-            SettingIssue::Replaced(replacement) => {
-                write!(
-                    formatter,
-                    "`{}`: deprecated, read as {replacement}",
-                    self.path
-                )
-            }
-        }
+        write!(formatter, "`{}`: {}; default kept", self.path, self.reason)
     }
 }
 
@@ -309,7 +328,7 @@ impl ServerSettings {
         if section.is_null() {
             section = Value::Object(Default::default());
         }
-        let mut problems = InlayHintSettings::upgrade_replaced_keys(&mut section);
+        let mut problems = Vec::new();
         loop {
             match serde_path_to_error::deserialize::<_, Self>(&section) {
                 Ok(settings) => return ParsedSettings { settings, problems },
@@ -321,7 +340,7 @@ impl ServerSettings {
                         } else {
                             "settings".to_string()
                         },
-                        issue: SettingIssue::Invalid(error.into_inner().to_string()),
+                        reason: error.into_inner().to_string(),
                     });
                     if !removed {
                         return ParsedSettings {
@@ -396,92 +415,6 @@ impl DiagnosticSettings {
     }
 }
 
-impl InlayHintSettings {
-    /// The group's key in the settings section.
-    const SECTION_KEY: &str = "inlayHints";
-
-    /// Rewrite the keys of the `inlayHints` group in `section` that `show`
-    /// and the type filters replaced into those, reporting each.
-    ///
-    /// `expressionTypes` became the `subexpressions` anchor; `allKnownTypes`
-    /// became it with `literalTypes` and `repeatedTypes`; `calls` became the
-    /// `lineEnds` and `calls` anchors with `callForm`.
-    fn upgrade_replaced_keys(section: &mut Value) -> Vec<SettingProblem> {
-        let Some(group) = section
-            .get_mut(Self::SECTION_KEY)
-            .and_then(Value::as_object_mut)
-        else {
-            return Vec::new();
-        };
-        let mut shown = match group.get("show") {
-            None => Some(
-                HintAnchor::DEFAULT_SHOWN
-                    .iter()
-                    .map(|anchor| json!(anchor))
-                    .collect::<Vec<_>>(),
-            ),
-            Some(Value::Array(anchors)) => Some(anchors.clone()),
-            // Left for deserialization to report.
-            Some(_) => None,
-        };
-        let mut show = |anchor: HintAnchor, shown_or_hidden: bool| {
-            if let Some(shown) = shown.as_mut() {
-                let anchor = json!(anchor);
-                shown.retain(|listed| *listed != anchor);
-                if shown_or_hidden {
-                    shown.push(anchor);
-                }
-            }
-        };
-        let mut problems = Vec::new();
-        let mut replaced = |key: &str, replacement: &'static str| {
-            problems.push(SettingProblem {
-                path: format!("{}.{key}", Self::SECTION_KEY),
-                issue: SettingIssue::Replaced(replacement),
-            });
-        };
-
-        if let Some(expression_types) = group.remove("expressionTypes") {
-            if expression_types == Value::Bool(true) {
-                show(HintAnchor::Subexpressions, true);
-            }
-            replaced("expressionTypes", "`show` listing `subexpressions`");
-        }
-        if let Some(all_known_types) = group.remove("allKnownTypes") {
-            if all_known_types == Value::Bool(true) {
-                show(HintAnchor::Subexpressions, true);
-                for filter in ["literalTypes", "repeatedTypes"] {
-                    group.entry(filter).or_insert(Value::Bool(true));
-                }
-            }
-            replaced(
-                "allKnownTypes",
-                "`show` listing `subexpressions`, with `literalTypes` and `repeatedTypes`",
-            );
-        }
-        if let Some(calls) = group.remove("calls") {
-            match calls.as_str() {
-                Some("off") => show(HintAnchor::LineEnds, false),
-                Some("every") => {
-                    show(HintAnchor::Calls, true);
-                    group
-                        .entry("callForm")
-                        .or_insert_with(|| json!(CallForm::All));
-                }
-                _ => {}
-            }
-            replaced(
-                "calls",
-                "`show` listing `lineEnds` or `calls`, with `callForm`",
-            );
-        }
-        if let Some(shown) = shown.filter(|_| !problems.is_empty()) {
-            group.insert("show".to_string(), Value::Array(shown));
-        }
-        problems
-    }
-}
-
 impl FormattingSettings {
     /// The soft and hard wrapping widths in effect: a zero width is none, and
     /// the soft width never exceeds the hard one.
@@ -539,11 +472,16 @@ mod tests {
                     "breakAfterSemicolon": false
                 },
                 "inlayHints": {
-                    "show": ["calls", "arguments"],
-                    "callForm": "all",
-                    "literalTypes": true,
+                    "afterCall": true,
+                    "afterCell": false,
+                    "argNames": true,
+                    "argTypes": true,
+                    "showLiteral": true,
+                    "showUpperClosure": false,
+                    "showNothing": true,
+                    "hideAfterSemicolon": true,
                     "maxLabelLength": 0,
-                    "hiddenTypes": ["ZZ"],
+                    "hideTypes": ["ZZ"],
                     "excludedCalls": ["print"]
                 },
                 "semanticTokens": {
@@ -569,11 +507,16 @@ mod tests {
         assert_eq!(
             settings.inlay_hints,
             InlayHintSettings {
-                show: HashSet::from([HintAnchor::Calls, HintAnchor::Arguments]),
-                call_form: CallForm::All,
-                literal_types: true,
+                after_call: true,
+                after_cell: false,
+                arg_names: true,
+                arg_types: true,
+                show_literal: true,
+                show_upper_closure: false,
+                show_nothing: true,
+                hide_after_semicolon: true,
                 max_label_length: Some(0),
-                hidden_types: HashSet::from([ObjectName::new("ZZ")]),
+                hide_types: HashSet::from([ObjectName::new("ZZ")]),
                 excluded_calls: HashSet::from([ObjectName::new("print")]),
                 ..InlayHintSettings::default()
             }
@@ -582,24 +525,15 @@ mod tests {
     }
 
     #[test]
-    fn replaced_inlay_hint_keys_are_read_as_their_replacements() {
+    fn inlay_hint_settings_are_read_only_under_their_own_names() {
         let parsed = ServerSettings::from_value(&serde_json::json!({
-            "inlayHints": {
-                "expressionTypes": true,
-                "allKnownTypes": false,
-                "calls": "every",
-                "unknownTypes": true
-            }
+            "inlayHints": { "show": ["calls"], "unknownTypes": true, "afterCall": true }
         }));
 
-        let mut show = HashSet::from(HintAnchor::DEFAULT_SHOWN);
-        show.extend([HintAnchor::Subexpressions, HintAnchor::Calls]);
         assert_eq!(
             parsed.settings.inlay_hints,
             InlayHintSettings {
-                show,
-                call_form: CallForm::All,
-                unknown_types: true,
+                after_call: true,
                 ..InlayHintSettings::default()
             }
         );
@@ -608,25 +542,13 @@ mod tests {
             .iter()
             .map(SettingProblem::to_string)
             .collect::<Vec<_>>();
-        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert_eq!(problems.len(), 2, "{problems:?}");
         assert!(
             problems
                 .iter()
-                .all(|problem| problem.contains("deprecated, read as")),
+                .all(|problem| problem.contains("unknown field")),
             "{problems:?}"
         );
-
-        // `allKnownTypes` turns on both filters it was split into, and
-        // `calls: off` hides line ends, which once showed only calls.
-        let parsed = ServerSettings::from_value(&serde_json::json!({
-            "inlayHints": { "allKnownTypes": true, "calls": "off", "show": ["bindings", "lineEnds"] }
-        }));
-        let hints = &parsed.settings.inlay_hints;
-        assert_eq!(
-            hints.show,
-            HashSet::from([HintAnchor::Bindings, HintAnchor::Subexpressions])
-        );
-        assert!(hints.literal_types && hints.repeated_types);
     }
 
     #[test]

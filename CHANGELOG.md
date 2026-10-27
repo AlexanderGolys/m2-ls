@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **Breaking:** inlay hint settings are independent keys, each with one name:
+  `afterCall`, `afterLineEnd`, `afterCell`, `duringAssignment`, `argNames`,
+  `argTypes`, `afterBrackets`, `afterReturn`, `everywhere`, `showLiteral`,
+  `showUpperClosure`, `showThing`, `showNothing`, `showRepeated`, `hideTypes`,
+  `hideAfterSemicolon`, `maxLabelLength` and `excludedCalls`. The former
+  `show`, `callForm`, `literalTypes`, `repeatedTypes`, `unknownTypes`,
+  `hiddenTypes`, `expressionTypes`, `allKnownTypes` and `calls` keys are no
+  longer read.
+- Line-end hints show the last expression complete on every line, so `2 +`
+  shows `2` and the line completing it the whole sum.
+- Parameter hints before arguments, `f(x: Number 2)`, from local method
+  installations, local functions and library signatures.
+
 ## 2.0.0 - 2026-10-26
 
 - **Breaking:** semantic tokens now use only LSP-standard token types; Macaulay2

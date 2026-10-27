@@ -1452,11 +1452,25 @@ impl Analysis {
         lambda: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<&Vec<ObjectName>> {
+        Some(
+            &self
+                .installation_receiving_arguments(lambda, source)?
+                .method
+                .domain,
+        )
+    }
+
+    /// The installation whose method arguments `lambda` receives.
+    pub fn installation_receiving_arguments(
+        &self,
+        lambda: SyntaxNode,
+        source: &(impl SourceNavigation + ?Sized),
+    ) -> Option<&MethodInstallation> {
         let id = self
             .registry
             .installations_by_argument_lambda
             .get(&source_range_key(source.range_for_node(lambda)))?;
-        Some(&self.registry.installations[id.0].method.domain)
+        Some(&self.registry.installations[id.0])
     }
 
     pub fn installation_for(

@@ -515,7 +515,7 @@ async fn method_codomains_use_type_annotations_and_all_known_types_are_configura
         complete
             .iter()
             .any(|(line, label)| *line == 2 && label == "Sequence"),
-        "literalTypes should expose the literal sequence type: {complete:?}"
+        "showLiteral should expose the literal sequence type: {complete:?}"
     );
 
     session.shutdown().await;
@@ -2456,7 +2456,7 @@ async fn inferred_subsets_are_reduced_with_source_type_edges() {
     );
     let mut session = DocumentSession::open(source).await;
     session
-        .set_inlay_hint_settings(json!({ "unknownTypes": false }))
+        .set_inlay_hint_settings(json!({ "showThing": false }))
         .await;
     let calm = inlay_labels_by_line(&mut session).await;
     assert!(
@@ -2464,7 +2464,7 @@ async fn inferred_subsets_are_reduced_with_source_type_edges() {
         "a type that says nothing is hidden by default: {calm:?}"
     );
     session
-        .set_inlay_hint_settings(json!({ "unknownTypes": true }))
+        .set_inlay_hint_settings(json!({ "showThing": true }))
         .await;
     let hints = inlay_labels_by_line(&mut session).await;
 

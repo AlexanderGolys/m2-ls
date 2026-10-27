@@ -317,8 +317,8 @@ impl LspProcess {
 /// type, uncut, so the tests observe all that inference finds.
 fn base_inlay_hint_settings() -> Value {
     json!({
-        "show": ["bindings", "returns", "cells", "lineEnds", "subexpressions"],
-        "unknownTypes": true,
+        "everywhere": true,
+        "showThing": true,
         "maxLabelLength": null
     })
 }
@@ -557,15 +557,13 @@ impl DocumentSession {
     /// Show inlay hints at the default places only, not after every
     /// subexpression.
     pub(crate) async fn show_default_inlay_hint_anchors(&mut self) {
-        self.set_inlay_hint_settings(
-            json!({ "show": ["bindings", "returns", "cells", "lineEnds"] }),
-        )
-        .await;
+        self.set_inlay_hint_settings(json!({ "everywhere": false }))
+            .await;
     }
 
     /// Also show the types literals state and nearby hints repeat.
     pub(crate) async fn show_every_known_inlay_hint_type(&mut self) {
-        self.set_inlay_hint_settings(json!({ "literalTypes": true, "repeatedTypes": true }))
+        self.set_inlay_hint_settings(json!({ "showLiteral": true, "showRepeated": true }))
             .await;
     }
 

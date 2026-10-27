@@ -111,7 +111,7 @@ Every setting is optional and applies without a restart. Send them under the
   "m2-ls": {
     "diagnostics": { "disabled": ["unused-binding", "T02"] },
     "formatting": { "indent": 4, "hardLineWidth": 100 },
-    "inlayHints": { "show": ["bindings", "returns", "cells", "calls"] }
+    "inlayHints": { "afterCall": true, "hideTypes": ["ZZ"] }
   }
 }
 ```
@@ -126,13 +126,23 @@ Every setting is optional and applies without a restart. Send them under the
 | `formatting.controlFlowLayout` | See source | `compact`, `multiline`, or `multilineCompactElse`. |
 | `formatting.compactFactorOperators` | See source | `2*x` instead of `2 * x`. |
 | `formatting.breakAfterSemicolon` | See source | Starts the next statement on a new line. |
-| `inlayHints.show` | `["bindings", "returns", "cells", "lineEnds"]` | Where types are shown: `bindings` (after a name, where its type is first known or changes), `returns` (after a function's returned value), `cells` (after each top-level value Macaulay2 prints, as its `oN : T` line), `calls`, `brackets` (after every closing bracket; one closing call arguments shows the call's result), `lineEnds` (after each line of an expression broken across lines), `arguments`, `subexpressions` (everywhere). |
-| `inlayHints.callForm` | `bracketed` | Which calls `calls` annotates: `bracketed` (`f(x)`, `QQ[x]`) or `all` (also `f x`). |
-| `inlayHints.literalTypes` | `false` | Also shows types a literal states, as in `x = 3`. |
-| `inlayHints.repeatedTypes` | `false` | Also shows types a nearby hint already shows, such as a binding's unchanged type. |
-| `inlayHints.unknownTypes` | `false` | Also shows hints that say nothing, of values only known to be a `Thing`. |
+| `inlayHints.afterCall` | `false` | After each call with bracketed arguments, `f(x)`, `f()` or `f(x, y)` (not `f x`): the type it returns. |
+| `inlayHints.afterLineEnd` | `true` | At each line end: the type of the last expression complete on it, so `2+` shows `2` and the next line `2` shows `2+2`. |
+| `inlayHints.afterCell` | `true` | After each top-level value, as Macaulay2's `oN : T` line. |
+| `inlayHints.duringAssignment` | `true` | After a name being assigned, where its type is first known or changes. |
+| `inlayHints.argNames` | `false` | Before each argument, the name of the parameter it is passed to, as `f(x: 2)`. |
+| `inlayHints.argTypes` | `false` | Before each argument, the type its parameter is declared for, as `f(Number 2)`; with `argNames`, `f(x: Number 2)`. A domain takes its subtypes, so it is never marked with `↑`. |
+| `inlayHints.afterBrackets` | `false` | After every closing bracket; one closing call arguments shows the call's result. |
+| `inlayHints.afterReturn` | `true` | After the value a function returns. |
+| `inlayHints.everywhere` | `false` | After every expression. |
+| `inlayHints.showLiteral` | `false` | Also shows types a literal states, as in `x = 3`. |
+| `inlayHints.showUpperClosure` | `true` | Marks a type that also stands for its subtypes with `↑`, as `↑Ring`. |
+| `inlayHints.showThing` | `false` | Also shows hints that say nothing, of values only known to be a `Thing`. |
+| `inlayHints.showNothing` | `false` | Also shows hints of values known to be `null`. |
+| `inlayHints.showRepeated` | `false` | Also shows types a nearby hint already shows, such as a binding's unchanged type. |
+| `inlayHints.hideTypes` | `[]` | Types never shown, e.g. `["ZZ", "String"]`. |
+| `inlayHints.hideAfterSemicolon` | `false` | Hides the hints of values a `;` discards. |
 | `inlayHints.maxLabelLength` | `40` | Cuts longer labels, with the whole type in the tooltip; `0` disables. |
-| `inlayHints.hiddenTypes` | `[]` | Types never shown, e.g. `["ZZ", "String"]`. |
 | `inlayHints.excludedCalls` | `[]` | Functions whose calls and arguments get no hints, e.g. `["print"]`. |
 | `semanticTokens.standardOnly` | `false` | Drops the custom semantic token modifiers. Token types are always LSP-standard. |
 | `semanticTokens.defaultLibrary` | `"CompiledFunction"` | Selects which bindings carry `defaultLibrary`; accepts a policy name or an array of package names. |
