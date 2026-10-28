@@ -543,7 +543,16 @@ impl LanguageServer for Backend {
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 document_highlight_provider: document_highlight_provider_capability(),
-                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![
+                            CodeActionKind::QUICKFIX,
+                            CodeActionKind::REFACTOR_REWRITE,
+                            CodeActionKind::SOURCE_FIX_ALL,
+                        ]),
+                        ..CodeActionOptions::default()
+                    },
+                )),
                 inlay_hint_provider: inlay_hint_provider_capability(),
                 inline_value_provider: inline_value_provider_capability(),
                 semantic_tokens_provider: Some(
@@ -743,17 +752,41 @@ impl LanguageServer for Backend {
         let position = params.range.start;
         Ok(self
             .with_source_at(uri, position, |document, _, _| {
-                let diagnostics = if params.context.diagnostics.is_empty() {
-                    visible_diagnostics(document, uri, &settings.diagnostics)
-                } else {
-                    params
-                        .context
-                        .diagnostics
-                        .into_iter()
-                        .filter(|diagnostic| settings.diagnostics.allows_lsp_diagnostic(diagnostic))
-                        .collect()
-                };
-                available_code_actions(document, uri, position, &diagnostics, &settings.formatting)
+                let mut diagnostics = visible_diagnostics(document, uri, &settings.diagnostics);
+                for diagnostic in params
+                    .context
+                    .diagnostics
+                    .into_iter()
+                    .filter(|diagnostic| settings.diagnostics.allows_lsp_diagnostic(diagnostic))
+                {
+                    if !diagnostics.contains(&diagnostic) {
+                        diagnostics.push(diagnostic);
+                    }
+                }
+                let mut actions = available_code_actions(
+                    document,
+                    uri,
+                    position,
+                    &diagnostics,
+                    &settings.formatting,
+                )?;
+                if let Some(only) = &params.context.only {
+                    actions.retain(|action| match action {
+                        CodeActionOrCommand::CodeAction(action) => {
+                            action.kind.as_ref().is_some_and(|kind| {
+                                only.iter().any(|requested| {
+                                    kind == requested
+                                        || kind
+                                            .as_str()
+                                            .strip_prefix(requested.as_str())
+                                            .is_some_and(|suffix| suffix.starts_with('.'))
+                                })
+                            })
+                        }
+                        CodeActionOrCommand::Command(_) => false,
+                    });
+                }
+                (!actions.is_empty()).then_some(actions)
             })
             .flatten())
     }

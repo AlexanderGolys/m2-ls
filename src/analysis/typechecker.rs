@@ -1254,26 +1254,22 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
 
     /// Reports only calls whose known domains are disjoint from every possible
     /// argument type. Missing type or signature facts leave the call unchecked.
-    pub fn call_has_disjoint_domain(
+    pub fn disjoint_call_argument_types(
         &self,
         node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> bool {
+    ) -> Option<Vec<InferredType>> {
         if !node.is_space_application() {
-            return false;
+            return None;
         }
-        let Some(parts) = node.binary_parts() else {
-            return false;
-        };
-        let Some(name) = symbol_node_text(parts.left) else {
-            return false;
-        };
+        let parts = node.binary_parts()?;
+        let name = symbol_node_text(parts.left)?;
         if self
             .analysis
             .is_method_installation_callable(parts.left, source)
         {
-            return false;
+            return None;
         }
         let position = source.position_for_node(node);
         let scope = self.find_scope_at(position).unwrap_or(0);
@@ -1281,7 +1277,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         let indexed_name = ObjectName::new(name);
         let record = if let Some(function) = function {
             if !function.is_method_function() {
-                return false;
+                return None;
             }
             function
                 .indexed_callable
@@ -1292,7 +1288,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
                 .visible_source_binding_from_scope(name, scope, position, knowledge)
                 .is_some()
             {
-                return false;
+                return None;
             }
             knowledge.get_record(&indexed_name)
         };
@@ -1301,7 +1297,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
                 .and_then(|record| record.callable())
                 .is_some_and(|callable| callable.is_method_function())
         {
-            return false;
+            return None;
         }
         let facts =
             self.infer_call_facts_for_callable(parts.right, source, scope, Some(name), knowledge);
@@ -1317,7 +1313,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
                     .local_call_candidate_installations(function, &sequence, position, knowledge)
                     .is_empty()
             }) {
-                return false;
+                return None;
             }
             if let Some(callable) = record.and_then(|record| record.callable()) {
                 let signatures = self.external_dispatch_domains(callable, knowledge);
@@ -1326,14 +1322,14 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
                     .iter()
                     .any(|index| callable.methods[*index].codomain.is_some())
                 {
-                    return false;
+                    return None;
                 }
             }
             let mut result = facts.argument_types[0].clone();
             for argument in &facts.argument_types[1..] {
                 let pair = [result, argument.clone()];
                 if self.method_domain_is_disjoint(function, record, &pair, position, knowledge) {
-                    return true;
+                    return Some(pair.to_vec());
                 }
                 result = if let Some(function) = function {
                     self.resolve_local_call_return_type(function, &pair, position, knowledge)
@@ -1348,9 +1344,10 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
                 }
                 .unwrap_or_else(InferredType::unknown);
             }
-            return false;
+            return None;
         }
         self.method_domain_is_disjoint(function, record, &facts.argument_types, position, knowledge)
+            .then_some(facts.argument_types)
     }
 
     fn method_domain_is_disjoint(

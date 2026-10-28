@@ -3721,7 +3721,8 @@ async fn documentation_markup_marks_delimiters_links_and_option_keys() {
 
 /// Ring variables the program determines reach the client as inline values,
 /// subscripts past a written ring's variables as `E14` errors, and lookups
-/// of names it lacks as `E15` errors.
+/// of names it lacks as `E15` errors, each once: a holder around a
+/// subscript, `(S_6)` or a function body ending in one, adds nothing.
 #[tokio::test]
 async fn ring_subscripts_evaluate_to_inline_values_and_bound_errors() {
     let mut session = DocumentSession::open(concat!(
@@ -3734,6 +3735,8 @@ async fn ring_subscripts_evaluate_to_inline_values_and_bound_errors() {
         "U_1\n",
         "P = RR[p, q_1]\n",
         "(\"q_1\"_P, \"q\"_P)\n",
+        "(S_6)\n",
+        "f = () -> (V := QQ[v]; V_5)\n",
     ))
     .await;
     let values = session
@@ -3772,10 +3775,11 @@ async fn ring_subscripts_evaluate_to_inline_values_and_bound_errors() {
             (2, "S_6 = z".to_string()),
             (4, "T_1 = x_0".to_string()),
             (8, "\"q_1\"_P = q_1".to_string()),
+            (9, "S_6 = z".to_string()),
         ]
     );
 
-    assert_eq!(diagnostic_lines(&session, "E14"), vec![4, 6]);
+    assert_eq!(diagnostic_lines(&session, "E14"), vec![4, 6, 10]);
     assert_eq!(diagnostic_lines(&session, "E15"), vec![8]);
     let messages = session
         .diagnostics()

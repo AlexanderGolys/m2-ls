@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.1.2 - 2026-10-28
+
+- Show inferred argument types in `call-domain-mismatch` (T05) diagnostics,
+  including the failing pair in chained binary method calls.
+- Add a `Fix all in file` code action for fixes and simplifications throughout
+  the document. Overlapping proposals may need another run.
+- Avoid duplicate ring subscript diagnostics and inline values for parenthesized
+  expressions and function bodies.
+- Accept deprecated CLI configuration keys with a warning instead of rejecting
+  the configuration.
+
 ## 2.1.1 - 2026-10-27
 
 - Document highlights on `new`, `of` or `from` light up all the keywords of

@@ -168,6 +168,17 @@ fn usage_and_io_errors_have_distinct_exit_status() {
             .code(),
         Some(2)
     );
+    fs::write(
+        workspace.0.join("settings.json"),
+        r#"{"inlayHints":{"calls":"every"}}"#,
+    )
+    .unwrap();
+    let deprecated = workspace.run(LINT, &["--config", "settings.json", "-"], "1 + 2\n");
+    assert!(deprecated.status.success(), "{deprecated:?}");
+    assert!(
+        String::from_utf8_lossy(&deprecated.stderr).contains("deprecated, read as"),
+        "{deprecated:?}"
+    );
     assert!(workspace.run(FMT, &["--help"], "").status.success());
     assert!(workspace.run(LINT, &["--version"], "").status.success());
 }

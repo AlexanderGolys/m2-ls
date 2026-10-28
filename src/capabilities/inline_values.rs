@@ -28,6 +28,10 @@ pub fn inline_values_response(
         .root_node()
         .descendants()
         .filter_map(|node| {
+            // A holder such as `(S_6)` shares the value of the subscript in it.
+            if node.is_holder() {
+                return None;
+            }
             let node_range = document.range_for_node(node);
             if node_range.start < range.start || range.end < node_range.end {
                 return None;

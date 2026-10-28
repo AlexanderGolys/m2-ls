@@ -416,8 +416,32 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
     .await;
     assert_eq!(
         action_titles(&ordered_actions),
-        ["Simplify unnecessary null branch", "Simplify if condition"]
+        [
+            "Simplify unnecessary null branch",
+            "Simplify if condition",
+            "Fix all in file"
+        ]
     );
+
+    let fix_all = server
+        .request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": workspace.uri},
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 0}
+                },
+                "context": {
+                    "diagnostics": document_diagnostics.iter().take(1).collect::<Vec<_>>(),
+                    "only": ["source.fixAll"]
+                }
+            }),
+        )
+        .await;
+    assert_eq!(action_titles(&fix_all), ["Fix all in file"]);
+    assert_eq!(fix_all[0]["kind"], "source.fixAll");
+    assert!(response_array(&fix_all[0]["edit"]["changes"][&workspace.uri]).len() > 1);
 
     for (needle, title, replacement) in [
         (

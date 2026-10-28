@@ -13,7 +13,7 @@ use crate::document::DocumentSnapshot;
 use crate::node_metadata::SyntaxParser;
 use crate::object_registry::ObjectRegistry;
 use crate::package_index::{InitializationFile, Macaulay2Environment};
-use crate::settings::ServerSettings;
+use crate::settings::{ServerSettings, SettingProblem};
 
 /// The standalone tool to execute.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -265,13 +265,17 @@ impl Options {
         let value =
             serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
         let parsed = ServerSettings::from_value(&value);
-        if !parsed.problems.is_empty() {
-            return Err(parsed
-                .problems
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; "));
+        let listed = parsed
+            .problems
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !parsed.problems.iter().all(SettingProblem::is_deprecated) {
+            return Err(listed);
+        }
+        if !listed.is_empty() {
+            eprintln!("{}: warning: {listed}", path.display());
         }
         Ok(parsed.settings)
     }

@@ -317,6 +317,14 @@ enum SettingIssue {
     Deprecated(&'static str),
 }
 
+impl SettingProblem {
+    /// Whether the value was read, under a deprecated key, rather than
+    /// dropped.
+    pub fn is_deprecated(&self) -> bool {
+        matches!(self.issue, SettingIssue::Deprecated(_))
+    }
+}
+
 impl fmt::Display for SettingProblem {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.issue {

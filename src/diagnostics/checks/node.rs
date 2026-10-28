@@ -243,6 +243,10 @@ fn protected_assignment_target(
 /// not have: a subscript `R_i` past its variables, or a lookup `"v"_R` of a
 /// name none of them has.
 fn ring_variable_selection(context: &NodeContext, sink: &mut DiagnosticSink) {
+    // A holder such as `(R_9)` is reported at the subscript it holds.
+    if context.node.is_holder() {
+        return;
+    }
     let Some(Err(error)) =
         context
             .analysis
@@ -774,16 +778,21 @@ fn install_codomain(context: &NodeContext, sink: &mut DiagnosticSink) {
 }
 
 fn call_domain(context: &NodeContext, sink: &mut DiagnosticSink) {
-    if TypeChecker::new(context.analysis, context.knowledge).call_has_disjoint_domain(
-        context.node,
-        context.source,
-        context.knowledge,
-    ) {
+    if let Some(arguments) = TypeChecker::new(context.analysis, context.knowledge)
+        .disjoint_call_argument_types(context.node, context.source, context.knowledge)
+    {
         sink.spawn(
             &catalog::CALL_DOMAIN_MISMATCH,
             Finding::new(
                 context.node_range(),
-                "No known method domain matches these argument types",
+                format!(
+                    "No known method domain matches these argument types: ({})",
+                    arguments
+                        .iter()
+                        .map(|argument| argument.label().unwrap_or_else(|| "unknown".into()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             ),
         );
     }
@@ -797,6 +806,30 @@ mod tests {
     };
     use crate::document::DocumentSnapshot;
     use crate::object_registry::ObjectRegistry;
+
+    #[test]
+    fn call_domain_mismatch_names_the_failing_argument_types() {
+        let builtins = ObjectRegistry::load(include_str!("../../data/m2-index.jsonl"));
+        for (source, expected) in [
+            ("f = method()\nf ZZ := x -> x\nf \"text\"\n", "(String)"),
+            ("f = method()\nf ZZ := x -> x\nf(1,2)\n", "(ZZ, ZZ)"),
+            (
+                "f = method(Binary => true)\nf(ZZ,ZZ) := List => (x,y) -> {x,y}\nf(1,2,3)\n",
+                "(List, ZZ)",
+            ),
+        ] {
+            let document = DocumentSnapshot::from_text(source.into(), &builtins).unwrap();
+            let diagnostic = document
+                .diagnostics()
+                .iter()
+                .find(|diagnostic| diagnostic.rule.code == catalog::CALL_DOMAIN_MISMATCH.code)
+                .expect("call must have disjoint argument types");
+            assert_eq!(
+                diagnostic.finding.message,
+                format!("No known method domain matches these argument types: {expected}")
+            );
+        }
+    }
 
     #[test]
     fn ring_variables_prefer_indexed_names_over_multicharacter_symbols() {

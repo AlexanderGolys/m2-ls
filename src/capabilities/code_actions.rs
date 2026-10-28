@@ -271,7 +271,7 @@ pub fn available_code_actions(
         diagnostics,
     };
     let options = FormatOptions::from(formatting);
-    let actions: CodeActionResponse = CODE_ACTION_PRODUCERS
+    let mut actions: CodeActionResponse = CODE_ACTION_PRODUCERS
         .iter()
         .filter_map(|produce| produce(&context))
         .chain(suppression_actions(&context))
@@ -285,7 +285,69 @@ pub fn available_code_actions(
         })
         .map(CodeActionOrCommand::CodeAction)
         .collect();
+    if let Some(action) = fix_all_action(document, uri, diagnostics, &options) {
+        actions.push(CodeActionOrCommand::CodeAction(action));
+    }
     (!actions.is_empty()).then_some(actions)
+}
+
+/// Collect the existing fixes and rewrites throughout the document. Prefer
+/// smaller edits when proposals overlap so no edit overwrites another fix.
+fn fix_all_action(
+    document: &DocumentSnapshot,
+    uri: &Url,
+    diagnostics: &[Diagnostic],
+    options: &FormatOptions,
+) -> Option<CodeAction> {
+    let mut edits = Vec::new();
+    for cursor in document.root_node().descendants() {
+        let context = CodeActionContext {
+            document,
+            uri,
+            position: document.position_for_node(cursor),
+            cursor,
+            diagnostics,
+        };
+        for mut action in CODE_ACTION_PRODUCERS
+            .iter()
+            .filter_map(|produce| produce(&context))
+        {
+            if let Some(changes) = action.edit.as_mut().and_then(|edit| edit.changes.as_mut()) {
+                if let Some(proposed) = changes.remove(uri) {
+                    edits.extend(proposed);
+                }
+            }
+        }
+    }
+    edits.sort_by_key(|edit| {
+        let bytes = document.bytes_for_range(edit.range).unwrap();
+        (bytes.len(), bytes.start, edit.new_text.clone())
+    });
+    edits.dedup();
+    let mut compatible: Vec<TextEdit> = Vec::new();
+    for mut edit in edits {
+        if compatible.iter().any(|accepted| {
+            edit.range == accepted.range
+                || (edit.range.start < accepted.range.end && accepted.range.start < edit.range.end)
+        }) {
+            continue;
+        }
+        format_action_edit(document, &mut edit, options);
+        compatible.push(edit);
+    }
+    if compatible.is_empty() {
+        return None;
+    }
+    compatible.sort_by_key(|edit| (edit.range.start, edit.range.end));
+    Some(CodeAction {
+        title: "Fix all in file".into(),
+        kind: Some(CodeActionKind::SOURCE_FIX_ALL),
+        edit: Some(WorkspaceEdit {
+            changes: Some(HashMap::from([(uri.clone(), compatible)])),
+            ..WorkspaceEdit::default()
+        }),
+        ..CodeAction::default()
+    })
 }
 
 /// Quick fixes silencing each m2-ls diagnostic at the cursor with a
@@ -582,6 +644,54 @@ mod tests {
         let root = parser.parse(text).unwrap();
         assert!(!root.has_error(), "{text}");
         format_document_with_options(root, &FormatOptions::from(settings))
+    }
+
+    #[test]
+    fn fix_all_collects_fixes_and_rewrites_across_the_file() {
+        let source = "-- λ 😀\nx.3\ny.4\nif ready then value else null\n";
+        let registry = ObjectRegistry::default();
+        let document = DocumentSnapshot::from_text(source.into(), &registry).unwrap();
+        let uri = Url::parse("file:///test.m2").unwrap();
+        let diagnostics = visible_diagnostics(&document, &uri, &DiagnosticSettings::default());
+        let action = fix_all_action(&document, &uri, &diagnostics, &FormatOptions::default())
+            .expect("file-wide fixes should be offered");
+        assert_eq!(action.kind, Some(CodeActionKind::SOURCE_FIX_ALL));
+        let changes = action.edit.unwrap().changes.unwrap();
+        let edits = &changes[&uri];
+        assert_eq!(edits.len(), 3);
+        assert!(edits
+            .windows(2)
+            .all(|pair| pair[0].range.end <= pair[1].range.start));
+        let mut result = source.to_string();
+        for edit in edits.iter().rev() {
+            result.replace_range(
+                document.bytes_for_range(edit.range).unwrap(),
+                &edit.new_text,
+            );
+        }
+        assert_eq!(result, "-- λ 😀\nx#3\ny#4\nif ready then\n    value\n");
+        let rewritten = DocumentSnapshot::from_text(result, &registry).unwrap();
+        let diagnostics = visible_diagnostics(&rewritten, &uri, &DiagnosticSettings::default());
+        assert!(
+            fix_all_action(&rewritten, &uri, &diagnostics, &FormatOptions::default()).is_none()
+        );
+    }
+
+    #[test]
+    fn fix_all_does_not_include_suppression_comments_or_overlapping_edits() {
+        let source = "if not (left == right) then value else null\n";
+        let document =
+            DocumentSnapshot::from_text(source.into(), &ObjectRegistry::default()).unwrap();
+        let uri = Url::parse("file:///test.m2").unwrap();
+        let diagnostics = visible_diagnostics(&document, &uri, &DiagnosticSettings::default());
+        let action =
+            fix_all_action(&document, &uri, &diagnostics, &FormatOptions::default()).unwrap();
+        let changes = action.edit.unwrap().changes.unwrap();
+        let edits = &changes[&uri];
+        assert!(edits
+            .windows(2)
+            .all(|pair| pair[0].range.end <= pair[1].range.start));
+        assert!(edits.iter().all(|edit| !edit.new_text.contains("m2-ls:")));
     }
 
     #[test]
