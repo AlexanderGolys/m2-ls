@@ -129,12 +129,11 @@ impl DocumentSource {
 
     /// Associates cell-local typed spans with their location in this revision.
     pub fn register_syntax(&mut self, syntax: &SyntaxSnapshot) {
-        use m2_syn::Spanned;
         self.syntax_offsets.clear();
         for cell in syntax.cells() {
-            if let Some(node) = cell.syntax() {
+            if let Some(file) = cell.file() {
                 self.syntax_offsets
-                    .insert(node.span().file(), cell.document_range().start);
+                    .insert(file, cell.document_range().start);
             }
         }
     }
@@ -159,13 +158,13 @@ pub trait SourceNavigation {
     fn syntax_bytes(&self, syntax: &(impl m2_syn::Spanned + ?Sized)) -> Option<ByteRange> {
         let span = syntax.try_span()?;
         let range = span.range()?;
-        let offset = self
-            .source()
-            .syntax_offsets
-            .get(&span.file())
-            .copied()
-            .unwrap_or(0);
+        let offset = self.source().syntax_offsets.get(&span.file()).copied()?;
         Some(offset + range.start..offset + range.end)
+    }
+
+    /// Maps generated syntax directly to an LSP range in this revision.
+    fn range_for_syntax(&self, syntax: &(impl m2_syn::Spanned + ?Sized)) -> Option<TextRange> {
+        Some(self.range_for_bytes(self.syntax_bytes(syntax)?))
     }
 
     /// The original source text.
@@ -374,11 +373,10 @@ pub struct SyntaxNavigation<'a, S: ?Sized> {
 impl<'a, S: SourceNavigation + ?Sized> SyntaxNavigation<'a, S> {
     /// Associates a source navigator with the cell offsets of this syntax revision.
     pub fn new(original: &'a S, snapshot: &SyntaxSnapshot) -> Self {
-        use m2_syn::Spanned;
         let offsets = snapshot
             .cells()
             .iter()
-            .filter_map(|cell| Some((cell.syntax()?.span().file(), cell.document_range().start)))
+            .filter_map(|cell| Some((cell.file()?, cell.document_range().start)))
             .collect();
         Self { original, offsets }
     }
@@ -391,7 +389,7 @@ impl<S: SourceNavigation + ?Sized> SourceNavigation for SyntaxNavigation<'_, S> 
     fn syntax_bytes(&self, syntax: &(impl m2_syn::Spanned + ?Sized)) -> Option<ByteRange> {
         let span = syntax.try_span()?;
         let range = span.range()?;
-        let offset = self.offsets.get(&span.file()).copied().unwrap_or(0);
+        let offset = self.offsets.get(&span.file()).copied()?;
         Some(offset + range.start..offset + range.end)
     }
 }
@@ -399,6 +397,48 @@ impl<S: SourceNavigation + ?Sized> SourceNavigation for SyntaxNavigation<'_, S> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_coordinates_require_registered_provenance() {
+        let snapshot = SyntaxSnapshot::parse("x = 1\n", None);
+        let cell = snapshot.cells()[0].syntax().unwrap();
+        let mut source = DocumentSource::new(snapshot.source().to_owned());
+        assert!(source.syntax_bytes(cell).is_none());
+        source.register_syntax(&snapshot);
+        assert_eq!(source.syntax_bytes(cell), Some(0..6));
+        let foreign = SyntaxSnapshot::parse("x = 1\n", None);
+        assert!(source
+            .syntax_bytes(foreign.cells()[0].syntax().unwrap())
+            .is_none());
+    }
+
+    #[test]
+    fn comment_and_failed_cell_provenance_survives_relocation() {
+        use m2_syn::Spanned;
+        let before = SyntaxSnapshot::parse("a = 1\n-- comment\ns = \"bad\\q\"\n", None);
+        let after = SyntaxSnapshot::parse("a = 12345\n-- comment\ns = \"bad\\q\"\n", Some(&before));
+        let mut source = DocumentSource::new(after.source().to_owned());
+        source.register_syntax(&after);
+        let mut diagnostics = 0;
+        for cell in after.cells() {
+            for trivia in cell.trivia() {
+                let local = trivia.span().range().unwrap();
+                let offset = cell.document_range().start;
+                assert_eq!(
+                    source.syntax_bytes(trivia),
+                    Some(offset + local.start..offset + local.end)
+                );
+            }
+            for error in cell.lexer_diagnostics() {
+                diagnostics += 1;
+                assert_eq!(
+                    source.syntax_offsets.get(&error.span().file()),
+                    Some(&cell.document_range().start)
+                );
+            }
+        }
+        assert_eq!(diagnostics, 1);
+    }
 
     #[test]
     fn navigation_converts_utf8_bytes_and_utf16_positions_both_ways() {

@@ -468,10 +468,7 @@ impl<'tree, 'source, Source: SourceNavigation + ?Sized> TypedWalker<'tree, 'sour
 
     /// The source range of typed syntax; `None` when it has no source bytes.
     fn range_of(&self, syntax: &(impl Spanned + ?Sized)) -> Option<TextRange> {
-        Some(
-            self.source
-                .range_for_bytes(self.source.syntax_bytes(syntax)?),
-        )
+        self.source.range_for_syntax(syntax)
     }
 
     /// Runs `visit` with `syntax` as the definition site of the bindings found.

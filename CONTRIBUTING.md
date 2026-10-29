@@ -28,8 +28,16 @@ src/
   data/m2-index.schema.json  wire format of the external builtin corpus
 ```
 
-Analysis runs first and records what it learns on syntax nodes; the modules in
-`capabilities/` read those facts rather than re-deriving them. Treat every
+Macaulay2 parsing goes through the released `m2-syn` API using its native
+parser. Each retained cell owns its generated `Cell` directly; unchanged cells
+share their allocation across document revisions. Typed spans map to the current
+revision through `SourceNavigation`, including comments and failed cells.
+
+Analysis runs first and records semantic facts; the modules in `capabilities/`
+read those facts rather than re-deriving them. New typed operations should read
+generated fields and use focused extension traits. Option, property, and quoted
+symbol roles follow this pattern; other existing operations still use the
+navigation adapter during migration. Treat every
 `target/` directory as build output.
 
 ## Development
@@ -51,7 +59,7 @@ cargo package --allow-dirty
 
 The build is expected to be warning-free. For LSP behavior changes, also test
 through an editor client when practical. Non-ASCII text matters: LSP positions
-are UTF-16, while Tree-sitter positions are byte-based.
+are UTF-16, while parser spans use byte offsets.
 
 ## Builtin metadata
 

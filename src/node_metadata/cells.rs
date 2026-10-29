@@ -1,10 +1,8 @@
 //! Document-owned cell parses and immutable syntax revisions.
 
 use m2_syn::{
-    frame_recovering, lex_str_recovering,
-    nodes::{Cell, SourceFile},
-    CellStream, CellTokenStream, CommentTrivia, LexError, NativeParseError, NativeParser, Parser,
-    Spanned, Token, Trivia,
+    frame_recovering, lex_str_recovering, nodes::Cell, CellStream, CellTokenStream, CommentTrivia,
+    File, LexError, NativeParseError, NativeParser, Parser, Spanned, Token, Trivia,
 };
 use serde_json::json;
 use std::sync::{
@@ -37,8 +35,10 @@ struct CellData {
     id: CellId,
     /// Original UTF-8 source bytes retained for this cell or document snapshot.
     source: Arc<str>,
-    /// Source-file parse result for this independently framed cell.
-    syntax: Option<SourceFile>,
+    /// Independently owned generated cell, without a source-file wrapper.
+    syntax: Option<Cell>,
+    /// Source identity shared by the cell syntax, trivia, and lexical diagnostics.
+    file: Option<File>,
     /// Comments retained alongside the cell parse.
     trivia: Vec<Trivia>,
     /// Recoverable and fatal lexical errors for this cell.
@@ -60,9 +60,9 @@ impl ParsedCell {
     pub fn document_range(&self) -> Range<usize> {
         self.range.clone()
     }
-    /// First generated cell in the retained parse result, absent for comment-only or invalid source.
+    /// Generated cell, absent for comment-only or invalid source.
     pub fn syntax(&self) -> Option<&Cell> {
-        self.data.syntax.as_ref()?.cells.first()
+        self.data.syntax.as_ref()
     }
     /// Comments retained alongside the cell, including when its code fails to parse.
     pub fn trivia(&self) -> &[Trivia] {
@@ -77,6 +77,11 @@ impl ParsedCell {
         self.data.parse_error.as_ref()
     }
 
+    /// Source identity used to relocate the retained cell's spans.
+    pub fn file(&self) -> Option<File> {
+        self.data.file
+    }
+
     /// Parses this framed source interval and retains lexical trivia even if grammar parsing fails.
     fn parse(source: &str, range: Range<usize>) -> Self {
         let _timing = Timing::start(
@@ -87,12 +92,14 @@ impl ParsedCell {
             id: CellId(NEXT_CELL_ID.fetch_add(1, Ordering::Relaxed)),
             source: Arc::from(source),
             syntax: None,
+            file: None,
             trivia: Vec::new(),
             lexer_diagnostics: Vec::new(),
             parse_error: None,
         };
         match lex_str_recovering(source) {
             Ok(recovered) => {
+                data.file = recovered.value.try_span().map(|span| span.file());
                 let comments = CommentTrivia::of(&recovered.value);
                 data.trivia = comments
                     .outer()
@@ -100,16 +107,32 @@ impl ParsedCell {
                     .chain(comments.inner())
                     .cloned()
                     .collect();
+                data.file = data
+                    .file
+                    .or_else(|| data.trivia.first()?.try_span().map(|span| span.file()));
                 data.lexer_diagnostics = recovered.diagnostics;
                 let framed = frame_recovering(recovered.value);
                 let cells =
                     CellStream::from_cells(framed.cells.into_iter().chain(framed.incomplete));
                 match NativeParser.parse_cells(cells) {
-                    Ok(syntax) => data.syntax = Some(syntax),
+                    Ok(syntax) => {
+                        let mut cells = syntax.cells.into_iter();
+                        data.syntax = cells.next();
+                        assert!(
+                            cells.next().is_none(),
+                            "a framed source slice must contain at most one cell"
+                        );
+                        if let Some(cell) = &data.syntax {
+                            data.file = Some(cell.span().file());
+                        }
+                    }
                     Err(error) => data.parse_error = Some(error),
                 }
             }
-            Err(error) => data.lexer_diagnostics.push(error),
+            Err(error) => {
+                data.file = Some(error.span().file());
+                data.lexer_diagnostics.push(error);
+            }
         }
         Self {
             range,
@@ -143,7 +166,7 @@ impl SyntaxSnapshot {
         &self.changed
     }
 
-    /// Parses this framed source interval and retains lexical trivia even if grammar parsing fails.
+    /// Frames changed source regions and shares unaffected cell allocations with the previous revision.
     pub fn parse(source: &str, previous: Option<&Self>) -> Self {
         let mut prefix = 0;
         let mut old_end = 0;

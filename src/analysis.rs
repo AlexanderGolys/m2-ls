@@ -14,6 +14,7 @@ use crate::node_metadata::TypedSource;
 mod first_pass;
 mod known_value;
 mod ring;
+mod syntax_roles;
 mod typechecker;
 
 pub use ring::RingVariableError;
@@ -26,10 +27,11 @@ use m2_syn::nodes::{
     Symbol, ThenClause,
 };
 use m2_syn::visit::{self, Visit};
-use m2_syn::Token;
+use m2_syn::{Spanned, Token};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::ops::Deref;
+use syntax_roles::{PropertyAccess, QuotedName};
 use tower_lsp::lsp_types::{Position, Range as TextRange, SymbolKind};
 
 use crate::builtin_index::{CallableKind, CallableOption, MethodSignature, OptionPassing, Record};
@@ -1571,33 +1573,7 @@ impl Analysis {
         }
     }
 
-    /// A quote yields its operand as a `Symbol` instead of evaluating it, so the
-    /// quoted name reads as a symbol regardless of what it is bound to.
-    fn record_quoted_symbol_role(
-        &mut self,
-        node: SyntaxNode,
-        source: &(impl SourceNavigation + ?Sized),
-    ) {
-        if !node.is::<QuoteExpression>() {
-            return;
-        }
-        if let Some(quoted) = node.quoted_symbol() {
-            self.register_source_semantic_role(
-                source.range_for_node(quoted),
-                SourceSemanticRole::QuotedSymbol,
-            );
-        }
-    }
-
-    /// Registers option key in the current semantic index.
-    fn register_option_key(&mut self, key: SyntaxNode, source: &(impl SourceNavigation + ?Sized)) {
-        self.register_source_semantic_role(
-            source.range_for_node(key),
-            SourceSemanticRole::OptionKey,
-        );
-    }
-
-    /// Records namespace role for later semantic or editor queries.
+    /// Marks literal package names and loaded-file paths for namespace highlighting.
     fn record_namespace_role(
         &mut self,
         node: SyntaxNode,
@@ -3015,27 +2991,17 @@ where
     Source: SourceNavigation + ?Sized,
     Knowledge: PositionedTypeKnowledge + ?Sized,
 {
-    /// Registers option in the current semantic index.
-    fn register_option(&mut self, node: &OptionExpression) {
-        let Some(expression) = self.root.related(node) else {
-            return;
-        };
-        let Some(left) = expression.binary_parts().map(|parts| parts.left) else {
-            return;
-        };
-        self.analysis.register_option_key(left, self.source);
+    /// Records a role using the generated syntax's own source span.
+    fn register_role(&mut self, syntax: &(impl Spanned + ?Sized), role: SourceSemanticRole) {
+        if let Some(range) = self.source.range_for_syntax(syntax) {
+            self.analysis.register_source_semantic_role(range, role);
+        }
     }
 
-    /// Registers property in the current semantic index.
-    fn register_property(&mut self, node: &(impl crate::node_metadata::SyntaxType + ?Sized)) {
-        let Some(expression) = self.root.related(node) else {
-            return;
-        };
-        if let Some(property) = expression.property_key() {
-            self.analysis.register_source_semantic_role(
-                self.source.range_for_node(property),
-                SourceSemanticRole::PropertyKey,
-            );
+    /// Records property keys without reconstructing navigation nodes.
+    fn register_property(&mut self, node: &impl PropertyAccess) {
+        if let Some(property) = node.property_key() {
+            self.register_role(property, SourceSemanticRole::PropertyKey);
         }
     }
 
@@ -3061,7 +3027,7 @@ where
     Knowledge: PositionedTypeKnowledge + ?Sized,
 {
     fn visit_expr_option(&mut self, node: &'ast OptionExpression) {
-        self.register_option(node);
+        self.register_role(node.key.as_ref(), SourceSemanticRole::OptionKey);
         visit::visit_expr_option(self, node);
     }
 
@@ -3081,9 +3047,7 @@ where
     }
 
     fn visit_expr_quote(&mut self, node: &'ast QuoteExpression) {
-        if let Some(quote) = self.root.related(node) {
-            self.analysis.record_quoted_symbol_role(quote, self.source);
-        }
+        self.register_role(node.quoted_name(), SourceSemanticRole::QuotedSymbol);
         visit::visit_expr_quote(self, node);
     }
 
