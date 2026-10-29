@@ -1,12 +1,12 @@
 [package]
 name = "m2-ls"
-version = "2.1.2"
+version = "2.2.0"
 authors = ["Alexander Golys <alexandergolys@gmail.com>"]
 description = "Language server for Macaulay2"
 edition = "2021"
 default-run = "m2-ls"
 rust-version = "1.88"
-license = "(MIT OR Apache-2.0) AND (GPL-2.0-only OR GPL-3.0-only)"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/AlexanderGolys/m2-ls"
 readme = "README.md"
 keywords = ["macaulay2", "lsp", "language-server", "parser"]
@@ -22,8 +22,24 @@ dashmap = "5"
 self_cell = "1.3.0"
 m2-syn = { version = "0.7.0", default-features = false }
 tree-sitter = "0.26.9"
+# 0.1.8 raises the compiler requirement above this crate's Rust 1.88 floor.
+tree-sitter-language = ">=0.1.0, <0.1.8"
 tree-sitter-md = { version = "0.5.3", features = ["parser"] }
 ropey = "1.6.1"
 serde_path_to_error = "0.1"
 strum = { version = "0.28.0", features = ["derive"] }
-these-macros-should-be-illegal = "0.12.0"
+these-macros-should-be-illegal = "0.12.2"
+sha2 = "0.10"
+tempfile = "3"
+ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
+pathdiff = "0.2.3"
+walkdir = "2.5.0"
+same-file = "1.0.6"
+
+[lints.rust]
+missing_docs = "deny"
+
+[lints.clippy]
+# Attribute forwarding must remain in item position inside doctests.
+needless_doctest_main = "allow"
+missing_docs_in_private_items = "deny"

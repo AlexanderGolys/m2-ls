@@ -1,5 +1,6 @@
 //! The occasions on which diagnostics are spawned from a completed analysis:
-//! each syntax node, each method installation, and the whole document.
+//! each syntax node, each method installation, and the whole document; and,
+//! once the document is published, its location on disk.
 //!
 //! Each occasion has a module whose `spawn` runs that occasion's checks. A
 //! check inspects what its occasion provides and spawns the diagnostics it
@@ -9,41 +10,55 @@ use crate::node_metadata::TypedSource;
 mod document;
 mod documentation;
 mod installation;
+mod location;
 mod node;
 
-use tower_lsp::lsp_types::Range as TextRange;
+use tower_lsp::lsp_types::{Range as TextRange, Url};
 
 use super::{DiagnosticRule, Finding, M2Diagnostic};
 use crate::analysis::{Analysis, MethodInstallation};
+use crate::document::DocumentSnapshot;
 use crate::node_metadata::{visit_source_nodes, SyntaxNode};
 use crate::object_registry::{ObjectRegistry, ObjectRegistryView};
 use crate::package_documentation::PackageDocumentation;
+use crate::package_index::SourceResolver;
 use crate::source::{DocumentSource, SourceNavigation};
 use crate::source_package::SourcePackages;
 
 /// What the node occasion provides: the node, the analysis of its document,
 /// and the source and the type knowledge positioned at the node.
 struct NodeContext<'context, 'tree> {
+    /// Whether this document is analyzed as library implementation code.
     primary_code: bool,
+    /// Semantic facts for the current document snapshot.
     analysis: &'context Analysis,
+    /// Syntax supplying this item's source and structure.
     node: SyntaxNode<'tree>,
+    /// Source data supplying text and coordinate conversions.
     source: &'context DocumentSource,
+    /// Positioned object and type facts available to this request.
     knowledge: &'context ObjectRegistryView<'context>,
 }
 
 /// What the installation occasion provides: the installation, the analysis
 /// that characterized it, and the type knowledge positioned at it.
 struct InstallationContext<'context> {
+    /// Semantic facts for the current document snapshot.
     analysis: &'context Analysis,
+    /// Method installation characterized by this item.
     installation: &'context MethodInstallation,
+    /// Positioned object and type facts available to this request.
     knowledge: &'context ObjectRegistryView<'context>,
 }
 
 /// What the document occasion provides: the analysis, the syntax root, and the
 /// source of the document.
 struct DocumentContext<'context, 'tree> {
+    /// Semantic facts for the current document snapshot.
     analysis: &'context Analysis,
+    /// Document syntax root used for navigation within this revision.
     root: SyntaxNode<'tree>,
+    /// Source data supplying text and coordinate conversions.
     source: &'context DocumentSource,
 }
 
@@ -51,17 +66,35 @@ struct DocumentContext<'context, 'tree> {
 /// document writes, the packages it declares, the syntax and source it is
 /// written in, and the knowledge of the packages the document loads.
 struct DocumentationContext<'context, 'tree> {
+    /// Documentation extracted from the current document or selected object.
     documentation: &'context PackageDocumentation,
+    /// Package declarations and imports visible to this operation.
     packages: &'context SourcePackages,
+    /// Document syntax root used for navigation within this revision.
     root: SyntaxNode<'tree>,
+    /// Parsed syntax backing this item, when available.
     syntax: Option<&'context TypedSource>,
+    /// Source data supplying text and coordinate conversions.
     source: &'context DocumentSource,
+    /// Positioned object and type facts available to this request.
     knowledge: &'context ObjectRegistry,
+}
+
+/// What the location occasion provides: the document, where it is, and where
+/// Macaulay2 looks for the files it names.
+struct LocationContext<'context> {
+    /// Immutable document snapshot being queried.
+    document: &'context DocumentSnapshot,
+    /// Document location associated with the request.
+    uri: &'context Url,
+    /// Candidate providers or source resolver supplying this operation.
+    sources: &'context SourceResolver,
 }
 
 /// The diagnostics spawned for one document, in the order they were found.
 #[derive(Debug, Default)]
 struct DiagnosticSink {
+    /// Findings associated with this request or collected by this pass.
     diagnostics: Vec<M2Diagnostic>,
 }
 
@@ -77,16 +110,25 @@ impl DiagnosticSink {
 /// document, then on the package documentation it writes.
 /// Shared semantic inputs, all derived from the same retained syntax snapshot.
 pub struct DiagnosticInputs<'a> {
+    /// Whether this document is analyzed as library implementation code.
     pub primary_code: bool,
+    /// Semantic facts for the current document snapshot.
     pub analysis: &'a Analysis,
+    /// Document syntax root used for navigation within this revision.
     pub root: SyntaxNode<'a>,
+    /// Parsed syntax backing this item, when available.
     pub syntax: Option<&'a TypedSource>,
+    /// Source data supplying text and coordinate conversions.
     pub source: &'a DocumentSource,
+    /// Positioned object and type facts available to this request.
     pub knowledge: &'a ObjectRegistry,
+    /// Package declarations and imports visible to this operation.
     pub packages: &'a SourcePackages,
+    /// Documentation extracted from the current document or selected object.
     pub documentation: &'a PackageDocumentation,
 }
 
+/// Runs the selected syntax, installation, document, and documentation checks in deterministic source order.
 pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
     let DiagnosticInputs {
         primary_code,
@@ -155,6 +197,25 @@ pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
     sink.diagnostics
 }
 
+/// Every diagnostic that depends on where the document at `uri` is: the
+/// files it names that `sources` and the disk cannot provide.
+pub fn collect_located(
+    document: &DocumentSnapshot,
+    uri: &Url,
+    sources: &SourceResolver,
+) -> Vec<M2Diagnostic> {
+    let mut sink = DiagnosticSink::default();
+    location::spawn(
+        &LocationContext {
+            document,
+            uri,
+            sources,
+        },
+        &mut sink,
+    );
+    sink.diagnostics
+}
+
 impl NodeContext<'_, '_> {
     /// The span of the node under inspection.
     fn node_range(&self) -> TextRange {
@@ -193,7 +254,7 @@ mod tests {
     /// `<-` domain, but nothing ever calls those methods.
     #[test]
     fn left_arrow_methods_take_effect_only_for_one_non_symbol_type() {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let findings = |installation: &str| {
             installation_findings(
                 &builtins,
@@ -222,7 +283,7 @@ mod tests {
     /// parts store, and operator or method targets install, all in one statement.
     #[test]
     fn parallel_assignment_targets_are_assigned_component_wise() {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let findings = |source: &str| installation_findings(&builtins, source);
 
         assert_eq!(
@@ -251,7 +312,7 @@ mod tests {
     /// The related notes, as start line and message, of each finding of `rule`
     /// in `source`, checked against the real builtin catalog.
     fn notes_of(rule: &DiagnosticRule, source: &str) -> Vec<Vec<(u32, String)>> {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = DocumentSnapshot::from_text(source.to_string(), &builtins)
             .expect("fixture should parse");
         document

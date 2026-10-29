@@ -27,7 +27,8 @@ sizeLabel = L -> (
   call.
 - **Move around by meaning.** Jump to definitions in your workspace or in the
   installed Macaulay2 library, find references, and rename a binding without
-  touching an unrelated one that shares its name.
+  touching an unrelated one that shares its name. `load` paths open on a
+  click, complete as you type, and follow files you move.
 - **Catch Macaulay2-specific mistakes early.** Non-Boolean conditions, `=` where a
   method installation needs `:=`, installs on non-flexible operators, mismatched
   parallel assignments, and more, several with a quick fix.
@@ -43,12 +44,46 @@ rather than guess.
 
 ## Install
 
+From a checkout, install the tools and automatically prepare the catalog:
+
+```sh
+./install.sh
+```
+
+The installer forwards options such as `--root /path/to/install` to
+`cargo install`, then runs the installed `m2-ls --download-catalog`.
+It downloads the catalog unless the latest one is already cached.
+
+You can also install directly from crates.io:
+
 ```sh
 cargo install m2-ls
 ```
 
-Requires Rust 1.88 or newer. Macaulay2 itself is optional: the builtin
-catalog ships with the server.
+Requires Rust 1.88 or newer. Macaulay2 itself is optional. Plain `cargo install`
+has no post-install hook, so this route prepares the catalog on first use.
+`m2-ls` and `m2-lint` download the builtin catalog from the latest
+[M2Book](https://github.com/AlexanderGolys/M2Book/releases) release over HTTPS
+and verify it against the SHA-256 checksum published with it. Later starts use
+the cached copy and work offline. The server checks for a new M2Book release in
+the background and uses its catalog from the next start; upgrading the server
+itself reuses the cache.
+`m2-fmt` does not need the catalog or network access.
+
+To download the catalog before opening your editor, run:
+
+```sh
+m2-ls --download-catalog
+```
+
+This prints the catalog's local path, downloading it only when M2Book has
+published a newer one.
+
+The catalog is stored under `$XDG_CACHE_HOME/m2-ls` (normally
+`~/.cache/m2-ls`) on Linux, `~/Library/Caches/m2-ls` on macOS, and
+`%LOCALAPPDATA%/m2-ls` on Windows. For offline installation or a custom catalog,
+set `M2_LS_CATALOG` to an existing JSONL file; this bypasses downloading and
+cache writes. Neither M2Book nor Macaulay2 is needed to download or use it.
 
 ## Command-line tools
 
@@ -100,6 +135,10 @@ it can find them; point `sources.paths` at an installation it does not find.
 Packages you write are read from source: importing `P` whose `P.m2` sits next
 to the importing file makes only the names `P` exports visible, and the code of
 each `TEST` block is analyzed like the session `check` runs it in.
+Workspace indexing follows opened files and user-package dependencies instead
+of scanning entire folders. Installed packages use the precomputed catalog;
+opening their source does not index their dependency trees. Core source opens
+in `primaryCode` mode, without automatic imports of prelude packages.
 
 ## Configuration
 
@@ -123,9 +162,11 @@ Every setting is optional and applies without a restart. Send them under the
 | `diagnostics.warningsAsHint`, `diagnostics.warningsAsInfo` | `[]` | Shows these rules' warnings as hints or information instead. |
 | `formatting.indent`, `formatting.useTabs` | See source | Indentation used by the formatter. |
 | `formatting.softLineWidth`, `formatting.hardLineWidth` | See source | Preferred and forced wrapping widths; `0` disables. |
-| `formatting.controlFlowLayout` | See source | `compact`, `multiline`, or `multilineCompactElse`. |
+| `formatting.controlFlowLayout` | See source | `compact`, `multiline`, `multilineCompactElse`, or `leadingKeywords` (`then` and `else` start lines under their `if`). |
 | `formatting.compactFactorOperators` | See source | `2*x` instead of `2 * x`. |
 | `formatting.breakAfterSemicolon` | See source | Starts the next statement on a new line. |
+| `formatting.keepLineBreaks` | `false` | Keeps every line break as written; only spacing and indentation change. |
+| `formatting.spaceInBraces` | `null` | `{ b }` when `true`, `{b}` when `false`, as written when `null`. |
 | `inlayHints.afterCall` | `false` | After each call with bracketed arguments, `f(x)`, `f()` or `f(x, y)` (not `f x`): the type it returns. |
 | `inlayHints.afterLineEnd` | `true` | At each line end: the type of the last expression complete on it, so `2+` shows `2` and the next line `2` shows `2+2`. |
 | `inlayHints.afterCell` | `true` | After each top-level value, as Macaulay2's `oN : T` line. |
@@ -148,6 +189,7 @@ Every setting is optional and applies without a restart. Send them under the
 | `semanticTokens.defaultLibrary` | `"CompiledFunction"` | Selects which bindings carry `defaultLibrary`; accepts a policy name or an array of package names. |
 | `sources.enabled` | `true` | Lets navigation enter the Macaulay2 library source. |
 | `sources.paths` | `[]` | Extra places to find it: an `M2` executable, an installation prefix (a build tree's `usr-dist` included), or a directory to add to Macaulay2's `path`. |
+| `sources.primaryCodePaths` | `[]` | Directories whose files implement the library itself, analyzed as if each declared `-- m2-ls: primaryCode`; the discovered Core sources are included automatically. |
 
 The 2.0.0 inlay hint keys are deprecated but still read, with a warning:
 `expressionTypes` as `everywhere`, `allKnownTypes` as `everywhere` with
@@ -240,7 +282,9 @@ error (`E13`); assigning to a local that shadows it remains allowed.
 For files implementing the library itself, such as Core, add the file property
 `-- m2-ls: primaryCode` in a line comment. These files start without prelude
 imports and allow definitions of protected symbols, without `readonly`
-highlighting. Explicit package imports still take effect in source order.
+highlighting. Files in the discovered Core sources and in
+`sources.primaryCodePaths` get this mode without the comment, and a
+`protected-assignment` error offers adding it as a quick fix. Explicit package imports still take effect in source order.
 Removing the property restores normal session analysis. TEST blocks and
 documentation examples continue to use their separate session environments.
 
@@ -280,9 +324,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 The server source code is dual licensed under [MIT](LICENSE-MIT) or
 [Apache 2.0](LICENSE-APACHE), at your option.
 
-The builtin catalog `src/data/m2-index.jsonl` is derived from the Macaulay2
-documentation and is distributed under the GNU General Public License, version 2
-or version 3 ([GPL-2.0](LICENSE-GPL-2.0), [GPL-3.0](LICENSE-GPL-3.0)), following
-Macaulay2's own terms. Documentation of individual Macaulay2 packages remains
-under the terms chosen by their authors. Because the catalog is embedded in the
-`m2-ls` executable, distributed binaries are also subject to the GPL.
+The builtin catalog is downloaded separately and is not included in this crate
+or its executables. It contains documentation and source excerpts from
+Macaulay2, copyright The Macaulay2 Authors, under their
+[GPL version 2 or version 3 terms](https://macaulay2.com/doc/Macaulay2/share/doc/Macaulay2/Macaulay2Doc/html/___Copyright_spand_splicense.html).
+Individual packages retain their authors' copyright notices and licenses.
+Downloading and displaying this material does not change its license.

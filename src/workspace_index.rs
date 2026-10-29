@@ -11,8 +11,11 @@
 //! lands in the package's private dictionary: the files of the package see it,
 //! everyone else sees only the names the package exports. A file belongs to a
 //! package by declaring it, or by being loaded from inside its section.
+//!
+//! Init files are the other exception: the globals of one are known only in
+//! the documents whose sessions start with it.
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -22,20 +25,26 @@ use tower_lsp::lsp_types::{Location, Position, Range as TextRange, Url};
 use crate::analysis::AssignmentFactKind;
 use crate::capabilities::document_symbols::{collect_workspace_symbols, WorkspaceSourceSymbol};
 use crate::document::DocumentSnapshot;
+use crate::file_load::FileLoad;
 use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::package_documentation::DocumentedSubject;
-use crate::package_index::collect_loaded_files_in_tree;
 use crate::semantic_token::{
     local_symbol_semantic_token, M2SemanticToken, M2SemanticTokenModifier, M2SemanticTokenType,
 };
-use crate::source::SourceNavigation;
 use crate::source_package::{ExportAccess, PackageDeclaration, PackageExport};
 
+/// Where one global is bound at the top level of an indexed file, with what
+/// requests about it answer.
 #[derive(Debug, Clone)]
 struct DefLocation {
+    /// The file.
     uri: Url,
+    /// The assignment binding the name.
     range: TextRange,
+    /// How the name is highlighted where other files use it.
     semantic_token: M2SemanticToken,
+    /// Whether this is where the name is declared, its first binding; later
+    /// assignments only rebind it.
     is_declaration: bool,
     /// The statement defining the name, as written, when it is more than
     /// the name.
@@ -44,15 +53,24 @@ struct DefLocation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImplementationKind {
+    /// A function bound to a name: `f = x -> …`.
     Lambda,
+    /// A method installation: `f ZZ := …`.
     Method,
 }
 
+/// Where one implementation of a global function is, at the top level of an
+/// indexed file.
 #[derive(Debug, Clone)]
 struct ImplementationLocation {
+    /// The file.
     uri: Url,
+    /// The assignment installing or binding it.
     range: TextRange,
+    /// Whether it is a bound function or a method installation.
     kind: ImplementationKind,
+    /// Whether it takes effect only once another file declares the name a
+    /// method, as an installation on a name not yet a method there does.
     requires_declaration: bool,
 }
 
@@ -63,6 +81,7 @@ struct IndexedExport {
     file: Url,
     /// The exporting package.
     package: ObjectName,
+    /// The export, with the global it names.
     export: PackageExport,
 }
 
@@ -70,6 +89,7 @@ struct IndexedExport {
 /// its keys documents.
 #[derive(Debug, Clone)]
 struct IndexedPage {
+    /// The file writing the page.
     file: Url,
     /// The key documenting the name.
     key: DocumentedSubject,
@@ -128,15 +148,20 @@ pub trait WorkspaceDocumentationKnowledge {
     fn declaration_code(&self, name: &str, exclude: &Url) -> Option<String>;
 }
 
+/// The source symbols of the workspace, for workspace symbol search.
 pub trait WorkspaceSymbolKnowledge {
+    /// Every symbol whose name matches `query`.
     fn matching_symbols(&self, query: &str) -> Vec<WorkspaceSourceSymbol>;
 }
 
 /// The method implementations of the workspace. `exclude` is the requesting
 /// document: its analysis answers for its own implementations.
 pub trait WorkspaceImplementationKnowledge {
+    /// Where the global function `name` is implemented as `kind`, outside
+    /// `exclude`.
     fn implementations(&self, name: &str, kind: ImplementationKind, exclude: &Url)
         -> Vec<Location>;
+    /// Whether a file other than `exclude` declares `name` a method.
     fn has_method_declaration(&self, name: &str, exclude: &Url) -> bool;
 }
 
@@ -164,10 +189,18 @@ impl<T: WorkspaceSymbolKnowledge + ?Sized> WorkspaceSymbolKnowledge for Arc<T> {
 /// The global definitions of the workspace. `exclude` is the requesting
 /// document: its analysis answers for its own definitions.
 pub trait WorkspaceDefinitionKnowledge {
+    /// Where the global `name` that `exclude` sees is declared, its first
+    /// binding in each file.
     fn declarations(&self, name: &str, exclude: &Url) -> Vec<Location>;
+    /// Every binding of the global `name` that `exclude` sees.
     fn definitions(&self, name: &str, exclude: &Url) -> Vec<Location>;
+    /// Where the type `name` that `exclude` sees is defined.
     fn type_definitions(&self, name: &str, exclude: &Url) -> Vec<Location>;
+    /// Whether `exclude` sees a global `name` defined elsewhere in the
+    /// workspace.
     fn is_defined(&self, name: &str, exclude: &Url) -> bool;
+    /// How `exclude` highlights the global `name` defined elsewhere in the
+    /// workspace.
     fn semantic_token(&self, name: &str, exclude: &Url) -> Option<M2SemanticToken>;
     /// Whether a package of the workspace exports `name` as protected from
     /// assignment by the sessions loading it.
@@ -218,20 +251,38 @@ impl<T: WorkspaceDefinitionKnowledge + ?Sized> WorkspaceDefinitionKnowledge for 
 /// they load and the user packages they import, from disk.
 #[derive(Debug, Default)]
 pub struct WorkspaceIndex {
+    /// The top-level bindings of every indexed file, by name.
     definitions_by_name: DashMap<ObjectName, Vec<DefLocation>>,
+    /// The bound functions and method installations of every indexed file, by
+    /// function name.
     implementations_by_name: DashMap<ObjectName, Vec<ImplementationLocation>>,
+    /// Where each name is declared a method with `method()`.
     method_declarations_by_name: DashMap<ObjectName, Vec<Location>>,
+    /// The documentation pages of every indexed file, by the name they
+    /// document.
     pages_by_name: DashMap<ObjectName, Vec<IndexedPage>>,
+    /// The names each indexed file contributes to the tables above, for
+    /// removing them again.
     names_by_file: DashMap<Url, Vec<ObjectName>>,
+    /// The source symbols of each indexed file, for workspace symbol search.
     symbols_by_file: DashMap<Url, Vec<WorkspaceSourceSymbol>>,
     /// Every indexed file, mapped to the files it loads and the user packages
     /// it imports.
     loads_by_file: DashMap<Url, Vec<Url>>,
+    /// The `load`/`needs`/`input` calls of each indexed file, whether or not
+    /// the files they name exist.
+    file_loads_by_file: DashMap<Url, Vec<FileLoad>>,
     /// The packages each indexed file declares.
     declared_packages_by_file: DashMap<Url, Vec<PackageDeclaration>>,
     /// The package a file belongs to because it is loaded from inside the
     /// package's section.
     package_of_loaded_file: DashMap<Url, ObjectName>,
+    /// The indexed files sessions start with, whose globals only those
+    /// sessions see.
+    init_files: DashSet<Url>,
+    /// The init file each indexed document's session starts with.
+    init_file_of_document: DashMap<Url, Url>,
+    /// Whether files outside a package see only its exports.
     privacy: PackagePrivacy,
 }
 
@@ -267,6 +318,18 @@ impl WorkspaceIndex {
     /// wave of newly discovered files is parsed in parallel; files already
     /// indexed keep their facts.
     pub fn index_files_from_disk(&self, files: Vec<Url>, knowledge_provider: &ObjectRegistry) {
+        self.index_files_from_disk_where(files, knowledge_provider, |_| true);
+    }
+
+    /// Index disk dependencies accepted by `should_index`, checking every
+    /// transitive dependency before reading it. The workspace uses this to
+    /// exclude installed sources while library navigation keeps its own cache.
+    pub fn index_files_from_disk_where(
+        &self,
+        files: Vec<Url>,
+        knowledge_provider: &ObjectRegistry,
+        should_index: impl Fn(&Url) -> bool,
+    ) {
         let mut timing = crate::telemetry::Timing::start(
             "workspace.dependencies",
             serde_json::json!({"roots": files.len()}),
@@ -277,7 +340,7 @@ impl WorkspaceIndex {
             pending.sort();
             pending.dedup();
             let candidates = pending.len();
-            pending.retain(|file| !self.is_indexed(file));
+            pending.retain(|file| !self.is_indexed(file) && should_index(file));
             crate::telemetry::event(
                 serde_json::json!({"operation": "workspace.index_wave", "queued": pending.len(), "cache_hits": candidates - pending.len()}),
             );
@@ -316,6 +379,7 @@ impl WorkspaceIndex {
         timing.record("cached_files", self.loads_by_file.len());
     }
 
+    /// Whether `uri` is indexed, even when it could not be parsed.
     pub fn is_indexed(&self, uri: &Url) -> bool {
         self.loads_by_file.contains_key(uri)
     }
@@ -344,6 +408,10 @@ impl WorkspaceIndex {
         knowledge_provider: &ObjectRegistry,
     ) -> Vec<Url> {
         self.remove_file(uri);
+        if let Some(init_file) = snapshot.object_registry().init_file().file() {
+            self.init_file_of_document
+                .insert(uri.clone(), init_file.uri().clone());
+        }
         let declarations = snapshot.packages().declarations().to_vec();
         if !declarations.is_empty() {
             self.declared_packages_by_file
@@ -420,31 +488,69 @@ impl WorkspaceIndex {
     /// `currentFileDirectory`. A file loaded from inside a package's section
     /// is recorded as belonging to that package.
     fn record_loaded_files(&self, uri: &Url, snapshot: &DocumentSnapshot) -> Vec<Url> {
-        let Some(directory) = file_directory(uri) else {
-            return Vec::new();
-        };
         let mut loaded_files = Vec::new();
-        for load in collect_loaded_files_in_tree(snapshot.root_node(), snapshot.syntax()) {
-            let path = directory.join(load.path);
-            let Some(loaded) = path
-                .is_file()
-                .then(|| Url::from_file_path(path).ok())
-                .flatten()
-            else {
+        for load in snapshot.file_loads() {
+            let Some(loaded) = load.resolve(uri, &[]).file().cloned() else {
                 continue;
             };
-            if let Some(package) = self.package_at(uri, snapshot.position_for_node(load.call)) {
+            if let Some(package) = self.package_at(uri, load.call) {
                 self.package_of_loaded_file.insert(loaded.clone(), package);
             }
             loaded_files.push(loaded);
         }
+        self.file_loads_by_file
+            .insert(uri.clone(), snapshot.file_loads().to_vec());
         loaded_files
     }
 
+    /// Drop `uri` from the index, along with the package a loading file
+    /// placed it in: what remains once it is deleted or moved away.
+    pub fn forget_file(&self, uri: &Url) {
+        self.remove_file(uri);
+        self.package_of_loaded_file.remove(uri);
+    }
+
+    /// The indexed files at or under `path`.
+    pub fn files_under(&self, path: &Path) -> Vec<Url> {
+        self.loads_by_file
+            .iter()
+            .map(|entry| entry.key().clone())
+            .filter(|file| file.to_file_path().is_ok_and(|file| file.starts_with(path)))
+            .collect()
+    }
+
+    /// The indexed files with a load naming a file at or under `path`,
+    /// whether or not one is there.
+    pub fn loaders_under(&self, path: &Path) -> Vec<Url> {
+        self.file_loads_by_file
+            .iter()
+            .filter(|entry| {
+                entry.value().iter().any(|load| {
+                    load.beside(entry.key())
+                        .and_then(|file| file.to_file_path().ok())
+                        .is_some_and(|file| file.starts_with(path))
+                })
+            })
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
+    /// Every indexed file with its loads.
+    pub fn file_loads(&self) -> Vec<(Url, Vec<FileLoad>)> {
+        self.file_loads_by_file
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
+
+    /// Drop the facts recorded for `uri`, keeping the package a loading file
+    /// placed it in, as when it is about to be indexed again.
     pub fn remove_file(&self, uri: &Url) {
         self.loads_by_file.remove(uri);
+        self.file_loads_by_file.remove(uri);
         self.symbols_by_file.remove(uri);
         self.declared_packages_by_file.remove(uri);
+        self.init_file_of_document.remove(uri);
         let Some((_, names)) = self.names_by_file.remove(uri) else {
             return;
         };
@@ -488,6 +594,17 @@ impl WorkspaceIndex {
                 self.pages_by_name.remove(&name);
             }
         }
+    }
+
+    /// Make the globals of the file `uri` known only in the documents whose
+    /// sessions start with it, as those of an init file.
+    pub fn add_init_file(&self, uri: &Url) {
+        self.init_files.insert(uri.clone());
+    }
+
+    /// Whether `uri` is indexed as an init file.
+    pub fn is_init_file(&self, uri: &Url) -> bool {
+        self.init_files.contains(uri)
     }
 
     /// Every indexed file: the open documents and the files they load.
@@ -560,6 +677,15 @@ impl WorkspaceIndex {
         uri: &Url,
         range: TextRange,
     ) -> bool {
+        if self.init_files.contains(uri) {
+            return match viewer {
+                WorkspaceViewer::Document(requester) => self
+                    .init_file_of_document
+                    .get(requester)
+                    .is_some_and(|init_file| init_file.value() == uri),
+                WorkspaceViewer::PackageSession => false,
+            };
+        }
         if self.privacy == PackagePrivacy::Waived {
             return true;
         }
@@ -681,6 +807,8 @@ impl WorkspaceIndex {
             })
     }
 
+    /// The package defining the global `name` that `viewer` sees, or exporting
+    /// it.
     fn defining_package_for(&self, name: &str, viewer: WorkspaceViewer<'_>) -> Option<ObjectName> {
         self.visible_definition(name, viewer)
             .and_then(|definition| self.package_at(&definition.uri, definition.range.start))
@@ -691,6 +819,9 @@ impl WorkspaceIndex {
             })
     }
 
+    /// Where `viewer` sees the global function `name` implemented as `kind`, in
+    /// file then source order. An installation needing a method declaration
+    /// counts only when another file declares one.
     fn implementations_for(
         &self,
         name: &str,
@@ -732,6 +863,8 @@ impl WorkspaceIndex {
         locations
     }
 
+    /// Whether a file `viewer` sees, other than its own, declares `name` a
+    /// method.
     fn has_method_declaration_for(&self, name: &str, viewer: WorkspaceViewer<'_>) -> bool {
         self.method_declarations_by_name
             .get(name)
@@ -1031,6 +1164,9 @@ fn top_level_definitions(uri: &Url, snapshot: &DocumentSnapshot) -> Vec<(ObjectN
         .collect()
 }
 
+/// The functions bound at the top level of `snapshot` and the methods it
+/// installs there, sorted by name and position: each with its name, range,
+/// kind, and whether it needs a method declaration elsewhere.
 fn top_level_implementations(
     snapshot: &DocumentSnapshot,
 ) -> Vec<(String, TextRange, ImplementationKind, bool)> {
@@ -1082,6 +1218,7 @@ fn top_level_implementations(
     implementations
 }
 
+/// The names `snapshot` declares methods at its top level, with where.
 fn top_level_method_declarations(snapshot: &DocumentSnapshot) -> Vec<(String, TextRange)> {
     let analysis = snapshot.analysis();
     let mut declarations = analysis

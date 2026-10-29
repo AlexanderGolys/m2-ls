@@ -20,6 +20,7 @@ use tower_lsp::lsp_types::Position;
 
 use super::{DiagnosticSink, DocumentationContext};
 use crate::diagnostics::{catalog, Finding};
+use crate::file_load::FileLoad;
 use crate::macaulay2::Macaulay2Conventions;
 use crate::node_metadata::SyntaxNode;
 use crate::object_registry::ObjectName;
@@ -27,7 +28,7 @@ use crate::package_documentation::{
     DocumentOption, DocumentTag, DocumentationFault, DocumentationFaultKind, DocumentationKey,
     DocumentedSubject, SimpleDocKeyword,
 };
-use crate::package_index::{collect_imported_packages_in_tree, collect_loaded_files_in_tree};
+use crate::package_index::collect_imported_packages_in_tree;
 use crate::source::SourceNavigation;
 use crate::source_package::PackageDeclaration;
 
@@ -271,10 +272,11 @@ struct PackageFile<'context> {
 }
 
 impl<'context> PackageFile<'context> {
+    /// Builds the documentation-check context from the analyzed document and its loaded packages.
     fn read(context: &DocumentationContext<'context, 'context>) -> Self {
-        let loads = collect_loaded_files_in_tree(context.root, context.syntax)
+        let loads = FileLoad::collect(context.root, context.syntax, context.source)
             .into_iter()
-            .map(|load| context.source.position_for_node(load.call))
+            .map(|load| load.call)
             .collect::<Vec<_>>();
         let self_contained = context
             .packages

@@ -46,24 +46,33 @@ const VARIABLE_RING_CLASSES: [&str; 2] = ["PolynomialRing", "QuotientRing"];
 /// Runtime binding shape produced for a ring generator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RingGeneratorKind {
+    /// Generator bound directly to a source name.
     Direct,
+    /// Generator family represented by an indexed variable table.
     IndexedTable,
 }
 
 /// A ring-generator name and source node extracted from constructor syntax.
 #[derive(Debug, Clone)]
 struct RingGeneratorBinding<'tree> {
+    /// Name used to resolve and present this item.
     name: String,
+    /// Semantic or presentation category of this item.
     kind: RingGeneratorKind,
+    /// Syntax supplying this item's source and structure.
     node: SyntaxNode<'tree>,
+    /// Known index selection, absent when no indexed selection was specified.
     indices: Option<IndexSelection>,
 }
 
 /// Compact reference retained for later ring-generator rebinding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RingGenerator {
+    /// Name used to resolve and present this item.
     name: ObjectName,
+    /// Semantic or presentation category of this item.
     kind: RingGeneratorKind,
+    /// Known index selection, absent when no indexed selection was specified.
     indices: Option<IndexSelection>,
 }
 
@@ -73,14 +82,18 @@ pub struct RingGenerator {
 /// even when their Cartesian product contains many generators.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexedVariableTypes {
+    /// Source-ordered updates used to determine the value at an index.
     writes: Vec<IndexedWrite>,
 }
 
 /// One write to indices of a table: what they hold from then on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IndexedWrite {
+    /// Indices affected by this operation.
     selection: IndexSelection,
+    /// Runtime class of the selected or assigned value.
     value_type: ObjectName,
+    /// The construct responsible for this indexed update.
     writer: IndexedWriter,
 }
 
@@ -134,17 +147,24 @@ impl IndexedVariableTypes {
     }
 }
 
+/// A statically known selector, including compound indices and quoted symbols.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IndexKey {
+    /// An integer-valued selector or literal.
     Integer(i64),
+    /// A string-valued selector or source literal.
     String(String),
+    /// A list of component selectors.
     List(Vec<IndexKey>),
+    /// A sequence of component selectors.
     Sequence(Vec<IndexKey>),
     /// A symbol evaluating to itself, `E` of `x_E`.
     Symbol(ObjectName),
     /// An indexed variable of such a symbol, `E_F` of `x_(E_F)`.
     IndexedVariable {
+        /// Name on which the indexed selection operates.
         base: ObjectName,
+        /// Index selecting an entry in the enclosing representation.
         index: Box<IndexKey>,
     },
 }
@@ -205,6 +225,7 @@ impl IndexKey {
         None
     }
 
+    /// Tests whether this key falls within the specified endpoints and upper-bound policy.
     fn in_range(&self, start: &Self, end: &Self, exclusive: bool) -> bool {
         match (self, start, end) {
             (Self::Integer(value), Self::Integer(start), Self::Integer(end)) => {
@@ -331,12 +352,18 @@ impl IndexKey {
     }
 }
 
+/// An exact selector, a bounded range, or a selection unavailable statically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IndexSelection {
+    /// A single known identity, value, or type point.
     Exact(IndexKey),
+    /// A bounded interval of selectors.
     Range {
+        /// Inclusive beginning of the represented interval.
         start: IndexKey,
+        /// Exclusive end of the represented interval.
         end: IndexKey,
+        /// Whether the upper endpoint is excluded from the selection.
         exclusive: bool,
     },
     /// An index known only at run time, the `i` of `x_i = i` in a loop: it
@@ -345,6 +372,7 @@ enum IndexSelection {
 }
 
 impl IndexSelection {
+    /// Tests membership in the represented selection or source extent.
     fn contains(&self, key: &IndexKey) -> bool {
         match self {
             Self::Exact(index) => index == key,
@@ -387,7 +415,9 @@ impl IndexSelection {
 /// One variable of a ring as Macaulay2 prints it: `z`, `x_0`, `w_(1,1)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RingVariable {
+    /// Name on which the indexed selection operates.
     base: ObjectName,
+    /// Index selecting an entry in the enclosing representation.
     index: Option<IndexKey>,
 }
 
@@ -446,7 +476,9 @@ pub enum RingValue {
     /// `coefficient_ring[variables]`, the coefficient ring `None` when the
     /// program does not determine it statically.
     Polynomial {
+        /// Known coefficient ring, absent when it cannot be established statically.
         coefficient_ring: Option<Box<RingValue>>,
+        /// Ring generators in the order used by positional selection.
         variables: Vec<RingGenerator>,
     },
     /// `ring / ideal`, whose subscripts select the images of those of `ring`.
@@ -519,7 +551,9 @@ impl RingValue {
 /// A subscript `R_index` past the variables of `R`, which Macaulay2 rejects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RingIndexOutOfBounds {
+    /// Index selecting an entry in the enclosing representation.
     pub index: i64,
+    /// Number of available ring generators.
     pub variable_count: usize,
 }
 
@@ -579,7 +613,9 @@ pub enum RingVariableError {
     IndexOutOfBounds(RingIndexOutOfBounds),
     /// A lookup `v_R` of a name no variable of `R` has.
     NotFound {
+        /// Name used to resolve and present this item.
         name: VariableName,
+        /// Explanation of why the variable selection cannot succeed.
         failure: &'static str,
     },
 }
@@ -598,14 +634,19 @@ impl Display for RingVariableError {
 /// it: `S_6`, `"x"_A`, `x_1_A`. `ring` is the operand naming the ring.
 #[derive(Debug, Clone)]
 pub struct SelectedRingVariable<'tree> {
+    /// Expression supplying the ring being selected from.
     pub ring: SyntaxNode<'tree>,
+    /// Resolved ring variable selected by the source expression.
     pub variable: RingVariable,
 }
 
 /// Whether a ring has a variable of some name.
 enum VariableSearch {
+    /// A statically resolved ring variable.
     Found(RingVariable),
+    /// No matching value or declaration is present.
     Absent,
+    /// Available static evidence cannot determine the result.
     Undetermined,
 }
 
@@ -613,7 +654,9 @@ enum VariableSearch {
 /// its tower is not known, only a prefix is: `complete` tells whether
 /// `generators` ends where the ring's variables do.
 struct RingVariables<'ring> {
+    /// Generators contributing to the represented set or type family.
     generators: Vec<&'ring RingGenerator>,
+    /// Whether every contributing value is known statically.
     complete: bool,
 }
 
@@ -685,6 +728,7 @@ impl RingSemantics {
 }
 
 impl Analysis {
+    /// Registers the statically recognizable generators introduced by a ring expression.
     pub fn collect_ring_generator_bindings(
         &mut self,
         ring_name: &str,
@@ -1148,6 +1192,7 @@ impl Analysis {
             .any(|spec| spec.start <= range.start && range.end <= spec.end)
     }
 
+    /// Name of the source binding supplying a ring identity, following parenthesized expressions.
     fn ring_source_symbol<'tree>(&self, expression: SyntaxNode<'tree>) -> Option<&'tree str> {
         let expression = parenthesized_value(expression).unwrap_or(expression);
         if let Some(name) = symbol_node_text(expression) {
@@ -1333,6 +1378,7 @@ impl Analysis {
         Some(ranges)
     }
 
+    /// Registers ring generator in the current semantic index.
     fn register_ring_generator(
         &mut self,
         ring_name: &str,
@@ -1426,6 +1472,7 @@ impl Analysis {
         );
     }
 
+    /// Registers dynamic global in the current semantic index.
     fn register_dynamic_global(
         &mut self,
         name: &str,
@@ -1487,6 +1534,7 @@ impl Analysis {
 }
 
 impl<'tree> RingGeneratorBinding<'tree> {
+    /// Variable specification supplied by a recognized polynomial-ring constructor.
     fn constructor_variables(application: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
         let argument = parenthesized_value(application.binary_parts().map(|parts| parts.right)?)?;
         let is_constructor_argument =
@@ -1500,6 +1548,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
             .filter(is_constructor_argument)
     }
 
+    /// Collects ring-generator specifications, retaining the selected policy for bare symbols.
     fn collect(container: SyntaxNode<'tree>, bare_symbols: BareSymbols<'_>) -> Vec<Self> {
         let elements = container.collection_elements().collect::<Vec<_>>();
         let variable_base = elements
@@ -1543,6 +1592,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
         bindings
     }
 
+    /// Value of the named option in a recognized option assignment.
     fn option_value(node: SyntaxNode<'tree>, key: &str) -> Option<SyntaxNode<'tree>> {
         if !node.is_option_assignment() {
             return None;
@@ -1553,6 +1603,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
         node.binary_parts().map(|parts| parts.right)
     }
 
+    /// Base symbol name of a generator, excluding a recognized index selection.
     fn base_name(node: SyntaxNode<'tree>) -> Option<String> {
         if node.is::<Symbol>() {
             Some(node.text().to_string())
@@ -1598,6 +1649,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
             .filter(|argument| argument.string_literal_inner_text().is_some())
     }
 
+    /// Collects spec from the supplied syntax and semantic context.
     fn collect_spec(
         node: SyntaxNode<'tree>,
         bindings: &mut Vec<RingGeneratorBinding<'tree>>,
@@ -1724,6 +1776,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
         }
     }
 
+    /// Base expression of a subscripted variable specification.
     fn indexed_base(node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
         let node = parenthesized_value(node)?;
         node.has_binary_operator::<Token![_]>()
@@ -1732,6 +1785,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
             .and_then(Self::name_node)
     }
 
+    /// Expands a statically known range of generator names into its individual symbols.
     fn symbol_range(
         range: SyntaxNode<'tree>,
         left: SyntaxNode<'tree>,
@@ -1762,6 +1816,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
         )
     }
 
+    /// Adds a ring-generator binding unless an equivalent binding is already present.
     fn push(bindings: &mut Vec<RingGeneratorBinding<'tree>>, binding: RingGeneratorBinding<'tree>) {
         if !bindings.iter().any(|existing| {
             existing.name == binding.name
@@ -1860,6 +1915,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         None
     }
 
+    /// Element class associated with the selected ring under the current source knowledge.
     pub(super) fn resolved_ring_element_type(
         &self,
         ring: SyntaxNode<'_>,
@@ -1910,6 +1966,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         .filter(|_| binding.state.source_type.is_some())
     }
 
+    /// Whether evaluating this expression creates a distinct ring rather than forwarding an existing one.
     fn expression_introduces_ring_identity(
         &self,
         expression: SyntaxNode<'_>,
@@ -1948,8 +2005,7 @@ mod tests {
 
     fn document(source: &str) -> DocumentSnapshot {
         static BUILTINS: OnceLock<ObjectRegistry> = OnceLock::new();
-        let builtins =
-            BUILTINS.get_or_init(|| ObjectRegistry::load(include_str!("../data/m2-index.jsonl")));
+        let builtins = BUILTINS.get_or_init(|| ObjectRegistry::load(crate::catalog::test_corpus()));
         DocumentSnapshot::from_text(source.to_string(), builtins).expect("fixture should parse")
     }
 

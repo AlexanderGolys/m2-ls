@@ -329,7 +329,7 @@ mod tests {
     /// function `value` nor the parameter of that name, so it has no hover.
     #[test]
     fn member_keys_have_no_hover() {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document =
             DocumentSnapshot::from_text("f = value -> output.value\n".to_string(), &builtins)
                 .expect("fixture should parse");
@@ -462,7 +462,7 @@ mod tests {
         let text = "needsPackage \"JSON\"\ntoJSON\n";
         let document = DocumentSnapshot::from_text(text.to_string(), &ObjectRegistry::default())
             .expect("fixture should parse");
-        let index = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let index = ObjectRegistry::load(crate::catalog::test_corpus());
         let scoped = index.with_source_imports(text);
         let hover = hover_at(&document, pos!(1, 0), &scoped)
             .expect("hover over an imported package object");
@@ -506,7 +506,7 @@ mod tests {
         let text = "-- use [[ideal]]\nx := 1\n";
         let document = DocumentSnapshot::from_text(text.to_string(), &ObjectRegistry::default())
             .expect("fixture should parse");
-        let index = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let index = ObjectRegistry::load(crate::catalog::test_corpus());
         let scoped = index.with_source_imports(text);
         let hover = hover_at(&document, pos!(0, 9), &scoped)
             .expect("indexed documentation reference should have a hover");
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn hover_call_context_specializes_builtin_method_signatures() {
         let text = "F := openOut \"test.oldvalues\"\n";
-        let index = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let index = ObjectRegistry::load(crate::catalog::test_corpus());
         let scoped = index.with_source_imports("");
         let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
         let tree = parser.parse_tree(text, None).expect("fixture should parse");
@@ -582,7 +582,7 @@ mod tests {
     #[test]
     fn hover_call_context_specializes_operator_method_signatures() {
         let text = "x := 1\ny := 2\nz := x + y\n";
-        let index = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let index = ObjectRegistry::load(crate::catalog::test_corpus());
         let scoped = index.with_source_imports("");
         let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
         let tree = parser.parse_tree(text, None).expect("fixture should parse");

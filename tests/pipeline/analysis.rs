@@ -1502,6 +1502,12 @@ async fn declarative_diagnostics_expose_their_coupled_quick_fixes() {
             "Use `??` coalescence",
             "candidate ?? fallback",
         ),
+        (
+            "f = method(Options => {Verbose => false})\nf ZZ := o -> n -> n\nf(1, Verbos => true)\n",
+            "E16",
+            "Replace with `Verbose`",
+            "Verbose",
+        ),
     ];
     let mut session = DocumentSession::open(cases[0].0).await;
 
@@ -1538,57 +1544,88 @@ async fn declarative_diagnostics_expose_their_coupled_quick_fixes() {
     session.shutdown().await;
 }
 
-/// Style simplifications are refactors, not diagnostics: they are offered on
-/// the code they rewrite, which no hint marks.
+/// Style simplifications are hints naming the shorter form, and their rewrite
+/// is the hint's preferred quick fix. Where the hint is turned off, the
+/// rewrite stays available as a refactor.
 #[tokio::test]
-async fn expression_simplification_actions_are_offered_without_hints() {
+async fn expression_simplifications_are_hints_with_quick_fixes() {
     let cases = [
         (
             "if (condition) then x else y\n",
+            "S03",
             "Remove redundant parentheses",
         ),
         (
-            "if ready then value else null\n",
+            "if val === null then null else (key, val)\n",
+            "S05",
             "Simplify unnecessary null branch",
         ),
         (
             "if not (left == right) then value\n",
+            "S05",
             "Simplify if condition",
         ),
         (
             "if outer then one else (if inner then two else three)\n",
+            "S05",
             "Flatten nested if into else-if chain",
         ),
-        ("try value then value\n", "Simplify try"),
+        ("try value then value\n", "S05", "Simplify try"),
     ];
     let mut session = DocumentSession::open(cases[0].0).await;
 
-    for (source, title) in cases {
+    for (source, code, title) in cases {
         session.replace(source).await;
-        let codes = session.diagnostic_codes();
-        assert!(
-            !codes.contains(&"S03") && !codes.contains(&"S05"),
-            "a simplification is no diagnostic: `{source}` {codes:?}"
-        );
-
-        let uri = session.uri().to_string();
-        let start = json!({"line": 0, "character": 0});
-        let response = session
-            .request(
-                "textDocument/codeAction",
-                json!({
-                    "textDocument": {"uri": uri},
-                    "range": {"start": start, "end": start},
-                    "context": {"diagnostics": []}
-                }),
-            )
-            .await;
-        let action = response_array(&response)
+        let hints = session
+            .diagnostics()
             .iter()
-            .find(|action| action["title"] == title)
-            .unwrap_or_else(|| panic!("expected `{title}` for `{source}`"));
-        assert_eq!(action["kind"], "refactor.rewrite");
+            .filter(|diagnostic| diagnostic["code"] == code)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(hints.len(), 1, "`{source}` should have one {code} hint");
+        assert_eq!(hints[0]["severity"], 4, "{code} is a hint");
+
+        let suppressed = format!("-- m2-ls: disable-next-line {code}\n{source}");
+        for (text, line, kind) in [
+            (source.to_owned(), 0, "quickfix"),
+            (suppressed, 1, "refactor.rewrite"),
+        ] {
+            session.replace(&text).await;
+            let uri = session.uri().to_string();
+            let start = json!({"line": line, "character": 0});
+            let diagnostics = session.diagnostics().to_vec();
+            let response = session
+                .request(
+                    "textDocument/codeAction",
+                    json!({
+                        "textDocument": {"uri": uri},
+                        "range": {"start": start, "end": start},
+                        "context": {"diagnostics": diagnostics}
+                    }),
+                )
+                .await;
+            let action = response_array(&response)
+                .iter()
+                .find(|action| action["title"] == title)
+                .unwrap_or_else(|| panic!("expected `{title}` for `{text}`"))
+                .clone();
+            assert_eq!(action["kind"], kind, "`{title}` for `{text}`");
+        }
     }
+
+    session
+        .replace("if val === null then null else (key, val)\n")
+        .await;
+    let message = session
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "S05")
+        .map(|diagnostic| diagnostic["message"].clone())
+        .expect("null-branch hint");
+    assert_eq!(
+        message,
+        "This expression can be simplified to `if val =!= null then (key, val)`"
+    );
 
     session.shutdown().await;
 }

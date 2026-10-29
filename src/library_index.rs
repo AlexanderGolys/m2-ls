@@ -16,33 +16,53 @@ use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::package_index::SourceResolver;
 use crate::workspace_index::WorkspaceIndex;
 
+/// Installed package file listing the source files to index.
 const LOAD_SEQUENCE: &str = "loadsequence";
+/// Maximum number of library packages retained in the source cache.
 const MAX_CACHED_PACKAGES: usize = 8;
+/// Bound on unresolved package names retained to suppress repeated lookups.
 const MAX_MISSING_PACKAGES: usize = 128;
+/// Maximum source-file count indexed for one library package.
 const MAX_PACKAGE_FILES: usize = 64;
+/// Maximum cumulative source bytes indexed for one library package.
 const MAX_PACKAGE_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Indexed files and synchronized progress for one lazily loaded library package.
 #[derive(Debug)]
 struct PackageSources {
+    /// Semantic index of library files already analyzed for this package.
     sources: WorkspaceIndex,
+    /// Mutable traversal progress for incremental library indexing.
     progress: Mutex<PackageProgress>,
+    /// Logical access time used to evict the least recently requested package.
     last_used: AtomicU64,
 }
 
+/// Pending files, visited locations, and resource usage for library indexing.
 #[derive(Debug, Default)]
 struct PackageProgress {
+    /// Source files waiting to be indexed.
     pending: VecDeque<Url>,
+    /// Source locations already scheduled or indexed.
     visited: HashSet<Url>,
+    /// Total source bytes consumed by this package's indexing pass.
     source_bytes: u64,
 }
 
+/// Bounded lazy index of library package sources supplementing the builtin catalog.
 #[derive(Debug)]
 pub struct LibraryIndex {
+    /// Package and file lookup paths for resolving source locations.
     source_resolver: SourceResolver,
+    /// Object and binding registry used to resolve semantic facts.
     registry: ObjectRegistry,
+    /// Package declarations and imports visible to this operation.
     packages: Mutex<HashMap<ObjectName, Arc<PackageSources>>>,
+    /// Known unresolved packages cached to avoid repeated lookups.
     missing_packages: Mutex<HashSet<ObjectName>>,
+    /// Monotonic logical clock used to record cache access order.
     clock: AtomicU64,
+    /// Async exclusion preventing concurrent library indexing passes.
     indexing: AsyncMutex<()>,
 }
 
@@ -50,11 +70,14 @@ pub struct LibraryIndex {
 /// which it needs another file. Finding a location never schedules more work.
 #[derive(Debug)]
 pub struct LibrarySources<'library> {
+    /// Library index borrowed for this request.
     library: &'library LibraryIndex,
+    /// Packages requested by the current source lookup session.
     wanted_packages: RefCell<Vec<ObjectName>>,
 }
 
 impl LibraryIndex {
+    /// Creates an empty lazy library index using the supplied resolver and builtin registry.
     pub fn new(source_resolver: SourceResolver, registry: ObjectRegistry) -> Self {
         Self {
             source_resolver,
@@ -66,10 +89,12 @@ impl LibraryIndex {
         }
     }
 
+    /// Package and file lookup configuration used by this index.
     pub fn source_resolver(&self) -> &SourceResolver {
         &self.source_resolver
     }
 
+    /// Starts a source-lookup session recording which library packages are needed.
     pub fn sources(&self) -> LibrarySources<'_> {
         LibrarySources {
             library: self,
@@ -120,6 +145,7 @@ impl LibraryIndex {
         }
     }
 
+    /// Obtains the cached sources of a package, optionally creating its indexing state.
     fn package(&self, name: &ObjectName, create: bool) -> Option<Arc<PackageSources>> {
         let mut packages = self.packages.lock().expect("library cache lock");
         let tick = self.clock.fetch_add(1, Ordering::Relaxed);
@@ -169,6 +195,7 @@ impl LibraryIndex {
 }
 
 impl PackageSources {
+    /// Whether any cached library package still has files waiting to be indexed.
     fn has_pending_files(&self) -> bool {
         !self
             .progress
@@ -178,6 +205,7 @@ impl PackageSources {
             .is_empty()
     }
 
+    /// Indexes one queued library file while respecting package resource limits.
     fn index_next_file(&self, registry: &ObjectRegistry) {
         loop {
             let (uri, remaining) = {
@@ -251,16 +279,19 @@ impl PackageSources {
 }
 
 impl LibrarySources<'_> {
+    /// Package and file lookup configuration used by this index.
     pub fn source_resolver(&self) -> &SourceResolver {
         self.library.source_resolver()
     }
 
+    /// Package owning the source location, when a containing package can be resolved.
     pub fn package_of_file(&self, document: &Url) -> Option<ObjectName> {
         self.library
             .source_resolver
             .package_of_source_file(&document.to_file_path().ok()?)
     }
 
+    /// Source locations matching the requested object and navigation role.
     pub fn locations(
         &self,
         document: &Url,
@@ -294,6 +325,7 @@ impl LibrarySources<'_> {
         Vec::new()
     }
 
+    /// Source installations matching the requested callable and method domain.
     pub fn method_installations(
         &self,
         document: &Url,
@@ -329,6 +361,7 @@ impl LibrarySources<'_> {
         locations
     }
 
+    /// Finishes the lookup session and returns the packages requested by it.
     pub fn into_wanted_packages(self) -> Vec<ObjectName> {
         let mut packages = self.wanted_packages.into_inner();
         packages.sort();

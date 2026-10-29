@@ -59,32 +59,59 @@ use crate::source_package::CodeFragment;
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, EnumString, IntoStaticStr, Display, EnumIter,
 )]
 pub enum SimpleDocKeyword {
+    /// Acknowledgements associated with the documented work.
     Acknowledgement,
+    /// The base function to which this documentation belongs.
     BaseFunction,
+    /// Precomputed example input and output.
     CannedExample,
+    /// Limitations or qualifications on the documented behavior.
     Caveat,
+    /// Preferred citation for the documented work.
     Citation,
+    /// Inline source code presented without execution.
     Code,
+    /// Effects beyond the callable's return value.
     Consequences,
+    /// People credited for the documented functionality.
     Contributors,
+    /// Explanatory prose describing the documented behavior.
     Description,
+    /// Executable source example with its session context.
     Example,
+    /// External source examples associated with this documentation.
     ExampleFiles,
+    /// Short summary introducing a documentation node.
     Headline,
+    /// A section heading in the rendered documentation.
     Heading,
+    /// Descriptions of input arguments and accepted types.
     Inputs,
+    /// An item within a documentation list.
     Item,
+    /// The object or signature described by this documentation node.
     Key,
+    /// A complete documentation node.
     Node,
+    /// Descriptions of return values and result types.
     Outputs,
+    /// Preformatted text preserving its source whitespace.
     Pre,
+    /// Bibliographic or documentation references.
     References,
+    /// Links to related documentation nodes.
     SeeAlso,
+    /// Source excerpts included in the rendered documentation.
     SourceCode,
+    /// Child nodes belonging beneath this documentation node.
     Subnodes,
+    /// A compact callable summary.
     Synopsis,
+    /// Ordinary prose content.
     Text,
+    /// A hierarchical documentation listing.
     Tree,
+    /// Example call forms for the documented callable.
     Usage,
 }
 
@@ -200,6 +227,7 @@ impl SimpleDocLine {
         lines
     }
 
+    /// Whether the documentation line contains only whitespace.
     fn is_blank(&self) -> bool {
         self.indent.is_none()
     }
@@ -230,7 +258,9 @@ impl SimpleDocLine {
 /// One section of a SimpleDoc string: its keyword line and its content lines.
 #[derive(Debug, Clone, Copy)]
 struct Section<'lines> {
+    /// Line introducing the current SimpleDoc section.
     keyword_line: &'lines SimpleDocLine,
+    /// Lines belonging to this section, excluding its introducing keyword line.
     content: &'lines [SimpleDocLine],
 }
 
@@ -244,10 +274,15 @@ impl Section<'_> {
 /// What one page collects while its sections are read.
 #[derive(Debug, Default)]
 struct PageReading {
+    /// Documentation keys identifying the objects described by this node.
     keys: Vec<DocumentationKey>,
+    /// Rendered documentation or its extracted Markdown coordinates.
     markdown: NodeMarkdown,
+    /// Code examples extracted from the documentation node.
     examples: Vec<CodeFragment>,
+    /// Options or sections already encountered while parsing this documentation.
     seen: Vec<SimpleDocKeyword>,
+    /// Whether the documentation already supplies an explicit Usage section.
     has_usage: bool,
     /// The first `Inputs` or `Outputs` keyword, which needs a `Usage`.
     described_items: Option<TextRange>,
@@ -1064,12 +1099,16 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString)]
 #[non_exhaustive]
 enum TexStyle {
+    /// Strong emphasis applied to the contained text.
     #[strum(serialize = "bf")]
     Bold,
+    /// Semantic emphasis applied to the contained text.
     #[strum(serialize = "em")]
     Emphasis,
+    /// Italic presentation of the contained text.
     #[strum(serialize = "it")]
     Italic,
+    /// Monospaced presentation of the contained text.
     #[strum(serialize = "tt")]
     Typewriter,
 }

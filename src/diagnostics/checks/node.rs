@@ -2,19 +2,23 @@
 
 use m2_syn::nodes::{
     ExprIf as IfStatement, ExprLambda as LambdaExpression, ExprQuote as QuoteExpression,
-    ExprWhile as WhileLoop, Symbol,
+    ExprTry as TryStatement, ExprWhile as WhileLoop, Symbol,
 };
 use m2_syn::Token;
 
 use super::{DiagnosticSink, NodeContext};
 use crate::analysis::{
     assigned_lambda, parenthesized_value, CallableHeadKind, ControlTransferTarget,
-    MethodCodomainEdit, MethodHead, OptionDeclaration, RingVariableError, TypeChecker,
+    MethodCodomainEdit, MethodHead, OptionDeclaration, OptionMisuse, RingVariableError,
+    TypeChecker,
 };
 use crate::diagnostics::rewrites::{
-    ambiguous_float_member_access_rewrite, coalescence_rewrite, simplification_of, Coalescence,
+    ambiguous_float_member_access_rewrite, coalescence_rewrite, else_if_chain_rewrite,
+    if_condition_rewrite, if_null_branch_rewrite, redundant_control_parentheses_inner,
+    simplification_of, try_statement_rewrite, Coalescence,
 };
 use crate::diagnostics::{catalog, Finding};
+use crate::document::FileProperties;
 use crate::node_metadata::{matches_token, SyntaxNode};
 use crate::object_registry::{ObjectKnowledge, ObjectName};
 use crate::source::SourceNavigation;
@@ -31,7 +35,9 @@ pub(super) fn spawn(context: &NodeContext, sink: &mut DiagnosticSink) {
     protected_assignment(context, sink);
     ring_variable_selection(context, sink);
     option_key_convention(context, sink);
+    redundant_control_parentheses(context, sink);
     prefer_coalescence(context, sink);
+    simplifiable_expression(context, sink);
     ring_variable_naming(context, sink);
     install_needs_colon_equals(context, sink);
     protect_computed_symbol(context, sink);
@@ -40,8 +46,10 @@ pub(super) fn spawn(context: &NodeContext, sink: &mut DiagnosticSink) {
     condition_type(context, sink);
     install_codomain(context, sink);
     call_domain(context, sink);
+    call_options(context, sink);
 }
 
+/// Checks syntax error and emits the corresponding finding when the source violates the rule.
 fn syntax_error(context: &NodeContext, sink: &mut DiagnosticSink) {
     let node = context.node;
     if node.is_error() {
@@ -67,6 +75,7 @@ fn syntax_error(context: &NodeContext, sink: &mut DiagnosticSink) {
     }
 }
 
+/// Checks missing node and emits the corresponding finding when the source violates the rule.
 fn missing_node(context: &NodeContext, sink: &mut DiagnosticSink) {
     if context.node.is_missing() {
         sink.spawn(
@@ -79,6 +88,7 @@ fn missing_node(context: &NodeContext, sink: &mut DiagnosticSink) {
     }
 }
 
+/// Checks ambiguous float member access and emits the corresponding finding when the source violates the rule.
 fn ambiguous_float_member_access(context: &NodeContext, sink: &mut DiagnosticSink) {
     let Some(replacement) = ambiguous_float_member_access_rewrite(context.node) else {
         return;
@@ -179,6 +189,7 @@ fn is_installation_target(context: &NodeContext, target: SyntaxNode) -> bool {
         .is_some_and(|(_, operands)| operands.iter().all(|operand| !operand.is_literal()))
 }
 
+/// Checks protected assignment and emits the corresponding finding when the source violates the rule.
 fn protected_assignment(context: &NodeContext, sink: &mut DiagnosticSink) {
     if context.primary_code {
         return;
@@ -234,7 +245,14 @@ fn protected_assignment_target(
     {
         sink.spawn(
             &catalog::PROTECTED_ASSIGNMENT,
-            Finding::new(range, format!("Cannot assign to protected symbol `{name}`")),
+            Finding::new(
+                range,
+                format!(
+                    "Cannot assign to protected symbol `{name}`; a file implementing the \
+                     library itself declares `{}`",
+                    FileProperties::primary_code_directive()
+                ),
+            ),
         );
     }
 }
@@ -274,6 +292,7 @@ fn ring_variable_selection(context: &NodeContext, sink: &mut DiagnosticSink) {
     );
 }
 
+/// Checks colon equal part assignment and emits the corresponding finding when the source violates the rule.
 fn colon_equal_part_assignment(context: &NodeContext, sink: &mut DiagnosticSink) {
     if !context.node.has_binary_operator::<Token![:=]>() {
         return;
@@ -408,6 +427,7 @@ fn parallel_assignment_value_type(
     );
 }
 
+/// Checks option key convention and emits the corresponding finding when the source violates the rule.
 fn option_key_convention(context: &NodeContext, sink: &mut DiagnosticSink) {
     let node = context.node;
     if !node.has_binary_operator::<Token![=>]>() {
@@ -436,6 +456,7 @@ fn option_key_convention(context: &NodeContext, sink: &mut DiagnosticSink) {
     );
 }
 
+/// Checks prefer coalescence and emits the corresponding finding when the source violates the rule.
 fn prefer_coalescence(context: &NodeContext, sink: &mut DiagnosticSink) {
     let node = context.node;
     let Some(replacement) = simplification_of(
@@ -453,6 +474,57 @@ fn prefer_coalescence(context: &NodeContext, sink: &mut DiagnosticSink) {
     );
 }
 
+/// Checks redundant control parentheses and emits the corresponding finding when the source violates the rule.
+fn redundant_control_parentheses(context: &NodeContext, sink: &mut DiagnosticSink) {
+    let Some(inner) = redundant_control_parentheses_inner(context.node) else {
+        return;
+    };
+    sink.spawn(
+        &catalog::REDUNDANT_CONTROL_PARENTHESES,
+        Finding::new(
+            context.node_range(),
+            format!(
+                "Parentheses around this control expression are redundant; use `{}`",
+                inner.text()
+            ),
+        ),
+    );
+}
+
+/// Names the first shorter form of an `if` or `try`. A conditional that `??`
+/// expresses is left to prefer-coalescence.
+fn simplifiable_expression(context: &NodeContext, sink: &mut DiagnosticSink) {
+    let node = context.node;
+    let rewrites = if node.is::<IfStatement>() {
+        [
+            if_null_branch_rewrite(node),
+            if_condition_rewrite(node),
+            else_if_chain_rewrite(node),
+        ]
+    } else if node.is::<TryStatement>() {
+        [try_statement_rewrite(node), None, None]
+    } else {
+        return;
+    };
+    if coalescence_rewrite(node).is_some() {
+        return;
+    }
+    let Some(replacement) = rewrites
+        .into_iter()
+        .find_map(|rewrite| simplification_of(node, rewrite))
+    else {
+        return;
+    };
+    sink.spawn(
+        &catalog::SIMPLIFIABLE_EXPRESSION,
+        Finding::new(
+            context.node_range(),
+            format!("This expression can be simplified to `{replacement}`"),
+        ),
+    );
+}
+
+/// Checks ring variable naming and emits the corresponding finding when the source violates the rule.
 fn ring_variable_naming(context: &NodeContext, sink: &mut DiagnosticSink) {
     let scope_idx = context
         .analysis
@@ -512,6 +584,7 @@ fn ring_variable_naming_message(name: &str) -> Option<String> {
     })
 }
 
+/// Checks install needs colon equals and emits the corresponding finding when the source violates the rule.
 fn install_needs_colon_equals(context: &NodeContext, sink: &mut DiagnosticSink) {
     let Some(name) = illegal_equals_install_head(context) else {
         return;
@@ -602,6 +675,7 @@ fn protect_computed_symbol(context: &NodeContext, sink: &mut DiagnosticSink) {
     }
 }
 
+/// Checks invalid control transfer and emits the corresponding finding when the source violates the rule.
 fn invalid_control_transfer(context: &NodeContext, sink: &mut DiagnosticSink) {
     let node = context.node;
     if !node.is_control_transfer() {
@@ -642,6 +716,7 @@ fn invalid_control_transfer(context: &NodeContext, sink: &mut DiagnosticSink) {
     );
 }
 
+/// Checks explicit install required and emits the corresponding finding when the source violates the rule.
 fn explicit_install_required(context: &NodeContext, sink: &mut DiagnosticSink) {
     let node = context.node;
     let is_classical_left_arrow_install = if node.has_binary_operator::<Token![<-]>() {
@@ -705,6 +780,7 @@ fn left_arrow_targets(node: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
         .collect()
 }
 
+/// Checks condition type and emits the corresponding finding when the source violates the rule.
 fn condition_type(context: &NodeContext, sink: &mut DiagnosticSink) {
     let node = context.node;
     let construct = if node.is::<IfStatement>() {
@@ -777,6 +853,7 @@ fn install_codomain(context: &NodeContext, sink: &mut DiagnosticSink) {
     }
 }
 
+/// Checks call domain and emits the corresponding finding when the source violates the rule.
 fn call_domain(context: &NodeContext, sink: &mut DiagnosticSink) {
     if let Some(arguments) = TypeChecker::new(context.analysis, context.knowledge)
         .disjoint_call_argument_types(context.node, context.source, context.knowledge)
@@ -798,6 +875,85 @@ fn call_domain(context: &NodeContext, sink: &mut DiagnosticSink) {
     }
 }
 
+/// Options a call passes that its function does not accept: unknown names,
+/// and values outside the documented types or possible symbols.
+fn call_options(context: &NodeContext, sink: &mut DiagnosticSink) {
+    let node = context.node;
+    let checker = TypeChecker::new(context.analysis, context.knowledge);
+    let misuses = checker.call_option_misuses(node, context.source, context.knowledge);
+    if misuses.is_empty() {
+        return;
+    }
+    let function = node.binary_parts().map_or("", |parts| parts.left.text());
+    let quoted = |names: &[ObjectName]| {
+        names
+            .iter()
+            .map(|name| format!("`{}`", name.name()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    for misuse in misuses {
+        let (rule, range, message) = match misuse {
+            OptionMisuse::UnknownName {
+                key,
+                suggestion,
+                accepted,
+            } => (
+                &catalog::UNKNOWN_OPTION,
+                context.source.range_for_node(key),
+                match suggestion {
+                    Some(suggestion) => format!(
+                        "`{}` is not an option of `{function}`; did you mean `{}`?",
+                        key.text(),
+                        suggestion.name()
+                    ),
+                    None if accepted.is_empty() => {
+                        format!(
+                            "`{function}` takes no options, so `{}` is rejected",
+                            key.text()
+                        )
+                    }
+                    None => format!(
+                        "`{}` is not an option of `{function}`, which accepts {}",
+                        key.text(),
+                        quoted(&accepted)
+                    ),
+                },
+            ),
+            OptionMisuse::ValueType {
+                value,
+                option,
+                actual,
+                accepted,
+            } => (
+                &catalog::OPTION_VALUE_MISMATCH,
+                context.source.range_for_node(value),
+                format!(
+                    "Option `{}` of `{function}` takes {}, but this value has type `{}`",
+                    option.name(),
+                    quoted(&accepted),
+                    actual.label().unwrap_or_else(|| "unknown".to_string())
+                ),
+            ),
+            OptionMisuse::ValueNotPossible {
+                value,
+                option,
+                possible,
+            } => (
+                &catalog::OPTION_VALUE_MISMATCH,
+                context.source.range_for_node(value),
+                format!(
+                    "Option `{}` of `{function}` takes one of {}, not `{}`",
+                    option.name(),
+                    quoted(&possible),
+                    value.text()
+                ),
+            ),
+        };
+        sink.spawn(rule, Finding::new(range, message));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,9 +963,149 @@ mod tests {
     use crate::document::DocumentSnapshot;
     use crate::object_registry::ObjectRegistry;
 
+    fn option_findings(builtins: &ObjectRegistry, source: &str) -> Vec<(&'static str, String)> {
+        let document = DocumentSnapshot::from_text(source.to_string(), builtins).unwrap();
+        document
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| {
+                [
+                    catalog::UNKNOWN_OPTION.code,
+                    catalog::OPTION_VALUE_MISMATCH.code,
+                ]
+                .contains(&diagnostic.rule.code)
+            })
+            .map(|diagnostic| {
+                (
+                    diagnostic.rule.code.as_str(),
+                    diagnostic.finding.message.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn source_declared_options_reject_unknown_names() {
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
+        let declarations = concat!(
+            "f = method(Options => {Verbose => false, Limit => 10})\n",
+            "f ZZ := o -> n -> n\n",
+            "g = {Depth => 2} >> o -> x -> x\n",
+            "h = method(Options => false)\n",
+            "h ZZ := o -> n -> n\n",
+            "e = method(Options => {})\n",
+            "e ZZ := o -> n -> n\n",
+        );
+        let findings = |call: &str| option_findings(&builtins, &format!("{declarations}{call}\n"));
+
+        assert_eq!(
+            findings("f(1, Verbos => true)"),
+            [(
+                "E16",
+                "`Verbos` is not an option of `f`; did you mean `Verbose`?".into()
+            )]
+        );
+        assert_eq!(
+            findings("f(1, Limit => 3, Strategy => 2)"),
+            [(
+                "E16",
+                "`Strategy` is not an option of `f`, which accepts `Verbose`, `Limit`".into()
+            )]
+        );
+        assert_eq!(
+            findings("g(3, Dept => 1)"),
+            [(
+                "E16",
+                "`Dept` is not an option of `g`; did you mean `Depth`?".into()
+            )]
+        );
+        assert_eq!(
+            findings("e(2, Any => 1)"),
+            [("E16", "`e` takes no options, so `Any` is rejected".into())]
+        );
+        assert!(findings("f(1, Verbose => true, Limit => 2)").is_empty());
+        assert!(
+            findings("h(2, Any => 1)").is_empty(),
+            "`Options => false` accepts any name"
+        );
+        assert!(
+            findings("f = 3\nf(1, Bogus => 2)").is_empty(),
+            "a rebound name is no longer the method"
+        );
+    }
+
+    #[test]
+    fn catalog_option_tables_check_names_and_values() {
+        let corpus = format!(
+            "{}\n{}\n{}\n",
+            crate::catalog::test_corpus().trim_end(),
+            concat!(
+                r#"{"kind":"methodFunction","name":"probeTable","package":"$Core$Core","#,
+                r#""class":"$Core$MethodFunctionWithOptions","option_passing":"table","#,
+                r#""methods":[{"domain":["$Core$ZZ"]}],"options":["#,
+                r#"{"key":"Limit","acceptedTypes":["$Core$ZZ","$Core$InfiniteNumber"]},"#,
+                r#"{"key":"Strategy","possibleValues":["Fast","Slow"]},"#,
+                r#"{"key":"Verify","acceptedTypes":["$Core$Boolean"]}]}"#,
+            ),
+            concat!(
+                r#"{"kind":"methodFunction","name":"probeForwarded","package":"$Core$Core","#,
+                r#""class":"$Core$MethodFunctionWithOptions","option_passing":"forwarded","#,
+                r#""methods":[{"domain":["$Core$ZZ"],"option_passing":"table","#,
+                r#""options":[{"key":"Generic"}]},{"domain":["$Core$String"]}]}"#,
+            ),
+        );
+        let builtins = ObjectRegistry::load(&corpus);
+        let findings = |call: &str| option_findings(&builtins, &format!("{call}\n"));
+
+        assert_eq!(
+            findings("probeTable(1, Limt => 2)"),
+            [(
+                "E16",
+                "`Limt` is not an option of `probeTable`; did you mean `Limit`?".into()
+            )]
+        );
+        assert!(
+            findings("probeTable(1, Limit => infinity, Verify => true, Strategy => Fast)")
+                .is_empty()
+        );
+        assert_eq!(
+            findings("probeTable(1, Verify => 3)"),
+            [(
+                "T06",
+                "Option `Verify` of `probeTable` takes `Boolean`, but this value has type `ZZ`"
+                    .into()
+            )]
+        );
+        assert_eq!(
+            findings("probeTable(1, Strategy => Medium)"),
+            [(
+                "T06",
+                "Option `Strategy` of `probeTable` takes one of `Fast`, `Slow`, not `Medium`"
+                    .into()
+            )]
+        );
+        assert!(
+            findings("s := Medium\nprobeTable(1, Strategy => s)").is_empty(),
+            "a variable's symbol is not judged by its name"
+        );
+
+        assert!(findings("probeForwarded(1, Generic => true)").is_empty());
+        assert_eq!(
+            findings("probeForwarded(1, Generik => true)"),
+            [(
+                "E16",
+                "`Generik` is not an option of `probeForwarded`; did you mean `Generic`?".into()
+            )]
+        );
+        assert!(
+            findings("probeForwarded(\"text\", Bogus => 1)").is_empty(),
+            "an installation without a recorded table is not checked"
+        );
+    }
+
     #[test]
     fn call_domain_mismatch_names_the_failing_argument_types() {
-        let builtins = ObjectRegistry::load(include_str!("../../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         for (source, expected) in [
             ("f = method()\nf ZZ := x -> x\nf \"text\"\n", "(String)"),
             ("f = method()\nf ZZ := x -> x\nf(1,2)\n", "(ZZ, ZZ)"),
@@ -833,7 +1129,7 @@ mod tests {
 
     #[test]
     fn ring_variables_prefer_indexed_names_over_multicharacter_symbols() {
-        let builtins = ObjectRegistry::load(include_str!("../../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let messages = |source: &str| {
             let document = DocumentSnapshot::from_text(source.to_string(), &builtins)
                 .expect("fixture should parse");

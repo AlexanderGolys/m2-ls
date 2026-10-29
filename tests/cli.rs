@@ -26,6 +26,12 @@ impl Workspace {
             .args(args)
             .current_dir(&self.0)
             .env("HOME", &self.0)
+            .env(
+                "M2_LS_CATALOG",
+                m2_ls::catalog::CatalogSource::current()
+                    .and_then(|source| source.path())
+                    .expect("test catalog must be available"),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -49,6 +55,65 @@ impl Drop for Workspace {
 
 const FMT: &str = env!("CARGO_BIN_EXE_m2-fmt");
 const LINT: &str = env!("CARGO_BIN_EXE_m2-lint");
+const SERVER: &str = env!("CARGO_BIN_EXE_m2-ls");
+
+#[test]
+fn server_can_prepare_a_catalog_without_starting_a_session() {
+    let workspace = Workspace::new();
+    let prepared = workspace.run(SERVER, &["--download-catalog"], "");
+    assert!(prepared.status.success(), "{prepared:?}");
+    let path = m2_ls::catalog::CatalogSource::current()
+        .and_then(|source| source.path())
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&prepared.stdout).trim_end(),
+        path.to_str().unwrap()
+    );
+    assert!(prepared.stderr.is_empty(), "{prepared:?}");
+
+    let missing = workspace.0.join("missing-catalog.jsonl");
+    for option in ["--help", "-h", "--version", "-V"] {
+        let output = Command::new(SERVER)
+            .arg(option)
+            .env("M2_LS_CATALOG", &missing)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{option}: {output:?}");
+        assert!(!output.stdout.is_empty());
+    }
+    let failed = Command::new(SERVER)
+        .arg("--download-catalog")
+        .env("M2_LS_CATALOG", &missing)
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(2));
+    assert!(failed.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("missing-catalog.jsonl"));
+    let unknown = workspace.run(SERVER, &["--unknown"], "");
+    assert_eq!(unknown.status.code(), Some(2));
+}
+
+#[test]
+fn formatter_needs_no_catalog_and_linter_reports_a_missing_override() {
+    let workspace = Workspace::new();
+    let source = workspace.0.join("file.m2");
+    fs::write(&source, "x=1+2\n").unwrap();
+    let missing = workspace.0.join("missing-catalog.jsonl");
+    let formatted = Command::new(FMT)
+        .args(["--stdout", source.to_str().unwrap()])
+        .env("M2_LS_CATALOG", &missing)
+        .output()
+        .unwrap();
+    assert!(formatted.status.success(), "{formatted:?}");
+    assert!(!formatted.stdout.is_empty());
+    let linted = Command::new(LINT)
+        .arg(&source)
+        .env("M2_LS_CATALOG", &missing)
+        .output()
+        .unwrap();
+    assert_eq!(linted.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&linted.stderr).contains("missing-catalog.jsonl"));
+}
 
 #[test]
 fn formatter_check_write_and_stdin_agree() {

@@ -17,6 +17,7 @@ use crate::record_lsp::record_symbol_kind;
 use crate::record_lsp::{LspKnowledge, PartitionedTypeKnowledge};
 use crate::source::SourceNavigation;
 
+/// Protocol request name intercepted for dynamic type-hierarchy support.
 pub const TYPE_HIERARCHY_METHOD: &str = "textDocument/prepareTypeHierarchy";
 
 /// The static-metadata side of type hierarchy: resolve a record by name,
@@ -24,11 +25,14 @@ pub const TYPE_HIERARCHY_METHOD: &str = "textDocument/prepareTypeHierarchy";
 /// out of the `Backend` handlers — kept here so `main.rs` only wires LSP
 /// requests to thin shims, matching the other capability modules.
 pub struct TypeHierarchyContext<'a, K: ?Sized> {
+    /// Positioned object and type facts available to this request.
     knowledge: &'a K,
+    /// Package and file lookup paths for resolving source locations.
     source_resolver: &'a SourceResolver,
 }
 
 impl<'a, K: PartitionedTypeKnowledge + ?Sized> TypeHierarchyContext<'a, K> {
+    /// Constructs this value from the supplied dependencies and initial state.
     pub fn new(knowledge: &'a K, source_resolver: &'a SourceResolver) -> Self {
         Self {
             knowledge,
@@ -167,12 +171,15 @@ impl<'a, K: PartitionedTypeKnowledge + ?Sized> TypeHierarchyContext<'a, K> {
     }
 }
 
+/// Service wrapper recognizing dynamically enabled type-hierarchy requests.
 #[derive(Debug)]
 pub struct TypeHierarchyCapabilityService<S> {
+    /// Wrapped service receiving requests after interception.
     inner: S,
 }
 
 impl<S> TypeHierarchyCapabilityService<S> {
+    /// Constructs this value from the supplied dependencies and initial state.
     pub fn new(inner: S) -> Self {
         Self { inner }
     }
@@ -253,7 +260,7 @@ mod tests {
     use crate::object_registry::ObjectRegistry;
 
     fn corpus() -> &'static str {
-        include_str!("../data/m2-index.jsonl")
+        crate::catalog::test_corpus()
     }
 
     #[test]

@@ -7,11 +7,14 @@ use tower_lsp::lsp_types::Range as TextRange;
 /// A zero-based line and UTF-8 byte column in source text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourcePoint {
+    /// Zero-based source line.
     pub row: usize,
+    /// UTF-8 byte column within the line.
     pub column: usize,
 }
 
 impl SourcePoint {
+    /// Creates a zero-based source point with a UTF-8 byte column.
     pub const fn new(row: usize, column: usize) -> Self {
         Self { row, column }
     }
@@ -32,7 +35,9 @@ pub type ByteRange = std::ops::Range<usize>;
 /// together by [`SourceNavigation::span_for_bytes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentSpan {
+    /// Inclusive start and exclusive end offsets into the document UTF-8 text.
     bytes: ByteRange,
+    /// Source extent used to locate this item.
     range: TextRange,
 }
 
@@ -54,6 +59,7 @@ impl DocumentSpan {
 /// navigation, highlights, references, and renames treat it as a use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolMention {
+    /// Source coordinates associated with this item.
     span: DocumentSpan,
 }
 
@@ -73,15 +79,18 @@ impl SymbolMention {
         &self.span
     }
 
+    /// LSP UTF-16 extent of the represented source item.
     pub fn range(&self) -> TextRange {
         self.span.range()
     }
 
+    /// Inclusive start and exclusive end byte offsets of the source extent.
     pub fn byte_span(&self) -> (usize, usize) {
         let bytes = self.span.bytes();
         (bytes.start, bytes.end)
     }
 
+    /// Tests membership in the represented selection or source extent.
     pub fn contains(&self, position: Position) -> bool {
         self.span.range().contains_position(position)
     }
@@ -89,6 +98,7 @@ impl SymbolMention {
 /// Cached byte ranges for every line's visible content.
 #[derive(Debug, Clone)]
 struct LineIndex {
+    /// Byte ranges of each line's content, excluding its line ending.
     content_ranges: Vec<ByteRange>,
 }
 
@@ -98,8 +108,11 @@ struct LineIndex {
 /// only once; the ranges are an index into it.
 #[derive(Debug, Clone)]
 pub struct DocumentSource {
+    /// Original or extracted text represented by this item.
     text: String,
+    /// Cached line boundaries used for byte and UTF-16 conversions.
     line_index: LineIndex,
+    /// Parser source identities mapped to their current document offsets.
     syntax_offsets: HashMap<m2_syn::File, usize>,
 }
 
@@ -352,11 +365,14 @@ fn utf16_len(text: &str) -> u32 {
 
 /// Source coordinates paired with the native snapshot supplying typed spans.
 pub struct SyntaxNavigation<'a, S: ?Sized> {
+    /// Original source navigator supplying unchanged text coordinates.
     original: &'a S,
+    /// Cell-local source identities mapped to revision-specific offsets.
     offsets: HashMap<m2_syn::File, usize>,
 }
 
 impl<'a, S: SourceNavigation + ?Sized> SyntaxNavigation<'a, S> {
+    /// Associates a source navigator with the cell offsets of this syntax revision.
     pub fn new(original: &'a S, snapshot: &SyntaxSnapshot) -> Self {
         use m2_syn::Spanned;
         let offsets = snapshot

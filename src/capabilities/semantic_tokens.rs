@@ -20,6 +20,7 @@ use crate::workspace_index::{WorkspaceDefinitionKnowledge, WorkspaceIndex, Works
 use tower_lsp::lsp_types::Range as TextRange;
 use tower_lsp::lsp_types::*;
 
+/// Collects semantic tokens from the supplied syntax and semantic context.
 pub fn collect_semantic_tokens(
     document: &DocumentSnapshot,
     builtins: &ObjectRegistry,
@@ -52,7 +53,7 @@ pub fn collect_semantic_tokens(
         .collect::<Vec<_>>();
     let mut string_spans = classifier.export_spans();
     string_spans.extend(classifier.documentation_spans());
-    string_spans.sort_by_key(|span| span.source.bytes().start);
+    string_spans.sort_by_key(|span| span.bytes().start);
     let mut emitter = SemanticTokenEmitter::new(document, settings);
 
     for source_token in document.analysis().source_semantic_tokens() {
@@ -65,11 +66,11 @@ pub fn collect_semantic_tokens(
             continue;
         }
         let bytes = source_token.span.bytes();
-        let first = string_spans.partition_point(|span| span.source.bytes().start < bytes.start);
+        let first = string_spans.partition_point(|span| span.bytes().start < bytes.start);
         let markup = string_spans[first..]
             .iter()
-            .take_while(|span| span.source.bytes().start == bytes.start)
-            .find(|span| span.source.bytes() == bytes);
+            .take_while(|span| span.bytes().start == bytes.start)
+            .find(|span| span.bytes() == bytes);
         if let Some(span) = markup {
             emitter.push(span.clone());
         } else if let Some(span) = classifier.semantic_span(
@@ -86,7 +87,9 @@ pub fn collect_semantic_tokens(
 /// The classifier of one package session's code, whose own analysis decides
 /// the tokens of the code embedded in the document's strings.
 struct SessionTokenClassifier<'a> {
+    /// Package-loading context for the current document or example.
     session: &'a PackageSession,
+    /// Role classifier combining document, workspace, and catalog knowledge.
     classifier: SemanticTokenClassifier<'a, WorkspaceView<'a>>,
 }
 
@@ -113,7 +116,7 @@ impl SessionTokenClassifier<'_> {
             .iter()
             .filter_map(|token| self.classifier.semantic_span(token, false))
             .filter_map(|span| {
-                let bytes = document.bytes_for_range(span.source.range())?;
+                let bytes = document.bytes_for_range(span.range())?;
                 (container.start <= bytes.start && bytes.end <= container.end).then(|| {
                     SemanticSpan {
                         source: document.span_for_bytes(bytes),
@@ -125,15 +128,22 @@ impl SessionTokenClassifier<'_> {
     }
 }
 
+/// Accumulates ordered protocol tokens while tracking relative coordinates.
 struct SemanticTokenEmitter<'a> {
+    /// Immutable document snapshot being queried.
     document: &'a DocumentSnapshot,
+    /// Current client-configured settings for this feature.
     settings: &'a SemanticTokenSettings,
+    /// Protocol tokens accumulated in source order.
     tokens: Vec<SemanticToken>,
+    /// Position of the previously emitted token for relative encoding.
     previous: Position,
+    /// Source regions paired with inherited semantic modifiers.
     contexts: Vec<(ByteRange, M2SemanticTokenModifier)>,
 }
 
 impl<'a> SemanticTokenEmitter<'a> {
+    /// Constructs this value from the supplied dependencies and initial state.
     fn new(document: &'a DocumentSnapshot, settings: &'a SemanticTokenSettings) -> Self {
         let documentation = document.package_documentation();
         let mut contexts = documentation
@@ -208,12 +218,12 @@ impl<'a> SemanticTokenEmitter<'a> {
             .flat_map(|session| session.spans_inside(self.document, &source_bytes))
             .collect::<Vec<_>>();
         let first_inside =
-            string_spans.partition_point(|span| span.source.bytes().start < source_bytes.start);
+            string_spans.partition_point(|span| span.bytes().start < source_bytes.start);
         spans.extend(
             string_spans[first_inside..]
                 .iter()
-                .take_while(|span| span.source.bytes().start < source_bytes.end)
-                .filter(|span| span.source.bytes().end <= source_bytes.end)
+                .take_while(|span| span.bytes().start < source_bytes.end)
+                .filter(|span| span.bytes().end <= source_bytes.end)
                 .cloned(),
         );
         spans.extend(
@@ -229,7 +239,7 @@ impl<'a> SemanticTokenEmitter<'a> {
             return false;
         }
         spans.sort_by_key(|span| {
-            let bytes = span.source.bytes();
+            let bytes = span.bytes();
             (bytes.start, bytes.end)
         });
 
@@ -238,7 +248,7 @@ impl<'a> SemanticTokenEmitter<'a> {
             || is_documentation;
         let mut boundaries = vec![source_bytes.start, source_bytes.end];
         for span in &spans {
-            let bytes = span.source.bytes();
+            let bytes = span.bytes();
             boundaries.extend([bytes.start, bytes.end]);
         }
         boundaries.sort_unstable();
@@ -251,13 +261,13 @@ impl<'a> SemanticTokenEmitter<'a> {
         let mut emitted = false;
         for segment in boundaries.windows(2) {
             let bytes = segment[0]..segment[1];
-            while next_span < spans.len() && spans[next_span].source.bytes().start <= bytes.start {
-                active.push(Reverse((spans[next_span].source.bytes().len(), next_span)));
+            while next_span < spans.len() && spans[next_span].bytes().start <= bytes.start {
+                active.push(Reverse((spans[next_span].bytes().len(), next_span)));
                 next_span += 1;
             }
             while active
                 .peek()
-                .is_some_and(|Reverse((_, index))| spans[*index].source.bytes().end <= bytes.start)
+                .is_some_and(|Reverse((_, index))| spans[*index].bytes().end <= bytes.start)
             {
                 active.pop();
             }
@@ -289,14 +299,16 @@ impl<'a> SemanticTokenEmitter<'a> {
         emitted
     }
 
+    /// Whether this value has context.
     fn has_context(&self, bytes: &ByteRange) -> bool {
         self.contexts
             .iter()
             .any(|(context, _)| context.start <= bytes.start && bytes.end <= context.end)
     }
 
+    /// Appends a nonempty semantic span after splitting it into valid line-local protocol tokens.
     fn push(&mut self, span: SemanticSpan) -> bool {
-        let bytes = span.source.bytes();
+        let bytes = span.bytes();
         let mut boundaries = vec![bytes.start, bytes.end];
         for (context, _) in &self.contexts {
             boundaries.extend(
@@ -347,17 +359,33 @@ impl<'a> SemanticTokenEmitter<'a> {
         emitted
     }
 
+    /// Consumes the emitter and returns its accumulated protocol tokens.
     fn finish(self) -> Vec<SemanticToken> {
         self.tokens
     }
 }
 
+/// A semantic classification paired with the document span it covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SemanticSpan {
+    /// Source data supplying text and coordinate conversions.
     source: DocumentSpan,
+    /// Operator or semantic token represented by this item.
     token: M2SemanticToken,
 }
 
+impl SemanticSpan {
+    /// Original UTF-8 byte interval covered by this semantic span.
+    pub fn bytes(&self) -> ByteRange {
+        self.source.bytes()
+    }
+    /// LSP UTF-16 extent of the represented source item.
+    pub fn range(&self) -> TextRange {
+        self.source.range()
+    }
+}
+
+/// Maps a token inside extracted documentation code back into the document's source coordinates.
 fn documentation_snippet_semantic_span(
     document: &DocumentSnapshot,
     snippet: &DocumentationSnippet,
@@ -368,11 +396,17 @@ fn documentation_snippet_semantic_span(
     }
 }
 
+/// Combines local, workspace, and catalog roles for source tokens.
 struct SemanticTokenClassifier<'a, W: ?Sized> {
+    /// Immutable document snapshot being queried.
     document: &'a DocumentSnapshot,
+    /// Builtin object registry used when source knowledge is insufficient.
     builtins: &'a ObjectRegistry,
+    /// Cross-file facts supplementing the current document.
     workspace_index: &'a W,
+    /// Current client-configured settings for this feature.
     settings: &'a SemanticTokenSettings,
+    /// Document location associated with the request.
     uri: &'a Url,
 }
 
@@ -644,6 +678,7 @@ where
             )
     }
 
+    /// Combines source, workspace, and catalog facts to classify this semantic token.
     fn classify(
         &self,
         source_token: &SourceSemanticToken,
@@ -722,7 +757,7 @@ mod tests {
             "a = symbol b\n",
             "squares = for i to 3 list i^2\n",
         );
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         // `augments_syntax_tokens` is off so plain keywords are emitted too;
         // the modifier tokens below are emitted either way.
@@ -792,7 +827,7 @@ mod tests {
     fn multi_line_string_token_is_split_per_line() {
         // A raw string spans two lines. The LSP protocol forbids a token from
         // crossing a line boundary, so it must be emitted as one token per line.
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let text = "x := ///alpha\nbeta///\n";
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
@@ -839,7 +874,7 @@ mod tests {
         // An M2 type defined at the top level of another workspace file
         // highlights as a type where it is referenced, even though it is neither
         // a local binding nor a builtin in the referencing file.
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let workspace_index = WorkspaceIndex::default();
         let defs_uri = Url::parse("file:///defs.m2").expect("valid uri");
         workspace_index.index_file(&defs_uri, "TokenStream = new Type of List\n", &builtins);
@@ -867,7 +902,7 @@ mod tests {
     fn cross_file_lookup_excludes_the_current_file() {
         // The current file's own definitions come from its live analysis, not the
         // workspace index, so a self-reference must not be sourced cross-file.
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let workspace_index = WorkspaceIndex::default();
         let main_uri = Url::parse("file:///main.m2").expect("valid uri");
         workspace_index.index_file(&main_uri, "TokenStream = new Type of List\n", &builtins);
@@ -912,7 +947,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     nestedNames := {};
     k := bodyStart;
 )";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
 
@@ -925,7 +960,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn typed_parameter_references_remain_parameters() {
         let text = "f ZZ := x -> x";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
 
         let tokens = collect_tokens(&document, &builtins, false);
@@ -983,7 +1018,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn semantic_tokens_color_wikilinks_as_properties() {
         let text = "x := 1\n-- use [[x]] and [[ideal]]\ny := 2\n";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
 
@@ -1036,7 +1071,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             "t := 1\n",
             "instance := x -> x\n",
         );
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, true);
         let line = text.lines().next().unwrap();
@@ -1077,7 +1112,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn comment_code_uses_one_property_color_when_augmenting() {
         let text = "-- example `if true then 1 + 2 else \"x\"`\ndocumented := 1\n";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, true);
         let line = text.lines().next().unwrap();
@@ -1119,7 +1154,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         // and even a lone opening bracket. M2 hands them all back as symbols —
         // `class(symbol +)` is `Keyword` — so the rule keys on the quote's
         // operand rather than on that operand being an identifier.
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         for quoted in ["+", "==", ",", "(", "{", "#", ".."] {
             let text = format!("a = symbol {quoted}\n");
             let document = document(&text, &builtins);
@@ -1146,7 +1181,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             "d = threadVariable f\n",
             "e = threadLocal f\n",
         );
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, true);
 
@@ -1246,7 +1281,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             "exportFrom {\"Pkg\"}\n",
             "print \"ordinary\""
         );
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
 
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
@@ -1276,6 +1311,41 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     }
 
     #[test]
+    fn semantic_tokens_classify_loaded_file_paths_as_namespaces() {
+        let text = concat!(
+            "load \"foo.m2\"\n",
+            "needs(\"../lib/bar.m2\")\n",
+            "input ///baz.m2///\n",
+            "print \"ordinary.m2\"\n",
+        );
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
+
+        let document = document(text, &builtins);
+        let tokens = collect_tokens(&document, &builtins, false);
+
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| token.token_type)
+                .filter(|token_type| {
+                    *token_type == M2SemanticTokenType::Namespace as u32
+                        || *token_type == M2SemanticTokenType::String as u32
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                M2SemanticTokenType::Namespace as u32, // load "foo.m2"
+                M2SemanticTokenType::Namespace as u32, // needs("../lib/bar.m2")
+                M2SemanticTokenType::Namespace as u32, // input ///baz.m2///
+                M2SemanticTokenType::String as u32,    // print "ordinary.m2"
+            ]
+        );
+        assert!(
+            document.package_mentions().is_empty(),
+            "a loaded file is not a package to navigate to"
+        );
+    }
+
+    #[test]
     fn new_package_binds_its_name_as_a_package() {
         // `newPackage "P"` binds the global `P` to the package it creates, even
         // from inside a function, so later references resolve as namespaces.
@@ -1285,7 +1355,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             "create = () -> newPackage \"Inner\"\n",
             "Inner\n",
         );
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, true);
 
@@ -1297,7 +1367,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
 
     #[test]
     fn cross_file_package_reference_is_highlighted_as_a_namespace() {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let workspace_index = WorkspaceIndex::default();
         let package_uri = Url::parse("file:///Pkg.m2").expect("valid uri");
         workspace_index.index_file(&package_uri, "newPackage \"Pkg\"\n", &builtins);
@@ -1326,7 +1396,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             "loadPackage(,\"AfterNull\")\n",
             "loadPackage(\"Muted\";)\n",
         );
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
 
@@ -1358,7 +1428,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             "importFrom(\"Core\", {\"first\", \"second\"})\n",
             "exportFrom(\"Pkg\", \"only\")\n",
         );
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
 
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
@@ -1429,7 +1499,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         );
         assert!(!is_readonly(9, 23), "the shadowing parameter's reference");
 
-        let index = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let index = ObjectRegistry::load(crate::catalog::test_corpus());
         let indexed = DocumentSnapshot::from_text("debugLevel = 1\nideal 1\n".into(), &index)
             .expect("fixture should parse");
         let tokens = collect_tokens(&indexed, &index, false);
@@ -1458,7 +1528,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             "hook = x -> x\n",
             "f 1\n",
         );
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         for augments_syntax in [false, true] {
             let tokens = collect_tokens(&document, &builtins, augments_syntax);
@@ -1498,7 +1568,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
 
     #[test]
     fn exported_functions_defined_in_loaded_files_receive_function_tokens() {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let text = "newPackage \"Pkg\"\nexport {\"helper\"}\n";
         let document = document(text, &builtins);
         let workspace = WorkspaceIndex::default();
@@ -1598,7 +1668,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn string_valued_locals_remain_variables() {
         let text = "s := 1\nt := toString s\nt\n";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
 
         let tokens = collect_tokens(&document, &builtins, true);
@@ -1616,7 +1686,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn commands_are_functions() {
         let text = "saveClearAll := clearAll\nclearAll = new Command from { () -> () }\nprotect symbol clearAll";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, true);
 
@@ -1648,7 +1718,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn manipulators_are_functions() {
         let text = "endl";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, true);
         let token = token_at(&tokens, 0, 0).expect("endl should have a semantic token");
@@ -1659,7 +1729,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
 
     #[test]
     fn scripted_functors_are_functions() {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let token = builtins
             .get_semantic_token("HH")
             .expect("HH should have builtin metadata");
@@ -1670,7 +1740,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn files_are_ordinary_variables() {
         let text = "stdio";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, true);
         let token = token_at(&tokens, 0, 0).expect("stdio should have a semantic token");
@@ -1682,7 +1752,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn indexed_and_local_noncompiled_values_have_no_provenance_modifier() {
         let text = "true\nlocalValue := true\nlocalValue";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, true);
 
@@ -1774,7 +1844,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
 
     #[test]
     fn builtin_constructor_like_names_do_not_emit_constructor_modifier() {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let token = builtins
             .get_semantic_token("toString")
             .expect("toString should have builtin metadata");
@@ -1789,7 +1859,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         // enum member, while `myKey` (an unprotected user name) is a field. The
         // value `7` is not a symbol, so it is not classified here.
         let text = "f(x, Strategy => 4, myKey => 7)";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
 
@@ -1806,7 +1876,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn option_keys_keep_option_and_binding_protection_modifiers() {
         let text = "f(x, Strategy => Linear, custom => 7)";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
 
@@ -1837,7 +1907,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn local_types_use_type_tokens_and_binding_sites_are_declarations() {
         let text = "TokenStream = new Type of List\nTokenStream\n";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
 
@@ -1856,7 +1926,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn semantic_tokens_never_emit_zero_length_entries() {
         let text = "f ZZ := x -> x";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
 
@@ -1879,7 +1949,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             "n = 3\n",
             "L = {1}\n",
         );
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
         let algebraic = M2SemanticTokenModifier::Algebraic.bit();
@@ -1909,7 +1979,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn ring_generators_have_the_algebraic_modifier_on_declarations_and_references() {
         let text = "R = RR[x, y]\nx\ny\nz = x\nz\nx = 7\nx\n";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
         let generator = M2SemanticTokenModifier::Algebraic.bit();
@@ -1935,7 +2005,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn indexed_generator_tokens_cover_only_registered_entries() {
         let text = "R = QQ[x_0 .. x_2]\nx_1\nx\nx_3\nx_0 + x_2\n";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
         let generator = M2SemanticTokenModifier::Algebraic.bit();
@@ -1982,7 +2052,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn constant_subscripts_are_single_tokens_and_accesses_keep_their_parts() {
         let text = "R = QQ[x, y]\n3_R + R_0\nRR_53\nL = {1, 2}\nL_0\nR_i\nL#0\n";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
         let generator = M2SemanticTokenModifier::Algebraic.bit();
@@ -2204,7 +2274,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn algebraic_type_names_are_type_tokens() {
         let text = "PolynomialRing\nIdeal\nRingElement\n";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
 
@@ -2290,7 +2360,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
 
     #[test]
     fn compiled_runtime_facts_are_retained_regardless_of_package() {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let mut compiled_functions = 0;
 
         for record in builtins.records_by_precedence() {
@@ -2321,7 +2391,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
 
     #[test]
     fn library_callables_are_classified_by_runtime_class() {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let command = M2SemanticToken::new(M2SemanticTokenType::Function);
         for (name, expected) in [
             ("source", M2SemanticToken::new(M2SemanticTokenType::Method)),
@@ -2348,7 +2418,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn method_installation_types_emit_type_parameters() {
         let text = "Ring Element := x -> x";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
 
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
@@ -2368,7 +2438,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
 p = method(TypicalValue => List)
 p(ZZ) := Array => x -> [x]
 ";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
 
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);

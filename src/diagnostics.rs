@@ -32,7 +32,7 @@ mod checks;
 pub mod rewrites;
 pub mod suppression;
 
-pub use checks::{collect, DiagnosticInputs};
+pub use checks::{collect, collect_located, DiagnosticInputs};
 
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location,
@@ -41,6 +41,7 @@ use tower_lsp::lsp_types::{
 use tower_lsp::Client;
 
 use crate::document::DocumentSnapshot;
+use crate::package_index::SourceResolver;
 use crate::settings::DiagnosticSettings;
 
 /// The stable code a diagnostic is published under, such as `S02`. Only the
@@ -103,6 +104,12 @@ impl DiagnosticCode {
             return None;
         };
         Self::from_selector(code)
+    }
+
+    /// Whether the diagnostic says the grammar cannot parse the source, as
+    /// opposed to what parsed source means.
+    pub fn is_parse_failure(self) -> bool {
+        self == catalog::SYNTAX_ERROR.code || self == catalog::MISSING_NODE.code
     }
 
     /// Every registered code, in registration order.
@@ -204,15 +211,19 @@ impl M2Diagnostic {
 }
 
 /// The findings of the document at `uri` that the user's settings allow,
-/// converted for publication.
+/// converted for publication: its analysis findings, then those of its
+/// location, with the files it names looked up in `sources`.
 pub fn visible_diagnostics(
     document: &DocumentSnapshot,
     uri: &Url,
     settings: &DiagnosticSettings,
+    sources: &SourceResolver,
 ) -> Vec<Diagnostic> {
+    let located = collect_located(document, uri, sources);
     document
         .diagnostics()
         .iter()
+        .chain(&located)
         .filter(|diagnostic| settings.allows(diagnostic.rule.code))
         .filter(|diagnostic| !document.diagnostic_suppressions().suppresses(diagnostic))
         .map(|diagnostic| {
@@ -232,9 +243,10 @@ pub async fn publish_diagnostics(
     uri: Url,
     document: &DocumentSnapshot,
     settings: &DiagnosticSettings,
+    sources: &SourceResolver,
     version: Option<i32>,
 ) {
-    let diagnostics = visible_diagnostics(document, &uri, settings);
+    let diagnostics = visible_diagnostics(document, &uri, settings, sources);
     client.publish_diagnostics(uri, diagnostics, version).await;
 }
 

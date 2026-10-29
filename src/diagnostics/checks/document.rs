@@ -15,6 +15,7 @@ pub(super) fn spawn(context: &DocumentContext, sink: &mut DiagnosticSink) {
     unused_binding(context, sink);
 }
 
+/// Reports ordinary source bindings that have no value-reading references.
 fn unused_binding(context: &DocumentContext, sink: &mut DiagnosticSink) {
     let &DocumentContext {
         analysis,

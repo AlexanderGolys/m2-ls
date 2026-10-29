@@ -8,39 +8,59 @@
 mod corpus;
 
 use std::mem;
+
+use serde::Deserialize;
 use std::{collections::HashMap, iter};
 
 use crate::object_registry::{ObjectId, ObjectName, OperatorForm, TypeData, TypeId};
-use corpus::{deserialize_records, RawOperatorForm, RawOptionSpec, RawRecord};
+use corpus::{deserialize_records, parse_records, RawOperatorForm, RawOptionSpec, RawRecord};
 
 /// The canonical metadata for one builtin M2 object.
 #[derive(Debug, Clone)]
 pub struct Record {
+    /// Stable identity used to refer to this retained item.
     pub id: ObjectId,
+    /// Name used to resolve and present this item.
     pub name: ObjectName,
+    /// Runtime class recorded for the object.
     pub class: ObjectName,
+    /// Owning package's canonical identity.
     pub package: ObjectId,
+    /// Type, callable, or ordinary-object payload associated with this canonical record.
     pub data: ObjectData,
+    /// Whether Macaulay2 forbids ordinary reassignment of this object.
     pub protected: bool,
+    /// Alternative names or typed views referring to the same retained item.
     aliases: Vec<String>,
+    /// Rendered documentation or its extracted Markdown coordinates.
     markdown: Option<String>,
 }
 
 /// The mutually exclusive semantic shape of one indexed M2 object.
 #[derive(Debug, Clone)]
 pub enum ObjectData {
+    /// Ordinary callable without method-option forwarding.
     Plain,
+    /// A runtime class identity or its catalog data.
     Type(TypeData),
+    /// Catalog data describing a callable object.
     Callable(CallableInfo),
 }
 
 /// Callable metadata derived from the callable's corpus record.
 #[derive(Debug, Clone)]
 pub struct CallableInfo {
+    /// Semantic or presentation category of this item.
     pub kind: CallableKind,
+    /// Known representative result type for this callable.
     pub typical_value: Option<TypeId>,
+    /// Available method signatures for this callable.
     pub methods: Vec<MethodSignature>,
+    /// Options accepted by the callable, or settings governing this request.
     pub options: Vec<CallableOption>,
+    /// How it takes options; `None` when the catalog does not record it.
+    pub option_passing: Option<OptionPassing>,
+    /// Whether multiple arguments are passed as a single sequence value.
     pub receives_sequence: bool,
 }
 
@@ -48,12 +68,16 @@ pub struct CallableInfo {
 /// the callable it specializes.
 #[derive(Debug, Clone)]
 pub enum CallableKind {
+    /// An ordinary callable name or its source expression.
     Function,
+    /// Method-dispatching function with its recorded option policy.
     MethodFunction,
+    /// An operator callable or its syntax classification.
     Operator(OperatorInfo),
 }
 
 impl Record {
+    /// Callable-specific catalog data, absent for non-callable records.
     pub fn callable(&self) -> Option<&CallableInfo> {
         match &self.data {
             ObjectData::Callable(callable) => Some(callable),
@@ -61,6 +85,7 @@ impl Record {
         }
     }
 
+    /// Runtime class information, absent when the record does not describe a type.
     pub fn type_info(&self) -> Option<&TypeData> {
         match &self.data {
             ObjectData::Type(type_info) => Some(type_info),
@@ -68,24 +93,29 @@ impl Record {
         }
     }
 
+    /// Operator forms and runtime attributes, absent for ordinary callable names.
     pub fn operator_info(&self) -> Option<&OperatorInfo> {
         self.callable()?.operator_info()
     }
 
+    /// All canonical and alias names under which this object can be found.
     pub fn lookup_names(&self) -> impl Iterator<Item = ObjectName> + '_ {
         iter::once(self.name.clone()).chain(self.aliases.iter().map(ObjectName::new))
     }
 
+    /// Rendered Markdown documentation attached to the record, when present.
     pub fn markdown(&self) -> Option<&str> {
         self.markdown.as_deref()
     }
 }
 
 impl CallableInfo {
+    /// Whether this node is a method function.
     pub fn is_method_function(&self) -> bool {
         matches!(self.kind, CallableKind::MethodFunction)
     }
 
+    /// Operator forms and runtime attributes, absent for ordinary callable names.
     pub fn operator_info(&self) -> Option<&OperatorInfo> {
         match &self.kind {
             CallableKind::Operator(operator) => Some(operator),
@@ -95,33 +125,63 @@ impl CallableInfo {
 }
 
 /// One option key and its structured value constraints.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallableOption {
+    /// Name used to resolve and present this item.
     pub name: ObjectName,
+    /// The symbols the option accepts when it works as an enumeration; any
+    /// other symbol is wrong. Empty when it is no enumeration, or unknown.
     pub possible_values: Vec<ObjectName>,
+    /// The types its value may have, as documented; empty when unknown.
+    pub accepted_types: Vec<ObjectName>,
+}
+
+/// How a function takes options, which decides the names a call may pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum OptionPassing {
+    /// It takes no options.
+    Absent,
+    /// It accepts exactly the options of its table, and no other name.
+    Table,
+    /// `method(Options => false)`: it receives the options a call passes as
+    /// a table, whatever their names.
+    Open,
+    /// `method(Options => true)`: the installation a call reaches decides
+    /// the options it accepts.
+    Forwarded,
 }
 
 /// Reverse option relationships indexed from the canonical callable records.
 #[derive(Debug, Clone, Default)]
 pub struct OptionFacts {
+    /// Documented uses grouped by the option value they mention.
     pub option_value_usages: HashMap<ObjectName, Vec<OptionValueUsage>>,
+    /// Documented values indexed by callable and option name.
     pub option_values_by_slot: HashMap<OptionSlot, Vec<ObjectName>>,
 }
 
+/// A callable and option name identifying one catalog option table entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OptionSlot {
+    /// Callable identity or expression selected for this operation.
     pub callable: ObjectName,
+    /// Name of the callable option being checked.
     pub option: ObjectName,
 }
 
 /// A callable/option slot that admits a particular indexed option value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptionValueUsage {
+    /// Callable identity or expression selected for this operation.
     pub callable: ObjectName,
+    /// Name of the callable option being checked.
     pub option: ObjectName,
 }
 
 impl OptionFacts {
+    /// Builds the lookup tables from already decoded canonical object records.
     pub fn from_records(records: &[Record]) -> Self {
         let mut facts = OptionFacts::default();
         for record in records {
@@ -173,27 +233,44 @@ impl OptionFacts {
 /// objects as well as types. Codomains are validated type identities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodSignature {
+    /// Argument identities accepted by the method signature.
     pub domain: Vec<ObjectId>,
+    /// Result type of the method, when known.
     pub codomain: Option<TypeId>,
+    /// The options the installed function itself declares, as `{…} >> o ->
+    /// …` does; `None` when it declares none or the catalog does not record
+    /// them.
+    pub options: Option<Vec<CallableOption>>,
 }
 
 /// Type references retained only until every corpus object has been indexed.
 struct PendingCallableTypes {
+    /// Callable identity or expression selected for this operation.
     callable: ObjectId,
+    /// Known representative result type for this callable.
     typical_value: Option<ObjectName>,
+    /// Available method signatures for this callable.
     methods: Vec<PendingMethodTypes>,
 }
 
+/// Unresolved signature names awaiting catalog object registration.
 struct PendingMethodTypes {
+    /// Argument identities accepted by the method signature.
     domain: Vec<ObjectName>,
+    /// Result type of the method, when known.
     codomain: Option<ObjectName>,
+    /// Options accepted by the callable, or settings governing this request.
+    options: Option<Vec<CallableOption>>,
 }
 
 /// Parser and runtime metadata for an operator-backed callable.
 #[derive(Debug, Clone)]
 pub struct OperatorInfo {
+    /// Name of the runtime method symbol used by an operator.
     pub method_symbol: ObjectName,
+    /// Operator forms recorded by the catalog.
     pub forms: Vec<String>,
+    /// Runtime attributes grouped by operator form.
     pub form_attributes: HashMap<OperatorForm, Vec<String>>,
 }
 
@@ -202,6 +279,7 @@ pub struct OperatorInfo {
 const FLEXIBLE_ATTRIBUTE: &str = "Flexible";
 
 impl OperatorInfo {
+    /// Whether the runtime attributes permit installing methods on this operator form.
     pub fn is_flexible(&self, form: OperatorForm) -> bool {
         self.form_attributes
             .get(&form)
@@ -212,14 +290,31 @@ impl OperatorInfo {
 /// Canonical record population plus name/alias lookup and corpus-global metadata.
 #[derive(Debug, Clone, Default)]
 pub struct BuiltinIndex {
+    /// Canonical object records retained by the index.
     records: Vec<Record>,
+    /// Canonical object identity to record position lookup.
     record_index_by_id: HashMap<ObjectId, usize>,
+    /// Visible name to canonical object identity lookup.
     record_index_by_name: HashMap<ObjectName, ObjectId>,
+    /// Type identities retained when their full catalog record is unavailable.
     opaque_types: HashMap<ObjectName, TypeId>,
+    /// Packages present in the default session before source imports.
     default_loaded: Vec<String>,
 }
 
 impl BuiltinIndex {
+    /// Check that untrusted corpus text is in the wire format [`Self::load`]
+    /// expects, including the mandatory leading `meta` record.
+    pub fn validate(corpus: &str) -> Result<(), String> {
+        let mut records = parse_records(corpus);
+        match records.next().transpose()? {
+            Some(meta) if meta.kind == "meta" => {}
+            _ => return Err("corpus does not start with a meta record".to_owned()),
+        }
+        records.try_for_each(|record| record.map(drop))
+    }
+
+    /// Loads and resolves object records from the supplied catalog text.
     pub fn load(corpus: &str) -> Self {
         let mut index = BuiltinIndex::default();
         let mut pending_type_parents = Vec::new();
@@ -255,14 +350,22 @@ impl BuiltinIndex {
                     let is_operator = raw.kind == "operator";
                     let default_class = if is_operator { "Keyword" } else { "Function" };
                     let mut record = base_record(object_id, &mut raw, keys, default_class);
-                    let methods = raw
-                        .methods
-                        .into_iter()
-                        .map(|method| PendingMethodTypes {
-                            domain: method.domain.into_iter().map(ObjectName).collect(),
-                            codomain: concrete_type_reference(method.typical_value.as_deref()),
-                        })
-                        .collect();
+                    let methods =
+                        raw.methods
+                            .into_iter()
+                            .map(|method| PendingMethodTypes {
+                                domain: method.domain.into_iter().map(ObjectName).collect(),
+                                codomain: concrete_type_reference(method.typical_value.as_deref()),
+                                options: (method.option_passing == Some(OptionPassing::Table))
+                                    .then(|| {
+                                        method
+                                            .options
+                                            .into_iter()
+                                            .map(CallableOption::from)
+                                            .collect()
+                                    }),
+                            })
+                            .collect();
                     let kind = match raw.kind.as_str() {
                         "function" => CallableKind::Function,
                         "methodFunction" => CallableKind::MethodFunction,
@@ -291,6 +394,7 @@ impl BuiltinIndex {
                         typical_value: None,
                         methods: Vec::new(),
                         options: raw.options.into_iter().map(CallableOption::from).collect(),
+                        option_passing: raw.option_passing,
                         receives_sequence: record.class == ObjectName::new("MethodFunctionSingle"),
                     });
                     pending_callable_types.push(PendingCallableTypes {
@@ -360,6 +464,7 @@ impl BuiltinIndex {
                         .codomain
                         .as_ref()
                         .map(|reference| index.resolve_or_insert_type_reference(reference)),
+                    options: method.options,
                 })
                 .collect();
             let callable = index
@@ -392,14 +497,17 @@ impl BuiltinIndex {
         index
     }
 
+    /// Registers a canonical object record together with its lookup names.
     fn insert(&mut self, record: Record) {
         self.insert_with_name_lookup(record, true);
     }
 
+    /// Inserts a canonical record without name lookup.
     fn insert_without_name_lookup(&mut self, record: Record) {
         self.insert_with_name_lookup(record, false);
     }
 
+    /// Inserts a canonical record while controlling name lookup.
     fn insert_with_name_lookup(&mut self, record: Record, include_names: bool) {
         let object_id = record.id.clone();
         let record_index = self.records.len();
@@ -424,6 +532,7 @@ impl BuiltinIndex {
         self.records.push(record);
     }
 
+    /// Resolves reference against the source position and available object knowledge.
     fn resolve_reference(&self, reference: &ObjectName) -> Option<ObjectId> {
         if reference.name().starts_with('$') {
             let canonical = ObjectId::new(reference.name());
@@ -435,6 +544,7 @@ impl BuiltinIndex {
         self.object_id(reference)
     }
 
+    /// Resolves type reference, allocating a retained identity when no record exists.
     fn resolve_or_insert_type_reference(&mut self, reference: &ObjectName) -> TypeId {
         if let Some(type_id) = self.opaque_types.get(reference) {
             return type_id.clone();
@@ -479,6 +589,7 @@ impl BuiltinIndex {
         type_id
     }
 
+    /// Inserts opaque type reference into the retained lookup tables.
     fn insert_opaque_type_reference(&mut self, reference: &ObjectName) -> TypeId {
         let id = ObjectId::new(format!(
             "$Unresolved${}",
@@ -505,6 +616,7 @@ impl BuiltinIndex {
         type_id
     }
 
+    /// Resolves dispatch reference, allocating a retained identity when no record exists.
     fn resolve_or_insert_dispatch_reference(&mut self, reference: &ObjectName) -> ObjectId {
         if let Some(type_id) = self.opaque_types.get(reference) {
             return type_id.object().clone();
@@ -516,17 +628,20 @@ impl BuiltinIndex {
         })
     }
 
+    /// Mutable access to a canonical record while the index is being constructed.
     fn record_mut(&mut self, object_id: &ObjectId) -> Option<&mut Record> {
         let index = *self.record_index_by_id.get(object_id)?;
         self.records.get_mut(index)
     }
 
+    /// Looks up the canonical object record for an identity.
     pub fn object(&self, object_id: &ObjectId) -> Option<&Record> {
         self.record_index_by_id
             .get(object_id)
             .and_then(|index| self.records.get(*index))
     }
 
+    /// Resolves a visible object name to its canonical identity.
     pub fn object_id(&self, name: &ObjectName) -> Option<ObjectId> {
         self.record_index_by_name.get(name).cloned()
     }
@@ -537,10 +652,12 @@ impl BuiltinIndex {
         self.object(&object)
     }
 
+    /// Canonical object records in their retained storage order.
     pub fn records(&self) -> &[Record] {
         &self.records
     }
 
+    /// Packages imported by the default runtime session.
     pub fn default_loaded_packages(&self) -> &[String] {
         &self.default_loaded
     }
@@ -561,12 +678,14 @@ fn canonical_object_id(raw: &RawRecord) -> ObjectId {
     ObjectId::new(format!("${package}${canonical_name}"))
 }
 
+/// Object id used to identify or resolve an owning package.
 fn package_object_id(raw: &RawRecord) -> ObjectId {
     raw.package
         .as_deref()
         .map_or_else(core_package_id, ObjectId::new)
 }
 
+/// Object name used to identify or resolve an owning package.
 fn package_object_name(raw: &RawRecord) -> ObjectName {
     raw.package
         .as_deref()
@@ -575,19 +694,23 @@ fn package_object_name(raw: &RawRecord) -> ObjectName {
         .unwrap_or_else(|| ObjectName::new("Core"))
 }
 
+/// Package id identifying the core runtime package.
 fn core_package_id() -> ObjectId {
     ObjectId::new("$Core$Core")
 }
 
+/// Package id retained when the corresponding package cannot be resolved.
 fn unresolved_package_id() -> ObjectId {
     ObjectId::new("$Unresolved$Unresolved")
 }
 
+/// Name from id used to identify or resolve an owning package.
 fn package_name_from_id(package: &ObjectId) -> ObjectName {
     ObjectName::new(deref_ref(package.name()))
 }
 
 impl Record {
+    /// Mutable access to this record's callable data during catalog resolution.
     fn callable_mut(&mut self) -> Option<&mut CallableInfo> {
         match &mut self.data {
             ObjectData::Callable(callable) => Some(callable),
@@ -595,6 +718,7 @@ impl Record {
         }
     }
 
+    /// Mutable access to this record's runtime class data during catalog resolution.
     fn type_info_mut(&mut self) -> Option<&mut TypeData> {
         match &mut self.data {
             ObjectData::Type(type_info) => Some(type_info),
@@ -603,6 +727,7 @@ impl Record {
     }
 }
 
+/// Constructs the shared identity, package, protection, and documentation fields of a catalog record.
 fn base_record(
     id: ObjectId,
     raw: &mut RawRecord,
@@ -658,6 +783,11 @@ impl From<RawOptionSpec> for CallableOption {
         CallableOption {
             name: ObjectName::new(&raw.key),
             possible_values: raw.possible_values.into_iter().map(ObjectName).collect(),
+            accepted_types: raw
+                .accepted_types
+                .iter()
+                .map(|reference| ObjectName::new(deref_ref(reference)))
+                .collect(),
         }
     }
 }
@@ -689,7 +819,7 @@ mod tests {
     use super::*;
 
     fn index() -> BuiltinIndex {
-        BuiltinIndex::load(include_str!("./data/m2-index.jsonl"))
+        BuiltinIndex::load(crate::catalog::test_corpus())
     }
 
     fn type_entry<'index>(index: &'index BuiltinIndex, name: &str) -> Option<&'index Record> {
@@ -751,7 +881,7 @@ mod tests {
 
     #[test]
     fn load_parses_new_format_corpus() {
-        let index = BuiltinIndex::load(include_str!("./data/m2-index.jsonl"));
+        let index = BuiltinIndex::load(crate::catalog::test_corpus());
 
         // A type record carries one canonical, typed parent edge.
         let zz = type_entry(&index, "ZZ").expect("ZZ type present");

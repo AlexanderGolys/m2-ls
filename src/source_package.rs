@@ -40,7 +40,9 @@ pub enum ExportAccess {
 /// they register.
 #[derive(Debug, Default)]
 pub struct SourcePackages {
+    /// Package declarations encountered in source order.
     declarations: Vec<PackageDeclaration>,
+    /// TEST blocks paired with the package session in which they execute.
     tests: Vec<PackageSessionCode>,
 }
 
@@ -160,9 +162,13 @@ impl PackageSessionCode {
 /// The package-structure calls of a source file, in source order, before they
 /// are grouped into sections.
 enum PackageCall<'tree> {
+    /// Navigates to the declaration that introduces the selected object.
     Declaration(SyntaxNode<'tree>, SyntaxNode<'tree>),
+    /// A source construct closing a package declaration.
     Closing(SyntaxNode<'tree>, &'tree str),
+    /// A source declaration exporting names with the selected access policy.
     Export(SyntaxNode<'tree>, ExportAccess),
+    /// A TEST block paired with its keyword and body.
     Test(SyntaxNode<'tree>, SyntaxNode<'tree>),
 }
 
@@ -282,6 +288,7 @@ impl SourcePackages {
             .find(|declaration| declaration.contains(position))
     }
 
+    /// Mutable access to the package declaration active at the supplied source position.
     fn declaration_at_mut(&mut self, position: Position) -> Option<&mut PackageDeclaration> {
         self.declarations
             .iter_mut()
@@ -309,6 +316,7 @@ impl PackageDeclaration {
 }
 
 impl<'tree> PackageCall<'tree> {
+    /// Recognizes a supported package declaration, export, closing marker, or TEST block.
     fn recognize(node: SyntaxNode<'tree>) -> Option<Self> {
         if let Some(name) = declared_package_name(node) {
             return Some(Self::Declaration(node, name));

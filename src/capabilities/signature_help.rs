@@ -19,6 +19,7 @@ use crate::object_registry::ObjectName;
 use crate::record_lsp::{LspKnowledge, ResolvedSignature};
 use crate::source::SourceNavigation;
 
+/// Help response used to render the resolved callable signature.
 pub fn signature_help_response(
     document: &DocumentSnapshot,
     position: Position,
@@ -182,6 +183,7 @@ fn local_signatures(
         .collect()
 }
 
+/// Signature information selected from the callable and binding facts of this document.
 fn local_signature_information(callable: &str, method: &Method) -> SignatureInformation {
     let domain = method
         .domain
@@ -196,6 +198,7 @@ fn local_signature_information(callable: &str, method: &Method) -> SignatureInfo
     )
 }
 
+/// Protocol signature labels and parameter information for a builtin callable.
 fn builtin_signature_information(
     callable: &str,
     signature: &ResolvedSignature,
@@ -242,7 +245,7 @@ mod tests {
     fn help(text: &str, position: Position) -> Option<SignatureHelp> {
         let document = DocumentSnapshot::from_text(text.to_string(), &ObjectRegistry::default())
             .expect("fixture should parse");
-        let index = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let index = ObjectRegistry::load(crate::catalog::test_corpus());
         let scoped = index.with_source_imports(text);
         signature_help_response(&document, position, &scoped)
     }

@@ -213,6 +213,7 @@ pub(super) fn nested_symbols<'tree>(
 /// One region of source that changes where names are bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Scope {
+    /// Source extent used to locate this item.
     range: TextRange,
     /// `None` only for [`ROOT_SCOPE`].
     parent: Option<ScopeId>,
@@ -224,6 +225,7 @@ struct Scope {
 /// Every scope of a file, indexed by [`ScopeId`] in pre-order.
 #[derive(Debug)]
 pub(super) struct ScopeTree {
+    /// Lexical scopes collected in traversal order.
     scopes: Vec<Scope>,
 }
 
@@ -241,6 +243,7 @@ impl Default for ScopeTree {
 }
 
 impl ScopeTree {
+    /// Appends a lexical scope and returns its index in traversal order.
     fn push(
         &mut self,
         range: TextRange,
@@ -341,6 +344,7 @@ impl ScopeKind {
         matches!(self, Self::Function(_) | Self::Branch)
     }
 
+    /// Argument shape of the function owning this scope, when one exists.
     fn function_dispatch(&self) -> Option<Dispatch> {
         match self {
             Self::Function(dispatch) => Some(*dispatch),
@@ -362,6 +366,7 @@ struct TraversalContext {
 }
 
 impl TraversalContext {
+    /// Initial traversal context with every binding target set to the document scope.
     const ROOT: Self = Self {
         scope: ROOT_SCOPE,
         assignment_scope: ROOT_SCOPE,
@@ -436,15 +441,20 @@ impl BoundSymbols for AssignmentPackComponent {
 struct TypedWalker<'tree, 'source, Source: ?Sized> {
     /// Root of the syntax tree, used to map typed nodes back to syntax nodes.
     root: SyntaxNode<'tree>,
+    /// Source data supplying text and coordinate conversions.
     source: &'source Source,
+    /// Lexical scopes collected in traversal order.
     scopes: ScopeTree,
+    /// Bindings collected for the containing analysis or scope.
     bindings: Vec<BindingFact>,
+    /// Inherited semantic context for the current traversal.
     context: TraversalContext,
     /// Range of the top-level cell being walked.
     definition: TextRange,
 }
 
 impl<'tree, 'source, Source: SourceNavigation + ?Sized> TypedWalker<'tree, 'source, Source> {
+    /// Starts syntax-only scope collection at the document root with an empty binding-fact stream.
     fn new(root: SyntaxNode<'tree>, source: &'source Source) -> Self {
         Self {
             root,

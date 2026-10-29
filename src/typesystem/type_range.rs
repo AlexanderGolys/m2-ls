@@ -8,26 +8,33 @@ use crate::object_registry::{ObjectName, TypeId, TypeStore};
 
 use super::{SubtypeEvidence, TypeRole};
 
+/// Shared textual identity used for resolved type ancestry comparisons.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TypeKey(Arc<str>);
 
 impl TypeKey {
+    /// Constructs a type representation from its resolved canonical identity.
     fn from_id(type_id: &TypeId) -> Self {
         Self(Arc::from(type_id.object().name()))
     }
 
+    /// Constructs an unresolved type key from its source-visible name.
     fn from_name(name: &ObjectName) -> Self {
         Self(Arc::from(name.name()))
     }
 }
 
+/// A named type together with its resolved identity and ancestry evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Type {
+    /// Name used to resolve and present this item.
     name: ObjectName,
+    /// Resolved ancestor identities used for subtype comparisons.
     ancestry: Arc<[TypeKey]>,
 }
 
 impl Type {
+    /// Constructs nominal type evidence containing the named type and the root Thing class.
     pub fn direct(name: ObjectName) -> Self {
         let thing = TypeKey::from_name(&ObjectName::new("Thing"));
         let type_key = TypeKey::from_name(&name);
@@ -42,6 +49,7 @@ impl Type {
         }
     }
 
+    /// Constructs a type representation from its resolved canonical identity.
     pub fn from_id(
         name: ObjectName,
         type_id: TypeId,
@@ -68,6 +76,7 @@ impl Type {
         })
     }
 
+    /// Name used to identify this value in source and catalog lookups.
     pub fn name(&self) -> &ObjectName {
         &self.name
     }
@@ -88,25 +97,32 @@ impl PartialOrd for Type {
     }
 }
 
+/// A union of exact types and upward-closed subtype families.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TypeRange {
+    /// Known exact type points included in this range.
     exact: HashSet<Type>,
+    /// Minimal roots of the upward-closed subtype families included in this range.
     generators: HashSet<Type>,
 }
 
 impl TypeRange {
+    /// An empty result range representing an expression that does not return normally.
     pub fn diverges() -> Self {
         Self::default()
     }
 
+    /// A range containing only the named runtime class.
     pub fn exact(name: &str) -> Self {
         Self::exact_type(Type::direct(ObjectName::new(name)))
     }
 
+    /// A range containing exactly the supplied class name.
     pub fn exact_from_id(name: ObjectName) -> Self {
         Self::exact_type(Type::direct(name))
     }
 
+    /// A range containing exactly the supplied resolved type point.
     pub fn exact_type(point: Type) -> Self {
         Self {
             exact: HashSet::from([point]),
@@ -114,14 +130,17 @@ impl TypeRange {
         }
     }
 
+    /// A range containing the named class and its possible subtypes.
     pub fn upward(name: &str) -> Self {
         Self::upward_type(Type::direct(ObjectName::new(name)))
     }
 
+    /// An upward-closed range rooted at the supplied class name.
     pub fn upward_from_id(name: ObjectName) -> Self {
         Self::upward_type(Type::direct(name))
     }
 
+    /// An upward-closed range rooted at the supplied resolved type.
     pub fn upward_type(generator: Type) -> Self {
         Self {
             exact: HashSet::new(),
@@ -129,6 +148,7 @@ impl TypeRange {
         }
     }
 
+    /// An unconstrained result range when no narrower type evidence is available.
     pub fn unknown() -> Self {
         Self::upward("Thing")
     }
@@ -142,6 +162,7 @@ impl TypeRange {
             .any(|generator| *generator.name() == top)
     }
 
+    /// The sole named type when this range has a single expressible result.
     pub fn single(&self) -> Option<&ObjectName> {
         match (self.exact.len(), self.generators.len()) {
             (1, 0) => self.exact.iter().next().map(Type::name),
@@ -150,14 +171,17 @@ impl TypeRange {
         }
     }
 
+    /// Exact type names included in this range.
     pub fn exact_points(&self) -> impl Iterator<Item = &ObjectName> {
         self.exact.iter().map(Type::name)
     }
 
+    /// Type names whose subtype families contribute to this range.
     pub fn upward_generators(&self) -> impl Iterator<Item = &ObjectName> {
         self.generators.iter().map(Type::name)
     }
 
+    /// Resolves stored names through the callback before comparing ancestry.
     pub fn resolved_by(mut self, mut resolve: impl FnMut(&ObjectName) -> Option<Type>) -> Self {
         let exact = std::mem::take(&mut self.exact)
             .into_iter()
@@ -170,6 +194,7 @@ impl TypeRange {
         Self::new(exact, generators)
     }
 
+    /// Formats the known result types as a compact user-facing label.
     pub fn label(&self) -> Option<String> {
         let mut names = self
             .exact
@@ -181,6 +206,7 @@ impl TypeRange {
         (!names.is_empty()).then(|| names.join(" | "))
     }
 
+    /// Formats this range with subtype markers when a compact label is available.
     pub fn subset_label(
         &self,
         has_strict_member_above: impl Fn(&ObjectName) -> bool,
@@ -205,6 +231,7 @@ impl TypeRange {
         (!names.is_empty()).then(|| names.join(" | "))
     }
 
+    /// Combines the available subtype evidence to classify a candidate result.
     pub fn possibility_by(
         &self,
         candidate: &ObjectName,
@@ -224,6 +251,7 @@ impl TypeRange {
         result
     }
 
+    /// Constructs a canonical type range from exact points and subtype-family generators.
     fn new(
         exact: impl IntoIterator<Item = Type>,
         generators: impl IntoIterator<Item = Type>,
@@ -238,6 +266,7 @@ impl TypeRange {
         range
     }
 
+    /// Tests membership in the represented selection or source extent.
     fn contains(&self, candidate: &Type) -> bool {
         self.exact.contains(candidate)
             || self
@@ -246,12 +275,14 @@ impl TypeRange {
                 .any(|generator| generator <= candidate)
     }
 
+    /// Adds an exact type point to the range without duplicating existing evidence.
     fn insert_exact(&mut self, point: Type) {
         if !self.contains(&point) {
             self.exact.insert(point);
         }
     }
 
+    /// Adds a subtype-family generator while preserving the range's canonical form.
     fn insert_generator(&mut self, generator: Type) {
         if self
             .generators

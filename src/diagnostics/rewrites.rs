@@ -10,6 +10,7 @@ use m2_syn::Token;
 use crate::analysis::{clause_of, clause_value, parenthesized_value, symbol_node_text};
 use crate::node_metadata::{matches_token, token_spelling, SyntaxNode};
 
+/// Inner expression whose control-flow parentheses can be removed without changing parsing.
 pub fn redundant_control_parentheses_inner(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     if !node.is_holder() {
         return None;
@@ -24,6 +25,7 @@ pub fn redundant_control_parentheses_inner(node: SyntaxNode<'_>) -> Option<Synta
         .flatten()
 }
 
+/// Replacement text for the recognized ambiguous float member access simplification, absent when it does not apply.
 pub fn ambiguous_float_member_access_rewrite(node: SyntaxNode<'_>) -> Option<String> {
     if !node.is_space_application() {
         return None;
@@ -42,6 +44,7 @@ pub fn ambiguous_float_member_access_rewrite(node: SyntaxNode<'_>) -> Option<Str
     Some(format!("{}#{member_index}", left.text()))
 }
 
+/// Rewrites a decimal-looking member selector into an unambiguous index spelling.
 fn member_index_for_ambiguous_float_literal(float_text: &str) -> Option<String> {
     let fractional_part = float_text.strip_prefix('.')?;
     (!fractional_part.is_empty() && fractional_part.chars().all(|ch| ch.is_ascii_digit()))
@@ -276,7 +279,9 @@ fn binding_precedence(spelling: &str) -> Option<u8> {
 /// Which branch of an `if` runs when its subject is null.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NullBranch {
+    /// The conditional's then branch.
     Then,
+    /// The conditional's else branch.
     Else,
 }
 
@@ -284,14 +289,18 @@ enum NullBranch {
 /// a `try` around the whole conditional.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubjectErrors {
+    /// The failure propagates beyond this expression.
     Propagate,
+    /// The failure is handled by this expression's fallback.
     Caught,
 }
 
 /// What an `if` compares with `null`, and the branch that runs when it is null.
 #[derive(Debug, Clone, Copy)]
 struct NullTest<'tree> {
+    /// Expression whose behavior the rewrite preserves.
     subject: SyntaxNode<'tree>,
+    /// Branch returning the null value in a conditional rewrite.
     null_branch: NullBranch,
 }
 
@@ -344,6 +353,7 @@ fn guarded_value(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
         .and_then(parenthesized_value)
 }
 
+/// Recognizes the subject and fallback branch of a conditional coalescence expression.
 fn coalescence_parts(
     if_statement: SyntaxNode<'_>,
     subject_errors: SubjectErrors,
@@ -361,6 +371,7 @@ fn coalescence_parts(
     same_expression(repeated_subject, subject).then_some((subject, fallback))
 }
 
+/// Replacement text for the recognized if null branch simplification, absent when it does not apply.
 pub fn if_null_branch_rewrite(if_node: SyntaxNode<'_>) -> Option<String> {
     let condition = if_node.control_condition()?;
     let then_branch = clause_of::<ThenClause>(if_node).and_then(clause_value)?;
@@ -385,6 +396,7 @@ pub fn if_null_branch_rewrite(if_node: SyntaxNode<'_>) -> Option<String> {
     None
 }
 
+/// Replacement text for the recognized try statement simplification, absent when it does not apply.
 pub fn try_statement_rewrite(try_node: SyntaxNode<'_>) -> Option<String> {
     let condition = try_node.clause_value()?;
     let consequence = clause_of::<ThenClause>(try_node).and_then(clause_value);
@@ -410,6 +422,7 @@ pub fn try_statement_rewrite(try_node: SyntaxNode<'_>) -> Option<String> {
     None
 }
 
+/// Replacement text for the recognized if condition simplification, absent when it does not apply.
 pub fn if_condition_rewrite(if_node: SyntaxNode<'_>) -> Option<String> {
     let condition = if_node.control_condition()?;
     let simplified = simplify_condition(condition)?;
@@ -424,6 +437,7 @@ pub fn if_condition_rewrite(if_node: SyntaxNode<'_>) -> Option<String> {
     Some(replacement)
 }
 
+/// Replacement text for the recognized else if chain simplification, absent when it does not apply.
 pub fn else_if_chain_rewrite(if_node: SyntaxNode<'_>) -> Option<String> {
     flatten_then_if_chain(if_node).or_else(|| flatten_parenthesized_else_if_chain(if_node))
 }
@@ -455,6 +469,7 @@ fn flatten_then_if_chain(if_node: SyntaxNode<'_>) -> Option<String> {
     ))
 }
 
+/// Flattens parenthesized else if chain while preserving the represented source behavior.
 fn flatten_parenthesized_else_if_chain(if_node: SyntaxNode<'_>) -> Option<String> {
     let else_branch = clause_of::<ElseClause>(if_node).and_then(clause_value)?;
     let nested_if = unwrap_parentheses(else_branch);
@@ -484,6 +499,7 @@ pub fn simplification_of(node: SyntaxNode<'_>, rewrite: Option<String>) -> Optio
     rewrite.filter(|replacement| replacement.trim() != node.text().trim())
 }
 
+/// Shorter condition text preserving the recognized expression's Boolean behavior.
 fn simplify_condition(node: SyntaxNode<'_>) -> Option<String> {
     // A condition's span runs up to the `then` keyword, so it carries the
     // separating whitespace. Comparing against the untrimmed text would make
@@ -517,6 +533,7 @@ fn simplify_condition(node: SyntaxNode<'_>) -> Option<String> {
     (simplified != original).then_some(simplified)
 }
 
+/// Follows nested holders to the underlying expression.
 fn unwrap_parentheses(node: SyntaxNode<'_>) -> SyntaxNode<'_> {
     if node.is_holder() && node.child_count() == 3 {
         if let Some(inner) = node.child(1) {
@@ -571,6 +588,7 @@ fn negated_condition_text(node: SyntaxNode<'_>) -> String {
     }
 }
 
+/// Equivalent comparison operator after logical negation, when one exists.
 fn negated_binary_operator(operator: &str) -> Option<&'static str> {
     if matches_token::<Token![==]>(operator) {
         Some(token_spelling::<Token![!=]>())

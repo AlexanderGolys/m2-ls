@@ -22,7 +22,9 @@ macro_rules! pos_max {
     };
 }
 
+/// Containment operations for LSP ranges using their half-open boundaries.
 pub trait TextRangeExt {
+    /// Tests half-open containment of an LSP UTF-16 position.
     fn contains_position(&self, position: Position) -> bool;
 }
 

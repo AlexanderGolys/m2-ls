@@ -1,13 +1,30 @@
-//! Shared Macaulay2 analysis, command-line tools, and language server.
+//! Macaulay2 language-server transport and standalone command-line tools.
+//!
+//! Editors start `m2-ls` over standard input and output. `m2-lint` reports
+//! diagnostics without executing source; `m2-fmt` applies the same formatting
+//! settings as the server. The [`cli`] module exposes their process entry point.
+//!
+//! Builtin metadata and documentation are loaded through [`catalog`]. An existing
+//! local catalog selected by `M2_LS_CATALOG` enables offline analysis; otherwise
+//! the tools download and verify the M2Book catalog before using its cached copy.
+//!
+//! ```
+//! use m2_ls::catalog::CatalogDigest;
+//! let first = CatalogDigest::of(b"catalog bytes");
+//! assert_eq!(first, CatalogDigest::of(b"catalog bytes"));
+//! ```
 
 use std::backtrace::Backtrace;
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::panic;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use tokio::{io, task};
 use tower_lsp::{
     jsonrpc::Result,
@@ -24,11 +41,16 @@ mod util;
 mod analysis;
 mod builtin_index;
 mod capabilities;
+pub mod catalog;
 pub mod cli;
+/// The optional client capabilities the server negotiates, such as refresh
+/// requests, and acting on them only when the client supports them.
 mod client_capabilities;
 mod diagnostics;
 mod document;
 mod documentation;
+mod file_load;
+mod init_file;
 mod library_index;
 mod macaulay2;
 mod meta;
@@ -42,6 +64,7 @@ mod session;
 mod settings;
 mod source;
 mod source_package;
+mod string_literal;
 mod telemetry;
 #[cfg(test)]
 mod test_support;
@@ -54,6 +77,7 @@ use capabilities::document_highlight::{
     document_highlight_provider_capability, document_highlights,
 };
 use capabilities::document_symbols::collect_document_symbols;
+use capabilities::file_operations::{file_operations_capability, FileMoves};
 use capabilities::formatting::{
     document_formatting_provider_capability, document_formatting_text_edits,
     folding_range_provider_capability, folding_ranges,
@@ -78,39 +102,67 @@ use client_capabilities::{
     SemanticTokensRefresh, TypeHierarchyDynamicRegistration, WorkspaceRefresh,
 };
 use diagnostics::{publish_diagnostics, visible_diagnostics};
-use document::DocumentSnapshot;
+use document::{DocumentSnapshot, FileProperties};
+use init_file::{InitFile, InitFileDirective, InitFileStart, InitFiles};
 use library_index::{LibraryIndex, LibrarySources};
-use package_index::{InitializationFile, Macaulay2Environment, SourceResolver};
+use package_index::{Macaulay2Environment, SourceResolver};
 use session::{ClientInput, ExitNotificationService, SessionEnd};
 
+use crate::catalog::CatalogSource;
+use crate::diagnostics::DiagnosticCode;
 use crate::object_registry::ObjectRegistry;
 use crate::semantic_token::M2SemanticToken;
 use crate::settings::{ServerSettings, SettingProblem, SettingsStore, SourceSettings};
 use crate::workspace_index::{WorkspaceIndex, WorkspaceView};
 
+/// The language server's state for one client session: the open documents, the
+/// indexes built from them and the library, and the settings.
 #[derive(Debug)]
 struct Backend {
+    /// The connection to the client, for notifications and server-side
+    /// requests.
     client: Client,
+    /// The builtin catalog with the default packages loaded, which every
+    /// session starts from; init files are added per document.
     registry: ObjectRegistry,
+    /// Where the Macaulay2 installation, the user's application directory and
+    /// the server's source override are.
     environment: Macaulay2Environment,
+    /// The open documents, each as analyzed for its latest text.
     documents: DashMap<Url, DocumentSnapshot>,
+    /// The client's version of each open document, which published diagnostics
+    /// carry.
     document_versions: DashMap<Url, i32>,
+    /// The global definitions of the open documents and of the files they load
+    /// and the packages they import.
     workspace_index: Arc<WorkspaceIndex>,
+    /// The library sources navigation enters, replaced when `sources.*`
+    /// changes.
     library: SettingsStore<Arc<LibraryIndex>>,
+    /// The settings the client sent last.
     settings: SettingsStore<ServerSettings>,
+    /// Whether the client keeps its syntax highlighting under semantic tokens.
     semantic_tokens_augment_syntax: ClientSupport<SemanticTokensAugmentSyntax>,
+    /// Whether the client registers the type hierarchy dynamically.
     type_hierarchy_dynamic_registration: ClientSupport<TypeHierarchyDynamicRegistration>,
+    /// Whether the client accepts requests to refresh inlay hints.
     inlay_hint_refresh: ClientSupport<InlayHintRefresh>,
+    /// Whether the client accepts requests to refresh semantic tokens.
     semantic_tokens_refresh: ClientSupport<SemanticTokensRefresh>,
-    /// The user's `init.m2`, which Macaulay2 runs before any document.
-    initialization_file: Option<InitializationFile>,
+    /// The init files the documents' sessions start with, which Macaulay2
+    /// runs before any document. `registry` itself starts without one.
+    init_files: InitFiles,
+    /// The workspace folders the client has open: where a rename looks for
+    /// the loads it has to edit. Closing one drops its files from the index.
+    workspace_folders: DashSet<Url>,
 }
 
 impl Backend {
-    fn new(client: Client) -> Self {
+    /// The state of a session with `client`, its catalog read from `corpus`,
+    /// before the client sends its settings.
+    fn new(client: Client, corpus: &str) -> Self {
         let environment = Macaulay2Environment::current();
-        let mut registry = ObjectRegistry::load(include_str!("./data/m2-index.jsonl"));
-        let initialization_file = InitializationFile::load(&environment, &mut registry);
+        let registry = ObjectRegistry::load(corpus);
         let library = configured_library(&environment, &registry, &SourceSettings::default());
         Backend {
             client,
@@ -125,16 +177,125 @@ impl Backend {
             type_hierarchy_dynamic_registration: ClientSupport::default(),
             inlay_hint_refresh: ClientSupport::default(),
             semantic_tokens_refresh: ClientSupport::default(),
-            initialization_file,
+            init_files: InitFiles::default(),
+            workspace_folders: DashSet::new(),
         }
     }
 
+    /// The open workspace folders on disk.
+    fn workspace_folder_paths(&self) -> Vec<PathBuf> {
+        self.workspace_folders
+            .iter()
+            .filter_map(|folder| folder.to_file_path().ok())
+            .collect()
+    }
+
+    /// Re-index the files loading something at or under `path`, after files
+    /// there appeared, moved or vanished, and republish the diagnostics of
+    /// the open ones.
+    async fn refresh_loaders_of(&self, path: &Path) {
+        for loader in self.workspace_index.loaders_under(path) {
+            let Some(document) = self.documents.get(&loader) else {
+                self.reindex_from_disk(&loader);
+                continue;
+            };
+            let loaded =
+                self.workspace_index
+                    .index_snapshot(&loader, document.value(), &self.registry);
+            drop(document);
+            self.index_loaded_in_background(loaded).await;
+            if let Some(document) = self.documents.get(&loader) {
+                self.publish_document_diagnostics(loader.clone(), document.value())
+                    .await;
+            }
+        }
+    }
+
+    /// Republish the diagnostics of the open documents loading something at
+    /// or under `path`, without re-indexing them.
+    async fn republish_open_loaders_of(&self, path: &Path) {
+        for loader in self.workspace_index.loaders_under(path) {
+            if let Some(document) = self.documents.get(&loader) {
+                self.publish_document_diagnostics(loader.clone(), document.value())
+                    .await;
+            }
+        }
+    }
+
+    /// Re-index the open documents and what they load, restoring the files
+    /// they need after others left the index.
+    async fn reindex_open_documents(&self) {
+        let loaded = self
+            .documents
+            .iter()
+            .flat_map(|document| {
+                self.workspace_index.index_snapshot(
+                    document.key(),
+                    document.value(),
+                    &self.registry,
+                )
+            })
+            .collect();
+        self.index_loaded_in_background(loaded).await;
+    }
+
+    /// Drop the closed files at or under `path` from the index.
+    fn forget_closed_files_under(&self, path: &Path) -> Vec<Url> {
+        let forgotten = self
+            .workspace_index
+            .files_under(path)
+            .into_iter()
+            .filter(|file| !self.documents.contains_key(file))
+            .collect::<Vec<_>>();
+        for file in &forgotten {
+            self.workspace_index.forget_file(file);
+        }
+        forgotten
+    }
+
+    /// A file or directory appeared at `path`.
+    async fn on_created(&self, path: &Path) {
+        self.refresh_loaders_of(path).await;
+        self.reload_init_file(path).await;
+    }
+
+    /// The file or directory at `path` is gone.
+    async fn on_deleted(&self, path: &Path) {
+        self.forget_closed_files_under(path);
+        self.refresh_loaders_of(path).await;
+        self.reload_init_file(path).await;
+    }
+
+    /// Files and directories moved: their closed files are indexed where
+    /// they went, and every file loading something on either side re-indexed.
+    async fn on_moved(&self, moves: &FileMoves) {
+        let origins = moves.origins().map(Path::to_path_buf).collect::<Vec<_>>();
+        let destinations = moves
+            .destinations()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        let moved = origins
+            .iter()
+            .flat_map(|origin| self.forget_closed_files_under(origin))
+            .filter_map(|file| moves.destination(&file))
+            .filter(|file| !self.documents.contains_key(file))
+            .collect();
+        self.index_loaded_in_background(moved).await;
+        for path in origins.iter().chain(&destinations) {
+            self.refresh_loaders_of(path).await;
+        }
+    }
+
+    /// Index the file `uri` again from its saved text, or drop it from the
+    /// index when it can no longer be read.
     fn reindex_from_disk(&self, uri: &Url) {
         let Ok(path) = uri.to_file_path() else {
             return;
         };
         match fs::read_to_string(&path) {
-            Ok(text) => self.workspace_index.index_file(uri, &text, &self.registry),
+            Ok(text) => self
+                .workspace_index
+                .index_file(uri, &text, &self.workspace_registry()),
             Err(_) => self.workspace_index.remove_file(uri),
         }
     }
@@ -144,6 +305,8 @@ impl Backend {
         document.object_registry()
     }
 
+    /// Answer `request` from the open document `uri`; `None` when it is not
+    /// open.
     fn with_document<R>(
         &self,
         uri: &Url,
@@ -153,6 +316,8 @@ impl Backend {
         Some(request(document.value()))
     }
 
+    /// Answer `request` from the open document `uri` and the packages it has
+    /// loaded; `None` when it is not open.
     fn with_scoped_document<R>(
         &self,
         uri: &Url,
@@ -262,7 +427,9 @@ impl Backend {
                 } else if let Ok(path) = file_uri.to_file_path() {
                     fs::read_to_string(path)
                         .ok()
-                        .and_then(|text| DocumentSnapshot::from_text(text, &self.registry))
+                        .and_then(|text| {
+                            DocumentSnapshot::from_text(text, &self.workspace_registry())
+                        })
                         .map(|snapshot| global_reference_ranges(&snapshot, name))
                         .unwrap_or_default()
                 } else {
@@ -274,6 +441,8 @@ impl Backend {
             })
     }
 
+    /// What type hierarchy requests resolve types against: the builtin catalog
+    /// and the sources of `library`.
     fn type_hierarchy_context<'a>(
         &'a self,
         library: &'a LibraryIndex,
@@ -290,10 +459,274 @@ impl Backend {
         ));
     }
 
+    /// Analyze again each open document whose location implies other
+    /// properties in the library now configured. Returns whether any was.
+    fn imply_document_properties(&self) -> bool {
+        let library = self.library.snapshot();
+        let mut reanalyzed = false;
+        for mut document in self.documents.iter_mut() {
+            let implied_properties =
+                FileProperties::implied_by_location(document.key(), library.source_resolver());
+            let registry = self.document_session_registry(document.key(), document.value());
+            reanalyzed |= document.imply_properties(implied_properties, &registry);
+            let registry = self.document_session_registry(document.key(), document.value());
+            reanalyzed |= document.restart_session(&registry);
+        }
+        reanalyzed
+    }
+
+    /// The registry the session of the document at `uri` with `properties`
+    /// starts with: the base registry with the init file `directive`
+    /// selects, or else the configured one. Library implementation code
+    /// starts without one.
+    fn session_registry(
+        &self,
+        uri: &Url,
+        directive: Option<&InitFileDirective>,
+        properties: FileProperties,
+    ) -> ObjectRegistry {
+        if properties.primary_code {
+            return self.registry.clone();
+        }
+        let start = self
+            .init_files
+            .start_for(uri, directive, &self.environment, &self.registry);
+        self.registry.with_init_file(start)
+    }
+
+    /// The registry the session of `document`, at `uri`, starts with as the
+    /// document now reads.
+    fn document_session_registry(&self, uri: &Url, document: &DocumentSnapshot) -> ObjectRegistry {
+        self.session_registry(uri, document.init_file_directive(), document.properties())
+    }
+
+    /// The registry the files the documents load are analyzed with: they
+    /// run in sessions starting with the configured init file.
+    fn workspace_registry(&self) -> ObjectRegistry {
+        self.registry.with_init_file(self.init_files.configured())
+    }
+
+    /// Start the session of each open document again where it should start
+    /// with another init file, re-indexing it and republishing its
+    /// diagnostics. Returns whether any was.
+    async fn restart_sessions(&self) -> bool {
+        let mut restarted = Vec::new();
+        for mut document in self.documents.iter_mut() {
+            let uri = document.key().clone();
+            let registry = self.document_session_registry(&uri, document.value());
+            if document.restart_session(&registry) {
+                self.workspace_index
+                    .index_snapshot(&uri, document.value(), &self.registry);
+                restarted.push(uri);
+            }
+        }
+        for uri in &restarted {
+            if let Some(document) = self.documents.get(uri) {
+                self.publish_document_diagnostics(uri.clone(), document.value())
+                    .await;
+            }
+        }
+        !restarted.is_empty()
+    }
+
+    /// Select the init file the documents without a directive start with,
+    /// as `sources` configures it, and start their sessions again with it.
+    /// Returns whether it changed.
+    async fn configure_init_file(&self, sources: &SourceSettings) -> bool {
+        let previous_files = self.init_files.files();
+        let previous = self.init_files.configured();
+        let workspace_folder = self.workspace_folder_paths().into_iter().next();
+        let replaced = match InitFiles::locate(
+            &sources.init_file,
+            sources.enabled,
+            workspace_folder.as_deref(),
+            &self.environment,
+        ) {
+            Ok(location) => self.init_files.configure(location, &self.registry),
+            Err(problem) => self.init_files.configure_unavailable(problem),
+        };
+        if replaced.is_none() {
+            return false;
+        }
+        self.report_configured_init_file(&previous).await;
+        self.sync_init_files(&previous_files).await;
+        self.restart_sessions().await;
+        true
+    }
+
+    /// Tell the user why the configured init file cannot be used, when it
+    /// became unusable since `previous`.
+    async fn report_configured_init_file(&self, previous: &InitFileStart) {
+        let current = self.init_files.configured();
+        if let Some(problem) = current.problem().filter(|_| current != *previous) {
+            self.client
+                .show_message(
+                    MessageType::WARNING,
+                    format!(
+                        "m2-ls analyzes every document without an init file: {problem}. \
+                         Set `sources.initFile` to a readable file, or to `false`."
+                    ),
+                )
+                .await;
+        }
+    }
+
+    /// Read the init file at `path` again after it changed, if a session may
+    /// start with it, and start the sessions starting with it again.
+    async fn reload_init_file(&self, path: &Path) {
+        let previous_files = self.init_files.files();
+        let previous = self.init_files.configured();
+        if !self.init_files.reload(path, &self.registry) {
+            return;
+        }
+        self.report_configured_init_file(&previous).await;
+        self.sync_init_files(&previous_files).await;
+        if self.restart_sessions().await {
+            let _ = refresh_if_changed(&self.inlay_hint_refresh, &self.client, true).await;
+            let _ = refresh_if_changed(&self.semantic_tokens_refresh, &self.client, true).await;
+        }
+    }
+
+    /// Bring the index and the client's diagnostics up to date with the
+    /// init files read now, `previous` being those read before: a file no
+    /// longer read leaves both, and each new reading replaces the old.
+    async fn sync_init_files(&self, previous: &[Arc<InitFile>]) {
+        let current = self.init_files.files();
+        for gone in previous
+            .iter()
+            .filter(|file| !current.iter().any(|now| now.path() == file.path()))
+        {
+            if !self.documents.contains_key(gone.uri()) {
+                self.workspace_index.forget_file(gone.uri());
+                self.client
+                    .publish_diagnostics(gone.uri().clone(), Vec::new(), None)
+                    .await;
+            }
+        }
+        for read in current
+            .iter()
+            .filter(|file| !previous.iter().any(|before| Arc::ptr_eq(before, file)))
+        {
+            self.adopt_init_file(read).await;
+        }
+    }
+
+    /// Index the init file `start` reads and publish its diagnostics, if no
+    /// session started with it before.
+    async fn adopt_started_init_file(&self, start: &InitFileStart) {
+        if let Some(init_file) = start.file() {
+            if !self.workspace_index.is_init_file(init_file.uri()) {
+                self.adopt_init_file(init_file).await;
+            }
+        }
+    }
+
+    /// Index `init_file`, whose globals only the sessions starting with it
+    /// see, and publish its diagnostics, unless it is open: its buffer then
+    /// does both.
+    async fn adopt_init_file(&self, init_file: &InitFile) {
+        self.workspace_index.add_init_file(init_file.uri());
+        if self.documents.contains_key(init_file.uri()) {
+            return;
+        }
+        let loaded = self.workspace_index.index_snapshot(
+            init_file.uri(),
+            init_file.snapshot(),
+            &self.registry,
+        );
+        self.index_loaded_in_background(loaded).await;
+        self.publish_init_file_diagnostics(init_file).await;
+    }
+
+    /// Publish the diagnostics of `init_file` as a file of the workspace,
+    /// not of the buffer that starts with it, unless it is open and
+    /// publishes its own. Outside the workspace folders the file is not the
+    /// user's project, so only what the grammar cannot parse is published.
+    async fn publish_init_file_diagnostics(&self, init_file: &InitFile) {
+        if self.documents.contains_key(init_file.uri()) {
+            return;
+        }
+        let settings = self.settings.snapshot();
+        let library = self.library.snapshot();
+        let in_workspace = self
+            .workspace_folder_paths()
+            .iter()
+            .any(|folder| init_file.path().starts_with(folder));
+        let diagnostics = visible_diagnostics(
+            init_file.snapshot(),
+            init_file.uri(),
+            &settings.diagnostics,
+            library.source_resolver(),
+        )
+        .into_iter()
+        .filter(|diagnostic| {
+            in_workspace
+                || DiagnosticCode::from_lsp(diagnostic)
+                    .is_some_and(DiagnosticCode::is_parse_failure)
+        })
+        .collect();
+        self.client
+            .publish_diagnostics(init_file.uri().clone(), diagnostics, None)
+            .await;
+    }
+
+    /// Publish the diagnostics of every init file read.
+    async fn publish_init_files_diagnostics(&self) {
+        for init_file in self.init_files.files() {
+            self.publish_init_file_diagnostics(&init_file).await;
+        }
+    }
+
+    /// Ask the client to report changes to the configured init file
+    /// wherever it is: the `.m2` watcher covers only the workspace.
+    async fn watch_init_file(&self) {
+        const METHOD: &str = "workspace/didChangeWatchedFiles";
+        const ID: &str = "m2-ls-watch-init-file";
+        let _ = self
+            .client
+            .unregister_capability(vec![Unregistration {
+                id: ID.to_string(),
+                method: METHOD.to_string(),
+            }])
+            .await;
+        let Some(location) = self.init_files.configured_location() else {
+            return;
+        };
+        let path = location.path();
+        let (Some(base), Some(name)) = (
+            path.parent()
+                .and_then(|directory| Url::from_directory_path(directory).ok()),
+            path.file_name().and_then(OsStr::to_str),
+        ) else {
+            return;
+        };
+        let _ = self
+            .client
+            .register_capability(vec![Registration {
+                id: ID.to_string(),
+                method: METHOD.to_string(),
+                register_options: Some(serde_json::json!({
+                    "watchers": [{ "globPattern": { "baseUri": base, "pattern": name } }]
+                })),
+            }])
+            .await;
+    }
+
+    /// Publish the diagnostics of the open `document` at `uri` the settings
+    /// allow, with its current version.
     async fn publish_document_diagnostics(&self, uri: Url, document: &DocumentSnapshot) {
         let settings = self.settings.snapshot();
         let version = self.document_versions.get(&uri).map(|version| *version);
-        publish_diagnostics(&self.client, uri, document, &settings.diagnostics, version).await;
+        let library = self.library.snapshot();
+        publish_diagnostics(
+            &self.client,
+            uri,
+            document,
+            &settings.diagnostics,
+            library.source_resolver(),
+            version,
+        )
+        .await;
     }
 
     /// Tell the user, not just the log, which settings were not read as
@@ -315,6 +748,10 @@ impl Backend {
             .await;
     }
 
+    /// Replace the settings with `settings`, then bring everything they decide
+    /// up to date: the library sources and the init file, the published
+    /// diagnostics, and, through `refresh_client`, inlay hints and semantic
+    /// tokens.
     async fn apply_settings(
         &self,
         settings: ServerSettings,
@@ -323,11 +760,19 @@ impl Backend {
               + ?Sized),
     ) -> Result<()> {
         let previous = self.settings.replace(settings.clone());
+        let mut reanalyzed = false;
         if previous.sources != settings.sources {
             self.configure_library(&settings.sources);
+            reanalyzed = self.imply_document_properties();
+            if self.configure_init_file(&settings.sources).await {
+                reanalyzed = true;
+                self.watch_init_file().await;
+            }
         }
 
-        if previous.diagnostics != settings.diagnostics {
+        if previous.diagnostics != settings.diagnostics || reanalyzed {
+            self.publish_init_files_diagnostics().await;
+            let library = self.library.snapshot();
             let diagnostics = self
                 .documents
                 .iter()
@@ -338,6 +783,7 @@ impl Backend {
                             document.value(),
                             document.key(),
                             &settings.diagnostics,
+                            library.source_resolver(),
                         ),
                     )
                 })
@@ -352,39 +798,53 @@ impl Backend {
         let inlay_hints = refresh_if_changed(
             &self.inlay_hint_refresh,
             refresh_client,
-            previous.inlay_hints != settings.inlay_hints,
+            previous.inlay_hints != settings.inlay_hints || reanalyzed,
         )
         .await;
         let semantic_tokens = refresh_if_changed(
             &self.semantic_tokens_refresh,
             refresh_client,
-            previous.semantic_tokens != settings.semantic_tokens,
+            previous.semantic_tokens != settings.semantic_tokens || reanalyzed,
         )
         .await;
         inlay_hints.and(semantic_tokens)
     }
 
+    /// Analyze a newly opened document, starting its session with the init file
+    /// it selects, index it with the files it loads, and publish its
+    /// diagnostics.
     async fn on_open(&self, params: TextDocumentItem) {
         let _timing = telemetry::Timing::start(
             "document.open",
             serde_json::json!({"uri": params.uri, "source_bytes": params.text.len()}),
         );
-        let Some(document) = DocumentSnapshot::from_text(params.text, &self.registry) else {
+        let uri = params.uri;
+        let implied_properties =
+            FileProperties::implied_by_location(&uri, self.library.snapshot().source_resolver());
+        let Some(mut document) = DocumentSnapshot::from_text_with_implied_properties(
+            params.text,
+            &self.session_registry(&uri, None, implied_properties),
+            implied_properties,
+        ) else {
             return;
         };
-        let uri = params.uri;
+        document.restart_session(&self.document_session_registry(&uri, &document));
+        let started = document.object_registry().init_file().clone();
         let loaded = self
             .workspace_index
             .index_snapshot(&uri, &document, &self.registry);
         self.document_versions.insert(uri.clone(), params.version);
         self.documents.insert(uri.clone(), document);
         self.index_loaded_in_background(loaded).await;
+        self.adopt_started_init_file(&started).await;
         if let Some(document) = self.documents.get(&uri) {
             self.publish_document_diagnostics(uri, document.value())
                 .await;
         }
     }
 
+    /// Apply the client's edits to the open document `uri` as of `version`,
+    /// analyze it again, and publish its diagnostics.
     async fn on_change(
         &self,
         uri: Url,
@@ -396,13 +856,17 @@ impl Backend {
             serde_json::json!({"uri": uri, "version": version, "changes": changes.len()}),
         );
         self.document_versions.insert(uri.clone(), version);
-        {
+        let started = {
             let Some(mut document) = self.documents.get_mut(&uri) else {
                 return;
             };
-            if document.apply_changes(&changes, &self.registry).is_none() {
+            let registry = self.document_session_registry(&uri, document.value());
+            if document.apply_changes(&changes, &registry).is_none() {
                 return;
             }
+            // An edit may select another init file.
+            let registry = self.document_session_registry(&uri, document.value());
+            document.restart_session(&registry);
             let library = self.library.snapshot();
             let library_file = uri.to_file_path().ok().is_some_and(|path| {
                 library
@@ -414,7 +878,9 @@ impl Backend {
                 self.workspace_index
                     .index_snapshot(&uri, document.value(), &self.registry);
             }
-        }
+            document.object_registry().init_file().clone()
+        };
+        self.adopt_started_init_file(&started).await;
 
         if let Some(document) = self.documents.get(&uri) {
             self.publish_document_diagnostics(uri, document.value())
@@ -422,18 +888,36 @@ impl Backend {
         }
     }
 
-    /// Refresh transitive disk dependencies on open/save, sharing the open document's facts.
+    /// Refresh user-source dependencies on open/save, sharing the open
+    /// document's facts. Installed sources are analyzed only when opened;
+    /// their dependencies stay out of the workspace index.
     async fn index_loaded_in_background(&self, loaded: Vec<Url>) {
         let index = Arc::clone(&self.workspace_index);
-        let registry = self.registry.clone();
-        task::spawn_blocking(move || index.index_files_from_disk(loaded, &registry))
-            .await
-            .expect("workspace indexing task panicked");
+        let registry = self.workspace_registry();
+        let library = self.library.snapshot();
+        task::spawn_blocking(move || {
+            index.index_files_from_disk_where(loaded, &registry, |file| {
+                file.to_file_path().is_ok_and(|path| {
+                    library
+                        .source_resolver()
+                        .package_of_source_file(&path)
+                        .is_none()
+                })
+            });
+        })
+        .await
+        .expect("workspace indexing task panicked");
     }
 
+    /// Analyze a saved document in full off the session task, keeping the
+    /// result only if the document did not change meanwhile; a saved init file
+    /// is read again.
     async fn on_save(&self, uri: Url) {
         let _timing = telemetry::Timing::start("document.save", serde_json::json!({"uri": uri}));
         self.library.snapshot().invalidate_saved_file(&uri);
+        if let Ok(path) = uri.to_file_path() {
+            self.reload_init_file(&path).await;
+        }
         let Some(version) = self.document_versions.get(&uri).map(|version| *version) else {
             return;
         };
@@ -441,7 +925,7 @@ impl Backend {
             let Some(document) = self.documents.get(&uri) else {
                 return;
             };
-            document.save_job(self.registry.clone())
+            document.save_job(self.document_session_registry(&uri, document.value()))
         };
         let saved = task::spawn_blocking(job)
             .await
@@ -491,8 +975,15 @@ fn install_panic_logging() {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        if let Some(initialization_file) = &self.initialization_file {
-            initialization_file.index_into(&self.workspace_index, &self.registry);
+        #[allow(deprecated)]
+        let folders = params
+            .workspace_folders
+            .clone()
+            .map(|folders| folders.into_iter().map(|folder| folder.uri).collect())
+            .or_else(|| params.root_uri.clone().map(|root| vec![root]))
+            .unwrap_or_default();
+        for folder in folders {
+            self.workspace_folders.insert(folder);
         }
         self.semantic_tokens_augment_syntax
             .negotiate(&params.capabilities);
@@ -555,6 +1046,13 @@ impl LanguageServer for Backend {
                 )),
                 inlay_hint_provider: inlay_hint_provider_capability(),
                 inline_value_provider: inline_value_provider_capability(),
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                        supported: Some(true),
+                        change_notifications: Some(OneOf::Left(true)),
+                    }),
+                    file_operations: Some(file_operations_capability()),
+                }),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
@@ -572,6 +1070,10 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        // Notifications such as the init file's diagnostics may only follow
+        // the initialization.
+        self.configure_init_file(&self.settings.snapshot().sources)
+            .await;
         if self.type_hierarchy_dynamic_registration.is_supported()
             && self
                 .client
@@ -604,6 +1106,7 @@ impl LanguageServer for Backend {
                 })),
             }])
             .await;
+        self.watch_init_file().await;
 
         self.client
             .log_message(
@@ -663,24 +1166,116 @@ impl LanguageServer for Backend {
         // Re-index from disk so the workspace index reflects the saved file
         // rather than the last in-editor edit.
         self.reindex_from_disk(&uri);
+        // A closed init file is a workspace file again.
+        if let Some(init_file) = self
+            .init_files
+            .files()
+            .into_iter()
+            .find(|init_file| init_file.uri() == &uri)
+        {
+            self.publish_init_file_diagnostics(&init_file).await;
+        }
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         for change in params.changes {
-            // Open documents are indexed from their live buffer; ignore disk
-            // events for them to avoid clobbering unsaved edits. Files neither
-            // open nor loaded by an open file stay out of the index.
-            if self.documents.contains_key(&change.uri)
-                || !self.workspace_index.is_indexed(&change.uri)
-            {
+            let Ok(path) = change.uri.to_file_path() else {
                 continue;
+            };
+            match change.typ {
+                FileChangeType::CREATED => self.on_created(&path).await,
+                FileChangeType::DELETED => self.on_deleted(&path).await,
+                // Open documents are indexed from their live buffer; ignore
+                // disk changes to them to avoid clobbering unsaved edits.
+                // Files neither indexed nor loaded by an indexed file stay
+                // out of the index; one an indexed file loads joins it once
+                // it can be read.
+                _ => {
+                    if !self.documents.contains_key(&change.uri)
+                        && (self.workspace_index.is_indexed(&change.uri)
+                            || !self.workspace_index.loaders_under(&path).is_empty())
+                    {
+                        self.reindex_from_disk(&change.uri);
+                    }
+                    // A file that changed on disk may have become readable
+                    // or unreadable to the loads naming it.
+                    self.republish_open_loaders_of(&path).await;
+                }
             }
-            if change.typ == FileChangeType::DELETED {
-                self.workspace_index.remove_file(&change.uri);
-            } else {
-                self.reindex_from_disk(&change.uri);
+            if change.typ == FileChangeType::CHANGED {
+                self.reload_init_file(&path).await;
             }
         }
+    }
+
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        let removed = params
+            .event
+            .removed
+            .into_iter()
+            .filter_map(|folder| self.workspace_folders.remove(&folder.uri))
+            .filter_map(|folder| folder.to_file_path().ok())
+            .collect::<Vec<_>>();
+        for folder in params.event.added {
+            self.workspace_folders.insert(folder.uri);
+        }
+        // A relative `sources.initFile` names a file of the first folder,
+        // and which init files are the user's project changed.
+        if self
+            .configure_init_file(&self.settings.snapshot().sources)
+            .await
+        {
+            self.watch_init_file().await;
+        }
+        self.publish_init_files_diagnostics().await;
+        if removed.is_empty() {
+            return;
+        }
+        for folder in &removed {
+            self.forget_closed_files_under(folder);
+        }
+        self.reindex_open_documents().await;
+    }
+
+    async fn did_create_files(&self, params: CreateFilesParams) {
+        for path in params
+            .files
+            .iter()
+            .filter_map(|file| Url::parse(&file.uri).ok()?.to_file_path().ok())
+        {
+            self.on_created(&path).await;
+        }
+    }
+
+    async fn did_delete_files(&self, params: DeleteFilesParams) {
+        for path in params
+            .files
+            .iter()
+            .filter_map(|file| Url::parse(&file.uri).ok()?.to_file_path().ok())
+        {
+            self.on_deleted(&path).await;
+        }
+    }
+
+    async fn will_rename_files(&self, params: RenameFilesParams) -> Result<Option<WorkspaceEdit>> {
+        let moves = params.files.into_iter().collect::<FileMoves>();
+        let index = Arc::clone(&self.workspace_index);
+        let folders = self.workspace_folder_paths();
+        let edits = task::spawn_blocking(move || {
+            let on_disk = moves.loaders_on_disk(&folders, |file| index.is_indexed(file));
+            moves.load_edits(index.file_loads().into_iter().chain(on_disk))
+        })
+        .await
+        .expect("rename edit task panicked");
+        Ok((!edits.is_empty()).then(|| WorkspaceEdit {
+            changes: Some(edits),
+            ..WorkspaceEdit::default()
+        }))
+    }
+
+    async fn did_rename_files(&self, params: RenameFilesParams) {
+        let moves = params.files.into_iter().collect::<FileMoves>();
+        self.on_moved(&moves).await;
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -698,7 +1293,7 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
         Ok(self
             .with_source_at(uri, position, |document, knowledge, _| {
-                completion_response(document, position, &knowledge.at(position))
+                completion_response(document, uri, position, &knowledge.at(position))
             })
             .flatten())
     }
@@ -752,7 +1347,12 @@ impl LanguageServer for Backend {
         let position = params.range.start;
         Ok(self
             .with_source_at(uri, position, |document, _, _| {
-                let mut diagnostics = visible_diagnostics(document, uri, &settings.diagnostics);
+                let mut diagnostics = visible_diagnostics(
+                    document,
+                    uri,
+                    &settings.diagnostics,
+                    self.library.snapshot().source_resolver(),
+                );
                 for diagnostic in params
                     .context
                     .diagnostics
@@ -1116,7 +1716,10 @@ impl LanguageServer for Backend {
 
     async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
         let uri = params.text_document.uri;
-        Ok(self.with_document(&uri, |document| document_links_response(document, &uri)))
+        let library = self.library.snapshot();
+        Ok(self.with_document(&uri, |document| {
+            document_links_response(document, &uri, library.source_resolver())
+        }))
     }
 
     async fn document_link_resolve(&self, link: DocumentLink) -> Result<DocumentLink> {
@@ -1145,20 +1748,17 @@ impl LanguageServer for Backend {
 }
 
 /// The library of the Macaulay2 sources `sources` configures; with library
-/// navigation disabled, a library without sources.
+/// discovery disabled, a library without sources.
 fn configured_library(
     environment: &Macaulay2Environment,
     registry: &ObjectRegistry,
     sources: &SourceSettings,
 ) -> Arc<LibraryIndex> {
-    let source_resolver = if sources.enabled {
-        SourceResolver::discover(environment, &sources.paths)
-    } else {
-        SourceResolver::default()
-    };
+    let source_resolver = SourceResolver::configured(environment, sources);
     Arc::new(LibraryIndex::new(source_resolver, registry.clone()))
 }
 
+/// The name and version the server reports to the client.
 fn server_info() -> ServerInfo {
     ServerInfo {
         name: env!("CARGO_PKG_NAME").to_string(),
@@ -1172,8 +1772,35 @@ fn server_info() -> ServerInfo {
 /// stack. The reservation is virtual; pages are committed only when touched.
 pub const RUNTIME_THREAD_STACK_BYTES: usize = 1 << 30;
 
-/// Start the stdio language server.
+/// Starts the stdio language server and runs until the protocol session ends.
+///
+/// Catalog initialization failures print an error and exit with status 2.
+/// The completed protocol session terminates the process with its session status.
+///
+/// # Panics
+///
+/// Panics if the asynchronous runtime cannot be built or its server task panics.
+///
+/// # Examples
+///
+/// ```no_run
+/// m2_ls::run_server();
+/// ```
 pub fn run_server() {
+    let (source, corpus) = CatalogSource::current()
+        .and_then(|source| source.load().map(|corpus| (source, corpus)))
+        .unwrap_or_else(|error| {
+            eprintln!("m2-ls: could not load builtin catalog: {error}");
+            std::process::exit(2);
+        });
+    // A newer M2Book catalog is fetched in the background and used from the next start.
+    if let CatalogSource::Cache(_) = source {
+        thread::spawn(move || {
+            if let Err(error) = source.update() {
+                eprintln!("m2-ls: builtin catalog not updated: {error}");
+            }
+        });
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(RUNTIME_THREAD_STACK_BYTES)
         .enable_all()
@@ -1181,16 +1808,18 @@ pub fn run_server() {
         .expect("tokio runtime builds");
     // The session runs on a runtime thread, never on the default-sized main thread.
     runtime
-        .block_on(runtime.spawn(serve()))
+        .block_on(runtime.spawn(serve(corpus)))
         .expect("language server session task panicked");
 }
 
-async fn serve() {
+/// Serve one client over stdio, its catalog read from `corpus`, until it exits
+/// or disconnects.
+async fn serve(corpus: String) {
     install_panic_logging();
     let session_end = SessionEnd::default();
     let stdin = ClientInput::new(io::stdin(), session_end.clone());
     let stdout = io::stdout();
-    let (service, socket) = LspService::new(Backend::new);
+    let (service, socket) = LspService::new(|client| Backend::new(client, &corpus));
     let service = ExitNotificationService::new(
         TypeHierarchyCapabilityService::new(service),
         session_end.clone(),

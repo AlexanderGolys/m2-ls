@@ -1,5 +1,64 @@
 # Changelog
 
+## 2.2.0 - 2026-10-29
+
+- Keep installed package dependencies out of the workspace index when opening
+  their source files. User-package dependencies continue to be indexed.
+- Follow the files named by `load`, `needs` and `input`, looked up the way
+  `load` looks them up (beside the loading file, then along `path`; `~/`,
+  `./`, `../` and absolute names; escapes read; symbolic links resolved by the
+  operating system): highlight the names as namespaces, open them as document
+  links and with go to definition, and complete `.m2` files and folders inside
+  the name, escaped for the string they go into.
+- Warn about a load that cannot run (E17 `unloadable-file`): no file where
+  `load` looks, a directory, a file or directory without permission, or an
+  empty name. Unsaved documents, sockets and pipes are not judged.
+- Support workspace folders and file operations: renaming or moving a file or
+  folder rewrites the loads that run it, in every known file and every file of
+  the workspace folders mentioning it, including the moved files' own relative
+  loads, keeping each name's style and delimiters; creating, deleting,
+  renaming and changing the permissions of files, in the editor or on disk,
+  keeps the workspace index and the E17 warnings current; closing a workspace
+  folder drops its closed files from the index.
+- Select the init file every document starts with by the new
+  `sources.initFile` setting: `true` for the discovered `init.m2`, `false` for
+  none, or a file; a file opts out or picks another with
+  `-- m2-ls: initFile none` or `-- m2-ls: initFile <path>`. Its globals are
+  known only in the documents starting with it, never in TEST blocks or
+  documentation examples; it is read again when it changes on disk. A
+  configured file that cannot be read is reported by a message, one a
+  directive names by E18 `unavailable-init-file`; code in it that does not
+  parse is published as the init file's own errors, and its other findings
+  only when it lies in a workspace folder.
+- Analyze files in the discovered Core sources, and in the directories listed by
+  the new `sources.primaryCodePaths` setting, as library implementation code
+  (`primaryCode`) without a directive; the setting also covers library
+  sources on a machine without Macaulay2. `m2-lint` applies the same rule.
+- Offer adding `-- m2-ls: primaryCode` as a quick fix for assignments to
+  protected symbols (E13), and name it in the error message.
+- Download the builtin catalog from M2Book releases and cache it instead of
+  embedding it in the executables or shipping it in the crate. Each download is
+  verified against the checksum published with it. First use needs network access;
+  `M2_LS_CATALOG` selects an existing file for offline use. Macaulay2 and M2Book
+  are not runtime dependencies.
+- Add `m2-ls --download-catalog` to prepare the catalog before opening an editor.
+- Add `install.sh` to install the tools and automatically prepare the catalog.
+  The server checks for a new M2Book release in the background and uses its
+  catalog from the next start; server upgrades reuse the cache.
+- Report option names a called function does not accept as errors (E16), with
+  the closest accepted name as a quick fix, and option values outside the
+  documented types or accepted symbols as warnings (T06). Functions declaring a
+  literal option list in source are checked now; library functions once the
+  catalog records their option tables.
+- Add formatting settings `keepLineBreaks` (keep line breaks as written),
+  `spaceInBraces` (`{ b }` or `{b}`), and the `leadingKeywords` control-flow
+  layout, which starts `then` and `else` on lines under their `if`.
+- Report redundant control parentheses (S03) and simplifiable conditionals
+  (S05) as hints again, naming the shorter form. Their rewrites are the hints'
+  quick fixes; turned off, the rewrites remain available as refactors.
+- Declare the server crate under MIT or Apache-2.0. The separately downloaded
+  documentation and source excerpts retain their original licenses.
+
 ## 2.1.2 - 2026-10-28
 
 - Show inferred argument types in `call-domain-mismatch` (T05) diagnostics,

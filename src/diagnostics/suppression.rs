@@ -21,10 +21,10 @@ use crate::node_metadata::SyntaxNode;
 use crate::source::SourceNavigation;
 
 /// What starts a directive inside a line comment.
-const DIRECTIVE_MARKER: &str = "m2-ls:";
+pub const DIRECTIVE_MARKER: &str = "m2-ls:";
 
 /// What starts a Macaulay2 line comment.
-const LINE_COMMENT: &str = "--";
+pub const LINE_COMMENT: &str = "--";
 
 /// Where a directive silences the rules it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, IntoStaticStr, Display)]
@@ -42,7 +42,9 @@ pub enum SuppressionScope {
 /// The rules one or more directives silence somewhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SilencedRules {
+    /// Applies to every diagnostic rule.
     Every,
+    /// Applies only to the listed diagnostic rule codes.
     Only(Vec<DiagnosticCode>),
 }
 
@@ -56,6 +58,7 @@ pub struct DiagnosticSuppressions {
 }
 
 impl SilencedRules {
+    /// Whether this suppression selection includes the requested diagnostic rule.
     fn covers(&self, code: DiagnosticCode) -> bool {
         match self {
             Self::Every => true,
@@ -165,7 +168,7 @@ mod tests {
     use crate::object_registry::ObjectRegistry;
 
     fn reported(text: &str) -> Vec<(u32, DiagnosticCode)> {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document =
             DocumentSnapshot::from_text(text.to_string(), &builtins).expect("fixture should parse");
         let suppressions = DiagnosticSuppressions::collect(document.root_node(), &document);

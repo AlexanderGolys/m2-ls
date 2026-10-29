@@ -31,6 +31,17 @@ impl Macaulay2Conventions {
     /// Functions whose first string argument identifies a source file to run.
     pub const FILE_LOAD_FUNCTIONS: [&str; 3] = ["load", "needs", "input"];
 
+    /// The first characters of a name `load` opens as a socket (`$`) or a
+    /// pipe (`!`) instead of a file.
+    pub const NON_FILE_NAME_PREFIXES: [char; 2] = ['$', '!'];
+
+    /// The prefix of a file name `load` looks up in the home directory.
+    pub const HOME_DIRECTORY_PREFIX: &str = "~/";
+
+    /// The prefix of a file name relative to the directory of the loading
+    /// file only.
+    pub const CURRENT_DIRECTORY_PREFIX: &str = "./";
+
     /// Source-file extension, without the leading dot.
     pub const SOURCE_EXTENSION: &str = "m2";
 

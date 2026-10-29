@@ -38,21 +38,37 @@ use crate::source_package::CodeFragment;
 /// list that is not an option.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, IntoStaticStr, Display, EnumIter)]
 pub enum DocumentOption {
+    /// The object or signature described by this documentation node.
     Key,
+    /// Short summary introducing a documentation node.
     Headline,
+    /// The base function to which this documentation belongs.
     BaseFunction,
+    /// Example call forms for the documented callable.
     Usage,
+    /// Descriptions of input arguments and accepted types.
     Inputs,
+    /// Descriptions of return values and result types.
     Outputs,
+    /// Effects beyond the callable's return value.
     Consequences,
+    /// Acknowledgements associated with the documented work.
     Acknowledgement,
+    /// People credited for the documented functionality.
     Contributors,
+    /// Bibliographic or documentation references.
     References,
+    /// Preferred citation for the documented work.
     Citation,
+    /// Limitations or qualifications on the documented behavior.
     Caveat,
+    /// Links to related documentation nodes.
     SeeAlso,
+    /// Child nodes belonging beneath this documentation node.
     Subnodes,
+    /// Source excerpts included in the rendered documentation.
     SourceCode,
+    /// External source examples associated with this documentation.
     ExampleFiles,
 }
 
@@ -98,69 +114,133 @@ mod tests {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, IntoStaticStr, EnumIter)]
 #[allow(clippy::upper_case_acronyms)]
 enum MarkupFunction {
+    /// Link to a documentation node.
     TO,
+    /// Link to a documentation node including its headline.
     TOH,
+    /// Link with an explicit label and documentation target.
     TO2,
+    /// Inline monospaced text.
     TT,
+    /// Inline source code.
     CODE,
+    /// Text representing keyboard input.
     KBD,
+    /// Text representing program output.
     SAMP,
+    /// Text representing a variable name.
     VAR,
+    /// Macaulay2 source code with syntax-aware presentation.
     M2CODE,
+    /// Bold text.
     BOLD,
+    /// Strongly emphasized text.
     STRONG,
+    /// Emphasized text.
     EM,
+    /// Italic text.
     ITALIC,
+    /// Hyperlink with an explicit external destination.
     HREF,
+    /// A paragraph of documentation prose.
     PARA,
+    /// A block of documentation content.
     DIV,
+    /// A quoted block of documentation.
     BLOCKQUOTE,
+    /// An indented documentation block.
     INDENT,
+    /// Inline documentation content.
     SPAN,
+    /// Text rendered at a smaller size.
     SMALL,
+    /// Subscript text.
     SUB,
+    /// Superscript text.
     SUP,
+    /// A label for related documentation content.
     LABEL,
+    /// Mathematical content expressed as TeX.
     TEX,
+    /// Text preserved without interpreting its markup.
     LITERAL,
+    /// An unordered list.
     UL,
+    /// An ordered list.
     OL,
+    /// A list of documentation navigation entries.
     MENU,
+    /// A definition list.
     DL,
+    /// A list item.
     LI,
+    /// A definition term.
     DT,
+    /// A definition description.
     DD,
+    /// A subsection heading.
     SUBSECTION,
+    /// A first-level heading.
     HEADER1,
+    /// A second-level heading.
     HEADER2,
+    /// A third-level heading.
     HEADER3,
+    /// A fourth-level heading.
     HEADER4,
+    /// A fifth-level heading.
     HEADER5,
+    /// A sixth-level heading.
     HEADER6,
+    /// A preformatted text block.
     PRE,
+    /// An executable documentation example.
     EXAMPLE,
+    /// A line break.
     BR,
+    /// A horizontal separator.
     HR,
+    /// Markup comment content.
     COMMENT,
+    /// An image with its source and alternate text.
     IMG,
+    /// A named hyperlink destination.
     ANCHOR,
+    /// Document body content.
     BODY,
+    /// An interactive button element.
     BUTTON,
+    /// Character data without markup interpretation.
     CDATA,
+    /// Document header metadata.
     HEAD,
+    /// A complete HTML document container.
     HTML,
+    /// An embedded document frame.
     IFRAME,
+    /// A form input element.
     INPUT,
+    /// Content deferred until a later rendering pass.
     LATER,
+    /// An external resource link.
     LINK,
+    /// Document metadata.
     META,
+    /// Script content retained as markup.
     SCRIPT,
+    /// Style content retained as markup.
     STYLE,
+    /// A table of documentation content.
     TABLE,
+    /// A table data cell.
     TD,
+    /// A table header cell.
     TH,
+    /// The document title.
     TITLE,
+    /// A table row.
     TR,
+    /// An individual executable example inside a documentation constructor.
     ExampleItem,
 }
 
@@ -198,6 +278,7 @@ enum MarkupRendering {
 }
 
 impl MarkupFunction {
+    /// Text style and block behavior used for this hypertext constructor.
     fn rendering(self) -> MarkupRendering {
         use MarkupFunction::*;
         match self {
@@ -237,6 +318,7 @@ impl HypertextMarkdown {
         })
     }
 
+    /// Code argument of a recognized example constructor, when present.
     pub(super) fn example_argument(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
         let (function, argument) = Self::markup_application(node)?;
         matches!(function.rendering(), MarkupRendering::Example).then_some(argument)
@@ -493,10 +575,15 @@ impl HypertextMarkdown {
 /// What one hypertext list collects while its elements are read.
 #[derive(Default)]
 struct HypertextPage {
+    /// Documentation keys identifying the objects described by this node.
     keys: Vec<DocumentationKey>,
+    /// Rendered documentation or its extracted Markdown coordinates.
     markdown: NodeMarkdown,
+    /// Code examples extracted from the documentation node.
     examples: Vec<CodeFragment>,
+    /// Options or sections already encountered while parsing this documentation.
     seen: Vec<DocumentOption>,
+    /// Human-readable description accumulated for this node.
     description: String,
 }
 

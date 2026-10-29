@@ -6,13 +6,18 @@ use tower_lsp::jsonrpc;
 use tower_lsp::lsp_types::ClientCapabilities;
 use tower_lsp::Client;
 
+/// A negotiated client feature with its request or registration behavior.
 pub trait ClientCapability {
+    /// Whether the initialization capabilities advertise this client feature.
     fn supported_by(capabilities: &ClientCapabilities) -> bool;
 }
 
+/// Thread-safe support flag for one negotiated client capability.
 #[derive(Debug)]
 pub struct ClientSupport<C> {
+    /// Whether the client advertised support for this capability.
     supported: AtomicBool,
+    /// Type marker identifying the negotiated capability.
     capability: PhantomData<fn() -> C>,
 }
 
@@ -26,20 +31,25 @@ impl<C> Default for ClientSupport<C> {
 }
 
 impl<C: ClientCapability> ClientSupport<C> {
+    /// Updates this support flag from the client's initialization capabilities.
     pub fn negotiate(&self, capabilities: &ClientCapabilities) {
         self.supported
             .store(C::supported_by(capabilities), Ordering::Relaxed);
     }
 
+    /// Whether this node is a supported.
     pub fn is_supported(&self) -> bool {
         self.supported.load(Ordering::Relaxed)
     }
 }
 
+/// Requests a refresh only when the client supports the relevant feature.
 pub trait WorkspaceRefresh<C> {
+    /// Requests a workspace refresh of the negotiated editor feature.
     fn refresh(&self) -> impl Future<Output = jsonrpc::Result<()>> + Send;
 }
 
+/// Requests a refresh when the feature settings changed and the client supports it.
 pub async fn refresh_if_changed<C>(
     support: &ClientSupport<C>,
     client: &(impl WorkspaceRefresh<C> + ?Sized),
@@ -55,6 +65,7 @@ where
     }
 }
 
+/// Marker for the client's inlay-hint refresh support.
 #[derive(Debug)]
 pub struct InlayHintRefresh;
 
@@ -75,6 +86,7 @@ impl WorkspaceRefresh<InlayHintRefresh> for Client {
     }
 }
 
+/// Marker for the client's semantic-token refresh support.
 #[derive(Debug)]
 pub struct SemanticTokensRefresh;
 
@@ -95,6 +107,7 @@ impl WorkspaceRefresh<SemanticTokensRefresh> for Client {
     }
 }
 
+/// Marker for clients that retain syntax highlighting beneath semantic tokens.
 #[derive(Debug)]
 pub struct SemanticTokensAugmentSyntax;
 
@@ -109,6 +122,7 @@ impl ClientCapability for SemanticTokensAugmentSyntax {
     }
 }
 
+/// Marker for clients supporting dynamic type-hierarchy registration.
 #[derive(Debug)]
 pub struct TypeHierarchyDynamicRegistration;
 

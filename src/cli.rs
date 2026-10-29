@@ -1,5 +1,14 @@
 //! Standalone commands sharing the server's formatter and diagnostics.
+//!
+//! [`Tool::run`] reads the process arguments and standard input, emits the
+//! selected command's output, and returns a process exit status.
+//!
+//! ```no_run
+//! let status = m2_ls::cli::Tool::Formatter.run();
+//! assert_eq!(status, std::process::ExitCode::SUCCESS);
+//! ```
 
+use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -8,15 +17,17 @@ use std::process::ExitCode;
 use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString, Url};
 
 use crate::capabilities::formatting::{format_document_with_options, FormatOptions};
+use crate::catalog::CatalogSource;
 use crate::diagnostics::visible_diagnostics;
-use crate::document::DocumentSnapshot;
+use crate::document::{DocumentSnapshot, FileProperties};
+use crate::init_file::InitFiles;
 use crate::node_metadata::SyntaxParser;
 use crate::object_registry::ObjectRegistry;
-use crate::package_index::{InitializationFile, Macaulay2Environment};
+use crate::package_index::{Macaulay2Environment, SourceResolver};
 use crate::settings::{ServerSettings, SettingProblem};
 
 /// The standalone tool to execute.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     /// Format a file in place, or print formatted stdin.
     Formatter,
@@ -26,7 +37,9 @@ pub enum Tool {
 
 /// The one source a tool reads.
 enum Input {
+    /// Standard input, named `-` on the command line.
     Stdin,
+    /// The file at this path.
     File(PathBuf),
 }
 
@@ -39,6 +52,7 @@ impl Input {
         }
     }
 
+    /// The whole text of the input.
     fn read(&self) -> Result<String, String> {
         match self {
             Self::Stdin => {
@@ -64,15 +78,24 @@ impl Input {
     }
 }
 
+/// What one command line asks a tool to do.
 struct Options {
+    /// The source to format or lint.
     input: Input,
+    /// `--check`: report whether the file needs formatting instead of writing
+    /// it.
     check: bool,
+    /// `--stdout`: print the formatted file instead of writing it.
     stdout: bool,
+    /// `--deny-warnings`: fail on warnings as well as errors.
     deny_warnings: bool,
+    /// `--config`: the JSON settings file, read as the server reads its
+    /// settings.
     config: Option<PathBuf>,
 }
 
 impl Tool {
+    /// The executable's name, as usage and messages show it.
     fn name(self) -> &'static str {
         match self {
             Self::Formatter => "m2-fmt",
@@ -103,6 +126,7 @@ impl Tool {
         }
     }
 
+    /// The usage text `--help` prints.
     fn help(self) -> String {
         let specific = match self {
             Self::Formatter => "    --check          Exit 1 if the file needs formatting; do not write\n    --stdout         Print the formatted file instead of writing it\n",
@@ -114,6 +138,8 @@ impl Tool {
         )
     }
 
+    /// The options of the process's command line; `None` when it asked only for
+    /// help or the version, which are then printed.
     fn parse(self) -> Result<Option<Options>, String> {
         let mut paths = Vec::new();
         let mut check = false;
@@ -166,6 +192,7 @@ impl Tool {
         }))
     }
 
+    /// Read the input and run the tool on it, returning the exit status.
     fn execute(self) -> Result<u8, String> {
         let Some(options) = self.parse()? else {
             return Ok(0);
@@ -183,6 +210,8 @@ impl Tool {
         .map_err(|error| format!("{label}: {error}"))
     }
 
+    /// Format `text`, writing, printing or only checking the result as
+    /// `options` say. Returns the exit status.
     fn format(options: &Options, settings: &ServerSettings, text: String) -> Result<u8, String> {
         let mut parser = SyntaxParser::new().ok_or("could not initialize parser")?;
         let tree = parser
@@ -213,16 +242,51 @@ impl Tool {
         Ok(0)
     }
 
+    /// Print the diagnostics the server would publish for `text`, analyzed with
+    /// the init file `settings` and its directive select. Returns the exit
+    /// status: `1` for an error, or a warning under `--deny-warnings`.
     fn lint(options: &Options, settings: &ServerSettings, text: String) -> Result<u8, String> {
-        let mut registry = ObjectRegistry::load(include_str!("data/m2-index.jsonl"));
-        InitializationFile::load(&Macaulay2Environment::current(), &mut registry);
-        let document =
-            DocumentSnapshot::from_text(text, &registry).ok_or("could not parse source")?;
+        let corpus = CatalogSource::current()
+            .and_then(|source| source.load())
+            .map_err(|error| error.to_string())?;
+        let environment = Macaulay2Environment::current();
+        let registry = ObjectRegistry::load(&corpus);
+        let uri = options.input.uri()?;
         let label = options.input.label();
+        let init_files = InitFiles::default();
+        let current_directory = env::current_dir().ok();
+        match InitFiles::locate(
+            &settings.sources.init_file,
+            settings.sources.enabled,
+            current_directory.as_deref(),
+            &environment,
+        ) {
+            Ok(location) => init_files.configure(location, &registry),
+            Err(problem) => init_files.configure_unavailable(problem),
+        };
+        if let Some(problem) = init_files.configured().problem() {
+            eprintln!("{label}: warning: analyzed without an init file: {problem}");
+        }
+        let sources = SourceResolver::configured(&environment, &settings.sources);
+        let implied_properties = FileProperties::implied_by_location(&uri, &sources);
+        let session_registry = |document: Option<&DocumentSnapshot>| {
+            let properties = document.map_or(implied_properties, DocumentSnapshot::properties);
+            if properties.primary_code {
+                return registry.clone();
+            }
+            let directive = document.and_then(DocumentSnapshot::init_file_directive);
+            registry.with_init_file(init_files.start_for(&uri, directive, &environment, &registry))
+        };
+        let mut document = DocumentSnapshot::from_text_with_implied_properties(
+            text,
+            &session_registry(None),
+            implied_properties,
+        )
+        .ok_or("could not parse source")?;
+        let directed = session_registry(Some(&document));
+        document.restart_session(&directed);
         let mut failed = false;
-        for diagnostic in
-            visible_diagnostics(&document, &options.input.uri()?, &settings.diagnostics)
-        {
+        for diagnostic in visible_diagnostics(&document, &uri, &settings.diagnostics, &sources) {
             let severity = diagnostic.severity.unwrap_or(DiagnosticSeverity::WARNING);
             failed |= severity == DiagnosticSeverity::ERROR
                 || (options.deny_warnings && severity == DiagnosticSeverity::WARNING);
@@ -256,6 +320,8 @@ impl Tool {
 }
 
 impl Options {
+    /// The settings `--config` names, or the defaults; an invalid value fails
+    /// the command, a deprecated key only warns.
     fn settings(&self) -> Result<ServerSettings, String> {
         let Some(path) = &self.config else {
             return Ok(ServerSettings::default());

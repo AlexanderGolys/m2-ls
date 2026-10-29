@@ -25,22 +25,26 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::capabilities::formatting::ControlFlowLayout;
 use crate::diagnostics::DiagnosticCode;
+use crate::init_file::InitFileChoice;
 use crate::object_registry::ObjectName;
 
 /// The current value of a setting that requests read while the client
 /// replaces it.
 #[derive(Debug, Default)]
 pub struct SettingsStore<T> {
+    /// The value, replaced whole so a reader never sees a partial update.
     current: RwLock<T>,
 }
 
 impl<T> SettingsStore<T> {
+    /// A store holding `value`.
     pub fn new(value: T) -> Self {
         Self {
             current: RwLock::new(value),
         }
     }
 
+    /// Replace the value with `value`, returning the one it replaced.
     pub fn replace(&self, value: T) -> T {
         mem::replace(
             &mut self
@@ -53,6 +57,7 @@ impl<T> SettingsStore<T> {
 }
 
 impl<T: Clone> SettingsStore<T> {
+    /// A copy of the current value, unaffected by later replacements.
     pub fn snapshot(&self) -> T {
         self.current
             .read()
@@ -66,10 +71,15 @@ impl<T: Clone> SettingsStore<T> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ServerSettings {
+    /// `diagnostics.*`: which diagnostics are published, and how prominently.
     pub diagnostics: DiagnosticSettings,
+    /// `formatting.*`: how the formatter lays out a document.
     pub formatting: FormattingSettings,
+    /// `inlayHints.*`: which inferred types are shown inline.
     pub inlay_hints: InlayHintSettings,
+    /// `semanticTokens.*`: the vocabulary of semantic highlighting.
     pub semantic_tokens: SemanticTokenSettings,
+    /// `sources.*`: where the library sources and the init file are.
     pub sources: SourceSettings,
 }
 
@@ -101,12 +111,18 @@ pub struct FormattingSettings {
     pub soft_line_width: Option<u32>,
     /// The width lines are always wrapped at; `0` or `null` disables it.
     pub hard_line_width: Option<u32>,
-    /// `compact`, `multiline`, or `multilineCompactElse`.
+    /// `compact`, `multiline`, `multilineCompactElse`, or `leadingKeywords`.
     pub control_flow_layout: ControlFlowLayout,
     /// `2*x` instead of `2 * x`.
     pub compact_factor_operators: bool,
     /// Whether the next expression after `;` starts on a new line.
     pub break_after_semicolon: bool,
+    /// Keep every line break as written: only spacing within lines and
+    /// indentation change, so line widths and `controlFlowLayout` have no
+    /// effect.
+    pub keep_line_breaks: bool,
+    /// `{ b }` when `true`, `{b}` when `false`; as written when unset.
+    pub space_in_braces: Option<bool>,
 }
 
 /// `inlayHints.*`: which inferred types are shown inline, and where.
@@ -192,7 +208,9 @@ pub struct SemanticTokenSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum DefaultLibrarySetting {
+    /// A named policy, written as a string.
     Mode(DefaultLibraryMode),
+    /// The packages whose globals receive the modifier, written as an array.
     Packages(Vec<String>),
 }
 
@@ -220,17 +238,31 @@ pub enum DefaultLibraryMode {
     None,
 }
 
-/// `sources.*`: where navigation finds the Macaulay2 library sources.
+/// `sources.*`: where the Macaulay2 library sources are, for navigation and
+/// for analyzing the files implementing the library.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceSettings {
-    /// Whether navigation enters the library sources at all. Default `true`.
+    /// Whether the library sources are discovered at all: navigation enters
+    /// them, the discovered Core sources are analyzed as primary code, and
+    /// the discovered `init.m2` is the init file. Default `true`.
     pub enabled: bool,
     /// Searched before the discovered installation: each an `M2` executable
     /// or an installation prefix (a build tree's `usr-dist` included),
     /// standing for that installation, or else a directory added to
     /// Macaulay2's `path`. A leading `~` is the home directory.
     pub paths: Vec<PathBuf>,
+    /// Directories whose files implement the library itself, analyzed as if
+    /// each declared `-- m2-ls: primaryCode`, in addition to the discovered
+    /// Core sources; independent of `enabled`. A leading `~` is the home
+    /// directory.
+    pub primary_code_paths: Vec<PathBuf>,
+    /// The init file every document starts with, unless its own
+    /// `-- m2-ls: initFile` comment selects another: `true` for the
+    /// discovered `init.m2`, `false` for none, or a path, relative to the
+    /// workspace folder, a leading `~` the home directory. Independent of
+    /// `enabled` when a path. Default `true`.
+    pub init_file: InitFileChoice,
 }
 
 impl Default for DiagnosticSettings {
@@ -254,6 +286,8 @@ impl Default for FormattingSettings {
             control_flow_layout: ControlFlowLayout::default(),
             compact_factor_operators: true,
             break_after_semicolon: false,
+            keep_line_breaks: false,
+            space_in_braces: None,
         }
     }
 }
@@ -288,6 +322,8 @@ impl Default for SourceSettings {
         Self {
             enabled: true,
             paths: Vec::new(),
+            primary_code_paths: Vec::new(),
+            init_file: InitFileChoice::Discovered,
         }
     }
 }
@@ -295,7 +331,10 @@ impl Default for SourceSettings {
 /// Settings read from a client, plus every value that could not be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSettings {
+    /// The settings, with defaults in place of the values that could not be
+    /// used.
     pub settings: ServerSettings,
+    /// Every value not read as given, in the order found.
     pub problems: Vec<SettingProblem>,
 }
 
@@ -304,6 +343,7 @@ pub struct ParsedSettings {
 pub struct SettingProblem {
     /// Where the value sits in the section, e.g. `diagnostics.disabled[1]`.
     path: String,
+    /// What is wrong with the value.
     issue: SettingIssue,
 }
 
@@ -860,6 +900,34 @@ mod tests {
 
             assert_eq!(settings.formatting.control_flow_layout, expected);
         }
+    }
+
+    #[test]
+    fn the_init_file_is_discovered_disabled_or_a_path() {
+        assert_eq!(
+            ServerSettings::default().sources.init_file,
+            InitFileChoice::Discovered
+        );
+        let settings = valid_settings(serde_json::json!({"sources": {"initFile": false}}));
+        assert_eq!(settings.sources.init_file, InitFileChoice::Disabled);
+        let settings =
+            valid_settings(serde_json::json!({"sources": {"initFile": "~/project/init.m2"}}));
+        assert_eq!(
+            settings.sources.init_file,
+            InitFileChoice::Path(PathBuf::from("~/project/init.m2"))
+        );
+        let parsed = ServerSettings::from_value(&serde_json::json!({
+            "sources": {"initFile": "", "primaryCodePaths": ["~/M2"]}
+        }));
+        assert_eq!(
+            parsed.settings.sources.init_file,
+            InitFileChoice::Discovered
+        );
+        assert_eq!(
+            parsed.settings.sources.primary_code_paths,
+            [PathBuf::from("~/M2")]
+        );
+        assert_eq!(parsed.problems.len(), 1, "{:?}", parsed.problems);
     }
 
     #[test]

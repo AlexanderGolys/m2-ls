@@ -21,6 +21,7 @@ pub(super) fn spawn(context: &InstallationContext, sink: &mut DiagnosticSink) {
     install_option_form(context, sink);
 }
 
+/// Reports method installations that cannot affect the callable they target.
 fn install_no_effect(context: &InstallationContext, sink: &mut DiagnosticSink) {
     let installation = context.installation;
     let method = &installation.method;
@@ -104,6 +105,7 @@ fn left_arrow_install_without_effect(context: &InstallationContext) -> Option<St
         })
 }
 
+/// Not flexible derived from the operator spelling and its runtime form.
 fn operator_not_flexible(context: &InstallationContext, sink: &mut DiagnosticSink) {
     let installation = context.installation;
     if installation.syntax == MethodInstallationSyntax::InstallMethod {
@@ -139,6 +141,7 @@ fn operator_form_is_flexible(
         .map(|operator_info| operator_info.is_flexible(operator.form))
 }
 
+/// Reports installation heads whose argument counts disagree with the implementation's lambda shape.
 fn install_arity(context: &InstallationContext, sink: &mut DiagnosticSink) {
     let installation = context.installation;
     let expected = installation.expected_argument_arity();
@@ -181,6 +184,7 @@ fn install_arity(context: &InstallationContext, sink: &mut DiagnosticSink) {
     );
 }
 
+/// Reports a method implementation whose option-table lambda shape does not match its callable.
 fn install_option_form(context: &InstallationContext, sink: &mut DiagnosticSink) {
     let installation = context.installation;
     let head = installation.method.head.name();

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::builtin_index::{BuiltinIndex, OptionFacts, Record};
+use crate::init_file::InitFileStart;
 #[cfg(test)]
 use crate::package_index::collect_imported_packages;
 use crate::package_index::PackageImport;
@@ -20,10 +21,12 @@ use tower_lsp::lsp_types::Position;
 pub struct ObjectName(pub String);
 
 impl ObjectName {
+    /// The name spelled `name`.
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
 
+    /// The name as spelled.
     pub fn name(&self) -> &str {
         &self.0
     }
@@ -50,9 +53,13 @@ impl AsRef<str> for ObjectName {
 /// Syntactic form in which an operator is applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperatorForm {
+    /// Between two operands: `x + y`.
     Binary,
+    /// Before its operand: `-x`.
     Prefix,
+    /// After its operand: `n!`.
     Postfix,
+    /// As an assignment: `x += y`.
     Assignment,
 }
 
@@ -70,38 +77,56 @@ impl Display for OperatorForm {
 /// Name and membership indexes for one package's objects.
 #[derive(Debug, Clone, Default)]
 pub struct PackageObjects {
+    /// The package's objects, in catalog order.
     pub objects: Vec<ObjectId>,
+    /// Each object by every name it is looked up by, its aliases included.
     pub objects_by_name: HashMap<ObjectName, ObjectId>,
 }
 
 /// Immutable indexed object population from which package registries are loaded.
 #[derive(Debug)]
 struct ObjectCatalog {
+    /// Every record of the catalog.
     index: BuiltinIndex,
+    /// The options functions accept, gathered from the records.
     option_facts: OptionFacts,
+    /// The objects of each package.
     packages: HashMap<ObjectId, PackageObjects>,
+    /// Each package by its name.
     packages_by_name: HashMap<ObjectName, ObjectId>,
+    /// The packages a normal session preloads.
     default_loaded: Vec<String>,
 }
 
 /// Ordered registry of the packages loaded for one Macaulay2 environment.
 #[derive(Debug, Clone)]
 pub struct ObjectRegistry {
+    /// The catalog the packages are loaded from, shared by every registry.
     catalog: Arc<ObjectCatalog>,
+    /// The packages loaded, in loading order: a later one hides the names of an
+    /// earlier one.
     packages: Vec<PackageRegistration>,
+    /// The init file the session starts with, whose packages are loaded.
+    init_file: InitFileStart,
 }
 
 /// One source-ordered package inclusion in an object registry.
 #[derive(Debug, Clone)]
 struct PackageRegistration {
+    /// The package loaded.
     package: ObjectId,
+    /// Where its names become visible; `None` from the start of the source.
     effective_from: Option<Position>,
+    /// Whether the session's init file loaded it.
+    loaded_by_init_file: bool,
 }
 
 /// Range-specific view of an object registry.
 #[derive(Debug, Clone, Copy)]
 pub struct ObjectRegistryView<'registry> {
+    /// The registry viewed.
     registry: &'registry ObjectRegistry,
+    /// The source position whose loaded packages the view sees.
     position: Position,
 }
 
@@ -112,10 +137,13 @@ impl Default for ObjectRegistry {
 }
 
 impl ObjectRegistry {
+    /// The registry of the catalog `corpus`, one JSON record per line, with the
+    /// default packages loaded.
     pub fn load(corpus: &str) -> Self {
         Self::from_index(BuiltinIndex::load(corpus))
     }
 
+    /// How many objects the loaded packages hold, each package counted once.
     pub fn len(&self) -> usize {
         let mut seen = HashSet::new();
         self.packages
@@ -126,6 +154,8 @@ impl ObjectRegistry {
             .sum()
     }
 
+    /// The registry of `index` with the packages a normal session preloads
+    /// loaded, or Core alone when the index records none.
     pub fn from_index(index: BuiltinIndex) -> Self {
         let option_facts = OptionFacts::from_records(index.records());
         let default_loaded = index.default_loaded_packages().to_vec();
@@ -159,6 +189,7 @@ impl ObjectRegistry {
         let mut registry = Self {
             catalog,
             packages: Vec::new(),
+            init_file: InitFileStart::None,
         };
         let mut baseline = registry.catalog.default_loaded.clone();
         if baseline.is_empty() {
@@ -170,14 +201,19 @@ impl ObjectRegistry {
         registry
     }
 
+    /// Load the package `name` from the start of the source; returns whether
+    /// the catalog knows it.
     pub fn load_package(&mut self, name: &ObjectName) -> bool {
-        self.register_package(name, None)
+        self.register_package(name, None, false)
     }
 
+    /// Load the package `name` from `position` on; returns whether the catalog
+    /// knows it.
     pub fn load_package_at(&mut self, name: &ObjectName, position: Position) -> bool {
-        self.register_package(name, Some(position))
+        self.register_package(name, Some(position), false)
     }
 
+    /// The registry with each of `imports` loaded from where it takes effect.
     pub fn with_imports(&self, imports: &[PackageImport]) -> Self {
         let mut registry = self.clone();
         for import in imports {
@@ -192,7 +228,38 @@ impl ObjectRegistry {
         Self {
             catalog: Arc::clone(&self.catalog),
             packages: Vec::new(),
+            init_file: InitFileStart::None,
         }
+    }
+
+    /// The session started with `init_file` in place of the init file this
+    /// one starts with: the packages it loads are loaded from the start.
+    pub fn with_init_file(&self, init_file: InitFileStart) -> Self {
+        let mut registry = self.without_init_file();
+        for package in init_file.file().map_or(&[][..], |file| file.packages()) {
+            registry.register_package(package, None, true);
+        }
+        registry.init_file = init_file;
+        registry
+    }
+
+    /// The session started without an init file.
+    pub fn without_init_file(&self) -> Self {
+        Self {
+            catalog: Arc::clone(&self.catalog),
+            packages: self
+                .packages
+                .iter()
+                .filter(|registration| !registration.loaded_by_init_file)
+                .cloned()
+                .collect(),
+            init_file: InitFileStart::None,
+        }
+    }
+
+    /// The init file the session starts with.
+    pub fn init_file(&self) -> &InitFileStart {
+        &self.init_file
     }
 
     #[cfg(test)]
@@ -200,7 +267,15 @@ impl ObjectRegistry {
         self.with_imports(&collect_imported_packages(text))
     }
 
-    fn register_package(&mut self, name: &ObjectName, effective_from: Option<Position>) -> bool {
+    /// Load the package `name` from `effective_from`, recording whether the
+    /// init file loads it; a package already loaded from the start is not
+    /// loaded again. Returns whether the catalog knows it.
+    fn register_package(
+        &mut self,
+        name: &ObjectName,
+        effective_from: Option<Position>,
+        loaded_by_init_file: bool,
+    ) -> bool {
         let Some(package) = self.catalog.packages_by_name.get(name) else {
             return false;
         };
@@ -214,6 +289,7 @@ impl ObjectRegistry {
         self.packages.push(PackageRegistration {
             package: package.clone(),
             effective_from,
+            loaded_by_init_file,
         });
         true
     }
@@ -235,10 +311,13 @@ impl ObjectRegistry {
             .map(|registration| &registration.package)
     }
 
+    /// The name of the package `package`.
     pub fn package_name(&self, package: &ObjectId) -> Option<&str> {
         self.object(package).map(|record| record.name.name())
     }
 
+    /// The names of the catalog's packages starting with `prefix`, sorted, at
+    /// most `limit` of them.
     pub fn package_names_with_prefix(&self, prefix: &str, limit: usize) -> Vec<String> {
         let mut names = self
             .catalog
@@ -259,10 +338,14 @@ impl ObjectRegistry {
         &self.catalog.default_loaded
     }
 
+    /// The records of the loaded packages, the last loaded first, each package
+    /// once.
     pub fn records_by_precedence(&self) -> impl Iterator<Item = &Record> {
         self.records_by_precedence_at(pos_max!())
     }
 
+    /// The records of the packages loaded at `position`, the last loaded first,
+    /// each package once.
     pub fn records_by_precedence_at(&self, position: Position) -> impl Iterator<Item = &Record> {
         let mut seen = HashSet::new();
         self.packages
@@ -288,22 +371,28 @@ impl ObjectRegistry {
             .collect()
     }
 
+    /// The options functions accept.
     pub fn option_facts(&self) -> &OptionFacts {
         &self.catalog.option_facts
     }
 
+    /// The objects of the package `package`, loaded or not.
     pub fn package_objects(&self, package: &ObjectId) -> Option<&PackageObjects> {
         self.catalog.packages.get(package)
     }
 
+    /// The package named `name` in the catalog, loaded or not.
     pub fn catalog_package_id(&self, name: &ObjectName) -> Option<&ObjectId> {
         self.catalog.packages_by_name.get(name)
     }
 
+    /// Every record of the catalog, loaded or not.
     pub fn catalog_records(&self) -> &[Record] {
         self.catalog.index.records()
     }
 
+    /// The registry as the source sees it at `position`: only the packages
+    /// loaded by then.
     pub fn at(&self, position: Position) -> ObjectRegistryView<'_> {
         ObjectRegistryView {
             registry: self,
@@ -313,6 +402,7 @@ impl ObjectRegistry {
 }
 
 impl PackageRegistration {
+    /// Whether the package's names are visible at `position`.
     fn is_effective_at(&self, position: Position) -> bool {
         self.effective_from
             .is_none_or(|effective_from| effective_from <= position)
@@ -320,30 +410,41 @@ impl PackageRegistration {
 }
 
 impl ObjectRegistryView<'_> {
+    /// The view at `position`, or at the view's own position if that is
+    /// earlier.
     pub fn at(&self, position: Position) -> Self {
         self.registry.at(position.min(self.position))
     }
 
+    /// The records of the packages loaded at the view's position, the last
+    /// loaded first.
     pub fn records_by_precedence(&self) -> impl Iterator<Item = &Record> {
         self.registry.records_by_precedence_at(self.position)
     }
 
+    /// The name of the package `package`.
     pub fn package_name(&self, package: &ObjectId) -> Option<&str> {
         self.registry.package_name(package)
     }
 
+    /// The packages loaded at the view's position, the last loaded first.
     pub fn loaded_packages(&self) -> Vec<ObjectName> {
         self.registry.loaded_packages_at(self.position)
     }
 
+    /// The names of the catalog's packages starting with `prefix`, sorted, at
+    /// most `limit` of them.
     pub fn package_names_with_prefix(&self, prefix: &str, limit: usize) -> Vec<String> {
         self.registry.package_names_with_prefix(prefix, limit)
     }
 
+    /// The options functions accept.
     pub fn option_facts(&self) -> &OptionFacts {
         self.registry.option_facts()
     }
 
+    /// Whether a package imported after `source_position` binds `name` at the
+    /// view's position, hiding the source definition made there.
     pub fn shadows_source(&self, name: &ObjectName, source_position: Position) -> bool {
         self.registry
             .registration_for_name_at(name, self.position)
@@ -361,10 +462,12 @@ impl ObjectRegistryView<'_> {
 pub struct ObjectId(ObjectName);
 
 impl ObjectId {
+    /// The identity spelled `name`, qualified as the catalog qualifies it.
     pub fn new(name: impl Into<String>) -> Self {
         Self(ObjectName(name.into()))
     }
 
+    /// The identity as spelled.
     pub fn name(&self) -> &str {
         self.0.name()
     }
@@ -384,10 +487,13 @@ impl Borrow<ObjectName> for ObjectId {
 pub struct TypeId(ObjectId);
 
 impl TypeId {
+    /// The type identity of `object`, which the caller checked is a type.
     fn from_validated_object(object: ObjectId) -> Self {
         Self(object)
     }
 
+    /// The type identity of a type the source defines, under the reserved
+    /// `$Source$` namespace, whose parent is the type `_parent`.
     pub fn from_source_type(object: ObjectId, _parent: &TypeId) -> Self {
         assert!(
             object.name().starts_with("$Source$"),
@@ -396,6 +502,7 @@ impl TypeId {
         Self(object)
     }
 
+    /// The object the type is.
     pub fn object(&self) -> &ObjectId {
         &self.0
     }
@@ -404,15 +511,20 @@ impl TypeId {
 /// Direct parent edge of one registered Macaulay2 type.
 #[derive(Debug, Clone)]
 pub struct TypeData {
+    /// The type's direct parent; `None` for `Thing`.
     pub parent: Option<TypeId>,
 }
 
 /// Direct parent access required to navigate the type partial order.
 pub trait TypeStore {
+    /// The direct parent of `type_id`.
     fn parent_type_id(&self, type_id: &TypeId) -> Option<TypeId>;
 
+    /// Whether some type has `type_id` as a proper ancestor.
     fn has_strict_subtype_id(&self, type_id: &TypeId) -> bool;
 
+    /// Whether `child` is `parent` or descends from it, following parent edges
+    /// and stopping at a cycle.
     fn is_subtype_id(&self, child: &TypeId, parent: &TypeId) -> bool {
         let mut current = child.clone();
         let mut visited = HashSet::new();
@@ -436,25 +548,31 @@ pub trait TypeStore {
 
 /// Identity and record lookup shared by every semantic object source.
 pub trait ObjectKnowledge: TypeStore {
+    /// The record of `object_id`.
     fn object(&self, object_id: &ObjectId) -> Option<&Record>;
 
+    /// The object `name` resolves to.
     fn resolve_object(&self, name: &ObjectName) -> Option<ObjectId>;
 
+    /// The record of the object `name` resolves to.
     fn get_record(&self, name: &ObjectName) -> Option<&Record> {
         let object = self.resolve_object(name)?;
         self.object(&object)
     }
 
+    /// The type `name` resolves to, if it names a type.
     fn resolve_type_id(&self, name: &ObjectName) -> Option<TypeId> {
         let object = self.resolve_object(name)?;
         self.type_id(&object)
     }
 
+    /// The type identity of `object`, if it is a type.
     fn type_id(&self, object: &ObjectId) -> Option<TypeId> {
         self.object(object)?.type_info()?;
         Some(TypeId::from_validated_object(object.clone()))
     }
 
+    /// The name of the type `type_id`.
     fn type_name(&self, type_id: &TypeId) -> Option<&ObjectName> {
         let record = self.object(type_id.object())?;
         record.type_info()?;
@@ -463,24 +581,31 @@ pub trait ObjectKnowledge: TypeStore {
 }
 
 impl ObjectRegistry {
+    /// The record of the object `name` resolves to in the loaded packages.
     pub fn get_record(&self, name: &ObjectName) -> Option<&Record> {
         let object = self.object_id(name)?;
         self.object(&object)
     }
 
+    /// The record of `object_id`, loaded or not.
     pub fn object(&self, object_id: &ObjectId) -> Option<&Record> {
         self.catalog.index.object(object_id)
     }
 
+    /// The object `name` resolves to once every package is loaded.
     pub fn object_id(&self, name: &ObjectName) -> Option<ObjectId> {
         self.object_id_at(name, pos_max!())
     }
 
+    /// The object `name` resolves to at `position`, in the last package loaded
+    /// by then that binds it.
     pub fn object_id_at(&self, name: &ObjectName, position: Position) -> Option<ObjectId> {
         self.registration_for_name_at(name, position)
             .map(|(object, _)| object)
     }
 
+    /// The object `name` resolves to at `position`, with where the package
+    /// binding it takes effect.
     fn registration_for_name_at(
         &self,
         name: &ObjectName,
@@ -503,6 +628,7 @@ impl ObjectRegistry {
 }
 
 impl BuiltinIndex {
+    /// The type identity of `object`, if it is a type.
     pub fn type_id(&self, object: &ObjectId) -> Option<TypeId> {
         self.object(object)?.type_info()?;
         Some(TypeId::from_validated_object(object.clone()))
@@ -587,7 +713,7 @@ mod tests {
     use crate::record_lsp::LspKnowledge;
 
     fn corpus() -> &'static str {
-        include_str!("./data/m2-index.jsonl")
+        crate::catalog::test_corpus()
     }
 
     #[test]

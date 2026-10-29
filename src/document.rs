@@ -2,47 +2,82 @@
 //! analysis for LSP requests.
 
 use crate::analysis::{Analysis, BindingView, FunctionInfo, MethodInstallation};
-use crate::diagnostics::suppression::DiagnosticSuppressions;
+use crate::diagnostics::suppression::{DiagnosticSuppressions, DIRECTIVE_MARKER, LINE_COMMENT};
 use crate::diagnostics::{self, M2Diagnostic};
 use crate::documentation::{
     collect_documentation, DocumentationBlock, DocumentationIndex, DocumentationSnippet,
 };
+use crate::file_load::FileLoad;
+use crate::init_file::InitFileDirective;
 use crate::node_metadata::TypedSource;
 use crate::node_metadata::{SyntaxNode, SyntaxParser, SyntaxTree};
 use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::package_documentation::PackageDocumentation;
-use crate::package_index::{collect_imported_packages_in_tree, PackageImport};
+use crate::package_index::{collect_imported_packages_in_tree, PackageImport, SourceResolver};
 use crate::source::SourcePoint as Point;
 use crate::source::{ByteRange, DocumentSource, SourceNavigation, SymbolMention};
 use crate::source_package::{PackageSessionCode, SourcePackages};
 use m2_syn::nodes::ExprLambda as LambdaExpression;
+use std::ops::BitOr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use tower_lsp::lsp_types::{Position, Range as TextRange, TextDocumentContentChangeEvent};
+use tower_lsp::lsp_types::{Position, Range as TextRange, TextDocumentContentChangeEvent, Url};
 
 /// One immutable source, syntax, and semantic-analysis snapshot served to LSP
 /// requests.
 #[derive(Debug)]
 pub struct DocumentSnapshot {
+    /// The properties the file's location implies, whatever its text declares.
+    implied_properties: FileProperties,
+    /// The implied properties with those the text declares.
     properties: FileProperties,
+    /// The text, with the positions of the parse tree it is analyzed from.
     source: DocumentSource,
+    /// The parse tree of the text, kept for incremental reparsing.
     tree: SyntaxTree,
+    /// Bindings, scopes, inferred types and method installations of the text.
     analysis: Analysis,
+    /// The findings of the analysis and of the package sessions, before
+    /// settings and suppressions filter them.
     diagnostics: Vec<M2Diagnostic>,
+    /// The packages loaded in the session: the provider's, with those the
+    /// document imports, each from where its import takes effect.
     object_registry: ObjectRegistry,
+    /// The documentation comments and the bindings they document.
     documentation: DocumentationIndex,
+    /// Names mentioned outside code, in documentation links and export lists,
+    /// sorted by position.
     symbol_mentions: Vec<SymbolMention>,
+    /// Package names in strings that load packages, such as `"Graphs"` in
+    /// `needsPackage "Graphs"`.
     package_mentions: Vec<SymbolMention>,
+    /// The packages the document imports, each from where its import takes
+    /// effect.
     imported_packages: Vec<PackageImport>,
+    /// The `load`, `needs` and `input` calls of the document.
+    file_loads: Vec<FileLoad>,
+    /// The packages the document declares with `newPackage`, with their exports
+    /// and TEST blocks.
     packages: SourcePackages,
+    /// The package documentation the document writes with `doc` and `document`.
     package_documentation: PackageDocumentation,
+    /// The diagnostics the document's `disable` directives hide.
     diagnostic_suppressions: DiagnosticSuppressions,
+    /// The comment selecting the init file the document starts with.
+    init_file_directive: Option<InitFileDirective>,
+    /// The TEST blocks and documentation examples, each analyzed as the session
+    /// that runs it, analyzed on first use.
     package_sessions: OnceLock<Vec<PackageSession>>,
+    /// The package sessions of the previous snapshot, whose analyses unchanged
+    /// sessions reuse.
     previous_sessions: Mutex<Vec<PackageSession>>,
+    /// The packages a package session starts with: the provider's, without an
+    /// init file.
     session_knowledge: ObjectRegistry,
 }
 
-/// File-wide analysis properties declared in source comments.
+/// File-wide analysis properties, declared in source comments or implied by
+/// where the file is.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FileProperties {
     /// Implementation code starts without the session's preloaded packages.
@@ -50,6 +85,10 @@ pub struct FileProperties {
 }
 
 impl FileProperties {
+    /// The directive command declaring a file primary code.
+    const PRIMARY_CODE_COMMAND: &str = "primaryCode";
+
+    /// The properties declared by the directive comments under `root`.
     fn collect(root: SyntaxNode<'_>) -> Self {
         Self {
             primary_code: root
@@ -58,10 +97,39 @@ impl FileProperties {
                 .any(|comment| {
                     comment
                         .text()
-                        .strip_prefix("--")
-                        .and_then(|body| body.trim_start().strip_prefix("m2-ls:"))
-                        .is_some_and(|body| body.trim() == "primaryCode")
+                        .strip_prefix(LINE_COMMENT)
+                        .and_then(|body| body.trim_start().strip_prefix(DIRECTIVE_MARKER))
+                        .is_some_and(|body| body.trim() == Self::PRIMARY_CODE_COMMAND)
                 }),
+        }
+    }
+
+    /// The properties the location of `uri` implies: primary code for the
+    /// files `sources` takes for implementing the library.
+    pub fn implied_by_location(uri: &Url, sources: &SourceResolver) -> Self {
+        Self {
+            primary_code: uri
+                .to_file_path()
+                .is_ok_and(|path| sources.is_primary_code_file(&path)),
+        }
+    }
+
+    /// The comment declaring a file primary code, as a quick fix writes it.
+    pub fn primary_code_directive() -> String {
+        format!(
+            "{LINE_COMMENT} {DIRECTIVE_MARKER} {}",
+            Self::PRIMARY_CODE_COMMAND
+        )
+    }
+}
+
+/// Every property either side has.
+impl BitOr for FileProperties {
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self {
+        Self {
+            primary_code: self.primary_code || other.primary_code,
         }
     }
 }
@@ -94,13 +162,29 @@ impl SourceNavigation for DocumentSnapshot {
 /// Resolved once per request and threaded through downstream collection.
 #[derive(Debug, Clone, Copy)]
 pub struct TargetSymbol<'a> {
+    /// The name as written.
     pub name: &'a str,
+    /// Where the occurrence is.
     pub range: TextRange,
+    /// The binding the occurrence refers to.
     pub symbol: BindingView<'a>,
 }
 
 impl DocumentSnapshot {
+    /// The snapshot of `text` analyzed against `knowledge_provider`, for a file
+    /// whose location implies nothing; `None` when the grammar cannot be
+    /// loaded or parsing fails.
     pub fn from_text(text: String, knowledge_provider: &ObjectRegistry) -> Option<Self> {
+        Self::from_text_with_implied_properties(text, knowledge_provider, FileProperties::default())
+    }
+
+    /// The snapshot of `text` in a file whose location implies
+    /// `implied_properties`.
+    pub fn from_text_with_implied_properties(
+        text: String,
+        knowledge_provider: &ObjectRegistry,
+        implied_properties: FileProperties,
+    ) -> Option<Self> {
         let source = DocumentSource::new(text);
         let parsing = crate::telemetry::Timing::start(
             "document.parse",
@@ -114,6 +198,7 @@ impl DocumentSnapshot {
             knowledge_provider,
             Vec::new(),
             true,
+            implied_properties,
         ))
     }
 
@@ -130,27 +215,37 @@ impl DocumentSnapshot {
         );
         let tree = SyntaxParser::new()?.parse_tree(source.text(), None)?;
         drop(parsing);
-        Some(Self::analyze(source, tree, knowledge, Vec::new(), false))
+        Some(Self::analyze(
+            source,
+            tree,
+            knowledge,
+            Vec::new(),
+            false,
+            FileProperties::default(),
+        ))
     }
 
     /// Analyze `source`, parsed as `tree`, against the packages
     /// `knowledge_provider` has loaded plus those the source imports, then
     /// the code of each of its package sessions against the same packages
     /// plus the session's, reusing the analysis of the unchanged
-    /// `previous_sessions`.
+    /// `previous_sessions`. The file is analyzed with `implied_properties`
+    /// and those its directive comments declare.
     fn analyze(
         source: DocumentSource,
         tree: SyntaxTree,
         knowledge_provider: &ObjectRegistry,
         previous_sessions: Vec<PackageSession>,
         full: bool,
+        implied_properties: FileProperties,
     ) -> Self {
         let mut source = source;
         source.register_syntax(tree.snapshot());
         let typed_ast = Some(tree.syntax());
         let root = tree.root(source.text());
-        let properties = FileProperties::collect(root);
+        let properties = implied_properties | FileProperties::collect(root);
         let imported_packages = collect_imported_packages_in_tree(root, typed_ast, &source);
+        let file_loads = FileLoad::collect(root, typed_ast, &source);
         let baseline = if properties.primary_code {
             knowledge_provider.without_prelude()
         } else {
@@ -170,6 +265,7 @@ impl DocumentSnapshot {
         let packages = SourcePackages::collect(root, &source);
         let package_documentation = PackageDocumentation::collect(root, &source, &packages);
         let diagnostic_suppressions = DiagnosticSuppressions::collect(root, &source);
+        let init_file_directive = InitFileDirective::collect(root, &source);
         drop(documentation_timing);
         let diagnostics_timing = crate::telemetry::Timing::start(
             "document.diagnostics",
@@ -231,6 +327,7 @@ impl DocumentSnapshot {
             .collect();
         drop(documentation_timing);
         let mut snapshot = Self {
+            implied_properties,
             properties,
             source,
             tree,
@@ -241,12 +338,16 @@ impl DocumentSnapshot {
             symbol_mentions,
             package_mentions,
             imported_packages,
+            file_loads,
             packages,
             package_documentation,
             diagnostic_suppressions,
+            init_file_directive,
             package_sessions: OnceLock::new(),
             previous_sessions: Mutex::new(previous_sessions),
-            session_knowledge: knowledge_provider.clone(),
+            // `check` and `installPackage` run the code with `-q`, which
+            // skips the init file.
+            session_knowledge: knowledge_provider.without_init_file(),
         };
         if full {
             let _timing = crate::telemetry::Timing::start(
@@ -273,9 +374,55 @@ impl DocumentSnapshot {
                 .expect("session cache lock")
                 .clone()
         });
-        move || Self::analyze(source, tree, &knowledge, previous, true)
+        let implied_properties = self.implied_properties;
+        move || Self::analyze(source, tree, &knowledge, previous, true, implied_properties)
     }
 
+    /// Analyze the document again if its location now implies other
+    /// properties, as when the configured primary code directories change.
+    /// Returns whether it was analyzed again.
+    pub fn imply_properties(
+        &mut self,
+        implied_properties: FileProperties,
+        knowledge_provider: &ObjectRegistry,
+    ) -> bool {
+        if implied_properties == self.implied_properties {
+            return false;
+        }
+        let previous_sessions = self.take_sessions();
+        *self = Self::analyze(
+            self.source.clone(),
+            self.tree.clone(),
+            knowledge_provider,
+            previous_sessions,
+            true,
+            implied_properties,
+        );
+        true
+    }
+
+    /// Analyze the document again if `knowledge_provider` starts its
+    /// session with another init file than the one it was analyzed with, as
+    /// when its directive or the settings select another, or the file
+    /// changed. Returns whether it was analyzed again.
+    pub fn restart_session(&mut self, knowledge_provider: &ObjectRegistry) -> bool {
+        if knowledge_provider.init_file() == self.object_registry.init_file() {
+            return false;
+        }
+        let previous_sessions = self.take_sessions();
+        *self = Self::analyze(
+            self.source.clone(),
+            self.tree.clone(),
+            knowledge_provider,
+            previous_sessions,
+            true,
+            self.implied_properties,
+        );
+        true
+    }
+
+    /// Take the package sessions out of the snapshot for reuse by its
+    /// successor: those analyzed, or else those it inherited.
     fn take_sessions(&mut self) -> Vec<PackageSession> {
         std::mem::take(&mut self.package_sessions)
             .into_inner()
@@ -288,6 +435,10 @@ impl DocumentSnapshot {
             })
     }
 
+    /// Apply the client's `changes` in order and analyze the result, reparsing
+    /// incrementally and re-checking only from the first changed cell on,
+    /// unless the file properties changed. `None` when a change range lies
+    /// outside the text or parsing fails.
     pub fn apply_changes(
         &mut self,
         changes: &[TextDocumentContentChangeEvent],
@@ -311,8 +462,17 @@ impl DocumentSnapshot {
         );
         let tree = SyntaxParser::new()?.parse_tree(source.text(), Some(&self.tree))?;
         drop(parsing);
-        if FileProperties::collect(tree.root(source.text())) != self.properties {
-            *self = Self::analyze(source, tree, knowledge_provider, Vec::new(), true);
+        let implied_properties = self.implied_properties;
+        if implied_properties | FileProperties::collect(tree.root(source.text())) != self.properties
+        {
+            *self = Self::analyze(
+                source,
+                tree,
+                knowledge_provider,
+                Vec::new(),
+                true,
+                implied_properties,
+            );
             return Some(());
         }
         let unchanged_prefix = source
@@ -340,36 +500,58 @@ impl DocumentSnapshot {
             .cloned()
             .collect::<Vec<_>>();
         let previous_sessions = self.take_sessions();
-        *self = Self::analyze(source, tree, knowledge_provider, previous_sessions, false);
+        *self = Self::analyze(
+            source,
+            tree,
+            knowledge_provider,
+            previous_sessions,
+            false,
+            implied_properties,
+        );
         self.diagnostics.extend(retained);
         Some(())
     }
 
+    /// The text analyzed.
     pub fn text(&self) -> &str {
         SourceNavigation::text(self)
     }
 
+    /// The packages loaded in the document's session, its imports included, and
+    /// the init file it started with.
     pub fn object_registry(&self) -> &ObjectRegistry {
         &self.object_registry
     }
 
+    /// The file properties analysis used: those implied by the location with
+    /// those the directives declare.
     pub fn properties(&self) -> FileProperties {
         self.properties
     }
 
+    /// The semantic analysis of the text.
     pub fn analysis(&self) -> &Analysis {
         &self.analysis
     }
 
+    /// The typed syntax tree of the text.
     pub fn syntax(&self) -> Option<&TypedSource> {
         Some(self.tree.syntax())
     }
 
+    /// Every finding of the analysis and the package sessions, before settings
+    /// and suppressions filter them.
     pub fn diagnostics(&self) -> &[M2Diagnostic] {
         &self.diagnostics
     }
 
     /// What the document's directive comments silence.
+    /// The comment selecting the init file the document starts with.
+    pub fn init_file_directive(&self) -> Option<&InitFileDirective> {
+        self.init_file_directive.as_ref()
+    }
+
+    /// The diagnostics the document's `disable` directives hide.
     pub fn diagnostic_suppressions(&self) -> &DiagnosticSuppressions {
         &self.diagnostic_suppressions
     }
@@ -377,6 +559,19 @@ impl DocumentSnapshot {
     /// The packages the document imports, each from where it takes effect.
     pub fn imported_packages(&self) -> &[PackageImport] {
         &self.imported_packages
+    }
+
+    /// The files the document runs with `load`/`needs`/`input`, in source
+    /// order.
+    pub fn file_loads(&self) -> &[FileLoad] {
+        &self.file_loads
+    }
+
+    /// The load whose file name contains `position`.
+    pub fn file_load_at(&self, position: Position) -> Option<&FileLoad> {
+        self.file_loads
+            .iter()
+            .find(|load| load.names_file_at(position))
     }
 
     /// The packages the document declares.
@@ -428,6 +623,7 @@ impl DocumentSnapshot {
             .find(|session| session.code.contains(position))
     }
 
+    /// The binding of the name at `position`, in code or in a mention.
     pub fn binding_at_position(&self, position: Position) -> Option<BindingView<'_>> {
         if let Some(mention) = self.symbol_mention_at(position) {
             return self.mention_symbol(&mention);
@@ -436,11 +632,16 @@ impl DocumentSnapshot {
         self.source_binding_at(node.text(), position)
     }
 
+    /// The binding `name` resolves to at `position`, if the session sees it
+    /// there.
     pub fn source_binding_at(&self, name: &str, position: Position) -> Option<BindingView<'_>> {
         self.analysis
             .visible_source_binding_at(name, position, &self.object_registry.at(position))
     }
 
+    /// The binding a later assignment of `name` gives it, for a use at
+    /// `position` before it, as in a function body run only after the
+    /// assignment.
     pub fn future_assignment_binding_at(
         &self,
         name: &str,
@@ -453,10 +654,14 @@ impl DocumentSnapshot {
             })
     }
 
+    /// The binding `name` resolves to at `position`, as
+    /// [`Self::source_binding_at`].
     pub fn source_symbol_at(&self, name: &str, position: Position) -> Option<BindingView<'_>> {
         self.source_binding_at(name, position)
     }
 
+    /// The name at `position` with its range and binding: what references,
+    /// highlights and rename start from.
     pub fn target_symbol_at(&self, position: Position) -> Option<TargetSymbol<'_>> {
         let mention = self.symbol_mention_at(position);
         let (name, range) = if let Some(mention) = mention.as_ref() {
@@ -498,6 +703,8 @@ impl DocumentSnapshot {
         self.documentation.example_ranges()
     }
 
+    /// The code snippets of the documentation comments, analyzed with the
+    /// document.
     pub fn documentation_snippets(&self) -> &[DocumentationSnippet] {
         self.documentation.snippets()
     }
@@ -534,6 +741,7 @@ impl DocumentSnapshot {
         Some(&self.text()[first.start_byte()..end])
     }
 
+    /// The documentation comment attached to `binding`.
     pub fn documentation_for_binding(
         &self,
         binding: BindingView<'_>,
@@ -541,6 +749,8 @@ impl DocumentSnapshot {
         self.documentation.for_binding(binding)
     }
 
+    /// The documentation comment attached to the method installation
+    /// `installation`.
     pub fn documentation_for_installation(
         &self,
         installation: crate::analysis::MethodInstallationId,
@@ -548,6 +758,7 @@ impl DocumentSnapshot {
         self.documentation.for_installation(installation)
     }
 
+    /// The mention outside code containing `position`.
     pub fn symbol_mention_at(&self, position: Position) -> Option<SymbolMention> {
         self.symbol_mentions
             .iter()
@@ -569,6 +780,7 @@ impl DocumentSnapshot {
             })
     }
 
+    /// The name at `position`, in code or in a mention, with its range.
     pub fn symbol_occurrence_at(&self, position: Position) -> Option<(&str, TextRange)> {
         if let Some(mention) = self.symbol_mention_at(position) {
             return Some((mention.name(self.text()), mention.range()));
@@ -577,11 +789,14 @@ impl DocumentSnapshot {
         Some((node.text(), self.range_for_node(node)))
     }
 
+    /// The function the name at `position` is bound to.
     pub fn callable_at_position(&self, position: Position) -> Option<&FunctionInfo> {
         let binding = self.binding_at_position(position)?;
         self.analysis.function_for_binding(binding)
     }
 
+    /// The ranges of the values that are functions, `x -> …`, possibly
+    /// parenthesized.
     pub fn lambda_value_ranges(&self) -> Vec<TextRange> {
         self.root_node()
             .descendants()
@@ -599,14 +814,17 @@ impl DocumentSnapshot {
             .collect()
     }
 
+    /// The parse tree of the text.
     pub(crate) fn syntax_tree(&self) -> &SyntaxTree {
         &self.tree
     }
 
+    /// The root of the parse tree.
     pub fn root_node(&self) -> SyntaxNode<'_> {
         self.tree.root(self.text())
     }
 
+    /// The smallest syntax node at `position`.
     pub fn node_at_position_minimal(&self, position: Position) -> Option<SyntaxNode<'_>> {
         let point = self.point_for_position(position)?;
         self.root_node().descendant_for_point_range(point, point)
@@ -946,7 +1164,7 @@ mod snapshot_scheduling_tests {
 
     #[test]
     fn live_updates_recheck_everything_after_the_edit() {
-        let knowledge = ObjectRegistry::load(include_str!("data/m2-index.jsonl"));
+        let knowledge = ObjectRegistry::load(crate::catalog::test_corpus());
         let mut document = DocumentSnapshot::from_text(
             "-- points\np = method()\np ZZ := n -> n + 1\n".into(),
             &knowledge,

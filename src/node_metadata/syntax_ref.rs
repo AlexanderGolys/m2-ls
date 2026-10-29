@@ -19,8 +19,11 @@ pub(super) fn child_enumerations() -> usize {
 
 /// Selects a concrete typed value without comparing its source span.
 pub trait SyntaxType: Spanned {
+    /// Wraps this generated AST value in a borrowed navigation reference.
     fn syntax_ref(&self) -> SyntaxRef<'_>;
+    /// Runtime identity of the generated type selected by this implementation.
     fn type_tag() -> TypeId;
+    /// Selects a reference of this concrete generated type, returning no value for other types.
     fn cast<'a>(node: &SyntaxRef<'a>) -> Option<&'a Self>;
 }
 
@@ -40,6 +43,7 @@ impl<T: SyntaxType> SyntaxType for Box<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SyntaxIdentity(TypeId, usize);
 
+/// Defines borrowed syntax references and concrete generated-type selection together.
 macro_rules! syntax_references {
     ($($name:ident => $visit:ident, $category:literal, $token:literal;)*) => {
         #[derive(Debug, Clone)]
@@ -361,6 +365,7 @@ syntax_references! {
 }
 
 impl<'a> SyntaxRef<'a> {
+    /// Adds delimiter-boundary references omitted by generated structural traversal.
     fn add_punctuation(&self, children: &mut Vec<Self>) {
         let delimiter = match self {
             Self::Array(n) => Some(n.delimiter.delimiter()),
@@ -393,6 +398,7 @@ impl<'a> SyntaxRef<'a> {
     }
 }
 
+/// Recovers a token's source span through its lexical representation.
 #[inline(never)]
 fn token_span(value: &impl Lex) -> Option<Span> {
     value

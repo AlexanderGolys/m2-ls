@@ -419,6 +419,8 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
         [
             "Simplify unnecessary null branch",
             "Simplify if condition",
+            "Disable S05 on this line",
+            "Disable S05 in this file",
             "Fix all in file"
         ]
     );
@@ -1744,5 +1746,249 @@ async fn package_documentation_reaches_hover_across_the_workspace() {
     );
     assert!(key.contains("doubles a number"), "{key}");
 
+    server.shutdown().await;
+}
+
+fn protected_assignments(diagnostics: &Value) -> Vec<Value> {
+    response_array(&diagnostics["params"]["diagnostics"])
+        .iter()
+        .filter(|diagnostic| diagnostic["code"] == "E13")
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn discovered_core_sources_are_primary_code_and_protected_assignments_offer_it() {
+    let library = LibraryFixture::new();
+    let source = "ZZ = 7\n";
+    let workspace = TestWorkspace::new(source);
+    let mut server = LspProcess::spawn().await;
+    server
+        .initialize_with_options(&workspace.root_uri(), library.sources_settings(true))
+        .await;
+
+    let core_file = library.uri("Core/betti.m2");
+    let in_core = server.open_document(&core_file, source).await;
+    assert!(protected_assignments(&in_core).is_empty());
+
+    let elsewhere = server.open_document(&workspace.uri, source).await;
+    let [protected] = protected_assignments(&elsewhere).try_into().unwrap();
+    assert!(protected["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("`-- m2-ls: primaryCode`")));
+    let actions = server
+        .request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": workspace.uri},
+                "range": protected["range"],
+                "context": {"diagnostics": [protected]}
+            }),
+        )
+        .await;
+    let declare = response_array(&actions)
+        .iter()
+        .find(|action| action["title"] == "Analyze this file as library implementation code")
+        .expect("a protected assignment offers declaring the file primary code");
+    assert_eq!(declare["kind"], "quickfix");
+    assert_eq!(
+        declare["edit"]["changes"][&workspace.uri],
+        json!([{
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 0}
+            },
+            "newText": "-- m2-ls: primaryCode\n"
+        }])
+    );
+    assert!(response_array(&actions)
+        .iter()
+        .filter(|action| action["kind"] == "source.fixAll")
+        .all(|fix_all| !fix_all.to_string().contains("primaryCode")));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn configured_primary_code_paths_apply_without_an_installation() {
+    let source = "ZZ = 7\n";
+    let workspace = TestWorkspace::new(source);
+    let mut server = LspProcess::spawn().await;
+    let root = Url::parse(&workspace.root_uri())
+        .unwrap()
+        .to_file_path()
+        .unwrap();
+    server
+        .initialize_with_options(
+            &workspace.root_uri(),
+            json!({"sources": {"enabled": false, "primaryCodePaths": [root]}}),
+        )
+        .await;
+    let opened = server.open_document(&workspace.uri, source).await;
+    assert!(protected_assignments(&opened).is_empty());
+
+    server
+        .notify(
+            "workspace/didChangeConfiguration",
+            json!({"settings": {"m2-ls": {"sources": {"enabled": false}}}}),
+        )
+        .await;
+    let republished = server
+        .wait_for_notification("textDocument/publishDiagnostics")
+        .await;
+    assert_eq!(protected_assignments(&republished).len(), 1);
+
+    server.shutdown().await;
+}
+
+/// User package dependencies are followed without opening their implementation,
+/// while unrelated files stay outside workspace symbol search.
+#[tokio::test]
+async fn user_package_dependencies_are_indexed_without_scanning_the_workspace() {
+    let source = "needsPackage \"LocalPackage\"\nlocalExport 2\n";
+    let workspace = TestWorkspace::new(source);
+    workspace.write_file("LocalPackage.m2", "newPackage \"LocalPackage\"\nexport {\"localExport\"}\nload \"./LocalPackage/impl.m2\"\nendPackage \"LocalPackage\"\n");
+    let implementation = workspace.write_file(
+        "LocalPackage/impl.m2",
+        "localExport = x -> localHelper x\nlocalHelper = x -> x\n",
+    );
+    workspace.write_file("unrelated.m2", "unrelatedSentinel = 1\n");
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    server.open_document(&workspace.uri, source).await;
+    assert_eq!(
+        locations_at(
+            &mut server,
+            "textDocument/definition",
+            &workspace.uri,
+            position(source, "localExport", 0)
+        )
+        .await,
+        vec![(implementation.clone(), 0)]
+    );
+    let implementation_source = "localExport = x -> localHelper x\nlocalHelper = x -> x\n";
+    server
+        .open_document(&implementation, implementation_source)
+        .await;
+    assert_eq!(
+        locations_at(
+            &mut server,
+            "textDocument/definition",
+            &implementation,
+            position(implementation_source, "localHelper", 0)
+        )
+        .await,
+        vec![(implementation, 1)]
+    );
+    let unrelated = server
+        .request("workspace/symbol", json!({"query": "unrelatedSentinel"}))
+        .await;
+    assert!(response_array(&unrelated).is_empty(), "{unrelated}");
+    server.shutdown().await;
+}
+
+/// Entering installed source must not add its dependency tree to the workspace,
+/// and the user's catalog-backed navigation must continue to work afterward.
+#[tokio::test]
+async fn opening_installed_sources_does_not_index_their_dependencies() {
+    let library = LibraryFixture::new();
+    let source = "betti 1\nsaturate 1\n";
+    let workspace = TestWorkspace::new(source);
+    let packages = library.root.join("usr-dist/common/share/Macaulay2");
+    std::fs::write(
+        packages.join("Core/dependency.m2"),
+        "coreDependencySentinel = 1\n",
+    )
+    .expect("Core dependency");
+    std::fs::write(
+        packages.join("Saturation/dependency.m2"),
+        "packageDependencySentinel = 1\n",
+    )
+    .expect("package dependency");
+    let mut server = LspProcess::spawn().await;
+    server
+        .initialize_with_options(&workspace.root_uri(), library.sources_settings(true))
+        .await;
+    server.open_document(&workspace.uri, source).await;
+    for (name, file, dependency, sentinel) in [
+        (
+            "betti",
+            "Core/betti.m2",
+            "./dependency.m2",
+            "coreDependencySentinel",
+        ),
+        (
+            "saturate",
+            "Saturation/impl.m2",
+            "./dependency.m2",
+            "packageDependencySentinel",
+        ),
+    ] {
+        let before = locations_at(
+            &mut server,
+            "textDocument/definition",
+            &workspace.uri,
+            position(source, name, 0),
+        )
+        .await;
+        assert!(!before.is_empty(), "{name} has a library definition");
+        let hover_params = document_position(&workspace.uri, position(source, name, 0));
+        let hover_before = server
+            .request("textDocument/hover", hover_params.clone())
+            .await;
+        assert!(!hover_before.is_null(), "{name} has catalog-backed hover");
+        let opened = format!("load \"{dependency}\"\n{name} = x -> x\n");
+        server.open_document(&library.uri(file), &opened).await;
+        let symbols = server
+            .request("workspace/symbol", json!({"query": sentinel}))
+            .await;
+        assert!(
+            response_array(&symbols).is_empty(),
+            "opening {file} indexed dependencies: {symbols}"
+        );
+        assert!(!locations_at(
+            &mut server,
+            "textDocument/definition",
+            &workspace.uri,
+            position(source, name, 0)
+        )
+        .await
+        .is_empty());
+        let hover_after = server.request("textDocument/hover", hover_params).await;
+        assert_eq!(
+            hover_after, hover_before,
+            "opening {file} changes the user's catalog-backed hover"
+        );
+    }
+    server.shutdown().await;
+}
+
+/// Core locations imply no-prelude analysis without a source directive.
+#[tokio::test]
+async fn opening_core_source_omits_prelude_completions() {
+    let library = LibraryFixture::new();
+    let source = "allowable\n";
+    let workspace = TestWorkspace::new(source);
+    let mut server = LspProcess::spawn().await;
+    server
+        .initialize_with_options(&workspace.root_uri(), library.sources_settings(true))
+        .await;
+    for (uri, expects_prelude) in [
+        (workspace.uri.clone(), true),
+        (library.uri("Core/betti.m2"), false),
+    ] {
+        server.open_document(&uri, source).await;
+        let completion = server
+            .request(
+                "textDocument/completion",
+                document_position(&uri, json!({"line": 0, "character": 9})),
+            )
+            .await;
+        let items = completion.get("items").unwrap_or(&completion);
+        let has_builtin = items
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["label"] == "allowableThreads"));
+        assert_eq!(has_builtin, expects_prelude, "{uri}: {completion}");
+    }
     server.shutdown().await;
 }

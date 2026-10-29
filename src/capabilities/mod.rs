@@ -1,9 +1,11 @@
 //! LSP feature handlers, grouped by protocol capability.
 
 pub mod code_actions;
+/// Cursor-pattern recognition and completion candidate selection.
 pub mod completion;
 pub mod document_highlight;
 pub mod document_symbols;
+pub mod file_operations;
 pub mod formatting;
 pub mod hover;
 pub mod inlay_hints;

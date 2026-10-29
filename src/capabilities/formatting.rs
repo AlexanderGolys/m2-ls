@@ -1,4 +1,13 @@
-//! Tree-sitter-guided formatting and folding ranges for Macaulay2 source.
+//! Syntax-guided whitespace formatting and folding for Macaulay2 source.
+//!
+//! Each formatting pass reads one immutable parse and edits a coordinate-mapped
+//! layout view. Whitespace changes update that mapping rather than reparsing the
+//! source between passes. String literals, comments, and invalid regions remain
+//! protected from edits. The pass order resolves spacing before control layout,
+//! indentation, wrapping, and final closer placement.
+//!
+//! Folding combines multiline literals and comments with indentation boundaries;
+//! it does not execute source or require the external builtin catalog.
 
 use std::collections::VecDeque;
 
@@ -23,22 +32,41 @@ use layout::{LayoutNode, LayoutSource};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Placement of control-flow keywords and their bodies during formatting.
+#[non_exhaustive]
 pub enum ControlFlowLayout {
+    /// Keeps control-flow expressions compact when their syntax permits it.
     Compact,
+    /// Places control-flow clause bodies on separate lines.
     Multiline,
+    /// Uses multiline bodies while retaining compact else placement where possible.
     #[default]
     MultilineCompactElse,
+    /// `then` and `else` each start a line under their `if`, followed by
+    /// their body; loops and `try` are laid out as in `Multiline`.
+    LeadingKeywords,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatOptions {
+    /// Whitespace unit inserted for each indentation level.
     indent: String,
+    /// Display columns occupied by a tab during width calculation.
     tab_width: usize,
+    /// Preferred wrapping width, absent when wrapping is disabled.
     soft_line_width: Option<usize>,
+    /// Maximum permitted line width before wrapping is required.
     max_line_width: Option<usize>,
+    /// Configured placement of control keywords and their bodies.
     control_flow_layout: ControlFlowLayout,
+    /// Whether multiplicative operators omit surrounding spaces.
     compact_factor_operators: bool,
+    /// Whether a semicolon begins a new formatted statement line.
     break_after_semicolon: bool,
+    /// Whether existing line boundaries are preserved.
+    keep_line_breaks: bool,
+    /// Explicit brace-spacing preference, absent to preserve the existing style.
+    space_in_braces: Option<bool>,
 }
 
 impl Default for FormatOptions {
@@ -65,7 +93,12 @@ impl FormatOptions {
     ) -> Self {
         let tab_width = settings.indent.unwrap_or(tab_size).max(1) as usize;
         let use_tabs = settings.use_tabs.unwrap_or(!insert_spaces);
-        let (soft_line_width, hard_line_width) = settings.line_widths();
+        let keep_line_breaks = settings.keep_line_breaks;
+        let (soft_line_width, hard_line_width) = if keep_line_breaks {
+            (None, None)
+        } else {
+            settings.line_widths()
+        };
         Self {
             indent: if use_tabs {
                 "\t".to_string()
@@ -75,21 +108,30 @@ impl FormatOptions {
             tab_width,
             soft_line_width: soft_line_width.map(|width| width as usize),
             max_line_width: hard_line_width.map(|width| width as usize),
-            control_flow_layout: settings.control_flow_layout,
+            control_flow_layout: if keep_line_breaks {
+                ControlFlowLayout::Compact
+            } else {
+                settings.control_flow_layout
+            },
             compact_factor_operators: settings.compact_factor_operators,
-            break_after_semicolon: settings.break_after_semicolon,
+            break_after_semicolon: settings.break_after_semicolon && !keep_line_breaks,
+            keep_line_breaks,
+            space_in_braces: settings.space_in_braces,
         }
     }
 }
 
+/// Advertises whole-document formatting support in the initialization response.
 pub fn document_formatting_provider_capability() -> Option<OneOf<bool, DocumentFormattingOptions>> {
     Some(OneOf::Left(true))
 }
 
+/// Advertises source-code and comment folding support in the initialization response.
 pub fn folding_range_provider_capability() -> Option<FoldingRangeProviderCapability> {
     Some(FoldingRangeProviderCapability::Simple(true))
 }
 
+/// Computes the protocol edits needed to apply the configured whitespace layout.
 pub fn document_formatting_text_edits(
     source: &DocumentSnapshot,
     tab_size: u32,
@@ -109,6 +151,7 @@ pub fn document_formatting_text_edits(
     }]
 }
 
+/// Foldable code, literal, and comment regions derived from the document syntax.
 pub fn folding_ranges(root: SyntaxNode<'_>) -> Vec<FoldingRange> {
     folding_ranges_for_syntax(root)
         .into_iter()
@@ -123,10 +166,14 @@ pub fn folding_ranges(root: SyntaxNode<'_>) -> Vec<FoldingRange> {
         .collect()
 }
 
+/// A whitespace replacement expressed in the current layout's byte offsets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FormatEdit {
+    /// Inclusive UTF-8 byte offset of the represented source interval.
     start_byte: usize,
+    /// Exclusive UTF-8 byte offset of the represented source interval.
     end_byte: usize,
+    /// Text replacing the selected source interval.
     replacement: String,
 }
 
@@ -164,6 +211,7 @@ pub(super) fn format_action_edit(
     edit.new_text = layout.text_for_bytes(bytes.start..end).to_string();
 }
 
+/// Runs the ordered whitespace passes against one immutable syntax snapshot.
 fn formatted_layout(root: SyntaxNode<'_>, options: &FormatOptions) -> LayoutSource {
     let root = root.root();
     let newline = detect_line_ending(root.source_text());
@@ -179,6 +227,9 @@ fn formatted_layout(root: SyntaxNode<'_>, options: &FormatOptions) -> LayoutSour
         FormatPass::Closers,
         FormatPass::Indent,
     ]);
+    if options.keep_line_breaks {
+        passes.retain(|pass| !pass.moves_line_breaks());
+    }
     while let Some(pass) = passes.pop_front() {
         let node = LayoutNode::new(root, &layout);
         let edits = match pass {
@@ -199,18 +250,39 @@ fn formatted_layout(root: SyntaxNode<'_>, options: &FormatOptions) -> LayoutSour
     layout
 }
 
+/// One ordered whitespace transformation in the formatter pipeline.
 #[derive(Clone, Copy)]
 enum FormatPass {
+    /// Normalizes spaces around operators, separators, and delimiters.
     Spacing,
+    /// Moves permitted leading operators into the configured line layout.
     LeadingOperators,
+    /// Selects the callable's option-passing policy.
     Options,
+    /// Compacts syntactically empty construct bodies.
     EmptyBodies,
+    /// Applies the configured placement of control-flow clauses.
     ControlFlow,
+    /// Applies indentation derived from syntax and source line structure.
     Indent,
+    /// Wraps long lines at syntactically permitted boundaries.
     Wrap,
+    /// Separates closing delimiters according to the surrounding line layout.
     Closers,
 }
 
+impl FormatPass {
+    /// Whether the pass adds, removes, or moves line breaks; such passes are
+    /// skipped when line breaks are kept as written.
+    fn moves_line_breaks(self) -> bool {
+        matches!(
+            self,
+            Self::LeadingOperators | Self::Options | Self::EmptyBodies | Self::Closers
+        )
+    }
+}
+
+/// Separates line end bracket closers by inserting whitespace at permitted source boundaries.
 fn separate_line_end_bracket_closers(
     root: LayoutNode<'_>,
     newline: &'static str,
@@ -371,6 +443,7 @@ fn lead_rows_with_operators(
     edits
 }
 
+/// Whitespace edits that keep syntactically empty bodies on a single line.
 fn inline_empty_bodies(root: LayoutNode<'_>) -> Vec<FormatEdit> {
     let text = root.source_text();
     let mut edits = Vec::new();
@@ -395,6 +468,7 @@ fn inline_empty_bodies(root: LayoutNode<'_>) -> Vec<FormatEdit> {
     edits
 }
 
+/// Whether this node occupies a callable or clause body eligible for empty-body compaction.
 fn empty_body_role(node: LayoutNode<'_>) -> bool {
     if !node.is_delimited_expression() {
         return false;
@@ -421,6 +495,7 @@ fn empty_body_role(node: LayoutNode<'_>) -> bool {
     parent.is::<TryStatement>()
 }
 
+/// Formats control flow using the current layout settings and source coordinates.
 fn format_control_flow(
     root: LayoutNode<'_>,
     options: &FormatOptions,
@@ -478,6 +553,21 @@ fn format_control_flow(
             continue;
         };
 
+        if options.control_flow_layout == ControlFlowLayout::LeadingKeywords
+            && clause
+                .parent()
+                .is_some_and(|owner| owner.is::<IfStatement>())
+        {
+            push_control_flow_break(
+                text,
+                same_line_horizontal_whitespace_start(text, clause.start_byte()),
+                clause.start_byte(),
+                newline,
+                &mut edits,
+            );
+            continue;
+        }
+
         if clause.is::<ElseClause>() || clause.is_except_clause() {
             if !clause.is::<ElseClause>() || !keep_else_after_closer(clause, text, &mut edits) {
                 push_control_flow_break(
@@ -504,6 +594,7 @@ fn format_control_flow(
     edits
 }
 
+/// Direct child keyword of the requested generated token type.
 fn direct_keyword<'tree, Keyword: m2_syn::Token>(
     node: LayoutNode<'tree>,
 ) -> Option<LayoutNode<'tree>> {
@@ -511,6 +602,7 @@ fn direct_keyword<'tree, Keyword: m2_syn::Token>(
         .find(|child| child.is_keyword_token() && matches_token::<Keyword>(child.text()))
 }
 
+/// Appends control clause body break to the current formatting edits or traversal results.
 fn push_control_clause_body_break(
     keyword: LayoutNode<'_>,
     body: LayoutNode<'_>,
@@ -533,6 +625,7 @@ fn push_control_clause_body_break(
     );
 }
 
+/// Keeps an else keyword beside the preceding closer when that layout remains valid.
 fn keep_else_after_closer(clause: LayoutNode<'_>, text: &str, edits: &mut Vec<FormatEdit>) -> bool {
     let Some(body) = clause.parent().and_then(|owner| {
         owner
@@ -567,6 +660,7 @@ fn keep_else_after_closer(clause: LayoutNode<'_>, text: &str, edits: &mut Vec<Fo
     true
 }
 
+/// Clause breaks are parseable associated with the enclosing callable or loop.
 fn control_clause_breaks_are_parseable(clause: LayoutNode<'_>, text: &str) -> bool {
     let mut current = clause;
     let control = loop {
@@ -628,6 +722,7 @@ fn control_clause_breaks_are_parseable(clause: LayoutNode<'_>, text: &str) -> bo
     false
 }
 
+/// Appends control flow break to the current formatting edits or traversal results.
 fn push_control_flow_break(
     text: &str,
     start_byte: Option<usize>,
@@ -698,13 +793,18 @@ fn reindent_from_tree(root: LayoutNode<'_>, options: &FormatOptions) -> Vec<Form
     edits
 }
 
+/// A permitted wrap point with its indentation and syntactic priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LineBreakCandidate {
+    /// Inclusive UTF-8 byte offset of the represented source interval.
     start_byte: usize,
+    /// Exclusive UTF-8 byte offset of the represented source interval.
     end_byte: usize,
 }
 
+/// Selects syntactically valid line-break points in a layout node.
 trait LineBreakRule {
+    /// Adds line-break candidates recognized by this rule without changing expression grouping.
     fn collect(
         &self,
         node: LayoutNode<'_>,
@@ -731,6 +831,7 @@ where
     }
 }
 
+/// Selects line breaks at collection delimiter boundaries.
 #[derive(Debug, Clone, Copy)]
 struct DelimiterBreakRule;
 
@@ -754,6 +855,7 @@ impl LineBreakRule for DelimiterBreakRule {
     }
 }
 
+/// Selects line breaks between comma-separated collection elements.
 #[derive(Debug, Clone, Copy)]
 struct CommaBreakRule;
 
@@ -771,6 +873,7 @@ impl LineBreakRule for CommaBreakRule {
     }
 }
 
+/// Selects line breaks around operators without changing expression grouping.
 #[derive(Debug, Clone, Copy)]
 struct OperatorBreakRule;
 
@@ -798,6 +901,7 @@ impl LineBreakRule for OperatorBreakRule {
     }
 }
 
+/// Appends line break candidate before to the current formatting edits or traversal results.
 fn push_line_break_candidate_before(
     node: LayoutNode<'_>,
     text: &str,
@@ -813,6 +917,7 @@ fn push_line_break_candidate_before(
     });
 }
 
+/// Appends line break candidate after to the current formatting edits or traversal results.
 fn push_line_break_candidate_after(
     node: LayoutNode<'_>,
     text: &str,
@@ -828,12 +933,16 @@ fn push_line_break_candidate_after(
     });
 }
 
+/// A source line with its byte extent and display-width information.
 #[derive(Debug, Clone, Copy)]
 struct TextLine {
+    /// Inclusive UTF-8 byte offset of the represented source interval.
     start_byte: usize,
+    /// Exclusive UTF-8 byte offset of the represented source interval.
     end_byte: usize,
 }
 
+/// Wraps long lines at permitted syntax boundaries using the configured widths.
 fn wrap_long_lines(
     root: LayoutNode<'_>,
     options: &FormatOptions,
@@ -859,6 +968,7 @@ fn wrap_long_lines(
     )
 }
 
+/// Collects line break candidates from the supplied syntax and semantic context.
 fn collect_line_break_candidates(
     root: LayoutNode<'_>,
     options: &FormatOptions,
@@ -874,6 +984,7 @@ fn collect_line_break_candidates(
     candidates
 }
 
+/// Selects line breaks according to the syntax and configured layout constraints.
 fn select_line_breaks(
     text: &str,
     candidates: &[LineBreakCandidate],
@@ -918,6 +1029,7 @@ fn select_line_breaks(
         .collect()
 }
 
+/// Splits text into source lines retaining byte coordinates for wrapping.
 fn text_lines(text: &str) -> Vec<TextLine> {
     let mut offset = 0;
     text.split_inclusive('\n')
@@ -934,6 +1046,7 @@ fn text_lines(text: &str) -> Vec<TextLine> {
         .collect()
 }
 
+/// Display width with tabs expanded using the configured tab stop.
 fn visual_width(text: &str, tab_width: usize) -> usize {
     text.chars().fold(0, |column, character| {
         if character == '\t' {
@@ -977,12 +1090,16 @@ fn folding_ranges_for_syntax(root: SyntaxNode<'_>) -> Vec<FormatFoldRange> {
 /// opened on, and a row beginning with that bracket's closer sits at the
 /// opener row's depth.
 struct TreeIndentLayout {
+    /// Indentation depth assigned to each source line.
     depths: Vec<usize>,
+    /// Foldable ranges identified inside multiline literals.
     literal_folds: Vec<FormatFoldRange>,
+    /// Lines beginning with a closing delimiter and requiring reduced indentation.
     leading_closer_rows: Vec<bool>,
 }
 
 impl TreeIndentLayout {
+    /// Collects line indentation and folding information from the parsed layout.
     fn from_root(root: LayoutNode<'_>, compact_factor_operators: bool) -> Self {
         let text = root.source_text();
         let line_count = text.lines().count().max(1);
@@ -1020,10 +1137,12 @@ impl TreeIndentLayout {
         }
     }
 
+    /// Indentation level assigned to the requested source row.
     fn depth(&self, row: usize) -> usize {
         self.depths.get(row).copied().unwrap_or(0)
     }
 
+    /// Whether the requested line begins with a closing delimiter.
     fn is_leading_closer(&self, row: usize) -> bool {
         self.leading_closer_rows.get(row).copied().unwrap_or(false)
     }
@@ -1074,6 +1193,7 @@ fn collect_literal_fold_ranges(root: LayoutNode<'_>, line_leads: &[usize]) -> Ve
     ranges
 }
 
+/// Appends line comment fold to the accumulated result in source order.
 fn append_line_comment_fold(
     ranges: &mut Vec<FormatFoldRange>,
     start_line: Option<u32>,
@@ -1096,8 +1216,11 @@ fn append_line_comment_fold(
 /// the same row collapse to one indent level, so the `open_row` is the group id.
 #[derive(Debug, Clone, Copy)]
 struct BracketGroup {
+    /// Line on which the foldable construct opens.
     open_row: usize,
+    /// Line on which the foldable construct closes.
     close_row: usize,
+    /// Display column at which the closing delimiter is aligned.
     closing_delimiter_column: usize,
 }
 
@@ -1398,6 +1521,7 @@ fn control_statement_is_standalone(node: LayoutNode<'_>, line_leads: &[usize]) -
     line_leads.get(row).copied().unwrap_or(0) >= column
 }
 
+/// Whether this conditional is the direct value of an enclosing else clause.
 fn if_statement_is_else_if(node: LayoutNode<'_>) -> bool {
     let Some(parent) = node.parent().filter(|parent| parent.is::<ElseClause>()) else {
         return false;
@@ -1414,30 +1538,44 @@ fn if_statement_is_else_if(node: LayoutNode<'_>) -> bool {
 /// produced; the LSP conversion maps them onto `FoldingRange`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatFoldRange {
+    /// First line of the represented source region.
     pub start_line: u32,
+    /// Last line of the represented source region.
     pub end_line: u32,
+    /// Semantic or presentation category of this item.
     pub kind: FormatFoldKind,
 }
 
+/// Whether a fold represents code structure or a comment block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FormatFoldKind {
+    /// A foldable source-code region.
     Region,
+    /// A foldable or classified comment span.
     Comment,
 }
 
+/// A nonempty source line classified by indentation and closing delimiters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IndentedLine {
+    /// Source line to which this layout fact applies.
     line: u32,
+    /// Indentation level assigned to the line or construct.
     depth: usize,
+    /// Whether the line begins with a closing delimiter.
     is_leading_closer: bool,
 }
 
+/// A prospective fold awaiting a line that closes its indentation level.
 #[derive(Debug, Clone, Copy)]
 struct OpenFoldRange {
+    /// First line of the represented source region.
     start_line: u32,
+    /// Indentation level assigned to the line or construct.
     depth: usize,
 }
 
+/// Collects indent fold ranges from the supplied syntax and semantic context.
 fn collect_indent_fold_ranges(lines: &[IndentedLine]) -> Vec<FormatFoldRange> {
     let mut ranges = Vec::new();
     let mut open_folds: Vec<OpenFoldRange> = Vec::new();
@@ -1472,6 +1610,7 @@ fn collect_indent_fold_ranges(lines: &[IndentedLine]) -> Vec<FormatFoldRange> {
     ranges
 }
 
+/// Closes fold range at the supplied source boundary.
 fn close_fold_range(
     ranges: &mut Vec<FormatFoldRange>,
     range: OpenFoldRange,
@@ -1491,6 +1630,7 @@ fn close_fold_range(
     });
 }
 
+/// Normalizes whitespace according to the resolved formatting settings.
 fn normalize_whitespace(root: LayoutNode<'_>, options: &FormatOptions) -> Vec<FormatEdit> {
     let text = root.source_text();
 
@@ -1499,6 +1639,7 @@ fn normalize_whitespace(root: LayoutNode<'_>, options: &FormatOptions) -> Vec<Fo
     edits
 }
 
+/// Collects format edits from the supplied syntax and semantic context.
 fn collect_format_edits(
     node: LayoutNode<'_>,
     text: &str,
@@ -1524,6 +1665,10 @@ fn collect_format_edits(
 
         if node.is_comma() {
             push_comma_whitespace_edits(text, node, edits);
+        }
+
+        if node.is::<List>() {
+            push_brace_whitespace_edits(text, node, options.space_in_braces, edits);
         }
 
         if node.is_semicolon() {
@@ -1619,6 +1764,7 @@ fn operator_spacing(parent: LayoutNode<'_>, operator: &str) -> OperatorSpacing {
     }
 }
 
+/// Operator spacing required by an infix operator in the surrounding expression.
 fn binary_operator_spacing(operator: &str) -> OperatorSpacing {
     // Factor operators participate in the adjacency rule before the static
     // spaced/compact tables.
@@ -1686,6 +1832,7 @@ fn binary_operator_spacing(operator: &str) -> OperatorSpacing {
     OperatorSpacing::None
 }
 
+/// Operator spacing required by a prefix operator and its operand.
 fn prefix_operator_spacing(operator: &str) -> OperatorSpacing {
     if matches_token::<Token![<<]>(operator) {
         return OperatorSpacing::SpacedPrefix;
@@ -1759,6 +1906,7 @@ fn breaks_before_operator(operator: LayoutNode<'_>, compact_factor_operators: bo
             .any(|node| node.is_delimited_expression())
 }
 
+/// Whether this node is a parenthesized call.
 fn is_parenthesized_call(node: LayoutNode<'_>) -> bool {
     if node.binary_operator().is_none() {
         return false;
@@ -1800,6 +1948,7 @@ fn is_method_installation_call_head(node: LayoutNode<'_>) -> bool {
         })
 }
 
+/// Appends call gap whitespace edit to the current formatting edits or traversal results.
 fn push_call_gap_whitespace_edit(
     node: LayoutNode<'_>,
     text: &str,
@@ -1823,6 +1972,7 @@ fn push_call_gap_whitespace_edit(
     });
 }
 
+/// Whether this node is a adjacent factor.
 fn is_adjacent_factor(node: LayoutNode<'_>) -> bool {
     node.is::<Symbol>()
         || node.is::<IntegerLiteral>()
@@ -1835,6 +1985,7 @@ fn is_adjacent_factor(node: LayoutNode<'_>) -> bool {
         || node.binary_operator().is_some()
 }
 
+/// Appends operator whitespace edits to the current formatting edits or traversal results.
 fn push_operator_whitespace_edits(
     text: &str,
     operator: LayoutNode<'_>,
@@ -1856,6 +2007,7 @@ fn push_operator_whitespace_edits(
     }
 }
 
+/// Appends compact operator whitespace edits to the current formatting edits or traversal results.
 fn push_compact_operator_whitespace_edits(
     text: &str,
     operator: LayoutNode<'_>,
@@ -1881,6 +2033,7 @@ fn push_compact_operator_whitespace_edits(
     });
 }
 
+/// Appends prefix operator whitespace edits to the current formatting edits or traversal results.
 fn push_prefix_operator_whitespace_edits(
     text: &str,
     operator: LayoutNode<'_>,
@@ -1898,6 +2051,7 @@ fn push_prefix_operator_whitespace_edits(
     });
 }
 
+/// Appends comma whitespace edits to the current formatting edits or traversal results.
 fn push_comma_whitespace_edits(text: &str, comma: LayoutNode<'_>, edits: &mut Vec<FormatEdit>) {
     if let Some(start_byte) = same_line_horizontal_whitespace_start(text, comma.start_byte()) {
         edits.push(FormatEdit {
@@ -1926,6 +2080,7 @@ fn push_comma_whitespace_edits(text: &str, comma: LayoutNode<'_>, edits: &mut Ve
     });
 }
 
+/// Whether the semicolon closes a statement inside a collection rather than a top-level cell.
 fn semicolon_terminates_collection_entry(semicolon: LayoutNode<'_>) -> bool {
     semicolon
         .parent()
@@ -1933,6 +2088,7 @@ fn semicolon_terminates_collection_entry(semicolon: LayoutNode<'_>) -> bool {
         .is_some_and(|container| container.is_collection_expression())
 }
 
+/// Appends semicolon whitespace edits to the current formatting edits or traversal results.
 fn push_semicolon_whitespace_edits(
     text: &str,
     semicolon: LayoutNode<'_>,
@@ -1969,6 +2125,56 @@ fn push_semicolon_whitespace_edits(
     }
 }
 
+/// Spacing just inside the braces of a `{…}` list: one space with
+/// `space_in_braces`, none without it, as written when unset. Empty braces
+/// are always `{}`, and a brace at a line break keeps its line layout.
+fn push_brace_whitespace_edits(
+    text: &str,
+    list: LayoutNode<'_>,
+    space_in_braces: Option<bool>,
+    edits: &mut Vec<FormatEdit>,
+) {
+    let children = list.children().collect::<Vec<_>>();
+    let (Some(opener), Some(closer)) = (children.first(), children.last()) else {
+        return;
+    };
+    if opener.is_missing()
+        || closer.is_missing()
+        || !opener.is_opening_delimiter()
+        || !closer.is_closing_delimiter()
+    {
+        return;
+    }
+    let inside = &text[opener.end_byte()..closer.start_byte()];
+    if inside.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
+        edits.push(FormatEdit {
+            start_byte: opener.end_byte(),
+            end_byte: closer.start_byte(),
+            replacement: String::new(),
+        });
+        return;
+    }
+    let Some(space_in_braces) = space_in_braces else {
+        return;
+    };
+    let padding = if space_in_braces { " " } else { "" };
+    if let Some(end_byte) = same_line_horizontal_whitespace_end(text, opener.end_byte()) {
+        edits.push(FormatEdit {
+            start_byte: opener.end_byte(),
+            end_byte,
+            replacement: padding.to_string(),
+        });
+    }
+    if let Some(start_byte) = same_line_horizontal_whitespace_start(text, closer.start_byte()) {
+        edits.push(FormatEdit {
+            start_byte,
+            end_byte: closer.start_byte(),
+            replacement: padding.to_string(),
+        });
+    }
+}
+
+/// Locates horizontal whitespace start without crossing a source line boundary.
 fn same_line_horizontal_whitespace_start(text: &str, byte_index: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut start_byte = byte_index;
@@ -1979,6 +2185,7 @@ fn same_line_horizontal_whitespace_start(text: &str, byte_index: usize) -> Optio
     (start_byte > 0 && !matches!(bytes[start_byte - 1], b'\n' | b'\r')).then_some(start_byte)
 }
 
+/// Locates horizontal whitespace end without crossing a source line boundary.
 fn same_line_horizontal_whitespace_end(text: &str, byte_index: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut end_byte = byte_index;
@@ -2004,6 +2211,8 @@ mod tests {
             control_flow_layout: ControlFlowLayout::MultilineCompactElse,
             compact_factor_operators: false,
             break_after_semicolon: true,
+            keep_line_breaks: false,
+            space_in_braces: None,
         })
     }
 
@@ -2882,6 +3091,96 @@ mod tests {
              \x20       two\n\
              \x20   else three\n\
              )\n"
+        );
+
+        let leading = FormatOptions {
+            control_flow_layout: ControlFlowLayout::LeadingKeywords,
+            ..fixture_options(4, true)
+        };
+        assert_eq!(
+            format_fixture_with_options(text, &leading),
+            "value := (\n\
+             \x20   if a\n\
+             \x20   then one\n\
+             \x20   else if b\n\
+             \x20   then two\n\
+             \x20   else three\n\
+             )\n"
+        );
+    }
+
+    fn settings_options(settings: FormattingSettings) -> FormatOptions {
+        FormatOptions::from_settings(4, true, &settings)
+    }
+
+    #[test]
+    fn leading_keywords_keep_bodies_after_their_keyword() {
+        let options = settings_options(FormattingSettings {
+            control_flow_layout: ControlFlowLayout::LeadingKeywords,
+            ..FormattingSettings::default()
+        });
+        assert_eq!(
+            format_fixture_with_options(
+                "f = x -> (\nif x then (\na;\nb\n) else c\n)\nif top then 1\n",
+                &options
+            ),
+            "f = x -> (\n    if x\n    then (\n        a;\n        b\n    )\n    else c\n)\nif top\nthen 1\n"
+        );
+    }
+
+    #[test]
+    fn space_in_braces_pads_strips_or_keeps_list_braces() {
+        let text = "a = { b, {c}, {  } }\nd = {e,\n    f }\n";
+        let with = |space_in_braces| {
+            format_fixture_with_options(
+                text,
+                &settings_options(FormattingSettings {
+                    space_in_braces,
+                    ..FormattingSettings::default()
+                }),
+            )
+        };
+        assert_eq!(
+            with(Some(true)),
+            "a = { b, { c }, {} }\nd = { e,\n    f }\n"
+        );
+        assert_eq!(with(Some(false)), "a = {b, {c}, {}}\nd = {e,\n    f}\n");
+        assert_eq!(with(None), "a = { b, {c}, {} }\nd = {e,\n    f }\n");
+    }
+
+    #[test]
+    fn keep_line_breaks_changes_only_spacing_and_indentation() {
+        let text = concat!(
+            "f = x -> (\n",
+            "a := {b,c};\n",
+            "y := if x then s1\n",
+            "else s2;\n",
+            "q := a +\n",
+            "b; r := 1\n",
+            "    )\n",
+            "g = {x => 1, y => 2}\n",
+        );
+        let options = settings_options(FormattingSettings {
+            keep_line_breaks: true,
+            control_flow_layout: ControlFlowLayout::Multiline,
+            break_after_semicolon: true,
+            hard_line_width: Some(10),
+            ..FormattingSettings::default()
+        });
+        let formatted = format_fixture_with_options(text, &options);
+        assert_eq!(formatted.lines().count(), text.lines().count());
+        assert_eq!(
+            formatted,
+            concat!(
+                "f = x -> (\n",
+                "    a := {b, c};\n",
+                "    y := if x then s1\n",
+                "        else s2;\n",
+                "    q := a +\n",
+                "        b; r := 1\n",
+                ")\n",
+                "g = {x => 1, y => 2}\n",
+            )
         );
     }
 

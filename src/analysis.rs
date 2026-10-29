@@ -1,4 +1,14 @@
 //! Staged analysis of one immutable document snapshot.
+//!
+//! The syntax-only scope pass establishes binding targets before enrichment
+//! resolves their values, callable identities, and method installations. A
+//! binding retains successive source-ordered states rather than one mutable
+//! value, so queries before and after a reassignment can produce different facts.
+//!
+//! [`Analysis`] owns the resulting registry. [`TypeChecker`] performs transient
+//! inference against those facts and the object knowledge visible at a requested
+//! position. Editor features consume retained source ranges and semantic roles
+//! instead of mutating analysis during a request.
 
 use crate::node_metadata::TypedSource;
 mod first_pass;
@@ -22,7 +32,8 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 use tower_lsp::lsp_types::{Position, Range as TextRange, SymbolKind};
 
-use crate::builtin_index::{CallableKind, MethodSignature, Record};
+use crate::builtin_index::{CallableKind, CallableOption, MethodSignature, OptionPassing, Record};
+use crate::file_load::FileLoad;
 use crate::meta::{BindingRole, Meta, Metadata};
 use crate::node_metadata::{
     matches_token, token_spelling, visit_source_nodes, SyntaxKind, SyntaxNode,
@@ -44,9 +55,12 @@ pub(crate) use typechecker::TypeChecker;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BindingId(u32);
 
+/// Identity of one source-ordered state of a scoped binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BindingStateId {
+    /// The scoped binding to which these facts apply.
     binding: BindingId,
+    /// Source-ordered state of the selected binding.
     state: usize,
 }
 
@@ -54,11 +68,14 @@ pub struct BindingStateId {
 /// `X SPACE Y`). Just another operator, not a special "adjacency" concept.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Operator {
+    /// Operator or semantic token represented by this item.
     pub token: ObjectName,
+    /// Prefix, infix, or postfix form of the operator.
     pub form: OperatorForm,
 }
 
 impl Operator {
+    /// Recognizes an operator and its form from expression syntax.
     fn from_expression(node: SyntaxNode<'_>) -> Option<Self> {
         let form = if node.is_adjacent_expr() || node.is_binary_expr() {
             OperatorForm::Binary
@@ -79,6 +96,7 @@ impl Operator {
         })
     }
 
+    /// Whether this binary operator is =, :=, or <- rather than an ordinary computation.
     fn is_assignment(&self) -> bool {
         self.form == OperatorForm::Binary
             && (matches_token::<Token![=]>(self.token.name())
@@ -86,6 +104,7 @@ impl Operator {
                 || matches_token::<Token![<-]>(self.token.name()))
     }
 
+    /// Whether this binary operator is the option-assignment arrow =>.
     fn is_option_assignment(&self) -> bool {
         self.form == OperatorForm::Binary && matches_token::<Token![=>]>(self.token.name())
     }
@@ -96,11 +115,14 @@ impl Operator {
 /// identity of this head.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MethodHead {
+    /// An ordinary callable name or its source expression.
     Function(ObjectName),
+    /// An operator callable or its syntax classification.
     Operator(Operator),
 }
 
 impl MethodHead {
+    /// Name used to identify this value in source and catalog lookups.
     pub fn name(&self) -> &ObjectName {
         match self {
             MethodHead::Function(name) => name,
@@ -126,12 +148,16 @@ pub struct CallableObjectId(usize);
 /// package inclusions make their resolution source-position dependent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Method {
+    /// Callable or operator on which the method is installed.
     pub head: MethodHead,
+    /// Argument identities accepted by the method signature.
     pub domain: Vec<ObjectName>,
+    /// Result type of the method, when known.
     pub codomain: Option<ObjectName>,
 }
 
 impl Method {
+    /// Combines a callable head, argument domain, and optional result type into a method signature.
     fn new(head: MethodHead, domain: Vec<ObjectName>, codomain: Option<ObjectName>) -> Self {
         Self {
             head,
@@ -146,7 +172,9 @@ impl Method {
 /// methods can still be total).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dispatch {
+    /// Accepts a variable number of arguments.
     Variadic,
+    /// Accepts exactly the recorded number of arguments.
     Fixed(usize),
 }
 
@@ -156,9 +184,13 @@ pub enum Dispatch {
 /// of each re-deciding installation syntax. `span` covers the whole assignment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodInstallation {
+    /// Stable identity used to refer to this retained item.
     pub id: MethodInstallationId,
+    /// Signature and callable information for the installation.
     pub method: Method,
+    /// Source coordinates associated with this item.
     pub span: TextRange,
+    /// Number of arguments required by this installation head.
     expected_argument_arity: usize,
     /// How the head passes options, which decides the form the installed
     /// function must have and which of its lambdas receives the arguments.
@@ -171,7 +203,9 @@ pub struct MethodInstallation {
     /// The shape of the lambda receiving the method's arguments, when the
     /// installed function has the form [`Self::options`] expect.
     pub argument_lambda_dispatch: Option<Dispatch>,
+    /// Parsed syntax backing this item, when available.
     pub(crate) syntax: MethodInstallationSyntax,
+    /// Whether the installation contributes a usable method.
     effect: MethodInstallationEffect,
     /// Where [`Method::codomain`] comes from; `Some` exactly when it is.
     pub codomain_origin: Option<CodomainOrigin>,
@@ -200,7 +234,7 @@ pub enum CodomainOrigin {
 /// | `method(…)` | installed value | `f 1` |
 /// | --- | --- | --- |
 /// | no `Options`, `Options => null` | `x -> body` | `body` |
-/// | `Options => {…}`, `Options => false` | `o -> x -> body` | `body`, `o` the option table |
+/// | `Options => {…}`, `Options => false` | `o -> x -> body` | `body`, `o` the option table (any names for `false`) |
 /// | `Options => true` | `{…} >> o -> x -> body` | `body`, `o` the declared options |
 ///
 /// Any other form either fails at the call or yields something else, for
@@ -221,6 +255,53 @@ pub enum MethodOptions {
     TableOrForwarded,
     /// Neither the source nor the catalog tells whether the method has options.
     Unrecorded,
+}
+
+impl From<OptionPassing> for MethodOptions {
+    fn from(passing: OptionPassing) -> Self {
+        match passing {
+            OptionPassing::Absent => Self::Absent,
+            OptionPassing::Table | OptionPassing::Open => Self::Table,
+            OptionPassing::Forwarded => Self::Forwarded,
+        }
+    }
+}
+
+/// An option a call passes that the called function does not accept as
+/// given.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum OptionMisuse<'tree> {
+    /// A name none of the function's options has.
+    UnknownName {
+        /// Option or member key written by the source.
+        key: SyntaxNode<'tree>,
+        /// The accepted name closest to the key, when one is close enough
+        /// to be a misspelling of it.
+        suggestion: Option<ObjectName>,
+        /// Names or types the callable accepts in this position.
+        accepted: Vec<ObjectName>,
+    },
+    /// A value whose type is none of the option's accepted types.
+    ValueType {
+        /// Value represented by this expression or semantic fact.
+        value: SyntaxNode<'tree>,
+        /// Name of the callable option being checked.
+        option: ObjectName,
+        /// Inferred type of the supplied value.
+        actual: InferredType,
+        /// Names or types the callable accepts in this position.
+        accepted: Vec<ObjectName>,
+    },
+    /// A symbol outside the values an enumeration-like option accepts.
+    ValueNotPossible {
+        /// Value represented by this expression or semantic fact.
+        value: SyntaxNode<'tree>,
+        /// Name of the callable option being checked.
+        option: ObjectName,
+        /// Candidates remaining compatible with the available evidence.
+        possible: Vec<ObjectName>,
+    },
 }
 
 impl MethodOptions {
@@ -281,7 +362,9 @@ enum InstalledFunction<'tree> {
     /// `{…} >> o -> …`: a function declaring its own options, whose handler
     /// `o -> …` receives them.
     OptionDeclaring {
+        /// Source construct declaring the represented value.
         declaration: SyntaxNode<'tree>,
+        /// Function receiving the option table before ordinary call arguments.
         handler: SyntaxNode<'tree>,
     },
     /// Any other value, such as a named function.
@@ -289,6 +372,7 @@ enum InstalledFunction<'tree> {
 }
 
 impl<'tree> InstalledFunction<'tree> {
+    /// Recognizes this semantic form from the supplied syntax, returning no value when it does not match.
     fn of(value: SyntaxNode<'tree>) -> Option<Self> {
         let value = parenthesized_value(value)?;
         if value.is::<LambdaExpression>() {
@@ -342,6 +426,29 @@ pub enum OptionDeclaration {
 }
 
 impl OptionDeclaration {
+    /// The options a literal `{key => default, …}` list declares, or `None`
+    /// when `list` is no such list.
+    pub fn declared_options(list: SyntaxNode<'_>) -> Option<Vec<CallableOption>> {
+        let list = parenthesized_value(list)?;
+        if !list.is::<List>() {
+            return None;
+        }
+        list.collection_elements()
+            .map(|entry| {
+                entry
+                    .is_option_assignment()
+                    .then(|| entry.binary_parts().map(|parts| parts.left))
+                    .flatten()
+                    .and_then(symbol_node_text)
+                    .map(|key| CallableOption {
+                        name: ObjectName::new(key),
+                        possible_values: Vec::new(),
+                        accepted_types: Vec::new(),
+                    })
+            })
+            .collect()
+    }
+
     /// The declaration the list holding `entry`, an option `key => default`,
     /// makes, or `None` when that list declares no options.
     pub fn of_entry(entry: SyntaxNode<'_>) -> Option<Self> {
@@ -387,54 +494,79 @@ pub enum InstalledValue {
 
 /// An installation read from its syntax, before its head is resolved.
 struct ClassifiedInstallation<'tree> {
+    /// Method installation characterized by this item.
     installation: MethodInstallation,
+    /// Domain and codomain spans with their semantic roles.
     method_type_spans: Vec<(TextRange, SourceSemanticRole)>,
+    /// Recognized shape of the installed function, when available.
     installed: Option<InstalledFunction<'tree>>,
 }
 
+/// The source construct that installs a method implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MethodInstallationSyntax {
+    /// An installation written using the assignment syntax.
     Classical,
+    /// An installation made through an installMethod call.
     InstallMethod,
 }
 
+/// Whether an installation is rejected, unresolved, or effective.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MethodInstallationEffect {
+    /// The installation is invalid and contributes no callable method.
     Rejected,
+    /// The installation cannot yet be associated with a known callable.
     Unresolved,
+    /// The installation contributes a usable callable method.
     Effective,
 }
 
 /// A lambda-body codomain that can safely drive an annotation quick fix.
 pub struct MethodCodomainDeduction {
+    /// Result type of the method, when known.
     pub codomain: ObjectName,
+    /// Explicit result-type annotation, when the source supplies one.
     pub annotated_codomain: Option<ObjectName>,
+    /// Source extent to highlight for the reported finding.
     pub diagnostic_range: TextRange,
+    /// Replacement policy used when updating the result-type annotation.
     pub edit: MethodCodomainEdit,
 }
 
 /// The source edit needed to make a method codomain annotation precise.
 pub enum MethodCodomainEdit {
+    /// Inserts the missing annotation at the recorded source extent.
     Add(TextRange),
+    /// Replaces an existing annotation in place.
     Replace,
 }
 
 /// The outline-relevant semantic shape of one characterized assignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignmentFactKind {
+    /// Assignment introducing a method installation.
     MethodInstallation(MethodInstallationId),
+    /// Assignment to an indexed variable-table entry.
     IndexedVariable,
+    /// Callable resolved through a source binding.
     ScopedCallable,
 }
 
 /// Source-facing assignment facts retained by analysis for capability projections.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignmentFact {
+    /// Text presented to the editor or user.
     pub label: String,
+    /// Source coordinates associated with this item.
     pub span: TextRange,
+    /// Source extent of the assignment target.
     pub target_span: TextRange,
+    /// Source extent of the assigned expression, when one exists.
     pub value_span: Option<TextRange>,
+    /// Index of the lexical scope owning this operation.
     pub scope_idx: usize,
+    /// Semantic or presentation category of this item.
     pub kind: AssignmentFactKind,
 }
 
@@ -444,10 +576,12 @@ impl MethodInstallation {
         self.expected_argument_arity
     }
 
+    /// Whether this value takes effect.
     pub fn takes_effect(&self) -> bool {
         self.effect == MethodInstallationEffect::Effective
     }
 
+    /// Whether this installation is effective and can be exposed to cross-file method lookup.
     pub fn is_workspace_candidate(&self) -> bool {
         self.effect != MethodInstallationEffect::Rejected
     }
@@ -457,14 +591,20 @@ impl MethodInstallation {
 /// installations take effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalFunctionKind {
+    /// Ordinary callable without method-option forwarding.
     Plain,
+    /// Method callable carrying its option-passing policy.
     Method(MethodOptions),
 }
 
+/// How a callable head receives arguments and options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CallableHeadKind {
+    /// Ordinary function without method dispatch.
     PlainFunction,
+    /// Method-dispatching function with its recorded option policy.
     MethodFunction(MethodOptions),
+    /// No narrower static result can be established.
     Unknown,
 }
 
@@ -475,15 +615,26 @@ pub(crate) enum CallableHeadKind {
 /// so their source facts have one owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionInfo {
+    /// Known representative result type for this callable.
     pub typical_value: Option<ObjectName>,
+    /// Method installations associated with this callable or analysis.
     pub installations: Vec<MethodInstallationId>,
+    /// Fixed or variadic argument shape known for the function.
     pub dispatch: Option<Dispatch>,
+    /// Recognized runtime class controlling callable behavior.
     runtime_class: Option<TypeRole>,
+    /// Catalog callable whose behavior this source value follows.
     indexed_callable: Option<ObjectName>,
+    /// Semantic or presentation category of this item.
     kind: LocalFunctionKind,
+    /// The options its source declares, with `method(Options => {…})` or
+    /// `{…} >> o -> …`; `None` when it declares none or they are not a
+    /// literal list.
+    pub declared_options: Option<Vec<CallableOption>>,
 }
 
 impl FunctionInfo {
+    /// Whether this node is a method function.
     pub fn is_method_function(&self) -> bool {
         matches!(self.kind, LocalFunctionKind::Method(_))
     }
@@ -493,15 +644,20 @@ impl FunctionInfo {
 /// from literal option assignments.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CallStaticFacts {
+    /// Inferred types of the arguments supplied at the call site.
     pub argument_types: Vec<InferredType>,
+    /// Option assignments whose keys and values can be recognized statically.
     pub literal_options: Vec<LiteralOption>,
 }
 
 /// Installed signatures classified by the typechecker's dispatch-range result.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CallSignatureFacts {
+    /// The single applicable signature, when selection is unambiguous.
     pub pinned: Option<MethodSignature>,
+    /// Candidates remaining compatible with the available evidence.
     pub possible: Vec<MethodSignature>,
+    /// Signatures ruled out by the known argument types.
     pub excluded: Vec<MethodSignature>,
 }
 
@@ -511,13 +667,21 @@ pub struct CallSignatureFacts {
 /// [`BindingStateInfo`] records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingInfo {
+    /// Stable identity of the scoped source binding.
     pub binding_id: BindingId,
+    /// Name used to resolve and present this item.
     pub name: ObjectName,
+    /// How the name participates in the binding or semantic operation.
     pub role: BindingRole,
+    /// Whether this binding can become visible outside the source file.
     pub potential_export: bool,
+    /// Source extent used to locate this item.
     pub range: TextRange,
+    /// Index of the lexical scope owning this operation.
     pub scope_idx: usize,
+    /// Successive values of the binding, ordered by their source position.
     pub states: Vec<BindingStateInfo>,
+    /// Whether an assignment creates this binding rather than updating an existing one.
     introduced_by_assignment: bool,
 }
 
@@ -533,22 +697,33 @@ impl BindingInfo {
 /// One source-ordered value and inferred-type state of a binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingStateInfo {
+    /// Symbol category used for editor presentation.
     pub presentation_kind: SymbolKind,
+    /// Type inferred from the binding's current value, when known.
     pub inferred_type: Option<InferredType>,
+    /// Identity of the callable object associated with this value.
     pub object_id: Option<CallableObjectId>,
+    /// Known types of entries in an indexed variable table.
     pub indexed_element_type: Option<ring::IndexedVariableTypes>,
     /// The value the state certainly holds, where the program determines
     /// more of it than its type: the ring `QQ[x, y]` of `S = QQ[x, y]`.
     pub known_value: Option<known_value::KnownValue>,
+    /// Whether this value is a generator introduced by a ring constructor.
     pub is_ring_generator: bool,
+    /// Identity of a runtime class declared by the source.
     pub source_type: Option<TypeId>,
+    /// Source extent of the expression supplying the binding's value.
     pub value_range: Option<TextRange>,
+    /// Enclosing declaration extent shown as the definition site.
     pub definition_range: TextRange,
+    /// Source coordinates associated with this item.
     pub span: TextRange,
+    /// Index of the lexical scope owning this operation.
     pub scope_idx: usize,
 }
 
 impl BindingStateInfo {
+    /// Position from which the recorded binding state is visible to later source.
     fn effective_from(&self) -> Position {
         self.value_range.map_or(self.span.end, |value| value.end)
     }
@@ -557,7 +732,9 @@ impl BindingStateInfo {
 /// A binding declaration paired with the state effective at a query position.
 #[derive(Debug, Clone, Copy)]
 pub struct BindingView<'a> {
+    /// The scoped binding to which these facts apply.
     pub binding: &'a BindingInfo,
+    /// Source-ordered state of the selected binding.
     pub state: &'a BindingStateInfo,
 }
 
@@ -586,11 +763,14 @@ impl Metadata for BindingView<'_> {
 /// Typed source-declared type edges and their source-symbol identities.
 #[derive(Debug, Default)]
 struct SourceTypeFacts {
+    /// Stored semantic data indexed by the corresponding identity.
     data: HashMap<TypeId, TypeData>,
 }
 
+/// Start and end UTF-16 coordinates used as a compact source-range lookup key.
 type SourceRangeKey = [u32; 4];
 
+/// Encodes the start and end UTF-16 positions as a compact hash-map key.
 fn source_range_key(range: TextRange) -> SourceRangeKey {
     [
         range.start.line,
@@ -600,6 +780,7 @@ fn source_range_key(range: TextRange) -> SourceRangeKey {
     ]
 }
 
+/// Finds the enclosing top-level cell of a source expression.
 fn source_cell(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     let root = node.root();
     node.ancestors().find(|ancestor| {
@@ -609,6 +790,7 @@ fn source_cell(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     })
 }
 
+/// Whether a source cell contributes an unmuted output value.
 fn is_value_cell(node: SyntaxNode<'_>) -> bool {
     node.is_source_cell() && !node.is_muted_statement()
 }
@@ -617,21 +799,34 @@ fn is_value_cell(node: SyntaxNode<'_>) -> bool {
 #[warn(missing_docs)]
 #[derive(Debug, Default)]
 struct SemanticRegistry {
+    /// Lexical scopes collected in traversal order.
     scopes: ScopeTree,
+    /// Bindings collected for the containing analysis or scope.
     bindings: Vec<BindingInfo>,
+    /// Name-to-binding lookup retaining distinct scoped declarations.
     bindings_by_name: HashMap<ObjectName, Vec<BindingId>>,
+    /// Source coordinates identifying the state written at an assignment.
     binding_states_by_range: HashMap<SourceRangeKey, BindingStateId>,
+    /// Callable identities discovered while analyzing source values.
     callable_objects: Vec<FunctionInfo>,
+    /// Catalog-to-local callable identity mapping.
     indexed_callable_objects: HashMap<ObjectId, CallableObjectId>,
+    /// Methods grouped by operator spelling and form.
     operator_functions: HashMap<Operator, FunctionInfo>,
+    /// Method installations associated with this callable or analysis.
     installations: Vec<MethodInstallation>,
     /// Function-head installations by the lambda receiving their arguments,
     /// whose parameters take the installation's domain types.
     installations_by_argument_lambda: HashMap<SourceRangeKey, MethodInstallationId>,
+    /// Source-ordered assignments used by later editor features.
     assignment_facts: Vec<AssignmentFact>,
+    /// Roles collected before final token classification.
     pending_source_semantic_roles: Vec<(TextRange, SourceSemanticRole)>,
+    /// Classified source spans retained for editor responses.
     source_semantic_tokens: Vec<SourceSemanticToken>,
+    /// Runtime classes and ancestry introduced by this source file.
     source_types: SourceTypeFacts,
+    /// Generator bindings grouped by the ring that introduced them.
     ring_generators: HashMap<ObjectName, Vec<ring::RingGenerator>>,
     /// Where ring generators are declared, in the order their bindings were
     /// made: each bound constructor's variable list and `Variable` option.
@@ -640,12 +835,16 @@ struct SemanticRegistry {
 
 #[derive(Clone, Copy)]
 pub enum OutputReference {
+    /// Output reference counted backward from the current source cell.
     Relative(NonZeroUsize),
+    /// Output reference selecting the recorded absolute output number.
     Absolute(NonZeroUsize),
+    /// Absolute output reference whose target is not available in the document.
     MissingAbsolute,
 }
 
 impl OutputReference {
+    /// Parses the supplied source or name into this representation.
     pub fn parse(name: &str) -> Option<Self> {
         let relative_distance = match name {
             "oo" => Some(1),
@@ -669,6 +868,7 @@ impl OutputReference {
         )
     }
 
+    /// Value expression selected by this absolute or relative output reference.
     pub fn referenced_value<'tree>(self, node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
         let cell = source_cell(node)?;
         if !is_value_cell(cell) {
@@ -697,28 +897,41 @@ impl OutputReference {
 }
 
 #[derive(Debug, Clone)]
+/// Type and presentation facts added after a binding has been registered.
 #[warn(missing_docs)]
 struct BindingEnrichment {
+    /// Symbol category used for editor presentation.
     presentation_kind: SymbolKind,
+    /// Type inferred from the binding's current value, when known.
     inferred_type: Option<InferredType>,
+    /// Identity of the callable object associated with this value.
     object_id: Option<CallableObjectId>,
+    /// Known types of entries in an indexed variable table.
     indexed_element_type: Option<ring::IndexedVariableTypes>,
+    /// Resolved superclass of a source-declared runtime class.
     parent_type: Option<TypeId>,
 }
 
 /// The parsed loop or function body receiving a control transfer.
 #[derive(Clone, Copy)]
 pub enum ControlTransferTarget<'tree> {
+    /// An ordinary callable name or its source expression.
     Function(SyntaxNode<'tree>),
+    /// Loop whose list clause collects returned values.
     ListLoop(SyntaxNode<'tree>),
+    /// Loop whose do clause evaluates values only for their effects.
     DoLoop(SyntaxNode<'tree>),
+    /// Callback invoked by a loop-like callable.
     LoopCallback {
+        /// Function expression owning this semantic context.
         function: SyntaxNode<'tree>,
+        /// Callable identity or expression selected for this operation.
         callable: SyntaxNode<'tree>,
     },
 }
 
 impl<'tree> ControlTransferTarget<'tree> {
+    /// Enclosing callable or loop owning the recognized control transfer.
     pub fn owner(self) -> SyntaxNode<'tree> {
         match self {
             Self::Function(owner) | Self::ListLoop(owner) | Self::DoLoop(owner) => owner,
@@ -726,6 +939,7 @@ impl<'tree> ControlTransferTarget<'tree> {
         }
     }
 
+    /// Whether this control-flow target can receive the given transfer form.
     pub fn accepts(self, transfer: SyntaxNode<'_>) -> bool {
         match self {
             Self::Function(_) => transfer.is_return_expr(),
@@ -744,6 +958,7 @@ impl<'tree> ControlTransferTarget<'tree> {
 /// types are not retained after inference.
 #[derive(Debug)]
 pub struct Analysis {
+    /// Object and binding registry used to resolve semantic facts.
     registry: SemanticRegistry,
 }
 
@@ -764,6 +979,7 @@ impl Analysis {
         })
     }
 
+    /// Visible binding state selected by name at the requested source position.
     pub fn get_binding_at(&self, name: &str, pos: Position) -> Option<BindingView<'_>> {
         let scope_idx = self.find_scope_at(pos)?;
         self.get_binding_from_scope(name, scope_idx, pos)
@@ -782,6 +998,7 @@ impl Analysis {
         Some(BindingView { binding, state })
     }
 
+    /// Source binding at available under the current source position and import context.
     pub fn visible_source_binding_at(
         &self,
         name: &str,
@@ -792,6 +1009,7 @@ impl Analysis {
         self.visible_source_binding_from_scope(name, scope_idx, pos, knowledge)
     }
 
+    /// Source binding from scope available under the current source position and import context.
     fn visible_source_binding_from_scope(
         &self,
         name: &str,
@@ -803,6 +1021,7 @@ impl Analysis {
             .filter(|binding| Self::source_binding_is_visible(*binding, knowledge))
     }
 
+    /// Whether the binding is visible under the selected source position and primary-code policy.
     pub fn source_binding_is_visible(
         binding: BindingView<'_>,
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -810,6 +1029,7 @@ impl Analysis {
         binding.scope_idx != 0 || !knowledge.shadows_source(&binding.name, binding.state.span.start)
     }
 
+    /// Transfer target associated with the enclosing callable or loop.
     pub fn control_transfer_target<'tree>(
         &self,
         transfer: SyntaxNode<'tree>,
@@ -873,6 +1093,7 @@ impl Analysis {
         None
     }
 
+    /// Visits control transfers together with the callable or loop that receives each one.
     pub fn for_each_control_transfer<'tree>(
         &self,
         root: SyntaxNode<'tree>,
@@ -890,6 +1111,7 @@ impl Analysis {
         });
     }
 
+    /// Finds the visible state of a named binding, searching outward from the supplied scope.
     fn get_binding_from_scope(
         &self,
         name: &str,
@@ -900,6 +1122,7 @@ impl Analysis {
         self.binding_state_from_scope(binding_id, scope_idx, pos)
     }
 
+    /// Identity of the named binding visible while searching outward from the supplied lexical scope.
     fn binding_id_from_scope(
         &self,
         name: &str,
@@ -909,6 +1132,7 @@ impl Analysis {
         self.binding_id_from_scope_in(name, scope_idx, pos, &self.registry.scopes)
     }
 
+    /// Resolves a name against the supplied binding collection starting in the selected lexical scope.
     fn binding_id_from_scope_in(
         &self,
         name: &str,
@@ -986,10 +1210,12 @@ impl Analysis {
         None
     }
 
+    /// Binding record addressed by the supplied stable identity.
     fn binding(&self, binding_id: BindingId) -> Option<&BindingInfo> {
         self.registry.bindings.get(binding_id.0 as usize)
     }
 
+    /// Later assignment of this name used as an anchor before its first visible write.
     fn future_assignment_binding(
         &self,
         name: &str,
@@ -1013,6 +1239,7 @@ impl Analysis {
             .map(|(binding_id, _)| binding_id)
     }
 
+    /// Later assignment that can supply the named binding's declaration anchor.
     pub fn future_assignment_binding_at(
         &self,
         name: &str,
@@ -1023,12 +1250,14 @@ impl Analysis {
         self.binding_anchor(binding_id)
     }
 
+    /// Anchor associated with the selected source binding and its current state.
     fn binding_anchor(&self, binding_id: BindingId) -> Option<BindingView<'_>> {
         let binding = self.binding(binding_id)?;
         let state = binding.states.first()?;
         Some(BindingView { binding, state })
     }
 
+    /// Latest visible value of the named binding while searching outward from the supplied lexical scope.
     fn binding_state_from_scope(
         &self,
         binding_id: BindingId,
@@ -1064,11 +1293,13 @@ impl Analysis {
         self.binding_anchor(binding_id)
     }
 
+    /// Callable facts attached to the named binding at a source position.
     pub fn function_at(&self, name: &str, position: Position) -> Option<&FunctionInfo> {
         let binding = self.get_binding_at(name, position)?;
         self.function_for_binding(binding)
     }
 
+    /// Result class attached to a source installation, when it can be resolved.
     pub fn method_installation_codomain<'a>(
         &'a self,
         installation: &'a MethodInstallation,
@@ -1076,6 +1307,7 @@ impl Analysis {
         installation.method.codomain.as_ref().map(ObjectName::name)
     }
 
+    /// Callable facts associated with the selected binding state.
     pub fn function_for_binding(&self, binding: BindingView<'_>) -> Option<&FunctionInfo> {
         self.registry
             .callable_objects
@@ -1105,6 +1337,7 @@ impl Analysis {
             .rev()
     }
 
+    /// Source installations for the selected callable that are effective at this source position.
     fn method_installations_for_at<'a>(
         &'a self,
         function: &FunctionInfo,
@@ -1128,39 +1361,48 @@ impl Analysis {
         installations
     }
 
+    /// Retained method installation with the supplied identity.
     pub fn method_installation(&self, id: MethodInstallationId) -> Option<&MethodInstallation> {
         self.registry.installations.get(id.0)
     }
 
+    /// All retained method installations in source discovery order.
     pub fn installations(&self) -> &[MethodInstallation] {
         &self.registry.installations
     }
 
+    /// Assignments retained for subsequent hints and semantic queries.
     pub fn assignment_facts(&self) -> &[AssignmentFact] {
         &self.registry.assignment_facts
     }
 
+    /// Scope whose registered extent exactly matches the supplied range.
     pub fn scope_with_range(&self, range: TextRange) -> Option<usize> {
         self.registry.scopes.with_range(range)
     }
 
+    /// Number of lexical scopes retained for this analysis.
     pub fn scope_count(&self) -> usize {
         self.registry.scopes.len()
     }
 
+    /// Enclosing scope index, absent for the document scope.
     pub fn parent_scope(&self, scope_idx: usize) -> Option<usize> {
         self.registry.scopes.parent(scope_idx)
     }
 
+    /// Syntax and semantic roles already classified for editor features.
     pub fn source_semantic_tokens(&self) -> &[SourceSemanticToken] {
         &self.registry.source_semantic_tokens
     }
 
+    /// Binding views declared directly in the selected lexical scope.
     pub fn bindings_in_scope(&self, scope_idx: usize) -> impl Iterator<Item = BindingView<'_>> {
         self.bindings()
             .filter(move |binding| binding.scope_idx == scope_idx)
     }
 
+    /// Binding views across all lexical scopes in this document.
     pub fn bindings(&self) -> impl Iterator<Item = BindingView<'_>> {
         self.registry
             .bindings
@@ -1168,6 +1410,7 @@ impl Analysis {
             .filter_map(|binding| self.binding_anchor(binding.binding_id))
     }
 
+    /// All source-ordered values recorded for the document's bindings.
     pub fn binding_states(&self) -> impl Iterator<Item = BindingView<'_>> {
         self.registry.bindings.iter().flat_map(|binding| {
             binding
@@ -1177,6 +1420,7 @@ impl Analysis {
         })
     }
 
+    /// Visible bindings whose names match the supplied prefix at a source position.
     pub fn in_scope_bindings(&self, prefix: &str, pos: Position) -> Vec<BindingView<'_>> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
@@ -1192,10 +1436,12 @@ impl Analysis {
         out
     }
 
+    /// Innermost lexical scope containing the source position.
     pub(crate) fn find_scope_at(&self, pos: Position) -> Option<usize> {
         self.registry.scopes.at(pos)
     }
 
+    /// Runs binding collection and semantic enrichment against positioned object knowledge.
     pub fn new_with_knowledge(
         root: SyntaxNode<'_>,
         syntax: Option<&TypedSource>,
@@ -1230,10 +1476,12 @@ impl Analysis {
         analysis
     }
 
+    /// Incorporates one syntax-pass binding fact into semantic state.
     fn collect_binding_fact(&mut self, fact: BindingFact, scopes: &ScopeTree) {
         self.collect_definition(fact, scopes);
     }
 
+    /// Collects semantic roles, assignments, and callable relationships after binding discovery.
     fn collect_semantics(
         &mut self,
         root: SyntaxNode,
@@ -1341,6 +1589,7 @@ impl Analysis {
         }
     }
 
+    /// Registers option key in the current semantic index.
     fn register_option_key(&mut self, key: SyntaxNode, source: &(impl SourceNavigation + ?Sized)) {
         self.register_source_semantic_role(
             source.range_for_node(key),
@@ -1348,23 +1597,29 @@ impl Analysis {
         );
     }
 
+    /// Records namespace role for later semantic or editor queries.
     fn record_namespace_role(
         &mut self,
         node: SyntaxNode,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) {
-        if (node.is::<StringLiteral>() || node.is::<RawStringLiteral>())
-            && (indexed_string_names_package(node, knowledge)
-                || PackageLoadingOption::lists_package(node))
-        {
-            self.register_source_semantic_role(
-                source.range_for_node(node),
-                SourceSemanticRole::NamespaceArgument,
-            );
+        if !(node.is::<StringLiteral>() || node.is::<RawStringLiteral>()) {
+            return;
         }
+        let role = if indexed_string_names_package(node, knowledge)
+            || PackageLoadingOption::lists_package(node)
+        {
+            SourceSemanticRole::NamespaceArgument
+        } else if FileLoad::names_file(node) {
+            SourceSemanticRole::LoadedFilePath
+        } else {
+            return;
+        };
+        self.register_source_semantic_role(source.range_for_node(node), role);
     }
 
+    /// Registers source semantic role in the current semantic index.
     fn register_source_semantic_role(&mut self, range: TextRange, role: SourceSemanticRole) {
         if self
             .registry
@@ -1378,6 +1633,7 @@ impl Analysis {
         }
     }
 
+    /// Replaces the semantic role at this source extent, or registers it when absent.
     fn set_source_semantic_role(&mut self, range: TextRange, role: SourceSemanticRole) {
         if let Some((_, registered)) = self
             .registry
@@ -1393,6 +1649,7 @@ impl Analysis {
         }
     }
 
+    /// Records source semantic token for later semantic or editor queries.
     fn record_source_semantic_token(
         &mut self,
         node: SyntaxNode,
@@ -1454,6 +1711,7 @@ impl Analysis {
         }
     }
 
+    /// Records assignment fact for later semantic or editor queries.
     fn record_assignment_fact(
         &mut self,
         assignment: SyntaxNode,
@@ -1533,6 +1791,7 @@ impl Analysis {
         Some(&self.registry.installations[id.0])
     }
 
+    /// Method installation represented by this syntax, when its shape is recognized.
     pub fn installation_for(
         &self,
         node: SyntaxNode,
@@ -1751,6 +2010,7 @@ impl Analysis {
         })
     }
 
+    /// Callable head recognized by the supported method-installation syntax.
     fn install_method_head(
         &self,
         node: SyntaxNode,
@@ -1777,6 +2037,7 @@ impl Analysis {
         Some(MethodHead::Operator(Operator { token, form }))
     }
 
+    /// Callable head and argument nodes implied by supported installation syntax.
     pub(crate) fn installation_shape<'tree>(
         &self,
         node: SyntaxNode<'tree>,
@@ -1865,6 +2126,7 @@ impl Analysis {
                 .is_some_and(|record| record.type_info().is_some())
     }
 
+    /// Type parent explicitly provided by the source declaration.
     fn declared_type_parent(
         &self,
         value: SyntaxNode<'_>,
@@ -1892,6 +2154,7 @@ impl Analysis {
         TypeChecker::new(self, knowledge).resolve_type_id_at(&parent, position, knowledge)
     }
 
+    /// Whether a source callable head denotes a plain function or method dispatcher.
     pub(crate) fn callable_head_kind(
         &self,
         name: &str,
@@ -1935,16 +2198,22 @@ impl Analysis {
             })
     }
 
-    /// The options of a catalog method function, read from its runtime class.
-    /// A record without a method function class leaves them unrecorded.
+    /// The options of a catalog method function, as the catalog records
+    /// them, or else as its runtime class implies. A record without either
+    /// leaves them unrecorded.
     fn catalog_method_options(
         record: &Record,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> MethodOptions {
-        MethodOptions::of_runtime_class(&record.class, knowledge)
+        record
+            .callable()
+            .and_then(|callable| callable.option_passing)
+            .map(MethodOptions::from)
+            .or_else(|| MethodOptions::of_runtime_class(&record.class, knowledge))
             .unwrap_or(MethodOptions::Unrecorded)
     }
 
+    /// Enriches parameters using the bindings and type knowledge already collected.
     fn enrich_parameters(
         &mut self,
         node: SyntaxNode,
@@ -1971,6 +2240,7 @@ impl Analysis {
         }
     }
 
+    /// Collects definition from the supplied syntax and semantic context.
     fn collect_definition(&mut self, fact: BindingFact, scopes: &ScopeTree) {
         let name = fact.name.name();
         match fact.effect {
@@ -1997,6 +2267,7 @@ impl Analysis {
         }
     }
 
+    /// Enriches definitions using the bindings and type knowledge already collected.
     fn enrich_definitions(
         &mut self,
         node: SyntaxNode,
@@ -2048,6 +2319,7 @@ impl Analysis {
         );
     }
 
+    /// Enriches symbol using the bindings and type knowledge already collected.
     fn enrich_symbol(
         &mut self,
         node: SyntaxNode,
@@ -2065,6 +2337,7 @@ impl Analysis {
         self.enrich_binding_state(binding_state.binding, binding_state.state, enrichment);
     }
 
+    /// Enriches binding state using the bindings and type knowledge already collected.
     fn enrich_binding_state(
         &mut self,
         binding_id: BindingId,
@@ -2099,6 +2372,7 @@ impl Analysis {
         state.source_type = source_type;
     }
 
+    /// Registers a new scoped name and returns its stable binding identity.
     fn add_binding(&mut self, fact: BindingFact) -> BindingId {
         let name = fact.name.clone();
         let binding_id = BindingId(self.registry.bindings.len() as u32);
@@ -2142,6 +2416,7 @@ impl Analysis {
         binding_id
     }
 
+    /// Appends a source-ordered value to an existing binding, when the binding exists.
     fn add_binding_state(&mut self, binding_id: BindingId, fact: BindingFact) -> Option<usize> {
         let state_index = self
             .binding(binding_id)
@@ -2174,6 +2449,7 @@ impl Analysis {
         }
     }
 
+    /// Rebuilds source-range lookup entries after changing a binding's recorded states.
     fn reindex_binding_states(&mut self, binding_id: BindingId) {
         let ranges = self
             .binding(binding_id)
@@ -2191,6 +2467,7 @@ impl Analysis {
         }
     }
 
+    /// Signature of the selected source installation, resolved at the requested source position.
     pub fn local_method_installation_signature_at<'a>(
         &'a self,
         node: SyntaxNode,
@@ -2208,6 +2485,7 @@ impl Analysis {
             .then_some((method, installation))
     }
 
+    /// Whether this node is a method installation callable.
     pub fn is_method_installation_callable(
         &self,
         node: SyntaxNode,
@@ -2218,6 +2496,7 @@ impl Analysis {
             .is_some()
     }
 
+    /// Infers call static facts from expression syntax and positioned type evidence.
     pub fn infer_call_static_facts(
         &self,
         node: SyntaxNode,
@@ -2230,6 +2509,7 @@ impl Analysis {
         TypeChecker::new(self, knowledge).infer_call_facts(node, source, scope_idx, knowledge)
     }
 
+    /// Source installations available to the selected local callable at the call position.
     pub fn local_call_installations<'a>(
         &'a self,
         function: &'a FunctionInfo,
@@ -2251,6 +2531,7 @@ impl Analysis {
             .collect()
     }
 
+    /// Infers the expression's source-visible result class when a single static class is available.
     pub fn infer_expression_static_type(
         &self,
         node: SyntaxNode,
@@ -2262,6 +2543,7 @@ impl Analysis {
             .cloned()
     }
 
+    /// Infers the expression's possible result types using positioned source and external knowledge.
     pub fn infer_expression_type(
         &self,
         node: SyntaxNode,
@@ -2274,6 +2556,7 @@ impl Analysis {
         TypeChecker::new(self, knowledge).type_of(node, source, scope_idx)
     }
 
+    /// Infers external call signature facts from expression syntax and positioned type evidence.
     pub fn infer_external_call_signature_facts(
         &self,
         callable: &ObjectName,
@@ -2285,6 +2568,7 @@ impl Analysis {
             .external_call_signature_facts(callable, facts, position, knowledge)
     }
 
+    /// Deduces an installed method's result class from its implementation and declared annotation.
     pub fn method_codomain_deduction(
         &self,
         assignment: SyntaxNode,
@@ -2355,6 +2639,7 @@ impl Analysis {
         })
     }
 
+    /// Callable identity attached to a source value, recognizing aliases and function declarations.
     fn callable_object_for_value(
         &mut self,
         value: SyntaxNode,
@@ -2415,6 +2700,7 @@ impl Analysis {
                     ),
                     CallableKind::Function | CallableKind::Operator(_) => LocalFunctionKind::Plain,
                 },
+                declared_options: None,
             };
             let object_id = CallableObjectId(self.registry.callable_objects.len());
             self.registry.callable_objects.push(function);
@@ -2432,6 +2718,7 @@ impl Analysis {
                 runtime_class: Some(declaration.runtime_class()),
                 indexed_callable: None,
                 kind: LocalFunctionKind::Method(declaration.options()),
+                declared_options: declaration.declared_options(),
             })
         } else if value.is::<LambdaExpression>() {
             Some(FunctionInfo {
@@ -2441,6 +2728,21 @@ impl Analysis {
                 indexed_callable: None,
                 dispatch: self.registry.scopes.function_dispatch(value, source),
                 kind: LocalFunctionKind::Plain,
+                declared_options: None,
+            })
+        } else if let Some(InstalledFunction::OptionDeclaring { declaration, .. }) =
+            InstalledFunction::of(value)
+        {
+            Some(FunctionInfo {
+                typical_value: None,
+                installations: Vec::new(),
+                runtime_class: None,
+                indexed_callable: None,
+                dispatch: None,
+                kind: LocalFunctionKind::Plain,
+                declared_options: declaration
+                    .binary_parts()
+                    .and_then(|parts| OptionDeclaration::declared_options(parts.left)),
             })
         } else {
             None
@@ -2474,6 +2776,7 @@ impl Analysis {
         )
     }
 
+    /// Records install method call for later semantic or editor queries.
     fn record_install_method_call(
         &mut self,
         call: SyntaxNode,
@@ -2485,6 +2788,7 @@ impl Analysis {
         self.retain_method_installation(classified, true, source, knowledge)
     }
 
+    /// Stores an installation and associates its source facts with a stable identity.
     fn retain_method_installation(
         &mut self,
         classified: ClassifiedInstallation,
@@ -2582,6 +2886,7 @@ impl Analysis {
         .then_some(codomain)
     }
 
+    /// Function value contributed by an assignment or installMethod expression.
     fn installed_value(
         &self,
         installed: InstalledFunction,
@@ -2608,6 +2913,7 @@ impl Analysis {
         }
     }
 
+    /// Associates an installation with its callable and records whether it takes effect.
     fn attach_method_installation(
         &mut self,
         installation: &mut MethodInstallation,
@@ -2676,6 +2982,7 @@ impl Analysis {
                         runtime_class: None,
                         indexed_callable: None,
                         kind: LocalFunctionKind::Plain,
+                        declared_options: None,
                     });
                 function.installations.push(installation.id);
                 MethodInstallationEffect::Effective
@@ -2683,17 +2990,23 @@ impl Analysis {
         }
     }
 
+    /// Identity of the named binding visible at the requested source position.
     pub fn binding_id_at(&self, name: &str, pos: Position) -> Option<BindingId> {
         let scope_idx = self.find_scope_at(pos)?;
         self.binding_id_from_scope(name, scope_idx, pos)
     }
 }
 
+/// AST visitor assigning semantic roles using positioned object knowledge.
 struct TypedSemanticRoles<'analysis, 'tree, 'source, 'knowledge, Source: ?Sized, Knowledge: ?Sized>
 {
+    /// Semantic facts for the current document snapshot.
     analysis: &'analysis mut Analysis,
+    /// Document syntax root used for navigation within this revision.
     root: SyntaxNode<'tree>,
+    /// Source data supplying text and coordinate conversions.
     source: &'source Source,
+    /// Object and type knowledge queried at each source position.
     knowledge_provider: &'knowledge Knowledge,
 }
 
@@ -2702,6 +3015,7 @@ where
     Source: SourceNavigation + ?Sized,
     Knowledge: PositionedTypeKnowledge + ?Sized,
 {
+    /// Registers option in the current semantic index.
     fn register_option(&mut self, node: &OptionExpression) {
         let Some(expression) = self.root.related(node) else {
             return;
@@ -2712,6 +3026,7 @@ where
         self.analysis.register_option_key(left, self.source);
     }
 
+    /// Registers property in the current semantic index.
     fn register_property(&mut self, node: &(impl crate::node_metadata::SyntaxType + ?Sized)) {
         let Some(expression) = self.root.related(node) else {
             return;
@@ -2724,6 +3039,7 @@ where
         }
     }
 
+    /// Registers namespace in the current semantic index.
     fn register_namespace<Syntax>(&mut self, syntax: &Syntax)
     where
         Syntax: crate::node_metadata::SyntaxType,
@@ -2782,6 +3098,7 @@ where
     }
 }
 
+/// Function literal supplied directly or through a codomain annotation.
 pub(crate) fn assigned_lambda(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     let node = parenthesized_value(node)?;
     if node.is::<LambdaExpression>() {
@@ -2793,6 +3110,7 @@ pub(crate) fn assigned_lambda(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
         .and_then(assigned_lambda)
 }
 
+/// Explicit result-type expression associated with a method implementation.
 pub(crate) fn method_codomain_annotation(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     if let Some(parent) = node.parent() {
         let annotation = parent
@@ -2813,14 +3131,17 @@ pub(crate) fn method_codomain_annotation(node: SyntaxNode<'_>) -> Option<SyntaxN
         .flatten()
 }
 
+/// Symbol name assigned by a simple single-target assignment.
 fn single_symbol_assignment_target<'tree>(node: SyntaxNode<'tree>) -> Option<&'tree str> {
     node.is::<Symbol>().then(|| node.text())
 }
 
+/// Original symbol spelling, absent when the syntax is not a symbol occurrence.
 pub fn symbol_node_text<'tree>(node: SyntaxNode<'tree>) -> Option<&'tree str> {
     node.is_symbol_like().then(|| node.text())
 }
 
+/// Whether this symbol is evaluated as a value rather than used as syntax metadata.
 fn is_expression_symbol(node: SyntaxNode<'_>) -> bool {
     if !node.is::<Symbol>() || matches!(node.text(), "true" | "false") {
         return false;
@@ -2846,6 +3167,7 @@ fn is_expression_symbol(node: SyntaxNode<'_>) -> bool {
     true
 }
 
+/// Whether this node supplies the condition of an enclosing control construct.
 fn is_condition_value(node: SyntaxNode<'_>) -> bool {
     if !node.is::<Symbol>() {
         return false;
@@ -2878,13 +3200,18 @@ fn is_condition_value(node: SyntaxNode<'_>) -> bool {
 /// The options of Macaulay2's `method` that shape the method function it creates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MethodDeclarationOption {
+    /// Selects binary method dispatch behavior.
     Binary,
+    /// Infer the result from applicable callable method domains.
     Dispatch,
+    /// Selects the callable's option-passing policy.
     Options,
+    /// Selects the callable's representative return type.
     TypicalValue,
 }
 
 impl MethodDeclarationOption {
+    /// Name used to identify this value in source and catalog lookups.
     fn name(self) -> &'static str {
         match self {
             Self::Binary => "Binary",
@@ -2901,10 +3228,12 @@ impl MethodDeclarationOption {
 /// such as `Options => {Binary => true}` does not configure the method itself.
 #[derive(Debug, Clone, Copy)]
 struct MethodDeclaration<'tree> {
+    /// Call expression supplying arguments and source coordinates.
     call: SyntaxNode<'tree>,
 }
 
 impl<'tree> MethodDeclaration<'tree> {
+    /// Recognizes this semantic form from the supplied syntax, returning no value when it does not match.
     fn of(node: SyntaxNode<'tree>) -> Option<Self> {
         (node.is_space_application()
             && node
@@ -2915,6 +3244,7 @@ impl<'tree> MethodDeclaration<'tree> {
         .then_some(Self { call: node })
     }
 
+    /// Value expression for the requested method-declaration option.
     fn option(self, option: MethodDeclarationOption) -> Option<SyntaxNode<'tree>> {
         let arguments = parenthesized_value(self.call.binary_parts().map(|parts| parts.right)?)?;
         let mut arguments = if arguments.is_sequence() {
@@ -2933,10 +3263,20 @@ impl<'tree> MethodDeclaration<'tree> {
         arguments.pop()?.binary_parts().map(|parts| parts.right)
     }
 
+    /// Declared representative result class, when the method declaration provides one.
     fn typical_value(self) -> Option<ObjectName> {
         self.option(MethodDeclarationOption::TypicalValue)
             .and_then(symbol_node_text)
             .map(ObjectName::new)
+    }
+
+    /// The options of a method declaring a literal option list. `Options =>
+    /// false` passes any option a call names, so it declares no list.
+    fn declared_options(self) -> Option<Vec<CallableOption>> {
+        if self.options() != MethodOptions::Table {
+            return None;
+        }
+        OptionDeclaration::declared_options(self.option(MethodDeclarationOption::Options)?)
     }
 
     /// `method` takes options exactly when `Options` is given and not `null`;
@@ -2975,6 +3315,7 @@ impl<'tree> MethodDeclaration<'tree> {
     }
 }
 
+/// Recognizes an option key and statically readable literal value.
 fn literal_option_assignment(node: SyntaxNode) -> Option<LiteralOption> {
     if !node.is_option_assignment() {
         return None;
@@ -2990,6 +3331,7 @@ fn literal_option_assignment(node: SyntaxNode) -> Option<LiteralOption> {
     })
 }
 
+/// Literal spelling accepted as a statically known option value.
 fn literal_option_value(node: SyntaxNode<'_>) -> Option<&str> {
     if symbol_node_text(node).is_some()
         || node.is::<IntegerLiteral>()
@@ -3003,6 +3345,7 @@ fn literal_option_value(node: SyntaxNode<'_>) -> Option<&str> {
     }
 }
 
+/// Installation assignment for callable node associated with the recognized method installation or signature.
 fn method_installation_assignment_for_callable_node<'tree>(
     node: SyntaxNode<'tree>,
 ) -> Option<SyntaxNode<'tree>> {
@@ -3052,14 +3395,17 @@ pub(crate) fn clause_value(clause: SyntaxNode) -> Option<SyntaxNode> {
         .or_else(|| clause.named_children().next())
 }
 
+/// Superclass expression supplied by a new expression's of clause.
 fn new_statement_parent(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     new_statement_value(clause_value(node.new_parent_clause()?)?)
 }
 
+/// Instance expression supplied by a new expression's from clause.
 fn new_statement_instance(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     new_statement_value(clause_value(node.new_instance_clause()?)?)
 }
 
+/// Value initialized by a new expression, when present.
 fn new_statement_value(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     if node.is_assignment() {
         node.binary_parts().map(|parts| parts.left)
@@ -3068,6 +3414,7 @@ fn new_statement_value(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     }
 }
 
+/// Installation assignment whose head creates a new instance or class.
 fn new_statement_installation_assignment(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     node.is::<NewStatement>()
         .then(|| {
@@ -3083,6 +3430,7 @@ fn new_statement_installation_assignment(node: SyntaxNode<'_>) -> Option<SyntaxN
         .flatten()
 }
 
+/// Target and value operands extracted from supported assignment syntax.
 pub(crate) fn assignment_parts(
     node: SyntaxNode<'_>,
 ) -> Option<(SyntaxNode<'_>, SyntaxNode<'_>, SyntaxNode<'_>)> {
@@ -3101,6 +3449,7 @@ pub(crate) fn assignment_parts(
     ))
 }
 
+/// Callable directly receiving this lambda as its callback argument.
 fn direct_callback_callable(lambda: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     let mut argument = lambda;
     let mut parent = argument.parent()?;
@@ -3143,6 +3492,7 @@ pub(crate) fn parenthesized_value(node: SyntaxNode) -> Option<SyntaxNode> {
     Some(current)
 }
 
+/// Source expressions naming the installed method's argument domains.
 fn method_installation_domain_nodes(node: SyntaxNode) -> Option<Vec<SyntaxNode>> {
     let node = parenthesized_value(node)?;
     if node.is::<Sequence>() || node.is::<List>() {
@@ -3153,6 +3503,7 @@ fn method_installation_domain_nodes(node: SyntaxNode) -> Option<Vec<SyntaxNode>>
     symbol_node_text(node).map(|_| vec![node])
 }
 
+/// Callable symbol directly to the left of this application argument.
 fn call_like_left_symbol_for_argument<'tree>(
     mut node: SyntaxNode<'tree>,
     allow_list_argument: bool,
@@ -3182,6 +3533,7 @@ fn call_like_left_symbol_for_argument<'tree>(
     }
 }
 
+/// Whether the literal string denotes a package recognized by the available object knowledge.
 fn indexed_string_names_package(
     node: SyntaxNode<'_>,
     knowledge: &(impl TypeKnowledge + ?Sized),
@@ -3215,6 +3567,7 @@ fn indexed_string_names_package(
     accepts_string && (accepts_package || returns_package)
 }
 
+/// Whether this node belongs to the left side of a local-binding assignment.
 fn is_colon_equal_assignment_left(node: SyntaxNode) -> bool {
     let Some(parent) = node.parent() else {
         return false;

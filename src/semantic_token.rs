@@ -94,10 +94,10 @@ pub trait SemanticTokenKnowledge: TypeKnowledge {
     /// Classify a local object from its inferred static type.
     fn semantic_token_for_static_type(&self, type_name: &str) -> Option<M2SemanticToken>;
 
-    /// Whether `name` is a protected object whose class is exactly `Symbol`.
+    /// Whether the named symbol has the runtime protection attribute.
     fn is_protected_symbol(&self, name: &str) -> bool;
 
-    /// Whether the indexed binding of `name` is protected from assignment.
+    /// Whether the visible global object is protected against ordinary assignment.
     fn is_protected_global(&self, name: &str) -> bool;
 }
 
@@ -131,10 +131,15 @@ pub enum M2SemanticTokenType {
     /// (`Strategy`, an option value such as `Linear`) or a quoted name
     /// (`symbol f`). Sent as `enumMember`, the standard type closest to it.
     Symbol = SemanticTokenType::ENUM_MEMBER,
+    /// Language keyword classified using the protocol keyword token category.
     Keyword = SemanticTokenType::KEYWORD,
+    /// A string-valued selector or source literal.
     String = SemanticTokenType::STRING,
+    /// Numeric literal classified using the protocol number token category.
     Number = SemanticTokenType::NUMBER,
+    /// An operator callable or its syntax classification.
     Operator = SemanticTokenType::OPERATOR,
+    /// A foldable or classified comment span.
     Comment = SemanticTokenType::COMMENT,
     /// A method function: an object made by `method()` that dispatches to
     /// the methods installed on it, such as `det` or `source`.
@@ -153,6 +158,7 @@ pub enum M2SemanticTokenType {
     /// `Key` or `Description`, or a link to another
     /// documentation page, `TO`, `TOH` or `TO2`. Sent as `decorator`.
     Annotation = SemanticTokenType::DECORATOR,
+    /// Regular-expression content classified using the protocol regexp category.
     Regexp = SemanticTokenType::REGEXP,
 }
 
@@ -234,14 +240,17 @@ impl M2SemanticTokenModifier {
     }
 }
 
+/// Bit set of protocol-standard and Macaulay2-specific token modifiers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct M2SemanticTokenModifiers(u32);
 
 impl M2SemanticTokenModifiers {
+    /// Adds the requested modifier to this immutable bit set.
     pub const fn with(self, modifier: M2SemanticTokenModifier) -> Self {
         Self(self.0 | modifier.bit())
     }
 
+    /// Tests membership in the represented selection or source extent.
     pub const fn contains(self, modifier: M2SemanticTokenModifier) -> bool {
         self.0 & modifier.bit() != 0
     }
@@ -252,18 +261,25 @@ impl M2SemanticTokenModifiers {
 /// repeating type analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompiledCallableKind {
+    /// An ordinary callable name or its source expression.
     Function,
+    /// Function value created from a source lambda.
     Closure,
 }
 
+/// A semantic token classification before source coordinates are attached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct M2SemanticToken {
+    /// Protocol semantic-token category assigned to this span.
     pub token_type: M2SemanticTokenType,
+    /// Independent semantic properties attached to the token.
     pub modifiers: M2SemanticTokenModifiers,
+    /// Compiled callable form recorded by the runtime catalog.
     pub compiled_callable: Option<CompiledCallableKind>,
 }
 
 impl M2SemanticToken {
+    /// Creates a token classification with the supplied category and no modifiers.
     pub const fn new(token_type: M2SemanticTokenType) -> Self {
         Self {
             token_type,
@@ -295,6 +311,7 @@ impl M2SemanticToken {
             .with_binding_protection(knowledge.is_protected_global(name))
     }
 
+    /// Adds one semantic modifier without changing the token category.
     pub const fn with_modifier(self, modifier: M2SemanticTokenModifier) -> Self {
         self.with_modifier_state(modifier, true)
     }
@@ -355,6 +372,7 @@ impl M2SemanticToken {
 /// quoted symbol even if its binding holds a function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceSemanticRole {
+    /// A variable introduced by a ring constructor.
     RingGenerator,
     /// A literal promoted into a ring by subscript, `3_R` or `1.5_RR`: one
     /// number, its ring part of how it is written.
@@ -365,6 +383,7 @@ pub enum SourceSemanticRole {
     /// A ring generator where a constructor declares it: the `x`, `y_1` and
     /// `z_0 .. z_2` of `QQ[x, y_1, z_0 .. z_2]`, quoted or not.
     RingGeneratorDeclaration,
+    /// A domain or codomain type in a method installation.
     MethodTypeParameter,
     /// What an installation installs on, the `f` of `f ZZ := …` or the `+`
     /// of `T + T := …`: highlighted as it is elsewhere, marked as defining.
@@ -373,6 +392,7 @@ pub enum SourceSemanticRole {
     /// `f ZZ := List => x -> …`: Macaulay2's syntax for stating the
     /// installation's typical value.
     CodomainAnnotation,
+    /// A symbol serving as a callable option name.
     OptionKey,
     /// What an access selects by name or position: the `key` of `H.key`,
     /// the `0` of `L_0` or `L#0`.
@@ -380,7 +400,12 @@ pub enum SourceSemanticRole {
     /// The operator of an access, the `_` of `L_0` or the `.` of `H.key`:
     /// it joins what is selected to what it is selected from.
     AccessOperator,
+    /// A string naming a loaded package.
     NamespaceArgument,
+    /// The path a `load`/`needs`/`input` call runs, the `"foo.m2"` of
+    /// `load "foo.m2"`: a source file brought in the way a package is,
+    /// highlighted as a namespace but not navigated as a package name.
+    LoadedFilePath,
     /// The name a quote yields as a `Symbol` rather than evaluating —
     /// `symbol f`, `global f`, `local f`, `threadVariable f`, `threadLocal f`.
     /// The quote wins over whatever `f` is otherwise bound to.
@@ -389,24 +414,39 @@ pub enum SourceSemanticRole {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSemanticToken {
+    /// Source coordinates associated with this item.
     pub span: DocumentSpan,
+    /// Classification derived directly from syntax, when one applies.
     pub syntax_token_type: Option<M2SemanticTokenType>,
+    /// Semantic role assigned by source analysis, when one applies.
     pub source_role: Option<SourceSemanticRole>,
+    /// Whether the source span denotes a symbol.
     pub is_symbol: bool,
+    /// Whether the symbol is evaluated rather than returned by quotation.
     pub is_unquoted_symbol: bool,
+    /// Whether the symbol occurs in an expression value position.
     pub is_expression_symbol: bool,
+    /// Whether this expression supplies a control-flow condition.
     pub is_condition_value: bool,
 }
 
+/// Positioned syntax and binding evidence used to classify a source token.
 pub struct SourceSemanticTokenContext<'a, M: ?Sized> {
+    /// Original document text used for token coordinates and classification.
     pub source_text: &'a str,
+    /// Source classification being refined with binding and workspace facts.
     pub source_token: &'a SourceSemanticToken,
+    /// The scoped binding to which these facts apply.
     pub binding: Option<&'a M>,
+    /// Whether this occurrence introduces the selected binding.
     pub is_declaration: bool,
+    /// Cross-file classification, when available.
     pub workspace_token: Option<M2SemanticToken>,
+    /// Whether syntax-only classifications should be emitted for this client.
     pub emit_syntax: bool,
 }
 
+/// Combines syntax, binding, and workspace evidence into a token classification.
 pub fn classify_source_semantic_token<M>(
     context: SourceSemanticTokenContext<'_, M>,
     knowledge: &(impl SemanticTokenKnowledge + ?Sized),
@@ -471,6 +511,7 @@ where
     token
 }
 
+/// Classifies a locally bound symbol using its semantic metadata.
 pub fn local_symbol_semantic_token(
     symbol: &(impl Metadata + ?Sized),
     knowledge: &(impl SemanticTokenKnowledge + ?Sized),
@@ -500,6 +541,7 @@ pub fn local_symbol_semantic_token(
     })
 }
 
+/// Token category determined solely by the node's syntax.
 pub fn syntax_semantic_token_type(node: SyntaxNode<'_>) -> Option<M2SemanticTokenType> {
     if node.is_operator() {
         return Some(M2SemanticTokenType::Operator);
@@ -520,6 +562,7 @@ pub fn syntax_semantic_token_type(node: SyntaxNode<'_>) -> Option<M2SemanticToke
     }
 }
 
+/// Token category and modifiers implied by a recorded semantic source role.
 fn source_role_semantic_token(
     role: &SourceSemanticRole,
     is_unquoted_symbol: bool,
@@ -549,13 +592,14 @@ fn source_role_semantic_token(
         SourceSemanticRole::AccessOperator => M2SemanticToken::new(M2SemanticTokenType::Operator)
             .with_modifier(M2SemanticTokenModifier::Access),
         SourceSemanticRole::QuotedSymbol => M2SemanticToken::new(M2SemanticTokenType::Symbol),
-        SourceSemanticRole::NamespaceArgument => {
+        SourceSemanticRole::NamespaceArgument | SourceSemanticRole::LoadedFilePath => {
             M2SemanticToken::new(M2SemanticTokenType::Namespace)
         }
     };
     Some(token)
 }
 
+/// Semantic classification implied by the local binding's inferred runtime class.
 fn local_symbol_static_type_token(
     symbol: &(impl Metadata + ?Sized),
     type_name: &str,
@@ -590,7 +634,7 @@ impl ObjectRegistry {
     }
 
     /// Whether `name` resolves to a protected object whose class is exactly
-    /// `Symbol`.
+    /// Whether the named symbol has the runtime protection attribute.
     pub fn is_protected_symbol(&self, name: &str) -> bool {
         is_protected_symbol(self, name)
     }
@@ -650,12 +694,14 @@ impl<T: SemanticTokenKnowledge + ?Sized> SemanticTokenKnowledge for &T {
     }
 }
 
+/// Whether the visible global object is protected against ordinary assignment.
 fn is_protected_global(knowledge: &(impl ObjectKnowledge + ?Sized), name: &str) -> bool {
     knowledge
         .get_record(&ObjectName::new(name))
         .is_some_and(|record| record.protected)
 }
 
+/// Whether the named symbol has the runtime protection attribute.
 fn is_protected_symbol(knowledge: &(impl ObjectKnowledge + ?Sized), name: &str) -> bool {
     let symbol_type = ObjectName::new("Symbol");
     knowledge
@@ -747,6 +793,7 @@ fn lives_over_a_ring(knowledge: &(impl TypeKnowledge + ?Sized), class: &ObjectNa
         })
 }
 
+/// Whether a catalog record denotes a type rather than an ordinary value.
 fn record_is_type_like(record: &Record) -> bool {
     record.type_info().is_some()
 }

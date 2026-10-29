@@ -35,39 +35,54 @@ const PUBLISHED_CODE_LANGUAGES: [&str; 2] = ["macaulay2", "m2"];
 /// prepared for LSP presentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSignature {
+    /// Input type names forming this displayed method signature.
     pub signature: Vec<ObjectName>,
+    /// Known result types attached to the displayed signature.
     pub output_types: Vec<ObjectName>,
 }
 
 /// Indexed queries used by hover, completion, navigation, and signature help.
 pub trait LspKnowledge: TypeKnowledge {
+    /// Looks up a visible object together with its owning package name.
     fn get_record_with_package(&self, name: &ObjectName) -> Option<(String, &Record)>;
 
+    /// Visible object names matching a prefix up to the requested result count.
     fn records_with_prefix(&self, prefix: &str, limit: usize) -> Vec<(String, &Record)>;
 
+    /// Known package names matching a prefix up to the result limit.
     fn package_names_with_prefix(&self, prefix: &str, limit: usize) -> Vec<String>;
 
+    /// Resolved method signatures supplied by the object's documentation.
     fn documented_signatures(&self, record: &Record) -> Vec<ResolvedSignature>;
 
+    /// Installed signatures not already represented by documented methods.
     fn undocumented_installed_methods(&self, record: &Record) -> Vec<MethodSignature>;
 
+    /// Callable names whose documentation mentions the specified option.
     fn option_usage_names(&self, option_name: &str, limit: usize) -> Vec<String>;
 
+    /// Callable names documenting the specified option value.
     fn option_value_usage_names(&self, value_name: &str, limit: usize) -> Vec<String>;
 
+    /// Rendered documentation for a visible object, when available.
     fn doc_markdown(&self, name: &ObjectName) -> Option<String>;
 
+    /// Packages currently visible through this knowledge view.
     fn loaded_packages(&self) -> Vec<ObjectName>;
 }
 
 /// Package-addressed record lookup used by static type-hierarchy navigation.
 pub trait PartitionedTypeKnowledge {
+    /// Looks up an object specifically within its owning package partition.
     fn get_record_from_package(&self, package: &str, name: &ObjectName) -> Option<&Record>;
 
+    /// Type record and package associated with a resolved runtime class identity.
     fn get_type_by_id(&self, type_id: &TypeId) -> Option<(String, &Record)>;
 
+    /// Runtime class identity of the supplied canonical object, when it denotes a type.
     fn type_id(&self, object_id: &ObjectId) -> Option<TypeId>;
 
+    /// Visible type records whose immediate parent is the requested class.
     fn direct_subtypes(&self, type_id: &TypeId) -> Vec<(String, &Record)>;
 }
 
@@ -108,19 +123,24 @@ impl PartitionedTypeKnowledge for ObjectRegistry {
 /// rule out do not describe the call.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SignatureUsage {
+    /// The single applicable signature, when selection is unambiguous.
     pub pinned: Option<ResolvedSignature>,
+    /// Candidates remaining compatible with the available evidence.
     pub possible: Vec<ResolvedSignature>,
 }
 
 impl ObjectRegistry {
+    /// Rendered documentation for a visible object, when available.
     pub fn doc_markdown(&self, name: &ObjectName) -> Option<&str> {
         self.get_record(name)?.markdown()
     }
 
+    /// Callable names whose documentation mentions the specified option.
     pub fn option_usage_names(&self, option_name: &str, limit: usize) -> Vec<String> {
         option_usage_names(self, self.records_by_precedence(), option_name, limit)
     }
 
+    /// Callable names documenting the specified option value.
     pub fn option_value_usage_names(&self, value_name: &str, limit: usize) -> Vec<String> {
         if limit == 0 {
             return Vec::new();
@@ -140,15 +160,18 @@ impl ObjectRegistry {
             .collect()
     }
 
+    /// Resolved method signatures supplied by the object's documentation.
     pub fn documented_signatures(&self, record: &Record) -> Vec<ResolvedSignature> {
         documented_signatures(self, record)
     }
 
+    /// Installed signatures not already represented by documented methods.
     pub fn undocumented_installed_methods(&self, record: &Record) -> Vec<MethodSignature> {
         undocumented_installed_methods(record)
     }
 }
 
+/// Usage from facts used to render the resolved callable signature.
 pub fn signature_usage_from_facts(
     knowledge: &(impl TypeKnowledge + ?Sized),
     record: &Record,
@@ -169,6 +192,7 @@ pub fn signature_usage_from_facts(
     (pinned.is_some() || !possible.is_empty()).then_some(SignatureUsage { pinned, possible })
 }
 
+/// Method signature after resolving the available source and catalog identities.
 fn resolved_method_signature(
     knowledge: &(impl TypeKnowledge + ?Sized),
     record: &Record,
@@ -332,6 +356,7 @@ impl LspKnowledge for ObjectRegistryView<'_> {
     }
 }
 
+/// Records available under the current source position and import context.
 fn visible_records<'a>(
     records: impl Iterator<Item = &'a Record>,
     prefix: &str,
@@ -340,6 +365,7 @@ fn visible_records<'a>(
     visible_records_matching(records, prefix, limit, true)
 }
 
+/// Records matching available under the current source position and import context.
 fn visible_records_matching<'a>(
     records: impl Iterator<Item = &'a Record>,
     query: &str,
@@ -365,6 +391,7 @@ fn visible_records_matching<'a>(
         .collect()
 }
 
+/// Callable names whose documentation mentions the specified option.
 fn option_usage_names<'a>(
     knowledge: &(impl TypeKnowledge + ?Sized),
     records: impl Iterator<Item = &'a Record>,
@@ -394,6 +421,7 @@ fn option_usage_names<'a>(
         .collect()
 }
 
+/// Installed signatures not already represented by documented methods.
 fn undocumented_installed_methods(record: &Record) -> Vec<MethodSignature> {
     let Some(callable) = record.callable() else {
         return Vec::new();
@@ -406,6 +434,7 @@ fn undocumented_installed_methods(record: &Record) -> Vec<MethodSignature> {
         .collect()
 }
 
+/// Removes duplicate resolved signatures while preserving presentation order.
 fn dedup_resolved_signatures(signatures: &mut Vec<ResolvedSignature>) {
     let mut seen = HashSet::new();
     signatures.retain(|signature| {
@@ -413,6 +442,7 @@ fn dedup_resolved_signatures(signatures: &mut Vec<ResolvedSignature>) {
     });
 }
 
+/// Editor symbol category appropriate for this catalog record.
 pub fn record_symbol_kind(record: &Record) -> SymbolKind {
     if record.type_info().is_some() {
         return SymbolKind::CLASS;
@@ -582,6 +612,7 @@ fn published_documentation(markdown: &str) -> String {
     lines.join("\n").trim().to_string()
 }
 
+/// Known result class attached to a callable catalog record.
 fn record_typical_value(
     record: &Record,
     knowledge: &(impl TypeKnowledge + ?Sized),
@@ -605,6 +636,7 @@ fn signature_code(signature: &ResolvedSignature, operator_info: Option<&Operator
     }
 }
 
+/// Human-readable call signature, accounting for operator presentation.
 fn signature_label(signature: &ResolvedSignature, operator_info: Option<&OperatorInfo>) -> String {
     let domain_parts = signature
         .signature
@@ -627,6 +659,7 @@ fn signature_label(signature: &ResolvedSignature, operator_info: Option<&Operato
     }
 }
 
+/// Signature domain label derived from the operator spelling and its runtime form.
 fn operator_signature_domain_label(
     signature: &ResolvedSignature,
     operator_info: Option<&OperatorInfo>,
@@ -666,6 +699,7 @@ fn operator_signature_domain_label(
     }
 }
 
+/// Operator spelling and binary-form flag decoded from a method key.
 fn operator_method_key(method_key: &str) -> Option<(&str, bool)> {
     if let Some(inner) = method_key
         .strip_prefix('(')

@@ -8,10 +8,12 @@ use tree_sitter_md::{MarkdownParser, MarkdownTree};
 /// Parser for Markdown documentation syntax.
 #[derive(Default)]
 pub struct MarkdownSyntaxParser {
+    /// Parser instance reused for successive Markdown inputs.
     parser: MarkdownParser,
 }
 
 impl MarkdownSyntaxParser {
+    /// Parses the supplied source or name into this representation.
     pub fn parse(&mut self, source: &str) -> Option<MarkdownSyntaxTree> {
         self.parser
             .parse(source.as_bytes(), None)
@@ -21,10 +23,12 @@ impl MarkdownSyntaxParser {
 
 /// Owned syntax tree for one Markdown document.
 pub struct MarkdownSyntaxTree {
+    /// Parsed syntax or the retained tree owning borrowed nodes.
     tree: MarkdownTree,
 }
 
 impl MarkdownSyntaxTree {
+    /// Walks the retained syntax with the supplied generated visitor.
     pub fn visit(&self, mut visit: impl FnMut(MarkdownNode<'_>)) {
         let mut cursor = self.tree.walk();
         loop {
@@ -46,10 +50,12 @@ impl MarkdownSyntaxTree {
 /// One node in a parsed Markdown document.
 #[derive(Clone, Copy)]
 pub struct MarkdownNode<'tree> {
+    /// Syntax supplying this item's source and structure.
     node: Node<'tree>,
 }
 
 impl<'tree> MarkdownNode<'tree> {
+    /// Target and display-label byte ranges of a recognized documentation wikilink.
     pub fn wiki_link_ranges(self, source: &str) -> Option<(Range<usize>, Range<usize>)> {
         if self.node.kind() != "shortcut_link" {
             return None;
@@ -65,6 +71,7 @@ impl<'tree> MarkdownNode<'tree> {
         Some((range.start - 1..range.end + 1, link_text.byte_range()))
     }
 
+    /// Source interval containing Macaulay2 code inside this Markdown node.
     pub fn embedded_m2_range(self, source: &str) -> Option<Range<usize>> {
         match self.node.kind() {
             "code_span" => {
@@ -78,17 +85,20 @@ impl<'tree> MarkdownNode<'tree> {
         }
     }
 
+    /// Direct named Markdown children, excluding anonymous punctuation tokens.
     fn named_children(self) -> Vec<Node<'tree>> {
         let mut cursor = self.node.walk();
         self.node.named_children(&mut cursor).collect()
     }
 
+    /// Direct named Markdown child with the requested grammar category.
     fn named_child(self, kind: &str) -> Option<Node<'tree>> {
         self.named_children()
             .into_iter()
             .find(|child| child.kind() == kind)
     }
 
+    /// Whether a Markdown fence declares Macaulay2 code.
     fn is_m2_fence(self, source: &str) -> bool {
         self.node
             .parent()

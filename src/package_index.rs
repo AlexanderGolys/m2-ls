@@ -10,23 +10,29 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, iter, str, thread};
 
-use m2_syn::nodes::{Sequence, Symbol};
-use m2_syn::Token;
+use m2_syn::nodes::Sequence;
 use tower_lsp::lsp_types::{Location, Position, Range as TextRange, Url};
 
-use crate::node_metadata::{matches_token, visit_source_nodes, SyntaxNode, SyntaxParser};
-use crate::object_registry::{ObjectName, ObjectRegistry};
+#[cfg(test)]
+use crate::node_metadata::SyntaxParser;
+use crate::node_metadata::{visit_source_nodes, SyntaxNode};
+use crate::object_registry::ObjectName;
+use crate::settings::SourceSettings;
 use crate::source::SourceNavigation;
-use crate::workspace_index::WorkspaceIndex;
 
 // Wrapper discovery must finish even when the runtime cannot start.
+/// How long an `M2` hidden behind a wrapper may take to print its prefix before
+/// discovery gives up on it.
 const INSTALLATION_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often the installation query checks whether `M2` has exited.
 const INSTALLATION_QUERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// One package inclusion and the source position from which it takes effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageImport {
+    /// The package imported.
     pub package: ObjectName,
+    /// Where its names become visible: right after the import call.
     pub effective_from: Position,
 }
 
@@ -38,7 +44,10 @@ pub enum Layout {
     Unified,
     /// `Layout#2`, the architecture-dependent files under the directory of
     /// `machine` and the others under `common`: a build tree (`usr-dist`).
-    SeparateExec { machine: OsString },
+    SeparateExec {
+        /// The machine directory's name, `version#"machine"`.
+        machine: OsString,
+    },
 }
 
 impl Layout {
@@ -244,6 +253,8 @@ impl Installation {
         }
     }
 
+    /// The installation under `prefix` in `layout`, with the source directory
+    /// its build directory records, if any.
     fn new(prefix: PathBuf, layout: Layout, build_directory: Option<PathBuf>) -> Self {
         let source_directory = build_directory
             .as_deref()
@@ -358,52 +369,19 @@ impl Macaulay2Environment {
     }
 
     /// `path` with a leading `~` standing for `HOME`, as a shell reads it.
-    fn expand_home(&self, path: &Path) -> PathBuf {
+    pub fn expand_home(&self, path: &Path) -> PathBuf {
         match (path.strip_prefix("~"), self.home.as_deref()) {
             (Ok(relative), Some(home)) => home.join(relative),
             _ => path.to_path_buf(),
         }
     }
 
-    /// The user's initialization file, which every Macaulay2 session started
-    /// without `-q` runs before loading its preloaded packages.
-    pub fn initialization_file(&self) -> Option<PathBuf> {
+    /// Where the user's init file is, whether or not it exists: every
+    /// Macaulay2 session started without `-q` runs it before loading its
+    /// preloaded packages.
+    pub fn init_file_path(&self) -> Option<PathBuf> {
         self.application_directory()
             .map(|directory| directory.join(Macaulay2Conventions::INITIALIZATION_FILE))
-            .filter(|file| file.is_file())
-    }
-}
-
-/// The user's `init.m2`. It runs before any document, as if it were imported
-/// on the first line of every file: its packages resolve like any other
-/// import and its global definitions are known in every file.
-#[derive(Debug)]
-pub struct InitializationFile {
-    uri: Url,
-    text: String,
-}
-
-impl InitializationFile {
-    /// The initialization file of `environment`, with the packages it loads
-    /// registered in `registry` as imported from the start of every document.
-    pub fn load(environment: &Macaulay2Environment, registry: &mut ObjectRegistry) -> Option<Self> {
-        let path = environment.initialization_file()?;
-        let text = fs::read_to_string(&path).ok()?;
-        let uri = Url::from_file_path(&path).ok()?;
-        collect_imported_packages(&text)
-            .into_iter()
-            .map(|import| import.package)
-            .chain(preloaded_package_additions(&text))
-            .for_each(|package| {
-                registry.load_package(&package);
-            });
-        Some(Self { uri, text })
-    }
-
-    /// Index its global definitions into `workspace_index`, making them known
-    /// in every file like those of a workspace file.
-    pub fn index_into(&self, workspace_index: &WorkspaceIndex, registry: &ObjectRegistry) {
-        workspace_index.index_file(&self.uri, &self.text, registry);
     }
 }
 
@@ -415,6 +393,8 @@ pub struct SourceResolver {
     core_path: Vec<PathBuf>,
     /// `path` once Core is loaded: the directories packages load from.
     path: Vec<PathBuf>,
+    /// Configured directories whose files implement the library, beside Core's.
+    primary_code_directories: Vec<PathBuf>,
 }
 
 impl SourceResolver {
@@ -458,7 +438,49 @@ impl SourceResolver {
         Self {
             core_path: Self::existing_directories(core_path),
             path: Self::existing_directories(path),
+            primary_code_directories: Vec::new(),
         }
+    }
+
+    /// The resolver `sources` configures: the discovered search lists, unless
+    /// discovery is disabled, and the configured primary code directories.
+    pub fn configured(environment: &Macaulay2Environment, sources: &SourceSettings) -> Self {
+        let discovered = if sources.enabled {
+            Self::discover(environment, &sources.paths)
+        } else {
+            Self::default()
+        };
+        Self {
+            primary_code_directories: sources
+                .primary_code_paths
+                .iter()
+                .map(|directory| environment.expand_home(directory))
+                .collect(),
+            ..discovered
+        }
+    }
+
+    /// Whether the file at `path` implements the library itself: it lies on
+    /// `corepath` or in a configured primary code directory, as written or
+    /// once symbolic links are resolved.
+    pub fn is_primary_code_file(&self, path: &Path) -> bool {
+        let resolved_path = fs::canonicalize(path).ok();
+        self.core_path
+            .iter()
+            .chain(&self.primary_code_directories)
+            .any(|directory| {
+                path.starts_with(directory)
+                    || resolved_path
+                        .as_deref()
+                        .zip(fs::canonicalize(directory).ok())
+                        .is_some_and(|(path, directory)| path.starts_with(directory))
+            })
+    }
+
+    /// `path` once Core is loaded: the directories `load` searches for a file
+    /// name it does not find beside the loading file.
+    pub fn path(&self) -> &[PathBuf] {
+        &self.path
     }
 
     /// The directories of `search_list` that exist, each once, in order: the
@@ -532,63 +554,19 @@ impl SourceResolver {
     }
 }
 
-/// The packages `init.m2` adds to `Core#"preloaded packages"`. Macaulay2 loads
-/// that list right after running `init.m2`, so this assignment is a way of
-/// loading packages that no import call shows. Replacing the list can also
-/// drop default packages, but their dependencies are unknown here, so the
-/// defaults stay: a name kept visible is never wrongly reported unknown.
-fn preloaded_package_additions(text: &str) -> Vec<ObjectName> {
-    let Some(mut parser) = SyntaxParser::new() else {
-        return Vec::new();
-    };
-    let Some(tree) = parser.parse_tree(text, None) else {
-        return Vec::new();
-    };
-    let syntax = Some(tree.syntax());
-    let mut packages = Vec::new();
-    visit_source_nodes(tree.root(text), syntax, |node| {
-        if let Some(listed) = preloaded_packages_assignment(node) {
-            packages.extend(
-                listed
-                    .descendants()
-                    .filter(|literal| literal.is_string_literal())
-                    .filter_map(|literal| literal.string_literal_inner_text())
-                    .map(ObjectName::new),
-            );
-        }
-    });
-    packages
-}
-
-/// The right side of `Core#"preloaded packages" = …` or `|= …`.
-fn preloaded_packages_assignment(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
-    let operator = node.binary_operator()?;
-    if !(matches_token::<Token![=]>(operator) || matches_token::<Token![|=]>(operator)) {
-        return None;
-    }
-    let target = node.binary_parts().map(|parts| parts.left)?;
-    let (Some(table), Some(key)) = (
-        target.binary_parts().map(|parts| parts.left),
-        target.binary_parts().map(|parts| parts.right),
-    ) else {
-        return None;
-    };
-    let names_preloaded_packages = target.has_binary_operator::<Token![#]>()
-        && table.is::<Symbol>()
-        && table.text() == Macaulay2Conventions::CORE
-        && key.string_literal_inner_text() == Some(Macaulay2Conventions::PRELOADED_PACKAGES_KEY);
-    names_preloaded_packages.then(|| node.binary_parts().map(|parts| parts.right))?
-}
-
 /// The function names whose string argument names a package to import.
 fn is_package_import_trigger(name: &str) -> bool {
     Macaulay2Conventions::PACKAGE_IMPORT_FUNCTIONS.contains(&name)
 }
 
+/// The package name a string literal gives an import, `"Graphs"` in
+/// `needsPackage "Graphs"`, without its delimiters.
 pub fn package_source_string(node: SyntaxNode<'_>) -> Option<&str> {
     is_package_import_string(node).then(|| node.string_literal_inner_text())?
 }
 
+/// Whether `node` is the string naming the package of an import call or of a
+/// `PackageImports`/`PackageExports` list.
 pub fn is_package_import_string(node: SyntaxNode<'_>) -> bool {
     PackageLoadingOption::lists_package(node)
         || node.ancestors().any(|application| {
@@ -596,6 +574,8 @@ pub fn is_package_import_string(node: SyntaxNode<'_>) -> bool {
         })
 }
 
+/// The string argument of the import call `application` with the package name
+/// it holds.
 fn package_import<'tree>(
     application: SyntaxNode<'tree>,
 ) -> Option<(SyntaxNode<'tree>, &'tree str)> {
@@ -603,39 +583,9 @@ fn package_import<'tree>(
     Some((argument, argument.string_literal_inner_text()?))
 }
 
+/// The first argument of `application` when it calls an import function.
 fn package_import_argument(application: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     first_call_argument(application, is_package_import_trigger)
-}
-
-/// The function names whose string argument names a source file to run.
-fn is_file_load_trigger(name: &str) -> bool {
-    Macaulay2Conventions::FILE_LOAD_FUNCTIONS.contains(&name)
-}
-
-/// One `load`/`needs`/`input` call running a source file.
-#[derive(Debug, Clone, Copy)]
-pub struct FileLoad<'tree> {
-    /// The call running the file.
-    pub call: SyntaxNode<'tree>,
-    /// The file's path as written, relative to the directory of the file
-    /// making the call.
-    pub path: &'tree str,
-}
-
-/// The source files a tree runs through `load`/`needs`/`input`.
-pub fn collect_loaded_files_in_tree<'tree>(
-    root: SyntaxNode<'tree>,
-    syntax: Option<&TypedSource>,
-) -> Vec<FileLoad<'tree>> {
-    let mut files = Vec::new();
-    visit_source_nodes(root, syntax, |call| {
-        if let Some(path) = first_call_argument(call, is_file_load_trigger)
-            .and_then(|argument| argument.string_literal_inner_text())
-        {
-            files.push(FileLoad { call, path });
-        }
-    });
-    files
 }
 
 /// The name string of `newPackage "P"` / `newPackage("P", …)`, which binds the
@@ -735,6 +685,7 @@ pub fn first_call_argument(
 }
 
 /// The packages `text` imports, each from the position its import takes effect.
+#[cfg(test)]
 pub fn collect_imported_packages(text: &str) -> Vec<PackageImport> {
     use crate::source::DocumentSource;
 
@@ -805,8 +756,8 @@ mod import_trigger_tests {
     use std::{env, fs};
 
     use super::{
-        collect_imported_packages, package_source_string, preloaded_package_additions,
-        Macaulay2Conventions, Macaulay2Environment, ObjectName, SourceResolver, SyntaxParser,
+        collect_imported_packages, package_source_string, Macaulay2Conventions,
+        Macaulay2Environment, ObjectName, SourceResolver, SyntaxParser,
     };
 
     /// An isolated fixture tree with canonical paths and automatic cleanup.
@@ -941,7 +892,6 @@ mod import_trigger_tests {
         let resolver = SourceResolver::discover(&environment, &[]);
 
         assert!(environment.executable().is_none());
-        assert!(environment.initialization_file().is_none());
         assert!(resolver.resolve_package_file("Core").is_none());
         assert!(resolver.resolve_package_file("Graphs").is_none());
         assert!(resolver.package_location("Graphs").is_none());
@@ -1234,53 +1184,19 @@ mod import_trigger_tests {
     }
 
     #[test]
-    fn initialization_file_is_found_in_the_application_directory() {
-        let fixture = SourceFixture::new();
-        let home = fixture.path();
-        let application_directory = home.join(Macaulay2Conventions::APPLICATION_DIRECTORY_SUFFIX);
-        fs::create_dir_all(&application_directory).expect("application directory");
+    fn initialization_file_is_in_the_application_directory() {
+        let home = Path::new("/home/user");
         let environment = Macaulay2Environment {
             home: Some(home.to_path_buf()),
             ..Macaulay2Environment::default()
         };
 
-        assert_eq!(environment.initialization_file(), None);
-        fs::write(
-            application_directory.join("init.m2"),
-            "needsPackage \"Graphs\"\n",
-        )
-        .expect("init.m2");
         assert_eq!(
-            environment.initialization_file(),
-            Some(application_directory.join("init.m2"))
-        );
-    }
-
-    /// Packages added to `Core#"preloaded packages"` load right after `init.m2`
-    /// runs; only that list counts, and commented-out lines do nothing.
-    #[test]
-    fn preloaded_package_additions_come_from_the_preloaded_packages_list() {
-        let additions = |text: &str| {
-            preloaded_package_additions(text)
-                .into_iter()
-                .map(|package| package.name().to_string())
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(
-            additions(concat!(
-                "Core#\"preloaded packages\" |= {\"Normaliz\", \"Polyhedra\"}\n",
-                "Core#\"preloaded packages\" = {\"Schubert2\"}\n",
-            )),
-            ["Normaliz", "Polyhedra", "Schubert2"]
-        );
-        assert_eq!(
-            additions(concat!(
-                "-- Core#\"preloaded packages\" |= {\"StateTables\"}\n",
-                "favorites = {\"NotAPackage\"}\n",
-                "Core#\"other key\" = {\"NotAPackage\"}\n",
-            )),
-            Vec::<String>::new()
+            environment.init_file_path(),
+            Some(
+                home.join(Macaulay2Conventions::APPLICATION_DIRECTORY_SUFFIX)
+                    .join(Macaulay2Conventions::INITIALIZATION_FILE)
+            )
         );
     }
 }

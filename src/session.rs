@@ -30,7 +30,9 @@ const EXIT_WITHOUT_SHUTDOWN: i32 = 1;
 /// observe it.
 #[derive(Debug, Clone, Default)]
 pub struct SessionEnd {
+    /// Notification used to wake the transport when the session ends.
     ended: Arc<Notify>,
+    /// Whether the client completed the shutdown-request phase.
     shutdown_requested: Arc<AtomicBool>,
 }
 
@@ -49,10 +51,12 @@ impl SessionEnd {
         }
     }
 
+    /// Notifies the protocol transport that the session has ended.
     fn end(&self) {
         self.ended.notify_one();
     }
 
+    /// Records the shutdown-request phase before the client sends exit.
     fn record_shutdown_request(&self) {
         self.shutdown_requested.store(true, Ordering::Release);
     }
@@ -60,11 +64,14 @@ impl SessionEnd {
 
 /// The client's input stream, ending the session when the client closes it.
 pub struct ClientInput<Input> {
+    /// Underlying input stream supplying protocol messages.
     input: Input,
+    /// Shared shutdown state for the client session.
     session_end: SessionEnd,
 }
 
 impl<Input> ClientInput<Input> {
+    /// Wraps the supplied transport component with the shared session-shutdown state.
     pub fn new(input: Input, session_end: SessionEnd) -> Self {
         Self { input, session_end }
     }
@@ -92,11 +99,14 @@ impl<Input: AsyncRead + Unpin> AsyncRead for ClientInput<Input> {
 /// Wraps the language service, ending the session when the client sends the
 /// `exit` notification and recording whether `shutdown` preceded it.
 pub struct ExitNotificationService<Inner> {
+    /// Wrapped service receiving requests after interception.
     inner: Inner,
+    /// Shared shutdown state for the client session.
     session_end: SessionEnd,
 }
 
 impl<Inner> ExitNotificationService<Inner> {
+    /// Wraps the supplied transport component with the shared session-shutdown state.
     pub fn new(inner: Inner, session_end: SessionEnd) -> Self {
         Self { inner, session_end }
     }

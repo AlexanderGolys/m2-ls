@@ -7,7 +7,7 @@ use m2_syn::Token;
 use tower_lsp::lsp_types::Range as TextRange;
 use tower_lsp::lsp_types::*;
 
-use crate::analysis::MethodCodomainEdit;
+use crate::analysis::{MethodCodomainEdit, OptionMisuse, TypeChecker};
 use crate::diagnostics::rewrites::{
     ambiguous_float_member_access_rewrite, coalescence_rewrite, else_if_chain_rewrite,
     if_condition_rewrite, if_null_branch_rewrite, redundant_control_parentheses_inner,
@@ -15,7 +15,7 @@ use crate::diagnostics::rewrites::{
 };
 use crate::diagnostics::suppression::{DiagnosticSuppressions, SuppressionScope};
 use crate::diagnostics::{catalog, DiagnosticCode, DiagnosticRule};
-use crate::document::DocumentSnapshot;
+use crate::document::{DocumentSnapshot, FileProperties};
 use crate::node_metadata::{token_spelling, SyntaxNode};
 use crate::settings::FormattingSettings;
 use crate::source::SourceNavigation;
@@ -23,11 +23,17 @@ use crate::util::TextRangeExt;
 
 use super::formatting::{format_action_edit, FormatOptions};
 
+/// Document and request data shared by code-action producers.
 struct CodeActionContext<'tree, 'request> {
+    /// Immutable document snapshot being queried.
     document: &'tree DocumentSnapshot,
+    /// Document location associated with the request.
     uri: &'request Url,
+    /// LSP UTF-16 position at which the request is evaluated.
     position: Position,
+    /// Smallest syntax node covering the requested code-action position.
     cursor: SyntaxNode<'tree>,
+    /// Findings associated with this request or collected by this pass.
     diagnostics: &'request [Diagnostic],
 }
 
@@ -44,6 +50,7 @@ const CODE_ACTION_PRODUCERS: &[CodeActionProducer] = &[
     option_key_convention_action,
     coalescence_action,
     install_needs_colon_equals_action,
+    unknown_option_action,
     method_codomain_action,
     convert_to_raw_string_action,
     redundant_control_parentheses_action,
@@ -53,6 +60,7 @@ const CODE_ACTION_PRODUCERS: &[CodeActionProducer] = &[
     flatten_else_if_action,
 ];
 
+/// Finding for the requested rule whose source range overlaps this code-action request.
 fn diagnostic_at(context: &CodeActionContext<'_, '_>, rule: &DiagnosticRule) -> Option<Diagnostic> {
     context
         .diagnostics
@@ -64,6 +72,7 @@ fn diagnostic_at(context: &CodeActionContext<'_, '_>, rule: &DiagnosticRule) -> 
         .cloned()
 }
 
+/// Code action for method codomain, absent when the request does not match.
 fn method_codomain_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
     let diagnostic = diagnostic_at(context, &catalog::INSTALL_CODOMAIN_MISSING)?;
     let mut current = Some(context.cursor);
@@ -103,6 +112,7 @@ fn method_codomain_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAct
     None
 }
 
+/// Code action for colon equal part assignment, absent when the request does not match.
 fn colon_equal_part_assignment_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
     assignment_operator_action(
         context,
@@ -113,6 +123,7 @@ fn colon_equal_part_assignment_action(context: &CodeActionContext<'_, '_>) -> Op
     )
 }
 
+/// Code action for install needs colon equals, absent when the request does not match.
 fn install_needs_colon_equals_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
     assignment_operator_action(
         context,
@@ -123,6 +134,7 @@ fn install_needs_colon_equals_action(context: &CodeActionContext<'_, '_>) -> Opt
     )
 }
 
+/// Code action for assignment operator, absent when the request does not match.
 fn assignment_operator_action(
     context: &CodeActionContext<'_, '_>,
     rule: &DiagnosticRule,
@@ -154,6 +166,7 @@ fn assignment_operator_action(
     None
 }
 
+/// Code action for option key convention, absent when the request does not match.
 fn option_key_convention_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
     let diagnostic = diagnostic_at(context, &catalog::OPTION_KEY_CONVENTION)?;
     let key = enclosing_node_with_range(context, diagnostic.range, |node| node.is::<Symbol>())?;
@@ -174,7 +187,8 @@ fn option_key_convention_action(context: &CodeActionContext<'_, '_>) -> Option<C
     )
 }
 
-/// Refactor: drop the parentheses around a condition, `try` value, or loop
+/// Quick fix for redundant-control-parentheses, and a refactor where it is
+/// not reported: drop the parentheses around a condition, `try` value, or loop
 /// range that its keyword already delimits (`if (n > 0) then` → `if n > 0
 /// then`), offered inside the parentheses or on the control expression
 /// holding them.
@@ -190,21 +204,54 @@ fn redundant_control_parentheses_action(context: &CodeActionContext<'_, '_>) -> 
             }
         })?;
     let inner = redundant_control_parentheses_inner(parentheses)?;
+    let range = context.document.range_for_node(parentheses);
     Some(
-        CodeActionSpec {
-            title: "Remove redundant parentheses".into(),
-            kind: CodeActionKind::REFACTOR_REWRITE,
-            is_preferred: None,
-            diagnostics: None,
-        }
-        .build(
-            context.uri,
-            context.document.range_for_node(parentheses),
-            inner.text().to_string(),
-        ),
+        CodeActionSpec::rewrite(
+            context,
+            &catalog::REDUNDANT_CONTROL_PARENTHESES,
+            range,
+            "Remove redundant parentheses",
+        )
+        .build(context.uri, range, inner.text().to_string()),
     )
 }
 
+/// Quick fix for unknown-option: replace a misspelled option name with the
+/// accepted name it most likely means.
+fn unknown_option_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
+    let diagnostic = diagnostic_at(context, &catalog::UNKNOWN_OPTION)?;
+    let call = context
+        .cursor
+        .ancestors()
+        .find(|node| node.is_space_application())?;
+    let knowledge = context
+        .document
+        .object_registry()
+        .at(context.document.position_for_node(call));
+    let suggestion = TypeChecker::new(context.document.analysis(), &knowledge)
+        .call_option_misuses(call, context.document, &knowledge)
+        .into_iter()
+        .find_map(|misuse| match misuse {
+            OptionMisuse::UnknownName {
+                key,
+                suggestion: Some(suggestion),
+                ..
+            } if context.document.range_for_node(key) == diagnostic.range => Some(suggestion),
+            _ => None,
+        })?;
+    let range = diagnostic.range;
+    Some(
+        CodeActionSpec {
+            title: format!("Replace with `{}`", suggestion.name()),
+            kind: CodeActionKind::QUICKFIX,
+            is_preferred: Some(true),
+            diagnostics: Some(vec![diagnostic]),
+        }
+        .build(context.uri, range, suggestion.name().to_string()),
+    )
+}
+
+/// Code action for coalescence, absent when the request does not match.
 fn coalescence_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
     let diagnostic = diagnostic_at(context, &catalog::PREFER_COALESCENCE)?;
     let mut current = Some(context.cursor);
@@ -232,6 +279,7 @@ fn coalescence_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction>
     None
 }
 
+/// Finds node with range in the enclosing source constructs.
 fn enclosing_node_with_range<'tree>(
     context: &CodeActionContext<'tree, '_>,
     range: TextRange,
@@ -274,6 +322,7 @@ pub fn available_code_actions(
     let mut actions: CodeActionResponse = CODE_ACTION_PRODUCERS
         .iter()
         .filter_map(|produce| produce(&context))
+        .chain(primary_code_action(&context))
         .chain(suppression_actions(&context))
         .map(|mut action| {
             if let Some(changes) = action.edit.as_mut().and_then(|edit| edit.changes.as_mut()) {
@@ -350,6 +399,28 @@ fn fix_all_action(
     })
 }
 
+/// Quick fix for assigning a protected symbol in a file implementing the
+/// library itself: declare the file primary code. Like the suppressions, it
+/// writes a directive, so fix-all leaves it out.
+fn primary_code_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
+    let diagnostic = diagnostic_at(context, &catalog::PROTECTED_ASSIGNMENT)?;
+    let position =
+        DiagnosticSuppressions::directive_position(SuppressionScope::File, diagnostic.range.start);
+    Some(
+        CodeActionSpec {
+            title: "Analyze this file as library implementation code".into(),
+            kind: CodeActionKind::QUICKFIX,
+            is_preferred: None,
+            diagnostics: Some(vec![diagnostic]),
+        }
+        .build(
+            context.uri,
+            TextRange::new(position, position),
+            format!("{}\n", FileProperties::primary_code_directive()),
+        ),
+    )
+}
+
 /// Quick fixes silencing each m2-ls diagnostic at the cursor with a
 /// directive comment: on its line, then in the whole file. They come last,
 /// after the fixes that address the diagnostic.
@@ -404,13 +475,42 @@ fn suppression_actions(context: &CodeActionContext<'_, '_>) -> Vec<CodeAction> {
 /// `WorkspaceEdit`/`CodeAction` boilerplate that every per-action producer
 /// would otherwise repeat.
 struct CodeActionSpec {
+    /// User-facing title of the proposed action.
     title: String,
+    /// Semantic or presentation category of this item.
     kind: CodeActionKind,
+    /// Whether the client should prefer this action over other applicable fixes.
     is_preferred: Option<bool>,
+    /// Findings associated with this request or collected by this pass.
     diagnostics: Option<Vec<Diagnostic>>,
 }
 
 impl CodeActionSpec {
+    /// A rewrite of `range`: the preferred quick fix of the `rule` hint
+    /// reported on exactly that range, or a plain refactor where the hint is
+    /// absent or suppressed.
+    fn rewrite(
+        context: &CodeActionContext<'_, '_>,
+        rule: &DiagnosticRule,
+        range: TextRange,
+        title: &str,
+    ) -> Self {
+        let diagnostic = context.diagnostics.iter().find(|diagnostic| {
+            DiagnosticCode::from_lsp(diagnostic) == Some(rule.code) && diagnostic.range == range
+        });
+        CodeActionSpec {
+            title: title.into(),
+            kind: if diagnostic.is_some() {
+                CodeActionKind::QUICKFIX
+            } else {
+                CodeActionKind::REFACTOR_REWRITE
+            },
+            is_preferred: diagnostic.map(|_| true),
+            diagnostics: diagnostic.map(|diagnostic| vec![diagnostic.clone()]),
+        }
+    }
+
+    /// Builds a protocol code action replacing the specified range in one document.
     fn build(self, uri: &Url, range: TextRange, new_text: String) -> CodeAction {
         CodeAction {
             title: self.title,
@@ -487,18 +587,15 @@ fn conditional_null_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAc
         .enclosing_node(|node| node.is::<IfStatement>())?;
     let replacement = simplification_of(if_node, if_null_branch_rewrite(if_node))?;
 
+    let range = context.document.range_for_node(if_node);
     Some(
-        CodeActionSpec {
-            title: "Simplify unnecessary null branch".into(),
-            kind: CodeActionKind::REFACTOR_REWRITE,
-            is_preferred: None,
-            diagnostics: None,
-        }
-        .build(
-            context.uri,
-            context.document.range_for_node(if_node),
-            replacement,
-        ),
+        CodeActionSpec::rewrite(
+            context,
+            &catalog::SIMPLIFIABLE_EXPRESSION,
+            range,
+            "Simplify unnecessary null branch",
+        )
+        .build(context.uri, range, replacement),
     )
 }
 
@@ -510,18 +607,15 @@ fn simplify_try_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction
         .enclosing_node(|node| node.is::<TryStatement>())?;
     let replacement = simplification_of(try_node, try_statement_rewrite(try_node))?;
 
+    let range = context.document.range_for_node(try_node);
     Some(
-        CodeActionSpec {
-            title: "Simplify try".into(),
-            kind: CodeActionKind::REFACTOR_REWRITE,
-            is_preferred: None,
-            diagnostics: None,
-        }
-        .build(
-            context.uri,
-            context.document.range_for_node(try_node),
-            replacement,
-        ),
+        CodeActionSpec::rewrite(
+            context,
+            &catalog::SIMPLIFIABLE_EXPRESSION,
+            range,
+            "Simplify try",
+        )
+        .build(context.uri, range, replacement),
     )
 }
 
@@ -533,18 +627,15 @@ fn simplify_if_condition_action(context: &CodeActionContext<'_, '_>) -> Option<C
         .enclosing_node(|node| node.is::<IfStatement>())?;
     let replacement = simplification_of(if_node, if_condition_rewrite(if_node))?;
 
+    let range = context.document.range_for_node(if_node);
     Some(
-        CodeActionSpec {
-            title: "Simplify if condition".into(),
-            kind: CodeActionKind::REFACTOR_REWRITE,
-            is_preferred: None,
-            diagnostics: None,
-        }
-        .build(
-            context.uri,
-            context.document.range_for_node(if_node),
-            replacement,
-        ),
+        CodeActionSpec::rewrite(
+            context,
+            &catalog::SIMPLIFIABLE_EXPRESSION,
+            range,
+            "Simplify if condition",
+        )
+        .build(context.uri, range, replacement),
     )
 }
 
@@ -562,21 +653,19 @@ fn flatten_else_if_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAct
         current = node.parent();
     }
     let (node, replacement) = candidate?;
+    let range = context.document.range_for_node(node);
     Some(
-        CodeActionSpec {
-            title: "Flatten nested if into else-if chain".into(),
-            kind: CodeActionKind::REFACTOR_REWRITE,
-            is_preferred: None,
-            diagnostics: None,
-        }
-        .build(
-            context.uri,
-            context.document.range_for_node(node),
-            replacement,
-        ),
+        CodeActionSpec::rewrite(
+            context,
+            &catalog::SIMPLIFIABLE_EXPRESSION,
+            range,
+            "Flatten nested if into else-if chain",
+        )
+        .build(context.uri, range, replacement),
     )
 }
 
+/// String replacement retaining the source literal representation.
 fn raw_string_replacement(string_node: SyntaxNode<'_>) -> Option<String> {
     let content = string_node.string_literal_inner_text()?;
     let escape_count = count_string_escapes(content);
@@ -592,6 +681,7 @@ fn raw_string_replacement(string_node: SyntaxNode<'_>) -> Option<String> {
     Some(format!("///{unescaped}///"))
 }
 
+/// Counts string escapes in the supplied source text.
 fn count_string_escapes(content: &str) -> usize {
     let mut chars = content.chars().peekable();
     let mut count = 0;
@@ -604,6 +694,7 @@ fn count_string_escapes(content: &str) -> usize {
     count
 }
 
+/// Decodes string literal content according to Macaulay2 string-literal rules.
 fn unescape_string_literal_content(content: &str) -> Option<String> {
     let mut result = String::new();
     let mut chars = content.chars();
@@ -637,6 +728,7 @@ mod tests {
     use crate::diagnostics::visible_diagnostics;
     use crate::node_metadata::SyntaxParser;
     use crate::object_registry::ObjectRegistry;
+    use crate::package_index::SourceResolver;
     use crate::settings::DiagnosticSettings;
 
     fn formatted(text: &str, settings: &FormattingSettings) -> String {
@@ -652,7 +744,12 @@ mod tests {
         let registry = ObjectRegistry::default();
         let document = DocumentSnapshot::from_text(source.into(), &registry).unwrap();
         let uri = Url::parse("file:///test.m2").unwrap();
-        let diagnostics = visible_diagnostics(&document, &uri, &DiagnosticSettings::default());
+        let diagnostics = visible_diagnostics(
+            &document,
+            &uri,
+            &DiagnosticSettings::default(),
+            &SourceResolver::default(),
+        );
         let action = fix_all_action(&document, &uri, &diagnostics, &FormatOptions::default())
             .expect("file-wide fixes should be offered");
         assert_eq!(action.kind, Some(CodeActionKind::SOURCE_FIX_ALL));
@@ -671,7 +768,12 @@ mod tests {
         }
         assert_eq!(result, "-- λ 😀\nx#3\ny#4\nif ready then\n    value\n");
         let rewritten = DocumentSnapshot::from_text(result, &registry).unwrap();
-        let diagnostics = visible_diagnostics(&rewritten, &uri, &DiagnosticSettings::default());
+        let diagnostics = visible_diagnostics(
+            &rewritten,
+            &uri,
+            &DiagnosticSettings::default(),
+            &SourceResolver::default(),
+        );
         assert!(
             fix_all_action(&rewritten, &uri, &diagnostics, &FormatOptions::default()).is_none()
         );
@@ -683,7 +785,12 @@ mod tests {
         let document =
             DocumentSnapshot::from_text(source.into(), &ObjectRegistry::default()).unwrap();
         let uri = Url::parse("file:///test.m2").unwrap();
-        let diagnostics = visible_diagnostics(&document, &uri, &DiagnosticSettings::default());
+        let diagnostics = visible_diagnostics(
+            &document,
+            &uri,
+            &DiagnosticSettings::default(),
+            &SourceResolver::default(),
+        );
         let action =
             fix_all_action(&document, &uri, &diagnostics, &FormatOptions::default()).unwrap();
         let changes = action.edit.unwrap().changes.unwrap();
@@ -703,7 +810,12 @@ mod tests {
         let document =
             DocumentSnapshot::from_text(source.into(), &ObjectRegistry::default()).unwrap();
         let uri = Url::parse("file:///test.m2").unwrap();
-        let diagnostics = visible_diagnostics(&document, &uri, &DiagnosticSettings::default());
+        let diagnostics = visible_diagnostics(
+            &document,
+            &uri,
+            &DiagnosticSettings::default(),
+            &SourceResolver::default(),
+        );
         assert!(available_code_actions(
             &document,
             &uri,
@@ -777,8 +889,12 @@ mod tests {
                     let document =
                         DocumentSnapshot::from_text(source.clone(), &ObjectRegistry::default())
                             .unwrap();
-                    let diagnostics =
-                        visible_diagnostics(&document, &uri, &DiagnosticSettings::default());
+                    let diagnostics = visible_diagnostics(
+                        &document,
+                        &uri,
+                        &DiagnosticSettings::default(),
+                        &SourceResolver::default(),
+                    );
                     let expression_start = rewritten_expression_start(&document);
                     let actions = available_code_actions(
                         &document,

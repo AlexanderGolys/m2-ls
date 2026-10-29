@@ -36,17 +36,24 @@ const MAX_SECTION_ENTRIES: usize = 15;
 /// The Markdown of one hover, assembled part by part.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HoverLayout {
+    /// Source example or code fragment retained for presentation.
     code: String,
+    /// Short semantic facts displayed before longer documentation.
     facts: Vec<String>,
+    /// Ordered sections composing the hover response.
     sections: Vec<HoverSection>,
+    /// Documentation extracted from the current document or selected object.
     documentation: Option<String>,
 }
 
 /// A titled part of a hover between its facts and its documentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HoverSection {
+    /// User-facing title of the proposed action.
     title: String,
+    /// Items accumulated in presentation order.
     entries: Vec<String>,
+    /// Body of the represented documentation section.
     content: SectionContent,
 }
 
@@ -141,6 +148,7 @@ impl HoverLayout {
 }
 
 impl HoverSection {
+    /// Renders the accumulated hover sections as Markdown.
     fn render(&self) -> String {
         let hidden = self.entries.len().saturating_sub(MAX_SECTION_ENTRIES);
         let shown = &self.entries[..self.entries.len() - hidden];

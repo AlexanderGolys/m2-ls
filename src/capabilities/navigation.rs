@@ -14,7 +14,7 @@ use crate::document::{DocumentSnapshot, TargetSymbol};
 use crate::library_index::LibrarySources;
 use crate::node_metadata::SyntaxNode;
 use crate::object_registry::ObjectName;
-use crate::package_index::package_source_string;
+use crate::package_index::{package_source_string, SourceResolver};
 use crate::record_lsp::LspKnowledge;
 use crate::source::SourceNavigation;
 use crate::workspace_index::{
@@ -46,6 +46,7 @@ pub fn references_response(
         .collect()
 }
 
+/// Workspace declarations matching the query, with source locations and presentation kinds.
 #[allow(deprecated)]
 pub fn workspace_symbols_response(
     query: &str,
@@ -65,13 +66,17 @@ pub fn workspace_symbols_response(
         .collect()
 }
 
+/// The declaration, definition, or type location requested by navigation.
 #[derive(Debug, Clone, Copy)]
 enum NavigationTarget {
+    /// Navigates to the declaration that introduces the selected object.
     Declaration,
+    /// Navigates to the source defining the selected object.
     Definition,
 }
 
 impl NavigationTarget {
+    /// Source locations matching the requested object and navigation role.
     fn locations(
         self,
         index: &(impl WorkspaceDefinitionKnowledge + ?Sized),
@@ -85,6 +90,7 @@ impl NavigationTarget {
     }
 }
 
+/// Declaration locations associated with the symbol or source reference at the cursor.
 pub fn goto_declaration_response(
     document: &DocumentSnapshot,
     uri: &Url,
@@ -104,6 +110,7 @@ pub fn goto_declaration_response(
     )
 }
 
+/// Definition locations associated with the symbol or source reference at the cursor.
 pub fn goto_definition_response(
     document: &DocumentSnapshot,
     uri: &Url,
@@ -123,6 +130,7 @@ pub fn goto_definition_response(
     )
 }
 
+/// Resolves the requested symbol-navigation role against local, workspace, and library facts.
 fn goto_symbol_response(
     document: &DocumentSnapshot,
     uri: &Url,
@@ -136,6 +144,15 @@ fn goto_symbol_response(
     let mention = document.symbol_mention_at(position);
 
     if let NavigationTarget::Definition = target {
+        if let Some(load) = document.file_load_at(position) {
+            return load
+                .resolve(uri, library.source_resolver().path())
+                .file()
+                .cloned()
+                .map(|file| {
+                    GotoDefinitionResponse::Scalar(Location::new(file, TextRange::default()))
+                });
+        }
         if let Some(string_node) = node.enclosing_node(SyntaxNode::is_string_literal) {
             if let Some(package_name) = crate::package_index::package_source_string(string_node) {
                 if let Some(path) = library.source_resolver().resolve_package_file(package_name) {
@@ -235,6 +252,7 @@ fn goto_symbol_response(
     }
 }
 
+/// Source locations of the runtime classes inferred for the selected value.
 pub fn goto_type_definition_response(
     document: &DocumentSnapshot,
     uri: &Url,
@@ -281,6 +299,7 @@ pub fn goto_type_definition_response(
     )
 }
 
+/// Source implementations applicable to the selected callable or method.
 pub fn goto_implementation_response(
     document: &DocumentSnapshot,
     position: Position,
@@ -446,7 +465,12 @@ pub fn goto_implementation_response(
     locations_response(locations)
 }
 
-pub fn document_links_response(document: &DocumentSnapshot, uri: &Url) -> Vec<DocumentLink> {
+/// Links to resolved source files named by load expressions in this document.
+pub fn document_links_response(
+    document: &DocumentSnapshot,
+    uri: &Url,
+    sources: &SourceResolver,
+) -> Vec<DocumentLink> {
     let mut links = document
         .symbol_mentions()
         .iter()
@@ -473,15 +497,29 @@ pub fn document_links_response(document: &DocumentSnapshot, uri: &Url) -> Vec<Do
                 ))
             }),
     );
+    links.extend(document.file_loads().iter().filter_map(|load| {
+        let file = load.resolve(uri, sources.path()).file()?.clone();
+        Some(DocumentLink {
+            range: load.literal,
+            tooltip: file
+                .to_file_path()
+                .ok()
+                .map(|path| format!("Open `{}`", path.display())),
+            target: Some(file),
+            data: None,
+        })
+    }));
     links.sort_by_key(|link| (link.range.start, link.range.end));
     links.dedup_by_key(|link| link.range);
     links
 }
 
+/// Builds a protocol document-link request for the supplied document URI.
 pub fn document_link_request(link: &DocumentLink) -> Option<TextDocumentPositionParams> {
     serde_json::from_value(link.data.clone()?).ok()
 }
 
+/// Resolves document link against the source position and available object knowledge.
 pub fn resolve_document_link(
     mut link: DocumentLink,
     response: GotoDefinitionResponse,
@@ -509,6 +547,7 @@ pub fn resolve_document_link(
     link
 }
 
+/// Protocol link covering the original source extent of a resolved file reference.
 fn document_link(range: TextRange, uri: &Url, tooltip: String) -> DocumentLink {
     let request =
         TextDocumentPositionParams::new(TextDocumentIdentifier::new(uri.clone()), range.start);
@@ -520,6 +559,7 @@ fn document_link(range: TextRange, uri: &Url, tooltip: String) -> DocumentLink {
     }
 }
 
+/// Encodes resolved locations in the protocol's scalar-or-array navigation response.
 fn locations_response(
     locations: impl IntoIterator<Item = Location>,
 ) -> Option<GotoDefinitionResponse> {
@@ -629,7 +669,9 @@ pub fn rename_edits(
 /// stay in the document; a global (top-level / workspace) symbol's references
 /// span every file.
 pub enum ReferenceTarget {
+    /// The lexically visible source binding.
     Local,
+    /// A global name resolved through package and catalog knowledge.
     Global(String),
 }
 
@@ -930,8 +972,7 @@ mod tests {
     fn goto_definition_does_not_jump_forward_from_documentation() {
         let text = "-- use [[x]]\nx := 1\n";
         let document = document(text);
-        let index =
-            crate::object_registry::ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let index = crate::object_registry::ObjectRegistry::load(crate::catalog::test_corpus());
         let scoped = index.with_source_imports(text);
         let uri = Url::parse("file:///t.m2").expect("uri");
         let library = sourceless_library(&index);
@@ -955,8 +996,7 @@ mod tests {
     fn declaration_of_a_builtin_is_not_its_first_use() {
         let text = "a = toString 1\nb = toString 2\nc = undefinedName\nd = undefinedName\n";
         let document = document(text);
-        let index =
-            crate::object_registry::ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let index = crate::object_registry::ObjectRegistry::load(crate::catalog::test_corpus());
         let scoped = index.with_source_imports(text);
         let uri = Url::parse("file:///t.m2").expect("uri");
         let library = sourceless_library(&index);

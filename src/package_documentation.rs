@@ -71,17 +71,26 @@ enum DocumentationFunction {
 /// Everything the documentation of one source file states.
 #[derive(Debug, Default)]
 pub struct PackageDocumentation {
+    /// Documentation nodes parsed from source declarations.
     nodes: Vec<DocumentationNode>,
+    /// Keys explicitly declared as lacking documentation.
     undocumented: Vec<DocumentationKey>,
+    /// Object names mentioned by documentation links.
     referenced_names: Vec<ReferencedName>,
     /// Strings naming a documentation key by a symbol's name, such as `"f"`
     /// in `TO "f"`: names, but not ones the documentation evaluates.
     key_strings: Vec<DocumentSpan>,
+    /// Source spans classified as documentation markup.
     markup: Vec<DocumentationMarkup>,
+    /// Source intervals belonging to package documentation.
     documentation_ranges: Vec<ByteRange>,
+    /// Source intervals treated as executable documentation examples.
     example_ranges: Vec<ByteRange>,
+    /// Malformed or inconsistent documentation entries found during extraction.
     faults: Vec<DocumentationFault>,
+    /// Executable examples paired with their package-loading context.
     example_sessions: Vec<PackageSessionCode>,
+    /// Source extents of functions that contribute SimpleDoc documentation.
     simple_doc_functions: Vec<TextRange>,
 }
 
@@ -118,13 +127,17 @@ pub enum DocumentedSubject {
     /// A method, written as the sequence `(f, ZZ, QQ)` of the method
     /// function and the types it is installed on.
     Method {
+        /// Function expression owning this semantic context.
         function: ObjectName,
+        /// Argument identities accepted by the method signature.
         domain: Vec<ObjectName>,
     },
     /// An optional argument of a function, written as the array `[f, Limit]`
     /// of the function and the option's symbol.
     OptionalArgument {
+        /// Function expression owning this semantic context.
         function: ObjectName,
+        /// Name of the callable option being checked.
         option: ObjectName,
     },
     /// Anything else, such as an overview page titled by a string with spaces
@@ -235,20 +248,33 @@ pub enum DocumentationFaultKind {
     /// start a section. A content line indented no deeper than the keyword
     /// above it reads as a keyword too.
     UnknownSimpleDocKeyword {
+        /// Section or constructor keyword recognized in the documentation.
         keyword: String,
+        /// Keywords or section kinds accepted at this location.
         expected: Vec<SimpleDocKeyword>,
     },
     /// An option of a hypertext list that is not a documentation option.
-    UnknownDocumentOption { option: String },
+    UnknownDocumentOption {
+        #[doc = "Name of the callable option being checked."]
+        option: String,
+    },
     /// A section given twice in one page.
-    RepeatedSection { section: String },
+    RepeatedSection {
+        #[doc = "Section name associated with the documentation finding."]
+        section: String,
+    },
     /// A section missing the content it needs, described by `expectation`.
     EmptySection {
+        /// Section name associated with the documentation finding.
         section: String,
+        /// Explanation of the form required by this documentation section.
         expectation: &'static str,
     },
     /// A `Headline` or `Heading` continued on further lines.
-    MultilineHeadline { section: String },
+    MultilineHeadline {
+        #[doc = "Section name associated with the documentation finding."]
+        section: String,
+    },
     /// An `Inputs`/`Outputs` item whose first line does not name the item and
     /// its type around one `:` or `=>`.
     MalformedItem,
@@ -262,14 +288,20 @@ pub enum DocumentationFaultKind {
     /// Documentation options passed to `document` outside of its list.
     OptionsOutsideList,
     /// A documentation option whose value must be a list.
-    ExpectedList { option: String },
+    ExpectedList {
+        #[doc = "Name of the callable option being checked."]
+        option: String,
+    },
     /// `Inputs` or `Outputs` without the `Usage` they describe.
     UsageRequired,
     /// A page without a `Key`.
     MissingKey,
     /// A headline longer than the 100 characters Macaulay2 allows; it rejects
     /// one longer than 200 outright.
-    HeadlineTooLong { length: usize },
+    HeadlineTooLong {
+        #[doc = "Headline length measured against the documentation length limit."]
+        length: usize,
+    },
 }
 
 impl PackageDocumentation {
@@ -523,12 +555,17 @@ impl DocumentedSubject {
 /// of subnodes, and the keys it links to.
 #[derive(Debug, Default)]
 struct NodeMarkdown {
+    /// Optional short summary introducing the documentation node.
     headline: Option<String>,
+    /// Rendered call forms illustrating use of the documented object.
     usage: Vec<String>,
+    /// Descriptions of the callable's input parameters.
     inputs: Vec<String>,
     /// The `Inputs` items naming an optional argument, `Opt => …`.
     options: Vec<String>,
+    /// Descriptions of the callable's return values.
     outputs: Vec<String>,
+    /// Documented effects beyond the callable's return value.
     consequences: Vec<String>,
     /// Markdown blocks: paragraphs, examples, menus.
     description: Vec<String>,
@@ -631,9 +668,11 @@ impl DocumentTag {
 /// Macaulay2 expressions the way the documentation functions do, and
 /// recording what the documentation states.
 struct DocumentationCollector<'source, S: SourceNavigation + ?Sized> {
+    /// Source data supplying text and coordinate conversions.
     source: &'source S,
     /// Parses the expressions SimpleDoc strings embed.
     parser: SyntaxParser,
+    /// Documentation extracted from the current document or selected object.
     documentation: PackageDocumentation,
     /// EXAMPLE applications evaluated inside SimpleDoc expressions.
     evaluated_examples: Vec<CodeFragment>,
@@ -920,6 +959,7 @@ impl ParsedOrigin {
 /// is decided after, by parsing its content.
 #[derive(Debug, Default)]
 struct CodeMarkup {
+    /// Source spans classified as documentation markup.
     markup: Vec<DocumentationMarkup>,
     /// The document bytes of the content of each string in a key position:
     /// the key itself, or the key a `TO`, `TOH`, or `TO2` link links to.

@@ -60,7 +60,9 @@ enum HintSource {
 struct PlacedHint {
     /// The range of the value, as [`described_value`] finds it.
     value: Option<TextRange>,
+    /// Semantic origin used to order and deduplicate hints at the same position.
     source: HintSource,
+    /// Protocol inlay hint emitted by this source.
     hint: InlayHint,
 }
 
@@ -124,10 +126,12 @@ struct CalledParameter {
     domain: Option<ObjectName>,
 }
 
+/// Advertises inlay-hint support in the server initialization response.
 pub fn inlay_hint_provider_capability() -> Option<OneOf<bool, InlayHintServerCapabilities>> {
     Some(OneOf::Left(true))
 }
 
+/// Collects configured hints for the requested range and removes duplicate type presentations.
 pub fn inlay_hints_response(
     document: &DocumentSnapshot,
     range: TextRange,
@@ -164,11 +168,15 @@ pub fn inlay_hints_response(
 /// analysis inferred for its expressions, and the settings choosing which
 /// are shown.
 struct HintContext<'request, 'tree> {
+    /// Immutable document snapshot being queried.
     document: &'tree DocumentSnapshot,
+    /// Positioned object and type facts available to this request.
     knowledge: &'request ObjectRegistry,
+    /// Options accepted by the callable, or settings governing this request.
     options: &'request InlayHintSettings,
     /// The part of the document the client asks hints for.
     range: TextRange,
+    /// Expression identities paired with their syntax and inferred types.
     inferred_types: HashMap<SyntaxNodeId, (SyntaxNode<'tree>, InferredType)>,
     /// The parts of the document's assignments, whose types binding hints
     /// show.
@@ -178,10 +186,12 @@ struct HintContext<'request, 'tree> {
     opaque_self_describing_values: Vec<TextRange>,
 }
 
+/// Ordering key used to place related hints consistently at one position.
 fn hint_order(label: &InlayHintLabel) -> bool {
     label_text(label).starts_with(CALL_RESULT_PREFIX)
 }
 
+/// Expression types derived from the available type evidence.
 fn inferred_expression_types<'tree>(
     document: &'tree DocumentSnapshot,
     knowledge: &ObjectRegistry,
@@ -200,6 +210,7 @@ fn inferred_expression_types<'tree>(
 }
 
 impl<'request, 'tree> HintContext<'request, 'tree> {
+    /// Constructs this value from the supplied dependencies and initial state.
     fn new(
         document: &'tree DocumentSnapshot,
         knowledge: &'request ObjectRegistry,
@@ -767,6 +778,7 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
                 })
     }
 
+    /// Target and value operands extracted from supported assignment syntax.
     fn assignment_parts(&self) -> AssignmentParts {
         let mut parts = AssignmentParts {
             assignments: Vec::new(),
@@ -792,6 +804,7 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
         parts
     }
 
+    /// Target/value pairs eligible for assignment type hints.
     fn assigned_values(&self) -> Vec<AssignedValue> {
         let mut values = Vec::new();
         for assignment in self
@@ -832,6 +845,7 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
         values
     }
 
+    /// Assignment value nodes whose literal syntax already communicates the displayed type.
     fn self_describing_assignment_value_nodes(&self) -> Vec<SyntaxNode<'tree>> {
         self.inferred_types
             .values()
@@ -846,6 +860,7 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
     }
 }
 
+/// Final expression contributing the lambda's return value.
 fn lambda_final_value(lambda: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     let mut value = lambda.lambda_body()?;
     while value.is_holder() {
@@ -854,6 +869,7 @@ fn lambda_final_value(lambda: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     (!value.is_return_expr()).then_some(value)
 }
 
+/// Plain text of either protocol inlay-label representation.
 fn label_text(label: &InlayHintLabel) -> &str {
     match label {
         InlayHintLabel::String(text) => text,
@@ -863,6 +879,7 @@ fn label_text(label: &InlayHintLabel) -> &str {
     }
 }
 
+/// Formats an inferred type name as an inlay label.
 fn inlay_type_label(type_name: String) -> String {
     let members = type_name.split(" | ").collect::<Vec<_>>();
     match members.as_slice() {
@@ -938,23 +955,33 @@ fn call_arguments(call: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
     }
 }
 
+/// A binding target paired with the value and inferred label shown as an inlay hint.
 struct AssignedValue {
+    /// Extent of the binding target associated with the hint.
     target_range: TextRange,
+    /// Source extent of the expression supplying the binding's value.
     value_range: TextRange,
     /// The range of the value [`described_value`] finds in the assigned one.
     described_range: TextRange,
+    /// Type label displayed by the inlay hint.
     type_name: String,
+    /// Whether the target receives one component of a parallel assignment.
     destructured: bool,
 }
 
+/// Source ranges already covered by assignment-related inlay hints.
 #[derive(Default)]
 struct AssignmentParts {
+    /// Assignment extents already represented by a hint.
     assignments: Vec<TextRange>,
+    /// Binding targets or documentation owners associated with this item.
     targets: Vec<TextRange>,
+    /// Assigned-value extents already represented by a hint.
     values: Vec<TextRange>,
 }
 
 impl AssignmentParts {
+    /// Whether an already shown assignment hint covers this expression or call.
     fn suppresses(&self, expression: TextRange, is_call: bool) -> bool {
         self.assignments.contains(&expression)
             || (!is_call && self.values.contains(&expression))
@@ -965,6 +992,7 @@ impl AssignmentParts {
     }
 }
 
+/// Assignment values paired according to the assignment component positions.
 fn paired_assignment_values<'tree>(
     target: SyntaxNode<'tree>,
     value: SyntaxNode<'tree>,
@@ -994,6 +1022,7 @@ fn paired_assignment_values<'tree>(
     }
 }
 
+/// Whether this node is a self describing value.
 fn is_self_describing_value(node: SyntaxNode<'_>) -> bool {
     let node = parenthesized_value(node);
     node.is_literal()
@@ -1005,6 +1034,7 @@ fn is_self_describing_value(node: SyntaxNode<'_>) -> bool {
             && node.collection_elements().all(is_self_describing_value))
 }
 
+/// Unwraps parentheses to obtain the expression supplying a value.
 fn parenthesized_value(mut node: SyntaxNode<'_>) -> SyntaxNode<'_> {
     while node.is_holder() {
         let Some(value) = node.final_value_child() else {
@@ -1015,6 +1045,7 @@ fn parenthesized_value(mut node: SyntaxNode<'_>) -> SyntaxNode<'_> {
     node
 }
 
+/// Tests whether the outer source range covers the complete inner range.
 fn range_contains(outer: TextRange, inner: TextRange) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
@@ -1066,7 +1097,7 @@ mod tests {
     /// The hints of `text` under `options`, with the library's types known,
     /// as their positions and labels.
     fn library_hints(text: &str, options: &InlayHintSettings) -> Vec<(Position, String)> {
-        let registry = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let registry = ObjectRegistry::load(crate::catalog::test_corpus());
         placed_labels(&hints_with(text, options, &registry))
     }
 
@@ -1329,7 +1360,7 @@ mod tests {
             arg_types: true,
             ..nowhere()
         };
-        let registry = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let registry = ObjectRegistry::load(crate::catalog::test_corpus());
         let hints = hints_with(source, &both, &registry);
 
         assert_eq!(
@@ -1443,7 +1474,7 @@ mod tests {
 
     #[test]
     fn long_labels_are_cut_with_the_whole_type_in_the_tooltip() {
-        let registry = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let registry = ObjectRegistry::load(crate::catalog::test_corpus());
         let options = InlayHintSettings {
             max_label_length: Some(4),
             ..InlayHintSettings {

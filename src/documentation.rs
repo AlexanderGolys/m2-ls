@@ -15,24 +15,37 @@ use crate::source::{ByteRange, SourceNavigation, SymbolMention};
 /// The semantic owner of one accepted documentation block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentationTarget {
+    /// Documentation attached to a package declaration.
     Package,
+    /// Documentation attached to a particular source binding state.
     Binding {
+        /// Stable identity of the scoped source binding.
         binding_id: BindingId,
+        /// Source extent identifying the selected binding state.
         state_span: TextRange,
+        /// Name used to resolve and present this item.
         name: ObjectName,
     },
+    /// Documentation attached to a method installation.
     Installation {
+        /// Identity of the documented method installation.
         installation_id: MethodInstallationId,
+        /// Name used to resolve and present this item.
         name: ObjectName,
+        /// Source extent used to associate documentation with its owner.
         anchor: TextRange,
     },
+    /// Documentation attached to an assignment's source extent.
     Assignment {
+        /// Text presented to the editor or user.
         label: String,
+        /// Source extent used to associate documentation with its owner.
         anchor: TextRange,
     },
 }
 
 impl DocumentationTarget {
+    /// Whether this value owns binding.
     pub fn owns_binding(&self, binding: BindingView<'_>) -> bool {
         matches!(
             self,
@@ -44,6 +57,7 @@ impl DocumentationTarget {
         )
     }
 
+    /// Whether this value owns installation.
     pub fn owns_installation(&self, installation_id: MethodInstallationId) -> bool {
         matches!(
             self,
@@ -58,7 +72,9 @@ impl DocumentationTarget {
 /// One Markdown block whose placement resolves to at least one meaningful owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentationBlock {
+    /// Rendered Markdown shown when hovering the documented item.
     hover_markdown: String,
+    /// Binding targets or documentation owners associated with this item.
     targets: Vec<DocumentationTarget>,
 }
 
@@ -71,6 +87,7 @@ impl DocumentationBlock {
         }
     }
 
+    /// Rendered Markdown associated with this documentation block.
     pub fn hover_markdown(&self) -> &str {
         &self.hover_markdown
     }
@@ -85,10 +102,12 @@ impl DocumentationBlock {
 /// documentation string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentationSnippet {
+    /// Original source interval in UTF-8 byte offsets.
     pub bytes: ByteRange,
 }
 
 impl DocumentationSnippet {
+    /// Original UTF-8 byte extent of this documentation snippet.
     pub fn span(&self) -> ByteRange {
         self.bytes.clone()
     }
@@ -97,10 +116,15 @@ impl DocumentationSnippet {
 /// All documentation projections computed for one source snapshot.
 #[derive(Debug, Default)]
 pub struct DocumentationIndex {
+    /// Documentation blocks associated with source declarations.
     blocks: Vec<DocumentationBlock>,
+    /// Code fragments extracted from documentation comments.
     snippets: Vec<DocumentationSnippet>,
+    /// Symbol mentions or typed references retained for later queries.
     references: Vec<SymbolMention>,
+    /// Original source intervals occupied by documentation comments.
     comment_ranges: Vec<ByteRange>,
+    /// Source intervals treated as executable documentation examples.
     example_ranges: Vec<ByteRange>,
 }
 
@@ -110,14 +134,17 @@ impl DocumentationIndex {
         &self.blocks
     }
 
+    /// Source intervals occupied by documentation comments.
     pub fn comment_ranges(&self) -> &[ByteRange] {
         &self.comment_ranges
     }
 
+    /// Source intervals treated as executable documentation examples.
     pub fn example_ranges(&self) -> &[ByteRange] {
         &self.example_ranges
     }
 
+    /// Code fragments extracted from the document's documentation comments.
     pub fn snippets(&self) -> &[DocumentationSnippet] {
         &self.snippets
     }
@@ -128,10 +155,12 @@ impl DocumentationIndex {
         self.blocks.extend(blocks);
     }
 
+    /// Symbol mentions extracted from documentation links and code snippets.
     pub fn references(&self) -> &[SymbolMention] {
         &self.references
     }
 
+    /// Documentation associated with the selected binding state.
     pub fn for_binding(&self, binding: BindingView<'_>) -> Option<&DocumentationBlock> {
         self.blocks.iter().find(|block| {
             block
@@ -141,6 +170,7 @@ impl DocumentationIndex {
         })
     }
 
+    /// Documentation associated with the selected method-installation identity.
     pub fn for_installation(
         &self,
         installation_id: MethodInstallationId,
@@ -207,13 +237,17 @@ pub fn collect_documentation(
     index
 }
 
+/// Extracted Markdown with mappings back to the original comment bytes.
 #[derive(Debug)]
 struct DocumentationText {
+    /// Rendered documentation or its extracted Markdown coordinates.
     markdown: String,
+    /// Mappings between extracted Markdown and original comment bytes.
     mappings: Vec<DocumentationMapping>,
 }
 
 impl DocumentationText {
+    /// Constructs this representation from line comments.
     fn from_line_comments(comments: &[SyntaxNode<'_>]) -> Self {
         let mut markdown = String::new();
         let mut mappings = Vec::new();
@@ -241,6 +275,7 @@ impl DocumentationText {
         Self { markdown, mappings }
     }
 
+    /// Constructs this representation from block comment.
     fn from_block_comment(comment: SyntaxNode<'_>) -> Self {
         // `-*` opens a block comment and `-**` a doc block comment, closing with
         // the mirrored `*-` / `**-`. Measuring the opening marker and mirroring
@@ -294,6 +329,7 @@ impl DocumentationText {
         Self { markdown, mappings }
     }
 
+    /// Maps an extracted Markdown interval to one original source interval.
     fn source_range(&self, markdown: Range<usize>) -> Option<ByteRange> {
         self.mappings.iter().find_map(|mapping| {
             (mapping.markdown.start <= markdown.start && markdown.end <= mapping.markdown.end).then(
@@ -306,6 +342,7 @@ impl DocumentationText {
         })
     }
 
+    /// Maps an extracted Markdown interval to all contributing original source intervals.
     fn source_ranges(&self, markdown: Range<usize>) -> Vec<ByteRange> {
         self.mappings
             .iter()
@@ -321,18 +358,25 @@ impl DocumentationText {
     }
 }
 
+/// A Markdown byte interval paired with the original source interval.
 #[derive(Debug)]
 struct DocumentationMapping {
+    /// Rendered documentation or its extracted Markdown coordinates.
     markdown: ByteRange,
+    /// Original document byte interval corresponding to the extracted Markdown text.
     source: ByteRange,
 }
 
+/// A borrowed documentation line retaining its original byte coordinates.
 #[derive(Debug)]
 struct SourceLine<'a> {
+    /// Original or extracted text represented by this item.
     text: &'a str,
+    /// Original document byte interval corresponding to the extracted Markdown text.
     source: ByteRange,
 }
 
+/// Splits documentation text into lines retaining original source offsets.
 fn source_lines(text: &str, source_start: usize) -> Vec<SourceLine<'_>> {
     let mut lines = Vec::new();
     let mut offset = 0;
@@ -354,6 +398,7 @@ fn source_lines(text: &str, source_start: usize) -> Vec<SourceLine<'_>> {
     lines
 }
 
+/// Collects line documentation from the supplied syntax and semantic context.
 fn collect_line_documentation(
     comments: &[SyntaxNode<'_>],
     source: &(impl SourceNavigation + ?Sized),
@@ -408,6 +453,7 @@ fn collect_line_documentation(
     }
 }
 
+/// Collects inner documentation from the supplied syntax and semantic context.
 fn collect_inner_documentation(
     comments: &[SyntaxNode<'_>],
     source: &(impl SourceNavigation + ?Sized),
@@ -453,6 +499,7 @@ fn collect_inner_documentation(
     }
 }
 
+/// Collects markdown block from the supplied syntax and semantic context.
 fn collect_markdown_block(
     text: DocumentationText,
     targets: Vec<DocumentationTarget>,
@@ -510,6 +557,7 @@ fn collect_markdown_block(
     });
 }
 
+/// Collects mapped m2 references from the supplied syntax and semantic context.
 fn collect_mapped_m2_references(
     text: &DocumentationText,
     target: ByteRange,
@@ -531,6 +579,7 @@ fn collect_mapped_m2_references(
     }
 }
 
+/// Collects legacy backtick snippets from the supplied syntax and semantic context.
 fn collect_legacy_backtick_snippets(
     node: SyntaxNode<'_>,
     source: &(impl SourceNavigation + ?Sized),
@@ -579,6 +628,7 @@ fn collect_legacy_backtick_snippets(
     }
 }
 
+/// Bindings, assignments, or installations to which this documented source item contributes.
 fn targets_for_item(
     item: SyntaxNode<'_>,
     source: &(impl SourceNavigation + ?Sized),
@@ -632,6 +682,7 @@ fn targets_for_item(
     targets
 }
 
+/// Unwraps a source item to its first meaningful expression.
 fn first_item_expression(mut item: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     while item.is_source_cell() {
         let next = {
@@ -643,6 +694,7 @@ fn first_item_expression(mut item: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     Some(item)
 }
 
+/// Whether this node is a new package declaration.
 fn is_new_package_declaration(item: SyntaxNode<'_>) -> bool {
     let Some(application) = first_item_expression(item) else {
         return false;
@@ -656,10 +708,12 @@ fn is_new_package_declaration(item: SyntaxNode<'_>) -> bool {
         .is_some_and(|callee| callee.is::<Symbol>() && callee.text() == "newPackage")
 }
 
+/// Tests whether the outer source range covers the complete inner range.
 fn range_contains(outer: TextRange, inner: TextRange) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 
+/// Finds the source item documented by a preceding comment.
 fn following_item(comment: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     let parent = comment.parent()?;
     let mut found = false;
@@ -672,6 +726,7 @@ fn following_item(comment: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     None
 }
 
+/// Whether a comment is the first meaningful content of its enclosing construct.
 fn is_first_content(comment: SyntaxNode<'_>, parent: SyntaxNode<'_>) -> bool {
     parent
         .named_children()
@@ -679,6 +734,7 @@ fn is_first_content(comment: SyntaxNode<'_>, parent: SyntaxNode<'_>) -> bool {
         .all(|child| child.is_comment())
 }
 
+/// Finds scope target in the enclosing source constructs.
 fn enclosing_scope_target(
     comment: SyntaxNode<'_>,
     parent: SyntaxNode<'_>,
@@ -713,6 +769,7 @@ fn enclosing_scope_target(
     None
 }
 
+/// Whether a comment occupies the whole visible content of its source line.
 fn takes_full_line(comment: SyntaxNode<'_>, source: &str) -> bool {
     let column = comment.start_position().column;
     comment
@@ -721,6 +778,7 @@ fn takes_full_line(comment: SyntaxNode<'_>, source: &str) -> bool {
         .is_some_and(|line_start| source[line_start..comment.start_byte()].trim().is_empty())
 }
 
+/// Whether both syntax nodes share the same enclosing navigation node.
 fn same_parent(left: SyntaxNode<'_>, right: SyntaxNode<'_>) -> bool {
     left.parent()
         .zip(right.parent())

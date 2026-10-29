@@ -20,3 +20,6 @@ example-workspace/
 # Local diagnostic logs
 *.log
 *.log.*
+
+# Local copy of the separately downloaded builtin catalog
+/m2-index.jsonl

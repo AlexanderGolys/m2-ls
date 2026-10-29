@@ -1,4 +1,14 @@
 //! Transient static type inference for a completed semantic snapshot.
+//!
+//! A checker borrows the source analysis and its positioned knowledge provider.
+//! Its expression cache lives only for that checker; inferred results are not
+//! written back into the syntax tree. Local bindings, explicit domain/codomain
+//! annotations, and external method tables contribute exact or upward-closed
+//! result ranges. Unknown evidence remains distinct from a proven mismatch.
+//!
+//! Dispatch selection bounds the Cartesian products of union-typed arguments,
+//! filters compatible signatures, and prefers strictly more specific domains
+//! before combining candidate codomains.
 
 use crate::builtin_index::CallableInfo;
 use crate::node_metadata::TypedSource;
@@ -24,7 +34,9 @@ use crate::object_registry::TypeStore;
 
 /// Partial-order view combining source and external type edges without copying.
 struct SourceTypeOrder<'analysis, Knowledge: ?Sized> {
+    /// Source-declared runtime classes supplementing the external type graph.
     source: &'analysis SourceTypeFacts,
+    /// External type knowledge supplementing source-declared facts.
     external: &'analysis Knowledge,
 }
 
@@ -51,48 +63,73 @@ impl<Knowledge: TypeKnowledge + ?Sized> TypeStore for SourceTypeOrder<'_, Knowle
     }
 }
 
+/// Transient inference over one analyzed document and its positioned type knowledge.
 pub struct TypeChecker<'analysis, 'knowledge, Knowledge: ?Sized> {
+    /// Semantic facts for the current document snapshot.
     analysis: &'analysis Analysis,
+    /// Object and type knowledge queried at each source position.
     knowledge_provider: &'knowledge Knowledge,
+    /// Memoized inferred types for syntax nodes in this inference session.
     type_cache: RefCell<HashMap<SyntaxNodeId, InferredType>>,
 }
 
+/// The class or singleton object a method-domain slot denotes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DispatchIdentity {
+    /// A runtime class identity or its catalog data.
     Type(TypeId),
+    /// A singleton runtime object identity.
     Object(ObjectId),
 }
 
+/// An exact dispatch identity or the types derived from a domain class.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DispatchRange {
+    /// A single known identity, value, or type point.
     Exact(DispatchIdentity),
+    /// A runtime class together with its possible subtypes.
     Upward(TypeId),
 }
 
+/// A candidate signature with its domain names resolved to object identities.
 struct ResolvedDispatchDomain {
+    /// Position of this candidate in the callable's signature list.
     signature_index: usize,
+    /// Resolved identities for the method-domain arguments.
     slots: Vec<DispatchIdentity>,
 }
 
+/// A deferred inference step resolved against bindings and callable signatures.
 enum TypeSubstitution<'tree> {
+    /// A single known identity, value, or type point.
     Exact(ObjectName),
+    /// Infer the result by following the referenced expression.
     Follow(SyntaxNode<'tree>),
+    /// Combine the possibilities contributed by each alternative.
     Union(Vec<Self>),
+    /// Resolve the symbol through its source binding and external knowledge.
     Symbol(SyntaxNode<'tree>),
+    /// Infer the result from applicable callable method domains.
     Dispatch(SyntaxNode<'tree>),
+    /// No narrower static result can be established.
     Unknown,
 }
 
 /// One transient operator-inference request passed to specialized rule sets.
 #[derive(Debug, Clone, Copy)]
 pub struct OperatorTypeQuery<'tree> {
+    /// Operator spelling or syntax controlling this expression.
     pub operator: &'tree str,
+    /// Left operand of the expression.
     pub left: SyntaxNode<'tree>,
+    /// Right operand, when this operation has one.
     pub right: Option<SyntaxNode<'tree>>,
+    /// Index of the lexical scope owning this operation.
     pub scope_idx: usize,
 }
 
 impl<'analysis, 'knowledge, Knowledge: ?Sized> TypeChecker<'analysis, 'knowledge, Knowledge> {
+    /// Starts an inference session with an empty expression-type cache and borrowed semantic knowledge.
     pub fn new(analysis: &'analysis Analysis, knowledge_provider: &'knowledge Knowledge) -> Self {
         Self {
             analysis,
@@ -111,6 +148,7 @@ impl<Knowledge: ?Sized> Deref for TypeChecker<'_, '_, Knowledge> {
 }
 
 impl Analysis {
+    /// Visits inferable expressions with their result ranges, evaluating child expressions before their parents.
     pub fn for_each_expression_type<'tree>(
         &self,
         root: SyntaxNode<'tree>,
@@ -133,6 +171,7 @@ impl Analysis {
         }
     }
 
+    /// Whether the class has a known proper subtype at this source position.
     pub fn has_strict_subtype_at(
         &self,
         name: &ObjectName,
@@ -151,6 +190,7 @@ impl Analysis {
             })
     }
 
+    /// Enriches lambda node using the bindings and type knowledge already collected.
     fn enrich_lambda_node(&mut self, node: SyntaxNode, source: &(impl SourceNavigation + ?Sized)) {
         if let Some(parameters) = node.lambda_parameters() {
             let parameter_types = self.argument_lambda_domain(node, source).cloned();
@@ -158,6 +198,7 @@ impl Analysis {
         }
     }
 
+    /// Enriches assignment node using the bindings and type knowledge already collected.
     fn enrich_assignment_node(
         &mut self,
         node: SyntaxNode,
@@ -256,6 +297,7 @@ impl Analysis {
         self.record_assignment_fact(node, left, right, scope_idx, installation_id, source);
     }
 
+    /// Traverses generated syntax to enrich callable and binding type facts.
     pub(super) fn enrich_types_typed(
         &mut self,
         syntax: &TypedSource,
@@ -272,10 +314,15 @@ impl Analysis {
     }
 }
 
+/// AST visitor recording types and installations after binding collection.
 struct TypedTypeEnricher<'analysis, 'tree, 'source, 'knowledge, Source: ?Sized, Knowledge: ?Sized> {
+    /// Semantic facts for the current document snapshot.
     analysis: &'analysis mut Analysis,
+    /// Document syntax root used for navigation within this revision.
     root: SyntaxNode<'tree>,
+    /// Source-declared runtime classes supplementing the external type graph.
     source: &'source Source,
+    /// Object and type knowledge queried at each source position.
     knowledge_provider: &'knowledge Knowledge,
 }
 
@@ -284,6 +331,7 @@ where
     Source: SourceNavigation + ?Sized,
     Knowledge: PositionedTypeKnowledge + ?Sized,
 {
+    /// Records install method call for later semantic or editor queries.
     fn record_install_method_call(&mut self, node: SyntaxNode) {
         let knowledge = self
             .knowledge_provider
@@ -337,6 +385,7 @@ where
     }
 }
 
+/// Value expression supplied by a generated assignment alternative.
 fn assignment_value(node: &Assignment) -> &Expr {
     use Assignment::*;
     match node {
@@ -354,6 +403,7 @@ fn assignment_value(node: &Assignment) -> &Expr {
 }
 
 impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge> {
+    /// Result range determined by positioned external object facts for this expression.
     pub fn inferred_external_type(
         &self,
         type_id: TypeId,
@@ -367,6 +417,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
             .unwrap_or_else(|| InferredType::upward_from_id(name))
     }
 
+    /// Resolves dispatch identity at against the source position and available object knowledge.
     fn resolve_dispatch_identity_at(
         &self,
         name: &ObjectName,
@@ -378,6 +429,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
             .or_else(|| knowledge.resolve_object(name).map(DispatchIdentity::Object))
     }
 
+    /// Dispatch products derived from the available type evidence.
     fn inferred_dispatch_products(
         &self,
         arguments: &[InferredType],
@@ -419,6 +471,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         Some(products)
     }
 
+    /// Signature indices compatible with the known argument identities and domains.
     fn dispatch_candidate_indices(
         &self,
         signatures: &[ResolvedDispatchDomain],
@@ -480,6 +533,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         candidates
     }
 
+    /// Catalog signatures compatible with the call's argument types, separated from excluded candidates.
     pub fn external_call_signature_facts(
         &self,
         callable: &ObjectName,
@@ -519,6 +573,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         })
     }
 
+    /// Infers this expression's result using the current binding scope and memoized evidence.
     pub fn type_of(
         &self,
         node: SyntaxNode,
@@ -544,6 +599,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
     }
 }
 
+/// Classifies syntax into the deferred inference operation needed to determine its result.
 fn type_substitution(node: SyntaxNode<'_>) -> TypeSubstitution<'_> {
     use TypeSubstitution::{Dispatch, Exact, Follow, Symbol, Union, Unknown};
 
@@ -634,6 +690,7 @@ fn type_substitution(node: SyntaxNode<'_>) -> TypeSubstitution<'_> {
 }
 
 impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge> {
+    /// Resolves a deferred inference step using source bindings and applicable method signatures.
     fn evaluate_type_substitution(
         &self,
         substitution: TypeSubstitution<'_>,
@@ -679,6 +736,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         }
     }
 
+    /// Forms the union of result possibilities contributed by the input expressions.
     fn join_types(
         &self,
         left: InferredType,
@@ -728,6 +786,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         InferredType::exact("Symbol")
     }
 
+    /// Type of a previous output selected by the source reference, when available.
     fn output_reference_type(
         &self,
         node: SyntaxNode,
@@ -1067,6 +1126,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         InferredType::unknown()
     }
 
+    /// Dispatch codomain after resolving the available source and catalog identities.
     fn resolved_dispatch_codomain(
         &self,
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -1085,6 +1145,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         self.resolve_external_call_return_type(&operator.token, args, options, position, knowledge)
     }
 
+    /// Resolves external call return type against the source position and available object knowledge.
     fn resolve_external_call_return_type(
         &self,
         callable: &ObjectName,
@@ -1144,6 +1205,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         }
     }
 
+    /// Dispatch domains supplied by the external object catalog.
     fn external_dispatch_domains(
         &self,
         callable: &CallableInfo,
@@ -1169,6 +1231,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
             .collect()
     }
 
+    /// Candidates return type supplied by the external object catalog.
     fn external_candidates_return_type(
         &self,
         callable: &CallableInfo,
@@ -1190,6 +1253,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
             })
     }
 
+    /// Infers call facts from expression syntax and positioned type evidence.
     pub fn infer_call_facts(
         &self,
         node: SyntaxNode,
@@ -1206,6 +1270,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         self.infer_call_facts_for_callable(node, source, scope_idx, callable, knowledge)
     }
 
+    /// Infers call facts for callable from expression syntax and positioned type evidence.
     fn infer_call_facts_for_callable(
         &self,
         node: SyntaxNode,
@@ -1350,6 +1415,196 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
             .then_some(facts.argument_types)
     }
 
+    /// The options `node`, a call `f args`, passes that `f` does not accept
+    /// as given. Only calls of a function whose complete option list is known
+    /// are checked: one declaring a literal option list in source, or a
+    /// catalog function recording its option table, directly or for the one
+    /// installation the call reaches.
+    pub fn call_option_misuses<'tree>(
+        &self,
+        node: SyntaxNode<'tree>,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Vec<OptionMisuse<'tree>> {
+        let Some(parts) = node
+            .is_space_application()
+            .then(|| node.binary_parts())
+            .flatten()
+        else {
+            return Vec::new();
+        };
+        let Some(name) = symbol_node_text(parts.left) else {
+            return Vec::new();
+        };
+        let arguments = parenthesized_value(parts.right).unwrap_or(parts.right);
+        let passed = if arguments.is::<Sequence>() {
+            arguments.collection_elements().collect::<Vec<_>>()
+        } else {
+            vec![arguments]
+        };
+        let passed = passed
+            .into_iter()
+            .filter(|argument| argument.is_option_assignment())
+            .filter_map(|argument| argument.binary_parts())
+            .filter(|option| option.left.is::<Symbol>())
+            .collect::<Vec<_>>();
+        if passed.is_empty()
+            || self
+                .analysis
+                .is_method_installation_callable(parts.left, source)
+        {
+            return Vec::new();
+        }
+        let position = source.position_for_node(node);
+        let scope = self.find_scope_at(position).unwrap_or(0);
+        let Some(accepted) =
+            self.accepted_call_options(name, parts.right, scope, position, source, knowledge)
+        else {
+            return Vec::new();
+        };
+        let mut misuses = Vec::new();
+        for option in passed {
+            let key = option.left;
+            let Some(spec) = accepted.iter().find(|spec| spec.name.name() == key.text()) else {
+                misuses.push(OptionMisuse::UnknownName {
+                    key,
+                    suggestion: Self::closest_option_name(key.text(), &accepted),
+                    accepted: accepted.iter().map(|spec| spec.name.clone()).collect(),
+                });
+                continue;
+            };
+            if let Some(misuse) =
+                self.option_value_misuse(spec, option.right, scope, source, knowledge)
+            {
+                misuses.push(misuse);
+            }
+        }
+        misuses
+    }
+
+    /// The complete option list of the function `name` names at a call with
+    /// `arguments`, or `None` when it is not known.
+    fn accepted_call_options(
+        &self,
+        name: &str,
+        arguments: SyntaxNode,
+        scope: usize,
+        position: Position,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Option<Vec<CallableOption>> {
+        let callable =
+            if let Some(function) = self.local_function_at(name, scope, position, knowledge) {
+                if let Some(options) = &function.declared_options {
+                    return Some(options.clone());
+                }
+                function.indexed_callable.clone()?
+            } else {
+                if self
+                    .visible_source_binding_from_scope(name, scope, position, knowledge)
+                    .is_some()
+                {
+                    return None;
+                }
+                ObjectName::new(name)
+            };
+        let info = knowledge.get_record(&callable)?.callable()?;
+        match info.option_passing? {
+            OptionPassing::Table => Some(info.options.clone()),
+            OptionPassing::Forwarded => {
+                let facts = self.infer_call_facts_for_callable(
+                    arguments,
+                    source,
+                    scope,
+                    Some(name),
+                    knowledge,
+                );
+                self.external_call_signature_facts(&callable, &facts, position, knowledge)?
+                    .pinned?
+                    .options
+            }
+            _ => None,
+        }
+    }
+
+    /// A value `spec` does not accept: one whose type is disproven for every
+    /// accepted type, or an unbound symbol outside its possible values.
+    fn option_value_misuse<'tree>(
+        &self,
+        spec: &CallableOption,
+        value: SyntaxNode<'tree>,
+        scope: usize,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Option<OptionMisuse<'tree>> {
+        let position = source.position_for_node(value);
+        if let Some(symbol) = symbol_node_text(value).filter(|_| !spec.possible_values.is_empty()) {
+            let evaluates_to_itself = self
+                .visible_source_binding_from_scope(symbol, scope, position, knowledge)
+                .is_none()
+                && knowledge
+                    .get_record(&ObjectName::new(symbol))
+                    .is_none_or(|record| record.class == TypeRole::Symbol.object_name());
+            if evaluates_to_itself {
+                return (!spec
+                    .possible_values
+                    .iter()
+                    .any(|possible| possible.name() == symbol))
+                .then(|| OptionMisuse::ValueNotPossible {
+                    value,
+                    option: spec.name.clone(),
+                    possible: spec.possible_values.clone(),
+                });
+            }
+        }
+        if spec.accepted_types.is_empty() {
+            return None;
+        }
+        let actual = self.type_of(value, source, scope);
+        let disproven = spec.accepted_types.iter().all(|accepted| {
+            actual.possibility_by(accepted, |candidate, bound| {
+                self.subtype_evidence(candidate, bound, position, knowledge)
+            }) == SubtypeEvidence::Disproven
+        });
+        disproven.then(|| OptionMisuse::ValueType {
+            value,
+            option: spec.name.clone(),
+            actual,
+            accepted: spec.accepted_types.clone(),
+        })
+    }
+
+    /// The accepted option name a misspelled `key` most likely means: the one
+    /// with the fewest single-character edits, ignoring case, provided they
+    /// change at most a third of the key.
+    fn closest_option_name(key: &str, accepted: &[CallableOption]) -> Option<ObjectName> {
+        let key = key.to_lowercase().chars().collect::<Vec<_>>();
+        let edits = |name: &str| {
+            let name = name.to_lowercase().chars().collect::<Vec<_>>();
+            let mut previous = (0..=name.len()).collect::<Vec<_>>();
+            for (row, key_char) in key.iter().enumerate() {
+                let mut current = vec![row + 1];
+                for (column, name_char) in name.iter().enumerate() {
+                    let substitution = previous[column] + usize::from(key_char != name_char);
+                    current.push(
+                        substitution
+                            .min(previous[column + 1] + 1)
+                            .min(current[column] + 1),
+                    );
+                }
+                previous = current;
+            }
+            previous[name.len()]
+        };
+        accepted
+            .iter()
+            .map(|option| (edits(option.name.name()), &option.name))
+            .filter(|(distance, _)| *distance <= (key.len() / 3).max(1))
+            .min_by_key(|(distance, _)| *distance)
+            .map(|(_, name)| name.clone())
+    }
+
+    /// Domain is disjoint associated with the recognized method installation or signature.
     fn method_domain_is_disjoint(
         &self,
         function: Option<&FunctionInfo>,
@@ -1404,6 +1659,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         has_domains
     }
 
+    /// Whether the callable receives the argument pack as one sequence value.
     fn callable_receives_sequence(
         &self,
         name: &str,
@@ -1422,6 +1678,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
             .is_some_and(|callable| callable.receives_sequence)
     }
 
+    /// Resolves local call return type against the source position and available object knowledge.
     fn resolve_local_call_return_type(
         &self,
         function: &FunctionInfo,
@@ -1498,6 +1755,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         }
     }
 
+    /// Identities of source methods compatible with the inferred argument tuple.
     pub fn local_call_candidate_installation_ids(
         &self,
         function: &FunctionInfo,
@@ -1511,6 +1769,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
             .collect()
     }
 
+    /// Source methods compatible with the inferred argument tuple and current visibility.
     fn local_call_candidate_installations(
         &self,
         function: &FunctionInfo,
@@ -1547,6 +1806,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
             .collect()
     }
 
+    /// Whether positioned source and external type facts prove the subtype relationship.
     pub fn is_subtype(
         &self,
         actual: &ObjectName,
@@ -1557,6 +1817,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         self.subtype_evidence(actual, expected, position, knowledge) == SubtypeEvidence::Proven
     }
 
+    /// Available proof that the child type belongs to the parent's subtype family.
     pub fn subtype_evidence(
         &self,
         actual: &ObjectName,
@@ -1581,6 +1842,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         }
     }
 
+    /// Resolves source type id against the source position and available object knowledge.
     fn resolve_source_type_id(&self, name: &ObjectName, position: Position) -> Option<TypeId> {
         self.get_binding_at(name.name(), position)?
             .state
@@ -1588,6 +1850,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
             .clone()
     }
 
+    /// Resolves type id at against the source position and available object knowledge.
     pub fn resolve_type_id_at(
         &self,
         name: &ObjectName,
@@ -1598,6 +1861,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
             .or_else(|| knowledge.resolve_type_id(name))
     }
 
+    /// Resolves type at against the source position and available object knowledge.
     fn resolve_type_at(
         &self,
         name: &ObjectName,
@@ -1615,6 +1879,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         )
     }
 }
+/// Whether the spelling denotes an operator whose result is Boolean.
 fn is_comparison_operator(operator: &str) -> bool {
     [
         <Token![==] as Token>::SPELLING,
@@ -1628,6 +1893,7 @@ fn is_comparison_operator(operator: &str) -> bool {
     .contains(&operator)
 }
 
+/// External candidate indices remaining after applying source visibility and dispatch specificity.
 fn effective_external_candidate_indices(
     callable: &CallableInfo,
     candidates: &[usize],
@@ -1673,6 +1939,7 @@ fn effective_external_candidate_indices(
     selected
 }
 
+/// Removes candidates whose dispatch domains strictly contain another applicable domain.
 fn minimal_candidates<T: Copy>(
     mut candidates: Vec<T>,
     strictly_smaller: impl Fn(T, T) -> bool,
@@ -1687,8 +1954,10 @@ fn minimal_candidates<T: Copy>(
     candidates
 }
 
+/// Upper bound on Cartesian products explored while resolving union-typed dispatch arguments.
 const MAX_DISPATCH_PRODUCTS: usize = 256;
 
+/// Whether a class or singleton argument identity satisfies a domain slot.
 fn dispatch_identity_matches(
     actual: &DispatchIdentity,
     expected: &DispatchIdentity,
@@ -1700,6 +1969,7 @@ fn dispatch_identity_matches(
                 if order.is_subtype_id(actual, expected))
 }
 
+/// Finds evidence that two dispatch domains can accept a common argument tuple.
 fn dispatch_intersection_witness(
     actual: &DispatchRange,
     expected: &DispatchIdentity,
@@ -1724,6 +1994,7 @@ fn dispatch_intersection_witness(
     }
 }
 
+/// Whether all argument identities satisfy the corresponding dispatch-domain slots.
 fn dispatch_domain_matches(
     expected: &[DispatchIdentity],
     actual: &[DispatchIdentity],
@@ -1736,6 +2007,7 @@ fn dispatch_domain_matches(
             .all(|(expected, actual)| dispatch_identity_matches(actual, expected, order))
 }
 
+/// Whether one dispatch domain is strictly more specific than another.
 fn dispatch_domain_strictly_smaller(
     smaller: &[DispatchIdentity],
     bigger: &[DispatchIdentity],

@@ -142,6 +142,18 @@ UNUSED_BINDING {
         tags: [UNNECESSARY],
     }
 
+    /// Parentheses around a condition, `try` value, or loop range that the
+    /// keyword already delimits.
+    ///
+    /// ```m2
+    /// f = n -> if (n > 0) then 1 else 2
+    /// ```
+REDUNDANT_CONTROL_PARENTHESES {
+        code: "S03",
+        name: "redundant-control-parentheses",
+        severity: HINT,
+    }
+
     /// A null test that `??` expresses directly: here `x ?? 0`, and
     /// `typeInfo ??= class value` for an `if` that only assigns the fallback.
     ///
@@ -155,6 +167,19 @@ UNUSED_BINDING {
 PREFER_COALESCENCE {
         code: "S04",
         name: "prefer-coalescence",
+        severity: HINT,
+    }
+
+    /// An `if` or `try` with a shorter equivalent form: a redundant `null`
+    /// branch, a negated condition, or a nesting that flattens into an
+    /// `else if` chain.
+    ///
+    /// ```m2
+    /// f = (key, val) -> if val === null then null else (key, val)
+    /// ```
+SIMPLIFIABLE_EXPRESSION {
+        code: "S05",
+        name: "simplifiable-expression",
         severity: HINT,
     }
 
@@ -387,6 +412,47 @@ INSTALL_CODOMAIN_MISMATCH {
         severity: WARNING,
     }
 
+    /// An option name the called function does not accept; Macaulay2 rejects
+    /// the call.
+    ///
+    /// ```m2
+    /// f = method(Options => {Verbose => false})
+    /// f ZZ := o -> n -> n
+    /// f(1, Verbos => true)
+    /// ```
+UNKNOWN_OPTION {
+        code: "E16",
+        name: "unknown-option",
+        severity: ERROR,
+    }
+
+    /// A file a `load`, `needs` or `input` call cannot run: nothing where
+    /// `load` looks (the directory of the loading file, then, for a name
+    /// without a leading `/`, `~/`, `./` or `../`, `path`), a directory, a
+    /// file it may not read, or an empty name.
+    ///
+    /// ```m2
+    /// load "no-such-file.m2"
+    /// ```
+UNLOADABLE_FILE {
+        code: "E17",
+        name: "unloadable-file",
+        severity: WARNING,
+    }
+
+    /// An `initFile` directive selecting a file that cannot be read: it is
+    /// not there, may not be read, or is no UTF-8 text. The document is
+    /// analyzed without an init file.
+    ///
+    /// ```m2
+    /// -- m2-ls: initFile no-such-init.m2
+    /// ```
+UNAVAILABLE_INIT_FILE {
+        code: "E18",
+        name: "unavailable-init-file",
+        severity: WARNING,
+    }
+
     /// A method call whose argument types cannot match any known domain.
     ///
     /// ```m2
@@ -397,6 +463,18 @@ INSTALL_CODOMAIN_MISMATCH {
 CALL_DOMAIN_MISMATCH {
         code: "T05",
         name: "call-domain-mismatch",
+        severity: WARNING,
+    }
+
+    /// An option a call passes whose value is none of the types the option is
+    /// documented to take, or a symbol outside the values it accepts.
+    ///
+    /// ```m2
+    /// gb(ideal x, ChangeMatrix => 3)
+    /// ```
+OPTION_VALUE_MISMATCH {
+        code: "T06",
+        name: "option-value-mismatch",
         severity: WARNING,
     }
 

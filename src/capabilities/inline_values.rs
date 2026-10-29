@@ -11,6 +11,7 @@ use crate::document::DocumentSnapshot;
 use crate::source::SourceNavigation;
 use crate::typesystem::TypeKnowledge;
 
+/// Protocol capability advertising support for inline values.
 pub fn inline_value_provider_capability() -> Option<OneOf<bool, InlineValueServerCapabilities>> {
     Some(OneOf::Left(true))
 }

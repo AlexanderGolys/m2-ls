@@ -10,42 +10,66 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+/// Maximum log size before rotation replaces the previous log backup.
 const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
+/// Duration threshold above which operation timing is emitted without verbose logging.
 const SLOW_OPERATION: Duration = Duration::from_millis(100);
+/// Minimum interval between aggregate telemetry summaries.
 const SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
+/// Bound on distinct operation names retained in aggregate statistics.
 const MAX_STATISTICS_KEYS: usize = 128;
+/// Process-wide logger initialized on the first telemetry operation.
 static LOGGER: OnceLock<Logger> = OnceLock::new();
+/// Process-wide counter allocating timing-event identities.
 static NEXT_SPAN: AtomicU64 = AtomicU64::new(1);
+/// Number of typed navigation lookups since process startup.
 static SYNTAX_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+/// Number of syntax-child enumerations since process startup.
 static SYNTAX_CHILDREN: AtomicU64 = AtomicU64::new(0);
 
+/// Counts one navigation lookup for aggregate syntax telemetry.
 pub fn syntax_lookup() {
     SYNTAX_LOOKUPS.fetch_add(1, Ordering::Relaxed);
 }
+/// Counts one syntax-child enumeration for aggregate telemetry.
 pub fn syntax_children() {
     SYNTAX_CHILDREN.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Bounded structured event writer with synchronized timing statistics.
 struct Logger {
+    /// Filesystem path of the represented file.
     path: PathBuf,
+    /// Whether to record detailed timings even for fast operations.
     verbose: bool,
+    /// Source-ordered state of the selected binding.
     state: Mutex<LogState>,
 }
 
+/// Mutable file, byte count, and accumulated operation statistics behind the logger lock.
 struct LogState {
+    /// Open log file, absent when logging could not be initialized.
     file: Option<File>,
+    /// Bytes already written to the current log file, used to decide when to rotate.
     bytes: u64,
+    /// Accumulated timings grouped by operation name.
     statistics: HashMap<String, Statistics>,
+    /// Time at which aggregate statistics were last written.
     last_summary: Instant,
 }
 
+/// Count, cumulative duration, and maximum duration for one timed operation.
 #[derive(Default)]
 struct Statistics {
+    /// Number of completed operations contributing to these statistics.
     count: u64,
+    /// Sum of operation durations in milliseconds.
     total_ms: f64,
+    /// Longest recorded operation duration in milliseconds.
     maximum_ms: f64,
 }
 
+/// Initializes the process logger once from the logging environment setting.
 fn logger() -> &'static Logger {
     LOGGER.get_or_init(|| {
         let setting = std::env::var_os("M2_LS_LOG");
@@ -58,6 +82,7 @@ fn logger() -> &'static Logger {
 }
 
 impl Logger {
+    /// Opens bounded structured logging at the configured path and records the verbosity policy.
     fn new(path: PathBuf, verbose: bool) -> Self {
         let bytes = fs::metadata(&path).map_or(0, |metadata| metadata.len());
         Self {
@@ -72,6 +97,7 @@ impl Logger {
         }
     }
 
+    /// Writes a structured log event, rotating the file at the configured size bound.
     fn write(&self, state: &mut LogState, event: Value) {
         let row = json!({
             "timestamp_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
@@ -105,6 +131,7 @@ impl Logger {
         }
     }
 
+    /// Records a structured event without writing to the protocol stream.
     fn event(&self, event: Value) {
         let mut state = self
             .state
@@ -113,6 +140,7 @@ impl Logger {
         self.write(&mut state, event);
     }
 
+    /// Records a finished operation and updates its aggregate duration statistics.
     fn complete(&self, operation: &str, fields: Value, elapsed: Duration, force: bool) {
         let mut state = self
             .state
@@ -141,6 +169,7 @@ impl Logger {
         }
     }
 
+    /// Writes accumulated operation counts and duration statistics.
     fn summary(&self, state: &mut LogState) {
         let mut statistics = state
             .statistics
@@ -167,13 +196,18 @@ impl Logger {
 /// A wall-clock interval. Unfinished request futures retain their cancellation
 /// status when dropped, and verbose start rows expose work still in progress.
 pub struct Timing {
+    /// Stable operation name used to group telemetry events.
     operation: &'static str,
+    /// Structured context attached to the timed operation.
     fields: Value,
+    /// Instant at which timing began.
     started: Instant,
+    /// Whether to emit this operation even below the slow-operation threshold.
     force: bool,
 }
 
 impl Timing {
+    /// Begins a timed operation with the supplied structured context.
     pub fn start(operation: &'static str, mut fields: Value) -> Self {
         let id = NEXT_SPAN.fetch_add(1, Ordering::Relaxed);
         fields["span_id"] = json!(id);
@@ -188,10 +222,12 @@ impl Timing {
         }
     }
 
+    /// Adds a context field to this timed operation.
     pub fn record(&mut self, key: &str, value: impl Into<Value>) {
         self.fields[key] = value.into();
     }
 
+    /// Records the failure context and forces emission of the timed operation.
     pub fn error(&mut self, error: impl Into<Value>) {
         self.record("error", error);
         self.force = true;
@@ -209,10 +245,12 @@ impl Drop for Timing {
     }
 }
 
+/// Records a structured event without writing to the protocol stream.
 pub fn event(event: Value) {
     logger().event(event);
 }
 
+/// Writes accumulated operation counts and duration statistics.
 pub fn summary() {
     let logger = logger();
     let mut state = logger

@@ -31,6 +31,12 @@ impl LspProcess {
         // Macaulay2 installation, so results do not depend on where tests run.
         let mut child = Command::new(env!("CARGO_BIN_EXE_m2-ls"))
             .env_clear()
+            .env(
+                "M2_LS_CATALOG",
+                m2_ls::catalog::CatalogSource::current()
+                    .and_then(|source| source.path())
+                    .expect("test catalog must be available"),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -329,6 +335,8 @@ pub(crate) struct TestWorkspace {
     pub(crate) uri: String,
     related_source_path: std::path::PathBuf,
     pub(crate) related_uri: String,
+    /// Paths whose permissions [`Self::lock`] took, restored before removal.
+    locked: std::cell::RefCell<Vec<std::path::PathBuf>>,
 }
 
 impl TestWorkspace {
@@ -360,12 +368,66 @@ impl TestWorkspace {
             uri,
             related_source_path,
             related_uri,
+            locked: std::cell::RefCell::default(),
         }
     }
 
-    /// Write `text` to the file `name` of the workspace, returning its URI.
+    /// Create the directory `name` and its parents.
+    pub(crate) fn create_dir(&self, name: &str) {
+        fs::create_dir_all(self.path(name)).expect("the workspace directory should be created");
+    }
+
+    /// Make `name` a symbolic link to `target`, as written, returning the
+    /// link's URI.
+    #[cfg(unix)]
+    pub(crate) fn symlink(&self, name: &str, target: &str) -> String {
+        std::os::unix::fs::symlink(target, self.path(name))
+            .expect("the symbolic link should be created");
+        self.file_uri(name)
+    }
+
+    /// Take every permission from `name`, returning whether the operating
+    /// system now refuses it: running as root, it does not.
+    #[cfg(unix)]
+    pub(crate) fn lock(&self, name: &str) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.path(name);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
+            .expect("the permissions should be taken");
+        self.locked.borrow_mut().push(path.clone());
+        fs::File::open(&path).is_err()
+    }
+
+    /// Give back the permissions [`Self::lock`] took from `name`.
+    #[cfg(unix)]
+    pub(crate) fn unlock(&self, name: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.path(name);
+        let mode = if path.is_dir() { 0o700 } else { 0o600 };
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+            .expect("the permissions should be given back");
+        self.locked.borrow_mut().retain(|locked| *locked != path);
+    }
+
+    /// The path of `name` in the workspace.
+    pub(crate) fn path(&self, name: &str) -> std::path::PathBuf {
+        self.root.join(name)
+    }
+
+    /// The URI of `name` in the workspace, whether or not it exists.
+    pub(crate) fn file_uri(&self, name: &str) -> String {
+        Url::from_file_path(self.path(name))
+            .expect("the workspace file path should become a URI")
+            .to_string()
+    }
+
+    /// Write `text` to the file `name` of the workspace, creating its
+    /// directories, returning its URI.
     pub(crate) fn write_file(&self, name: &str, text: &str) -> String {
         let path = self.root.join(name);
+        if let Some(directory) = path.parent() {
+            fs::create_dir_all(directory).expect("the workspace directory should be created");
+        }
         fs::write(&path, text).expect("the workspace file should be written");
         Url::from_file_path(&path)
             .expect("the workspace file path should become a URI")
@@ -381,6 +443,11 @@ impl TestWorkspace {
 
 impl Drop for TestWorkspace {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        for path in self.locked.take() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o700));
+        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }

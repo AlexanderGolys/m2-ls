@@ -14,10 +14,14 @@ use crate::meta::BindingRole;
 use crate::object_registry::ObjectName;
 use crate::typesystem::InferredType;
 
+/// A source declaration with the location and kind shown in workspace search.
 #[derive(Debug, Clone)]
 pub struct WorkspaceSourceSymbol {
+    /// Name used to resolve and present this item.
     pub name: ObjectName,
+    /// Semantic or presentation category of this item.
     pub kind: SymbolKind,
+    /// Resolved source location used for navigation.
     pub location: Location,
 }
 
@@ -97,6 +101,7 @@ pub fn collect_document_symbols(document: &DocumentSnapshot) -> Vec<DocumentSymb
     build_document_symbol_tree(analysis, declarations)
 }
 
+/// Signature detail associated with the recognized method installation or signature.
 fn method_signature_detail(
     analysis: &Analysis,
     installation: &MethodInstallation,
@@ -133,17 +138,26 @@ fn document_symbol(
     }
 }
 
+/// Intermediate symbol entry awaiting attachment to its enclosing document scope.
 #[derive(Debug)]
 struct Declaration {
+    /// Name used to resolve and present this item.
     name: String,
+    /// Additional text shown beside the completion label.
     detail: Option<String>,
+    /// Semantic or presentation category of this item.
     kind: SymbolKind,
+    /// Source extent used to locate this item.
     range: TextRange,
+    /// Identifier extent selected by symbol navigation.
     selection_range: TextRange,
+    /// Index of the lexical scope owning this operation.
     scope_idx: usize,
+    /// Nested scope whose declarations belong beneath this symbol.
     child_scope_idx: Option<usize>,
 }
 
+/// Collects workspace symbols from the supplied syntax and semantic context.
 pub fn collect_workspace_symbols(
     document: &DocumentSnapshot,
     uri: &Url,
@@ -161,6 +175,7 @@ pub fn collect_workspace_symbols(
         .collect()
 }
 
+/// Groups source declarations under their nearest enclosing symbol containers.
 fn build_document_symbol_tree(
     analysis: &Analysis,
     declarations: Vec<Declaration>,
@@ -183,6 +198,7 @@ fn build_document_symbol_tree(
     build_scope_symbols(0, &mut by_scope)
 }
 
+/// Nearest ancestor scope whose declarations should appear as children of a document symbol.
 fn nearest_container_scope(
     analysis: &Analysis,
     container_scopes: &[bool],
@@ -199,6 +215,7 @@ fn nearest_container_scope(
     }
 }
 
+/// Builds the symbol hierarchy for one lexical scope and its nested containers.
 fn build_scope_symbols(scope_idx: usize, by_scope: &mut [Vec<Declaration>]) -> Vec<DocumentSymbol> {
     std::mem::take(&mut by_scope[scope_idx])
         .into_iter()
@@ -250,7 +267,7 @@ mod tests {
     #[test]
     fn document_symbols_exclude_package_indexed_option_keys() {
         let text = "newPackage(\"P\", Version => \"0.1\", DebuggingMode => false)\n";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let symbols = collect_document_symbols(&document);
 
@@ -512,7 +529,7 @@ Z = new Type of X
 Y + X := (a,b) -> \"Y + X\"
 X + Z := (a,b) -> \"X + Z\"
 ";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
 
         let document = document(text, &builtins);
         let symbols = collect_document_symbols(&document);
@@ -575,7 +592,7 @@ x := 1
     #[test]
     fn document_symbols_keep_to_type_functions_as_functions() {
         let text = "toString := x -> x";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
 
         let document = document(text, &builtins);
         let symbols = collect_document_symbols(&document);

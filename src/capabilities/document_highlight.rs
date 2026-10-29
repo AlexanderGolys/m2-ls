@@ -15,6 +15,7 @@ use tower_lsp::lsp_types::{
     DocumentHighlight, DocumentHighlightKind, DocumentHighlightOptions, OneOf, Position,
 };
 
+/// Advertises document-highlight support in the server initialization response.
 pub fn document_highlight_provider_capability() -> Option<OneOf<bool, DocumentHighlightOptions>> {
     Some(OneOf::Left(true))
 }
@@ -260,6 +261,7 @@ fn symbol_reference_highlights(
     )
 }
 
+/// Highlight ranges for control transfer in the current document.
 fn control_transfer_highlights(
     document: &DocumentSnapshot,
     position: Position,
@@ -291,6 +293,7 @@ fn control_transfer_highlights(
     Some(highlights_for_nodes(nodes, document))
 }
 
+/// Highlight ranges for control owner in the current document.
 fn control_owner_highlights(
     document: &DocumentSnapshot,
     position: Position,
@@ -320,6 +323,7 @@ fn control_owner_highlights(
     }
 }
 
+/// Appends transfers owned by the selected callable or loop without crossing nested owners.
 fn extend_control_transfer_nodes<'tree>(
     nodes: &mut Vec<SyntaxNode<'tree>>,
     owner: SyntaxNode<'tree>,
@@ -339,6 +343,7 @@ fn extend_control_transfer_nodes<'tree>(
     );
 }
 
+/// Builds for nodes using the selected source nodes and their ranges.
 fn highlights_for_nodes(
     mut nodes: Vec<SyntaxNode<'_>>,
     document: &DocumentSnapshot,
@@ -355,6 +360,7 @@ fn highlights_for_nodes(
         .collect()
 }
 
+/// Finds control transfer in the enclosing source constructs.
 fn enclosing_control_transfer(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     node.enclosing_node(SyntaxNode::is_control_transfer)
 }
@@ -386,6 +392,7 @@ fn keyword_sequence_highlights(
     )
 }
 
+/// Finds keyword statement in the enclosing source constructs.
 fn enclosing_keyword_statement(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
     node.enclosing_node(SyntaxNode::is_keyword_statement)
 }
@@ -499,7 +506,7 @@ mod tests {
 
     #[test]
     fn does_not_highlight_null_or_boolean_literals() {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         for literal in ["null", "true", "false"] {
             let text = format!("{literal}\n{literal}\n");
             let document = document(&text);
@@ -532,7 +539,7 @@ mod tests {
 
     #[test]
     fn package_strings_highlight_package_references_without_strings_or_shadowed_locals() {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let text = concat!(
             "needsPackage \"Graphs\"\n",
             "loadPackage \"Graphs\"\n",
@@ -561,7 +568,7 @@ mod tests {
 
     #[test]
     fn package_declaration_is_a_write_and_package_strings_use_utf16_ranges() {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let text = "newPackage \"Pkg\"\nneedsPackage \"Pkg\"\nPkg\n";
         let document = DocumentSnapshot::from_text(text.into(), &builtins).unwrap();
         let highlights = document_highlights(&document, pos!(1, 14), &builtins).unwrap();
@@ -590,7 +597,7 @@ mod tests {
 
     #[test]
     fn highlights_unshadowed_builtin_names_but_excludes_keywords() {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let text = "ideal I\n-- call [[ideal]] again\nx := ideal J\nif true then ideal K\n";
         let source_document = document(text);
         let words = document_highlights(&source_document, pos!(0, 1), &builtins)
@@ -614,7 +621,7 @@ mod tests {
 
     #[test]
     fn builtin_highlights_do_not_cross_a_local_shadow() {
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let text = "ideal I\nf := ideal -> (ideal + 1)\nideal J\n";
         let document = document(text);
         let highlights = document_highlights(&document, pos!(0, 1), &builtins)
@@ -705,7 +712,7 @@ mod tests {
     #[test]
     fn break_highlights_its_apply_callback() {
         let text = "apply(0..3, i -> if i then break i else break)\n";
-        let builtins = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document =
             DocumentSnapshot::from_text(text.to_string(), &builtins).expect("fixture should parse");
         let cursor = text.find("break").expect("fixture should contain break") as u32;

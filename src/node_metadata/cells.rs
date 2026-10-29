@@ -6,60 +6,82 @@ use m2_syn::{
     CellStream, CellTokenStream, CommentTrivia, LexError, NativeParseError, NativeParser, Parser,
     Spanned, Token, Trivia,
 };
-use std::ops::Range;
+use serde_json::json;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
+use std::{iter, ops::Range};
 
+use crate::telemetry::Timing;
+
+/// Stable identity shared by revisions retaining the same cell parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CellId(u64);
+/// Process-wide counter allocating identities for newly parsed cells.
 static NEXT_CELL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A revision-specific location of an independently retained parse result.
 #[derive(Debug, Clone)]
 pub struct ParsedCell {
+    /// Source extent used to locate this item.
     range: Range<usize>,
+    /// Parse allocation shared by revisions retaining the same cell.
     data: Arc<CellData>,
 }
 
+/// Shared ownership of one cell's source, parse result, trivia, and diagnostics.
 #[derive(Debug)]
 struct CellData {
+    /// Stable identity used to refer to this retained item.
     id: CellId,
+    /// Original UTF-8 source bytes retained for this cell or document snapshot.
     source: Arc<str>,
+    /// Source-file parse result for this independently framed cell.
     syntax: Option<SourceFile>,
+    /// Comments retained alongside the cell parse.
     trivia: Vec<Trivia>,
+    /// Recoverable and fatal lexical errors for this cell.
     lexer_diagnostics: Vec<LexError>,
+    /// Fatal grammatical error, absent when parsing succeeded.
     parse_error: Option<NativeParseError>,
 }
 
 impl ParsedCell {
+    /// Identity of this retained item, stable while its owning cell is reused.
     pub fn id(&self) -> CellId {
         self.data.id
     }
+    /// Original source bytes owned by this retained parse.
     pub fn source(&self) -> &str {
         &self.data.source
     }
+    /// Cell extent in this document revision; sharing the parse does not share its location.
     pub fn document_range(&self) -> Range<usize> {
         self.range.clone()
     }
+    /// First generated cell in the retained parse result, absent for comment-only or invalid source.
     pub fn syntax(&self) -> Option<&Cell> {
         self.data.syntax.as_ref()?.cells.first()
     }
+    /// Comments retained alongside the cell, including when its code fails to parse.
     pub fn trivia(&self) -> &[Trivia] {
         &self.data.trivia
     }
+    /// Recoverable and fatal lexical diagnostics recorded for this cell.
     pub fn lexer_diagnostics(&self) -> &[LexError] {
         &self.data.lexer_diagnostics
     }
+    /// Fatal grammatical error for the owning cell, when one was recorded.
     pub fn parse_error(&self) -> Option<&NativeParseError> {
         self.data.parse_error.as_ref()
     }
 
+    /// Parses this framed source interval and retains lexical trivia even if grammar parsing fails.
     fn parse(source: &str, range: Range<usize>) -> Self {
-        let _timing = crate::telemetry::Timing::start(
+        let _timing = Timing::start(
             "syntax.native_cell_parse",
-            serde_json::json!({"source_bytes": source.len(), "byte_start": range.start, "byte_end": range.end}),
+            json!({"source_bytes": source.len(), "byte_start": range.start, "byte_end": range.end}),
         );
         let mut data = CellData {
             id: CellId(NEXT_CELL_ID.fetch_add(1, Ordering::Relaxed)),
@@ -99,22 +121,29 @@ impl ParsedCell {
 /// Syntax shared by all capabilities for one document revision.
 #[derive(Debug, Clone)]
 pub struct SyntaxSnapshot {
+    /// Original UTF-8 source bytes retained for this cell or document snapshot.
     source: Arc<str>,
+    /// Independently retained cells in document order.
     cells: Arc<[ParsedCell]>,
+    /// Current revision ranges that required reparsing.
     changed: Arc<[Range<usize>]>,
 }
 
 impl SyntaxSnapshot {
+    /// Original source bytes owned by this retained parse.
     pub fn source(&self) -> &str {
         &self.source
     }
+    /// Independently retained cell parses in document order.
     pub fn cells(&self) -> &[ParsedCell] {
         &self.cells
     }
+    /// Source ranges reparsed in the current document revision.
     pub fn changed_ranges(&self) -> &[Range<usize>] {
         &self.changed
     }
 
+    /// Parses this framed source interval and retains lexical trivia even if grammar parsing fails.
     pub fn parse(source: &str, previous: Option<&Self>) -> Self {
         let mut prefix = 0;
         let mut old_end = 0;
@@ -225,6 +254,7 @@ impl SyntaxSnapshot {
     }
 }
 
+/// Frames independently parseable source cells without guessing boundaries inside lexical constructs.
 fn frame_ranges(source: &str) -> Vec<Range<usize>> {
     if source.is_empty() {
         return Vec::new();
@@ -237,7 +267,7 @@ fn frame_ranges(source: &str) -> Vec<Range<usize>> {
             let end = error.span().start().unwrap_or(0);
             match lex_str_recovering(&source[..end]) {
                 Ok(prefix) => (prefix.value, Some(end)),
-                Err(_) => return std::iter::once(0..source.len()).collect(),
+                Err(_) => return iter::once(0..source.len()).collect(),
             }
         }
     };
@@ -262,6 +292,7 @@ fn frame_ranges(source: &str) -> Vec<Range<usize>> {
     ranges
 }
 
+/// End of a framed cell including its terminating newline when appropriate.
 fn cell_end(tokens: &CellTokenStream, source: &str) -> usize {
     let end = tokens.try_span().and_then(|span| span.end()).unwrap_or(0);
     let semicolon =

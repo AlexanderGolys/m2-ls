@@ -1,20 +1,26 @@
 use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
 
 use m2_syn::nodes::{ExprNew as NewStatement, ExprOption as OptionExpression, Symbol};
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionResponse, CompletionTextEdit,
-    Position, Range as TextRange, SymbolKind, TextEdit,
+    Position, Range as TextRange, SymbolKind, TextEdit, Url,
 };
 
 use crate::builtin_index::{CallableKind, Record};
 use crate::document::DocumentSnapshot;
+use crate::file_load::FileLoad;
+use crate::macaulay2::Macaulay2Conventions;
 use crate::node_metadata::SyntaxNode;
 use crate::object_registry::{ObjectKnowledge, ObjectName};
 use crate::package_index::is_package_import_string;
 use crate::record_lsp::LspKnowledge;
 use crate::source::SourceNavigation;
+use crate::string_literal::StringDelimiter;
 use crate::typesystem::{SubtypeEvidence, TypeKnowledge, TypeRole};
 
+/// Language keywords offered alongside visible symbol completions.
 const COMPLETION_KEYWORDS: &[&str] = &[
     "if",
     "then",
@@ -48,17 +54,25 @@ const COMPLETION_KEYWORDS: &[&str] = &[
     "threadLocal",
 ];
 
+/// Maximum number of candidates returned by an ordinary completion query.
 const COMPLETION_LIMIT: usize = 80;
+/// Maximum candidate count allowed for a short symbol prefix.
 const NARROW_COMPLETION_LIMIT: usize = 4;
+/// Prefix length below which symbol completion uses the narrow limit.
 const NARROW_PREFIX_LENGTH: usize = 2;
 
+/// Object and type queries needed to select completion candidates.
 pub trait CompletionKnowledge {
+    /// Visible object names matching a prefix up to the requested result count.
     fn records_with_prefix<'a>(&'a self, prefix: &str, limit: usize) -> Vec<(String, &'a Record)>;
 
+    /// Known package names matching a prefix up to the result limit.
     fn package_names_with_prefix(&self, prefix: &str, limit: usize) -> Vec<String>;
 
+    /// Looks up the visible catalog record for a completion name.
     fn record<'a>(&'a self, name: &ObjectName) -> Option<&'a Record>;
 
+    /// Available proof that the child type belongs to the parent's subtype family.
     fn subtype_evidence(&self, child: &ObjectName, parent: &ObjectName) -> SubtypeEvidence;
 }
 
@@ -80,24 +94,38 @@ impl<Knowledge: LspKnowledge> CompletionKnowledge for Knowledge {
     }
 }
 
+/// The document, cursor, and recognized syntax for one completion request.
 pub struct CompletionContext<'a> {
+    /// Immutable document snapshot being queried.
     document: &'a DocumentSnapshot,
+    /// Document location associated with the request.
+    uri: &'a Url,
+    /// LSP UTF-16 position at which the request is evaluated.
     position: Position,
+    /// Document UTF-8 byte offset corresponding to the requested LSP position.
     cursor: usize,
+    /// Syntax supplying this item's source and structure.
     node: SyntaxNode<'a>,
+    /// Recognized symbol under the cursor, when present.
     symbol: Option<SyntaxNode<'a>>,
+    /// Entered symbol text and the range completion will replace.
     symbol_prefix: Option<CompletionPrefix>,
 }
 
+/// Recognizes a cursor context and selects completion sources for it.
 pub trait CompletionPattern: Sync {
+    /// Recognizes this completion pattern at the current cursor position.
     fn query(&self, context: &CompletionContext<'_>) -> Option<CompletionQuery>;
 
+    /// Characters on which the client should request this completion pattern.
     fn trigger_characters(&self) -> &'static [&'static str] {
         &[]
     }
 }
 
+/// Produces candidates for a recognized completion prefix.
 pub trait CompletionSource: Send + Sync {
+    /// Candidates accepted by this completion source for the entered prefix.
     fn candidates(
         &self,
         context: &CompletionContext<'_>,
@@ -107,13 +135,18 @@ pub trait CompletionSource: Send + Sync {
     ) -> Vec<CompletionCandidate>;
 }
 
+/// Selected candidate sources, replacement prefix, and result limit.
 pub struct CompletionQuery {
+    /// Entered text and replacement coordinates used to select candidates.
     prefix: CompletionPrefix,
+    /// Candidate providers or source resolver supplying this operation.
     sources: Vec<Box<dyn CompletionSource>>,
+    /// Maximum result count or suppression policy for broad candidate sets.
     limit: CompletionLimit,
 }
 
 impl CompletionQuery {
+    /// Constructs this value from the supplied dependencies and initial state.
     pub fn new(prefix: CompletionPrefix, source: impl CompletionSource + 'static) -> Self {
         Self {
             prefix,
@@ -122,25 +155,33 @@ impl CompletionQuery {
         }
     }
 
+    /// Adds another completion source to this query without changing its prefix.
     pub fn and(mut self, source: impl CompletionSource + 'static) -> Self {
         self.sources.push(Box::new(source));
         self
     }
 
+    /// Suppresses this query when its candidate set exceeds the supplied bound.
     pub fn only_when_at_most(mut self, limit: usize) -> Self {
         self.limit = CompletionLimit::AtMost(limit);
         self
     }
 }
 
+/// A proposed completion with presentation details and ranking priority.
 pub struct CompletionCandidate {
+    /// Text presented to the editor or user.
     label: String,
+    /// Semantic or presentation category of this item.
     kind: CompletionItemKind,
+    /// Additional text shown beside the completion label.
     detail: Option<String>,
+    /// Relative candidate ranking, with lower values preferred.
     priority: u8,
 }
 
 impl CompletionCandidate {
+    /// Constructs this value from the supplied dependencies and initial state.
     pub fn new(label: impl Into<String>, kind: CompletionItemKind) -> Self {
         Self {
             label: label.into(),
@@ -150,29 +191,38 @@ impl CompletionCandidate {
         }
     }
 
+    /// Attaches explanatory text to a completion candidate.
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
         self
     }
 
+    /// Sets the ranking priority of this completion candidate.
     pub fn with_priority(mut self, priority: u8) -> Self {
         self.priority = priority;
         self
     }
 }
 
+/// Text already entered together with the range a completion replaces.
 #[derive(Clone)]
 pub struct CompletionPrefix {
+    /// Original or extracted text represented by this item.
     text: String,
+    /// Source range replaced when accepting the completion.
     replace: TextRange,
 }
 
+/// Whether to truncate candidates or suppress an overly broad result set.
 enum CompletionLimit {
+    /// Returns no more than the recorded number of candidates.
     UpTo(usize),
+    /// Suppresses completion when more than the recorded number of candidates match.
     AtMost(usize),
 }
 
 impl CompletionLimit {
+    /// Numeric limit used when requesting candidates from a source.
     fn value(&self) -> usize {
         match self {
             Self::UpTo(limit) | Self::AtMost(limit) => *limit,
@@ -180,26 +230,43 @@ impl CompletionLimit {
     }
 }
 
+/// Recognizes the string argument of a package-loading call.
 struct PackageImportPattern;
+/// Recognizes a file-loading string whose path can be completed.
+struct LoadedFilePattern;
+/// Recognizes a class argument of a new expression.
 struct NewTypePattern;
+/// Recognizes a value position in a callable's option assignment.
 struct OptionValuePattern;
+/// Recognizes an option-name position for a known callable.
 struct OptionKeyPattern;
+/// Recognizes short symbol prefixes requiring a narrow candidate set.
 struct NarrowSymbolPattern;
 
+/// Shared completion recognizer for package import.
 static PACKAGE_IMPORT_PATTERN: PackageImportPattern = PackageImportPattern;
+/// Shared completion recognizer for loaded file.
+static LOADED_FILE_PATTERN: LoadedFilePattern = LoadedFilePattern;
+/// Shared completion recognizer for new type.
 static NEW_TYPE_PATTERN: NewTypePattern = NewTypePattern;
+/// Shared completion recognizer for option value.
 static OPTION_VALUE_PATTERN: OptionValuePattern = OptionValuePattern;
+/// Shared completion recognizer for option key.
 static OPTION_KEY_PATTERN: OptionKeyPattern = OptionKeyPattern;
+/// Shared completion recognizer for narrow symbol.
 static NARROW_SYMBOL_PATTERN: NarrowSymbolPattern = NarrowSymbolPattern;
 
-static COMPLETION_PATTERNS: [&dyn CompletionPattern; 5] = [
+/// Completion recognizers evaluated in priority order for each cursor request.
+static COMPLETION_PATTERNS: [&dyn CompletionPattern; 6] = [
     &PACKAGE_IMPORT_PATTERN,
+    &LOADED_FILE_PATTERN,
     &NEW_TYPE_PATTERN,
     &OPTION_VALUE_PATTERN,
     &OPTION_KEY_PATTERN,
     &NARROW_SYMBOL_PATTERN,
 ];
 
+/// Protocol completion options including triggers recognized by the supported cursor patterns.
 pub fn completion_options() -> CompletionOptions {
     let mut seen = HashSet::new();
     let trigger_characters = COMPLETION_PATTERNS
@@ -214,12 +281,14 @@ pub fn completion_options() -> CompletionOptions {
     }
 }
 
+/// Recognizes the cursor context and returns ranked completion items with replacement ranges.
 pub fn completion_response<Knowledge: LspKnowledge>(
     document: &DocumentSnapshot,
+    uri: &Url,
     position: Position,
     knowledge: &Knowledge,
 ) -> Option<CompletionResponse> {
-    let context = CompletionContext::new(document, position)?;
+    let context = CompletionContext::new(document, uri, position)?;
     let knowledge: &dyn CompletionKnowledge = knowledge;
     COMPLETION_PATTERNS
         .iter()
@@ -228,7 +297,8 @@ pub fn completion_response<Knowledge: LspKnowledge>(
 }
 
 impl<'a> CompletionContext<'a> {
-    fn new(document: &'a DocumentSnapshot, position: Position) -> Option<Self> {
+    /// Constructs this value from the supplied dependencies and initial state.
+    fn new(document: &'a DocumentSnapshot, uri: &'a Url, position: Position) -> Option<Self> {
         let cursor = document.byte_for_position(position)?;
         let node = document.node_at_position_minimal(position)?;
         let symbol = node
@@ -247,6 +317,7 @@ impl<'a> CompletionContext<'a> {
             symbol.and_then(|symbol| CompletionPrefix::symbol(document, cursor, symbol));
         Some(Self {
             document,
+            uri,
             position,
             cursor,
             node,
@@ -255,11 +326,13 @@ impl<'a> CompletionContext<'a> {
         })
     }
 
+    /// Recognized symbol syntax associated with this completion request.
     fn symbol_node(&self) -> Option<SyntaxNode<'a>> {
         self.symbol
     }
 
-    fn package_prefix(&self, string: SyntaxNode<'_>) -> Option<CompletionPrefix> {
+    /// The text of `string` before the cursor, when the cursor is in it.
+    fn string_prefix(&self, string: SyntaxNode<'_>) -> Option<CompletionPrefix> {
         let start = string.string_literal_inner_bytes()?.start;
         (start <= self.cursor && self.cursor <= string.end_byte()).then(|| CompletionPrefix {
             text: self.document.text()[start..self.cursor].to_string(),
@@ -269,6 +342,7 @@ impl<'a> CompletionContext<'a> {
 }
 
 impl CompletionPrefix {
+    /// Builds a symbol completion prefix with its exact replacement range.
     fn symbol(
         source: &(impl SourceNavigation + ?Sized),
         cursor: usize,
@@ -289,13 +363,32 @@ impl CompletionPattern for PackageImportPattern {
             .enclosing_node(|node| node.is_string_literal())?;
         is_package_import_string(string).then_some(())?;
         Some(CompletionQuery::new(
-            context.package_prefix(string)?,
+            context.string_prefix(string)?,
             PackageNames,
         ))
     }
 
     fn trigger_characters(&self) -> &'static [&'static str] {
         &["\""]
+    }
+}
+
+impl CompletionPattern for LoadedFilePattern {
+    fn query(&self, context: &CompletionContext<'_>) -> Option<CompletionQuery> {
+        let string = context
+            .node
+            .enclosing_node(|node| node.is_string_literal())?;
+        FileLoad::names_file(string).then_some(())?;
+        Some(CompletionQuery::new(
+            context.string_prefix(string)?,
+            LoadableFiles {
+                delimiter: StringDelimiter::of(string)?,
+            },
+        ))
+    }
+
+    fn trigger_characters(&self) -> &'static [&'static str] {
+        &["\"", "/"]
     }
 }
 
@@ -380,17 +473,21 @@ impl CompletionPattern for NarrowSymbolPattern {
     }
 }
 
+/// Completion source for visible names, optionally restricted by type.
 struct KnownSymbols {
+    /// Type constraint used to filter proposed names.
     required_type: Option<ObjectName>,
 }
 
 impl KnownSymbols {
+    /// Selects known-symbol completion without a type restriction.
     fn any() -> Self {
         Self {
             required_type: None,
         }
     }
 
+    /// Restricts known-symbol completion to values compatible with the supplied type.
     fn of_type(required_type: ObjectName) -> Self {
         Self {
             required_type: Some(required_type),
@@ -454,6 +551,7 @@ impl CompletionSource for KnownSymbols {
     }
 }
 
+/// Whether a visible source binding satisfies the completion type constraint.
 fn binding_matches_type(
     binding: crate::analysis::BindingView<'_>,
     required_type: &ObjectName,
@@ -476,6 +574,7 @@ fn binding_matches_type(
         })
 }
 
+/// Completion source for package names known to the catalog and source resolver.
 struct PackageNames;
 
 impl CompletionSource for PackageNames {
@@ -497,7 +596,68 @@ impl CompletionSource for PackageNames {
     }
 }
 
+/// The source files and directories a load can name from what is typed:
+/// the entries of the directory the typed name is in, found the way `load`
+/// finds a file, each written the way the literal's `delimiter` can hold it.
+/// Hidden entries are offered once their leading `.` is typed; symbolic
+/// links count as what they point to.
+struct LoadableFiles {
+    /// Literal delimiter needed to encode inserted string content.
+    delimiter: StringDelimiter,
+}
+
+impl CompletionSource for LoadableFiles {
+    fn candidates(
+        &self,
+        context: &CompletionContext<'_>,
+        prefix: &str,
+        limit: usize,
+        _knowledge: &dyn CompletionKnowledge,
+    ) -> Vec<CompletionCandidate> {
+        let (typed_directory, typed_name) =
+            prefix.split_at(prefix.rfind('/').map_or(0, |slash| slash + 1));
+        let Some(entries) = self
+            .delimiter
+            .decode(typed_directory)
+            .and_then(|directory| FileLoad::first_location_of(&directory, context.uri))
+            .and_then(|directory| fs::read_dir(directory).ok())
+        else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                if name.starts_with('.') && !typed_name.starts_with('.') {
+                    return None;
+                }
+                let (written, kind) = if fs::metadata(entry.path()).ok()?.is_dir() {
+                    let written = self
+                        .delimiter
+                        .encode(&format!("{name}/"))
+                        .or_else(|| self.delimiter.encode(&name))?;
+                    (written, CompletionItemKind::FOLDER)
+                } else if Path::new(&name)
+                    .extension()
+                    .is_some_and(|extension| extension == Macaulay2Conventions::SOURCE_EXTENSION)
+                {
+                    (self.delimiter.encode(&name)?, CompletionItemKind::FILE)
+                } else {
+                    return None;
+                };
+                Some(CompletionCandidate::new(
+                    format!("{typed_directory}{written}"),
+                    kind,
+                ))
+            })
+            .take(limit)
+            .collect()
+    }
+}
+
+/// Completion source for option names accepted by a selected callable.
 struct CallableOptions {
+    /// Callable identity or expression selected for this operation.
     callable: ObjectName,
 }
 
@@ -524,8 +684,11 @@ impl CompletionSource for CallableOptions {
     }
 }
 
+/// Completion source for the documented values of a selected option.
 struct OptionValues {
+    /// Callable identity or expression selected for this operation.
     callable: ObjectName,
+    /// Name of the callable option being checked.
     option: ObjectName,
 }
 
@@ -558,12 +721,16 @@ impl CompletionSource for OptionValues {
     }
 }
 
+/// Completion source backed by a fixed list of names and one presentation kind.
 struct StaticNames {
+    /// Names offered by this fixed candidate source.
     names: &'static [&'static str],
+    /// Semantic or presentation category of this item.
     kind: CompletionItemKind,
 }
 
 impl StaticNames {
+    /// Constructs this value from the supplied dependencies and initial state.
     fn new(names: &'static [&'static str], kind: CompletionItemKind) -> Self {
         Self { names, kind }
     }
@@ -586,6 +753,7 @@ impl CompletionSource for StaticNames {
     }
 }
 
+/// Combines, ranks, and limits candidates into protocol completion items.
 fn complete(
     query: CompletionQuery,
     context: &CompletionContext<'_>,
@@ -638,6 +806,7 @@ fn complete(
     }
 }
 
+/// Converts a symbol presentation category to a completion category.
 fn completion_item_kind(kind: SymbolKind) -> CompletionItemKind {
     if kind == SymbolKind::FUNCTION {
         CompletionItemKind::FUNCTION
@@ -652,6 +821,7 @@ fn completion_item_kind(kind: SymbolKind) -> CompletionItemKind {
     }
 }
 
+/// Completion category appropriate for a catalog object record.
 fn record_completion_kind(record: &Record) -> CompletionItemKind {
     if record.type_info().is_some() {
         return CompletionItemKind::CLASS;
@@ -676,11 +846,12 @@ mod tests {
     use crate::object_registry::ObjectRegistry;
 
     fn completion_items(text: &str, position: Position) -> Vec<CompletionItem> {
-        let index = ObjectRegistry::load(include_str!("../data/m2-index.jsonl"));
+        let index = ObjectRegistry::load(crate::catalog::test_corpus());
         let document =
             DocumentSnapshot::from_text(text.to_string(), &index).expect("fixture should parse");
         let scoped = index.with_source_imports(text);
-        match completion_response(&document, position, &scoped) {
+        let uri = Url::parse("file:///fixture.m2").expect("fixture uri");
+        match completion_response(&document, &uri, position, &scoped) {
             Some(CompletionResponse::Array(items)) => items,
             Some(CompletionResponse::List(list)) => list.items,
             None => Vec::new(),
