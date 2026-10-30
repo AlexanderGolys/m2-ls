@@ -94,7 +94,7 @@ fn server_can_prepare_a_catalog_without_starting_a_session() {
 }
 
 #[test]
-fn formatter_needs_no_catalog_and_linter_reports_a_missing_override() {
+fn formatter_and_linter_remain_usable_without_a_catalog() {
     let workspace = Workspace::new();
     let source = workspace.0.join("file.m2");
     fs::write(&source, "x=1+2\n").unwrap();
@@ -111,7 +111,7 @@ fn formatter_needs_no_catalog_and_linter_reports_a_missing_override() {
         .env("M2_LS_CATALOG", &missing)
         .output()
         .unwrap();
-    assert_eq!(linted.status.code(), Some(2));
+    assert_ne!(linted.status.code(), Some(2), "{linted:?}");
     assert!(String::from_utf8_lossy(&linted.stderr).contains("missing-catalog.jsonl"));
 }
 

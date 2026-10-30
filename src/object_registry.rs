@@ -143,6 +143,14 @@ impl ObjectRegistry {
         Self::from_index(BuiltinIndex::load(corpus))
     }
 
+    /// Whether builtin records are available, independently of loaded packages.
+    ///
+    /// Without a catalog, callers can resolve installed packages through their
+    /// source files instead of assuming their metadata is already indexed.
+    pub fn has_catalog(&self) -> bool {
+        !self.catalog.index.records().is_empty()
+    }
+
     /// How many objects the loaded packages hold, each package counted once.
     pub fn len(&self) -> usize {
         let mut seen = HashSet::new();

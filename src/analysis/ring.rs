@@ -1,13 +1,17 @@
 //! Ring construction, generator rebinding, and ring-specific type rules.
 
-use m2_syn::nodes::{Array, ExprNew as NewStatement, FloatLiteral, IntegerLiteral, Symbol};
+use m2_syn::nodes::{FloatLiteral, IntegerLiteral, Symbol};
 use m2_syn::Token;
 use std::fmt::{self, Display, Formatter};
 
 use crate::node_metadata::visit_expression_nodes;
 
+use super::inference::session::InferenceSession;
 use super::known_value::KnownValue;
-use super::typechecker::{OperatorTypeQuery, TypeChecker};
+use super::typechecker::TypeChecker;
+
+pub mod syntax;
+pub mod values;
 use super::*;
 
 /// The option of a field constructor such as `GF` naming its generator.
@@ -183,46 +187,10 @@ impl IndexKey {
     /// `bare_symbols` says evaluate to themselves and indexed variables of
     /// them.
     fn from_node(node: SyntaxNode<'_>, bare_symbols: BareSymbols<'_>) -> Option<Self> {
-        let node = parenthesized_value(node)?;
-        if node.is::<IntegerLiteral>() {
-            return node.text().parse().ok().map(Self::Integer);
-        }
-        if node.is_prefix_expr() && node.operator_node()?.text() == "-" {
-            let Self::Integer(value) = Self::from_node(node.unary_operand()?, bare_symbols)? else {
-                return None;
-            };
-            return value.checked_neg().map(Self::Integer);
-        }
-        if node.is::<Symbol>() {
-            return bare_symbols(node).then(|| Self::Symbol(ObjectName::new(node.text())));
-        }
-        if node.has_binary_operator::<Token![_]>() {
-            let parts = node.binary_parts()?;
-            let base = parenthesized_value(parts.left)?;
-            return (base.is::<Symbol>() && bare_symbols(base))
-                .then(|| Self::from_node(parts.right, bare_symbols))
-                .flatten()
-                .map(|index| Self::IndexedVariable {
-                    base: ObjectName::new(base.text()),
-                    index: Box::new(index),
-                });
-        }
-        if let Some(text) = node.string_literal_inner_text() {
-            // Escaped strings require evaluation; do not compare their raw spelling.
-            return (!text.contains('\\')).then(|| Self::String(text.to_string()));
-        }
-        if node.is::<List>() || node.is::<Sequence>() {
-            let items = node
-                .collection_elements()
-                .map(|element| Self::from_node(element, bare_symbols))
-                .collect::<Option<Vec<_>>>()?;
-            return Some(if node.is::<List>() {
-                Self::List(items)
-            } else {
-                Self::Sequence(items)
-            });
-        }
-        None
+        let expression = node.get::<Expr>()?;
+        Self::from_expression(expression, &|symbol| {
+            node.related(symbol).is_some_and(bare_symbols)
+        })
     }
 
     /// Tests whether this key falls within the specified endpoints and upper-bound policy.
@@ -635,7 +603,7 @@ impl Display for RingVariableError {
 #[derive(Debug, Clone)]
 pub struct SelectedRingVariable<'tree> {
     /// Expression supplying the ring being selected from.
-    pub ring: SyntaxNode<'tree>,
+    pub ring: &'tree Expr,
     /// Resolved ring variable selected by the source expression.
     pub variable: RingVariable,
 }
@@ -804,7 +772,16 @@ impl Analysis {
             .ring_generators
             .insert(ObjectName::new(ring_name), generators);
 
-        let value = self.ring_value(expression, source, knowledge, scope_idx);
+        let value = syntax
+            .or_else(|| expression.get::<Expr>())
+            .and_then(|syntax| {
+                let checker = TypeChecker::new(self, knowledge);
+                let source =
+                    crate::source::SyntaxNavigation::new(source.source(), expression.snapshot());
+                let session = InferenceSession::new(&checker, &source, expression.snapshot());
+                let value = session.ring_values(scope_idx).value(syntax);
+                value
+            });
         if let Some(state) = ring_state.and_then(|id| {
             self.registry
                 .bindings
@@ -827,78 +804,13 @@ impl Analysis {
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<Result<SelectedRingVariable<'tree>, RingVariableError>> {
-        let expression = parenthesized_value(expression)?;
-        let parts = expression
-            .binary_parts()
-            .filter(|_| expression.has_binary_operator::<Token![_]>())?;
-        self.subscript_selection(parts.left, parts.right, source, knowledge)
-    }
-
-    /// What `left _ right` selects: a variable of the written ring `left` by
-    /// the literal index `right`, or of the written ring `right` by the name
-    /// `left` gives.
-    pub(super) fn subscript_selection<'tree>(
-        &self,
-        left: SyntaxNode<'tree>,
-        right: SyntaxNode<'tree>,
-        source: &(impl SourceNavigation + ?Sized),
-        knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> Option<Result<SelectedRingVariable<'tree>, RingVariableError>> {
-        if let Some(ring) = self.written_ring(left, source) {
-            let IndexKey::Integer(index) = IndexKey::literal(right)? else {
-                return None;
-            };
-            return Some(
-                ring.subscript(index)?
-                    .map(|variable| SelectedRingVariable {
-                        ring: left,
-                        variable,
-                    })
-                    .map_err(RingVariableError::IndexOutOfBounds),
-            );
-        }
-        let ring = self.written_ring(right, source)?;
-        let (name, lookup) = self.variable_name(left, source, knowledge)?;
-        match ring.search(&name) {
-            VariableSearch::Found(variable) => Some(Ok(SelectedRingVariable {
-                ring: right,
-                variable,
-            })),
-            VariableSearch::Absent => lookup
-                .failure()
-                .map(|failure| Err(RingVariableError::NotFound { name, failure })),
-            VariableSearch::Undetermined => None,
-        }
-    }
-
-    /// Whether `left _ right` reads an unindexed ring variable `left` at
-    /// the index `right`, which Macaulay2 answers with the indexed variable
-    /// of its name: `x_1` for `A_0_1` when `A_0` is `x`, or for `x_1` when
-    /// `x` holds a ring generator.
-    pub(super) fn indexes_ring_variable(
-        &self,
-        left: SyntaxNode<'_>,
-        right: SyntaxNode<'_>,
-        source: &(impl SourceNavigation + ?Sized),
-        knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> bool {
-        let bare_symbols = |symbol: SyntaxNode<'_>| self.is_bare_symbol(symbol, source, knowledge);
-        IndexKey::from_node(right, &bare_symbols).is_some()
-            && match parenthesized_value(left) {
-                Some(symbol) if symbol.is::<Symbol>() => {
-                    let position = source.position_for_node(symbol);
-                    let scope_idx = self.find_scope_at(position).unwrap_or(0);
-                    self.get_binding_from_scope(symbol.text(), scope_idx, position)
-                        .is_some_and(|binding| {
-                            binding.state.is_ring_generator
-                                && binding.state.indexed_element_type.is_none()
-                        })
-                }
-                _ => matches!(
-                    self.selected_ring_variable(left, source, knowledge),
-                    Some(Ok(selected)) if selected.variable.index.is_none()
-                ),
-            }
+        let syntax = expression.get::<Expr>()?;
+        syntax::RingSyntax::operands(syntax, "_")?;
+        let checker = TypeChecker::new(self, knowledge);
+        let source = crate::source::SyntaxNavigation::new(source.source(), expression.snapshot());
+        let session = InferenceSession::new(&checker, &source, expression.snapshot());
+        let selected = session.ring_values(0).selected(syntax);
+        selected
     }
 
     /// Whether `symbol` evaluates to itself: nothing the analysis sees binds
@@ -920,184 +832,6 @@ impl Analysis {
                 .type_of(symbol, source, scope_idx)
                 .single()
                 .is_some_and(|class| *class == TypeRole::Symbol.object_name())
-    }
-
-    /// The ring `ring` names when its binding holds one the program writes
-    /// out.
-    fn written_ring(
-        &self,
-        ring: SyntaxNode<'_>,
-        source: &(impl SourceNavigation + ?Sized),
-    ) -> Option<&RingValue> {
-        let ring = parenthesized_value(ring)?;
-        let name = ring.is::<Symbol>().then(|| ring.text())?;
-        let position = source.position_for_node(ring);
-        let binding =
-            self.get_binding_from_scope(name, self.find_scope_at(position).unwrap_or(0), position)?;
-        match &binding.state.known_value {
-            Some(KnownValue::Ring(value)) => Some(value),
-            _ => None,
-        }
-    }
-
-    /// The name the left operand of a lookup `v_R` gives, with the method
-    /// Macaulay2 dispatches it to: a string, a symbol not holding an indexed
-    /// variable table (whose `x_R` reads the table at the key `R`), a
-    /// selected ring variable, or such a name indexed by a literal.
-    fn variable_name(
-        &self,
-        expression: SyntaxNode<'_>,
-        source: &(impl SourceNavigation + ?Sized),
-        knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> Option<(VariableName, VariableLookup)> {
-        let expression = parenthesized_value(expression)?;
-        if let Some(text) = expression.string_literal_inner_text() {
-            // Escaped strings require evaluation; do not compare their raw spelling.
-            return (!text.contains('\\'))
-                .then(|| (VariableName(text.to_string()), VariableLookup::String));
-        }
-        if expression.is::<Symbol>() {
-            let position = source.position_for_node(expression);
-            let scope_idx = self.find_scope_at(position).unwrap_or(0);
-            let lookup = match self.get_binding_from_scope(expression.text(), scope_idx, position) {
-                None => VariableLookup::Symbol,
-                Some(binding) if binding.state.indexed_element_type.is_some() => return None,
-                Some(binding) if binding.state.is_ring_generator => VariableLookup::RingElement,
-                Some(_) => return None,
-            };
-            return Some((VariableName(expression.text().to_string()), lookup));
-        }
-        if let Some(Ok(selected)) = self.selected_ring_variable(expression, source, knowledge) {
-            return Some((
-                VariableName(selected.variable.to_string()),
-                VariableLookup::RingElement,
-            ));
-        }
-        let parts = expression
-            .binary_parts()
-            .filter(|_| expression.has_binary_operator::<Token![_]>())?;
-        let bare_symbols = |symbol: SyntaxNode<'_>| self.is_bare_symbol(symbol, source, knowledge);
-        let index = IndexKey::from_node(parts.right, &bare_symbols)?;
-        let (base, lookup) = self.indexed_variable_base(parts.left, &index, source, knowledge)?;
-        Some((
-            VariableName(format!("{base}_{}", index.subscript())),
-            lookup,
-        ))
-    }
-
-    /// The name `base` gives an indexed variable `base_index`, with what the
-    /// indexed variable is: a symbol unbound, holding an indexed variable
-    /// table — whose index a ring constructor may have made a ring element —
-    /// or holding a ring generator, or a selected unindexed ring variable.
-    fn indexed_variable_base(
-        &self,
-        base: SyntaxNode<'_>,
-        index: &IndexKey,
-        source: &(impl SourceNavigation + ?Sized),
-        knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> Option<(VariableName, VariableLookup)> {
-        let base = parenthesized_value(base)?;
-        if base.is::<Symbol>() {
-            let position = source.position_for_node(base);
-            let scope_idx = self.find_scope_at(position).unwrap_or(0);
-            let lookup = match self.get_binding_from_scope(base.text(), scope_idx, position) {
-                None => VariableLookup::IndexedVariable,
-                Some(binding) => match &binding.state.indexed_element_type {
-                    Some(table) => match table.write_at(index) {
-                        None => VariableLookup::IndexedVariable,
-                        Some(write) if write.writer == IndexedWriter::RingConstructor => {
-                            VariableLookup::RingElement
-                        }
-                        Some(_) => return None,
-                    },
-                    None if binding.state.is_ring_generator => VariableLookup::IndexedVariable,
-                    None => return None,
-                },
-            };
-            return Some((VariableName(base.text().to_string()), lookup));
-        }
-        match self.selected_ring_variable(base, source, knowledge)? {
-            Ok(selected) if selected.variable.index.is_none() => Some((
-                VariableName(selected.variable.base.name().to_string()),
-                VariableLookup::IndexedVariable,
-            )),
-            _ => None,
-        }
-    }
-
-    /// The ring `expression` evaluates to when the program writes it out: a
-    /// constructor over its coefficient ring, a quotient, a named ring
-    /// holding one, or a ring certainly adding no variables.
-    fn ring_value(
-        &self,
-        expression: SyntaxNode,
-        source: &(impl SourceNavigation + ?Sized),
-        knowledge: &(impl TypeKnowledge + ?Sized),
-        scope_idx: usize,
-    ) -> Option<RingValue> {
-        let expression = parenthesized_value(expression)?;
-        if let Some(variables) =
-            self.ring_constructor_variables(expression, source, knowledge, scope_idx)
-        {
-            let coefficient_ring = expression.binary_parts()?.left;
-            return Some(RingValue::Polynomial {
-                coefficient_ring: self
-                    .ring_value(coefficient_ring, source, knowledge, scope_idx)
-                    .map(Box::new),
-                variables: RingGeneratorBinding::collect(variables, &|symbol| {
-                    self.is_bare_symbol(symbol, source, knowledge)
-                })
-                .iter()
-                .map(RingGenerator::from)
-                .collect(),
-            });
-        }
-        if expression.has_binary_operator::<Token![/]>() {
-            let quotiented = expression.binary_parts()?.left;
-            return self
-                .ring_value(quotiented, source, knowledge, scope_idx)
-                .map(|ring| RingValue::Quotient(Box::new(ring)));
-        }
-        self.written_ring(expression, source).cloned().or_else(|| {
-            self.is_basic_ring(expression, source, knowledge, scope_idx)
-                .then_some(RingValue::Basic)
-        })
-    }
-
-    /// Whether `ring` is certainly a ring of a class with no variables to
-    /// select: every class its type admits is a ring neither polynomial nor
-    /// quotient, as `RealField` of `RR_53`, exactly `Ring` of `QQ`, or the
-    /// family `RR` standing for its default field. A bound such as `↑Ring`
-    /// admits polynomial rings, so it is not.
-    fn is_basic_ring(
-        &self,
-        ring: SyntaxNode,
-        source: &(impl SourceNavigation + ?Sized),
-        knowledge: &(impl TypeKnowledge + ?Sized),
-        scope_idx: usize,
-    ) -> bool {
-        let ring_type = TypeChecker::new(self, knowledge).type_of(ring, source, scope_idx);
-        let variable_classes = VARIABLE_RING_CLASSES.map(ObjectName::new);
-        let is_ring = |class: &ObjectName| {
-            knowledge.has_type_role(class, TypeRole::Ring)
-                || knowledge.is_subtype(class, &ObjectName::new(INEXACT_FIELD_FAMILY))
-        };
-        let mut exact = ring_type.exact_points().peekable();
-        let mut bounds = ring_type.upward_generators().peekable();
-        (exact.peek().is_some() || bounds.peek().is_some())
-            && exact.all(|class| {
-                is_ring(class)
-                    && !variable_classes
-                        .iter()
-                        .any(|variable_class| knowledge.is_subtype(class, variable_class))
-            })
-            && bounds.all(|bound| {
-                is_ring(bound)
-                    && !variable_classes.iter().any(|variable_class| {
-                        knowledge.is_subtype(bound, variable_class)
-                            || knowledge.is_subtype(variable_class, bound)
-                    })
-            })
     }
 
     /// The variables a ring constructor spells out as plain symbols — `QQ[x, y]`
@@ -1536,80 +1270,37 @@ impl Analysis {
 impl<'tree> RingGeneratorBinding<'tree> {
     /// Variable specification supplied by a recognized polynomial-ring constructor.
     fn constructor_variables(application: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
-        let argument = parenthesized_value(application.binary_parts().map(|parts| parts.right)?)?;
-        let is_constructor_argument =
-            |node: &SyntaxNode<'tree>| node.is::<Array>() || node.is::<List>();
-        if is_constructor_argument(&argument) {
-            return Some(argument);
-        }
-        argument
-            .binary_parts()
-            .map(|parts| parts.left)
-            .filter(is_constructor_argument)
+        let syntax = application.get::<m2_syn::nodes::ExprOpBinAdj>()?;
+        application.related(syntax::RingSyntax::constructor_variables(syntax)?)
     }
 
     /// Collects ring-generator specifications, retaining the selected policy for bare symbols.
     fn collect(container: SyntaxNode<'tree>, bare_symbols: BareSymbols<'_>) -> Vec<Self> {
-        let elements = container.collection_elements().collect::<Vec<_>>();
-        let variable_base = elements
-            .iter()
-            .find_map(|element| Self::option_value(*element, "VariableBaseName"))
-            .and_then(Self::base_name);
-        let mut bindings = Vec::new();
-
-        for element in elements {
-            if element.is_option_assignment() {
-                if let Some(variables) = Self::option_value(element, "Variables") {
-                    if variables.is::<IntegerLiteral>() {
-                        let name = variable_base.clone().unwrap_or_else(|| "p".to_string());
-                        Self::push(
-                            &mut bindings,
-                            RingGeneratorBinding {
-                                name,
-                                kind: RingGeneratorKind::IndexedTable,
-                                node: variables,
-                                indices: variables
-                                    .text()
-                                    .parse::<i64>()
-                                    .ok()
-                                    .filter(|n| *n > 0)
-                                    .map(|n| IndexSelection::Range {
-                                        start: IndexKey::Integer(0),
-                                        end: IndexKey::Integer(n - 1),
-                                        exclusive: false,
-                                    }),
-                            },
-                        );
-                    } else {
-                        Self::collect_spec(variables, &mut bindings, bare_symbols);
-                    }
-                }
-                continue;
-            }
-            Self::collect_spec(element, &mut bindings, bare_symbols);
-        }
-
-        bindings
+        let Some(expression) = container.get::<Expr>() else {
+            return Vec::new();
+        };
+        syntax::RingSyntax::generators(expression, &|symbol| {
+            container.related(symbol).is_some_and(bare_symbols)
+        })
+        .into_iter()
+        .filter_map(|spec| {
+            let node = match spec.anchor {
+                syntax::GeneratorAnchor::Symbol(symbol) => container.related(symbol),
+                syntax::GeneratorAnchor::Expression(expression) => container.related(expression),
+            }?;
+            Some(Self {
+                name: spec.generator.name.0,
+                kind: spec.generator.kind,
+                indices: spec.generator.indices,
+                node,
+            })
+        })
+        .collect()
     }
 
     /// Value of the named option in a recognized option assignment.
     fn option_value(node: SyntaxNode<'tree>, key: &str) -> Option<SyntaxNode<'tree>> {
-        if !node.is_option_assignment() {
-            return None;
-        }
-        node.binary_parts()
-            .map(|parts| parts.left)
-            .filter(|left| left.is::<Symbol>() && left.text() == key)?;
-        node.binary_parts().map(|parts| parts.right)
-    }
-
-    /// Base symbol name of a generator, excluding a recognized index selection.
-    fn base_name(node: SyntaxNode<'tree>) -> Option<String> {
-        if node.is::<Symbol>() {
-            Some(node.text().to_string())
-        } else {
-            node.string_literal_inner_text().map(ToString::to_string)
-        }
+        node.related(syntax::RingSyntax::option(node.get::<Expr>()?, key)?)
     }
 
     /// The generators named by the `Variable` option of the outermost call
@@ -1635,18 +1326,7 @@ impl<'tree> RingGeneratorBinding<'tree> {
     /// The name `node` gives a generator, unquoted: `x`, `symbol x`,
     /// `local x`, or `(x)`.
     fn name_node(node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
-        let node = parenthesized_value(node)?;
-        Some(node.quoted_symbol().unwrap_or(node)).filter(|node| node.is::<Symbol>())
-    }
-
-    /// The string of `getSymbol "x"`, which names the symbol `x`.
-    fn get_symbol_argument(node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
-        let parts = node
-            .binary_parts()
-            .filter(|_| node.is_space_application())?;
-        (parts.left.is::<Symbol>() && parts.left.text() == GET_SYMBOL_FUNCTION).then_some(())?;
-        parenthesized_value(parts.right)
-            .filter(|argument| argument.string_literal_inner_text().is_some())
+        node.related(syntax::RingSyntax::name(node.get::<Expr>()?)?)
     }
 
     /// Collects spec from the supplied syntax and semantic context.
@@ -1655,344 +1335,25 @@ impl<'tree> RingGeneratorBinding<'tree> {
         bindings: &mut Vec<RingGeneratorBinding<'tree>>,
         bare_symbols: BareSymbols<'_>,
     ) {
-        let Some(node) = parenthesized_value(node) else {
+        let Some(expression) = node.get::<Expr>() else {
             return;
         };
-        if let Some(argument) = Self::get_symbol_argument(node) {
-            if let Some(name) = argument.string_literal_inner_text() {
-                Self::push(
-                    bindings,
-                    RingGeneratorBinding {
-                        name: name.to_string(),
-                        kind: RingGeneratorKind::Direct,
-                        node: argument,
-                        indices: None,
-                    },
-                );
-            }
-            return;
-        }
-        let node = Self::name_node(node).unwrap_or(node);
-        if node.is::<Symbol>() {
-            Self::push(
-                bindings,
-                RingGeneratorBinding {
-                    name: node.text().to_string(),
-                    kind: RingGeneratorKind::Direct,
-                    node,
-                    indices: None,
-                },
-            );
-            return;
-        }
-
-        if node.has_binary_operator::<Token![_]>() {
-            if let Some(base) = node
-                .binary_parts()
-                .and_then(|parts| Self::name_node(parts.left))
-            {
-                Self::push(
-                    bindings,
-                    RingGeneratorBinding {
-                        name: base.text().to_string(),
-                        kind: RingGeneratorKind::IndexedTable,
-                        node: base,
-                        indices: node
-                            .binary_parts()
-                            .and_then(|parts| IndexKey::from_node(parts.right, bare_symbols))
-                            .map(IndexSelection::Exact),
-                    },
-                );
-            }
-            return;
-        }
-
-        if node.has_binary_operator::<Token![..]>() || node.has_binary_operator::<Token![..<]>() {
-            let left = node
-                .binary_parts()
-                .map(|parts| parts.left)
-                .and_then(parenthesized_value);
-            let right = node
-                .binary_parts()
-                .map(|parts| parts.right)
-                .and_then(parenthesized_value);
-            if let (Some(left), Some(right)) = (left, right) {
-                if let (Some(left_base), Some(right_base)) =
-                    (Self::indexed_base(left), Self::indexed_base(right))
-                {
-                    let indices = left
-                        .binary_parts()
-                        .and_then(|parts| IndexKey::from_node(parts.right, bare_symbols))
-                        .zip(
-                            right
-                                .binary_parts()
-                                .and_then(|parts| IndexKey::from_node(parts.right, bare_symbols)),
-                        )
-                        .map(|(start, end)| IndexSelection::Range {
-                            start,
-                            end,
-                            exclusive: node.has_binary_operator::<Token![..<]>(),
-                        });
-                    if let Some(names) = Self::symbol_range(node, left_base, right_base) {
-                        for name in names {
-                            Self::push(
-                                bindings,
-                                RingGeneratorBinding {
-                                    name,
-                                    kind: RingGeneratorKind::IndexedTable,
-                                    node,
-                                    indices: indices.clone(),
-                                },
-                            );
-                        }
-                    }
-                    return;
-                }
-
-                if let Some(names) = Self::name_node(left)
-                    .zip(Self::name_node(right))
-                    .and_then(|(left, right)| Self::symbol_range(node, left, right))
-                {
-                    for name in names {
-                        Self::push(
-                            bindings,
-                            RingGeneratorBinding {
-                                name,
-                                kind: RingGeneratorKind::Direct,
-                                node,
-                                indices: None,
-                            },
-                        );
-                    }
-                    return;
-                }
-            }
-        }
-
-        if node.is_collection_expression() {
-            for element in node.collection_elements() {
-                Self::collect_spec(element, bindings, bare_symbols);
-            }
-        }
-    }
-
-    /// Base expression of a subscripted variable specification.
-    fn indexed_base(node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
-        let node = parenthesized_value(node)?;
-        node.has_binary_operator::<Token![_]>()
-            .then(|| node.binary_parts().map(|parts| parts.left))
-            .flatten()
-            .and_then(Self::name_node)
-    }
-
-    /// Expands a statically known range of generator names into its individual symbols.
-    fn symbol_range(
-        range: SyntaxNode<'tree>,
-        left: SyntaxNode<'tree>,
-        right: SyntaxNode<'tree>,
-    ) -> Option<Vec<String>> {
-        if !left.is::<Symbol>() || !right.is::<Symbol>() {
-            return None;
-        }
-        let names = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        // Equal endpoints also support names outside the standard vars alphabet.
-        if left.text() == right.text() {
-            return Some(if range.has_binary_operator::<Token![..<]>() {
-                Vec::new()
-            } else {
-                vec![left.text().to_string()]
-            });
-        }
-        let start = names.chars().position(|c| c.to_string() == left.text())?;
-        let end = names.chars().position(|c| c.to_string() == right.text())?;
-        let stop = end + usize::from(!range.has_binary_operator::<Token![..<]>());
-        Some(
-            names
-                .chars()
-                .skip(start)
-                .take(stop.saturating_sub(start))
-                .map(|c| c.to_string())
-                .collect(),
-        )
-    }
-
-    /// Adds a ring-generator binding unless an equivalent binding is already present.
-    fn push(bindings: &mut Vec<RingGeneratorBinding<'tree>>, binding: RingGeneratorBinding<'tree>) {
-        if !bindings.iter().any(|existing| {
-            existing.name == binding.name
-                && existing.kind == binding.kind
-                && existing.indices == binding.indices
+        for spec in syntax::RingSyntax::specifications(expression, &|symbol| {
+            node.related(symbol).is_some_and(bare_symbols)
         }) {
-            bindings.push(binding);
-        }
-    }
-}
-
-impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge> {
-    /// Infer the ring-specific indexed-variable, precision-field, and quotient
-    /// operator cases.
-    pub fn ring_operator_type(
-        &self,
-        query: OperatorTypeQuery<'_>,
-        left_name: &ObjectName,
-        source: &(impl SourceNavigation + ?Sized),
-        knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> Option<InferredType> {
-        let promoted_value = parenthesized_value(query.left)?;
-        // `InexactFieldFamily _ ZZ` is the only subscript of a family, so
-        // `RR_p` is the real field of precision `p` whatever `p` is.
-        if matches_token::<Token![_]>(query.operator)
-            && knowledge.is_subtype(left_name, &ObjectName::new(INEXACT_FIELD_FAMILY))
-        {
-            let family = symbol_node_text(promoted_value);
-            let field = PRECISION_FIELD_CLASSES
-                .iter()
-                .find(|(name, _)| family == Some(*name))
-                .map_or(INEXACT_FIELD, |(_, field)| field);
-            return Some(InferredType::exact(field));
-        }
-
-        if matches_token::<Token![_]>(query.operator)
-            && (promoted_value.is::<IntegerLiteral>() || promoted_value.is::<FloatLiteral>())
-        {
-            let ring = parenthesized_value(query.right?)?;
-            let ring_type = self.type_of(ring, source, query.scope_idx);
-            if knowledge.has_type_role(ring_type.single()?, TypeRole::Ring) {
-                let element_type = self
-                    .resolved_ring_element_type(
-                        ring,
-                        source,
-                        query.scope_idx,
-                        knowledge,
-                        &mut HashSet::new(),
-                    )
-                    .unwrap_or_else(|| ObjectName::new("RingElement"));
-                return Some(InferredType::exact_from_id(element_type));
+            let anchor = match spec.anchor {
+                syntax::GeneratorAnchor::Symbol(symbol) => node.related(symbol),
+                syntax::GeneratorAnchor::Expression(expression) => node.related(expression),
+            };
+            if let Some(anchor) = anchor {
+                bindings.push(Self {
+                    name: spec.generator.name.0,
+                    kind: spec.generator.kind,
+                    indices: spec.generator.indices,
+                    node: anchor,
+                });
             }
         }
-
-        if matches_token::<Token![_]>(query.operator)
-            && left_name.as_ref() == INDEXED_VARIABLE_TABLE
-        {
-            if let Some(elements) = self
-                .get_binding_from_scope(
-                    query.left.text(),
-                    query.scope_idx,
-                    source.position_for_node(query.left),
-                )
-                .and_then(|binding| binding.state.indexed_element_type.as_ref())
-            {
-                if let Some(index) = query.right.and_then(IndexKey::literal) {
-                    return Some(elements.read_type(&index));
-                }
-                if query
-                    .right
-                    .is_some_and(|key| self.written_ring(key, source).is_some())
-                {
-                    return Some(elements.read_nonliteral_type());
-                }
-                return Some(
-                    elements.writes.iter().fold(
-                        InferredType::exact(INDEXED_VARIABLE),
-                        |types, write| {
-                            types | InferredType::exact_from_id(write.value_type.clone())
-                        },
-                    ),
-                );
-            }
-            return Some(InferredType::exact(INDEXED_VARIABLE));
-        }
-
-        if matches_token::<Token![/]>(query.operator)
-            && knowledge.has_type_role(left_name, TypeRole::Ring)
-        {
-            let right_type = self.type_of(query.right?, source, query.scope_idx);
-            if right_type.single()?.as_ref() == "ZZ" {
-                return Some(InferredType::exact("QuotientRing"));
-            }
-        }
-
-        None
-    }
-
-    /// Element class associated with the selected ring under the current source knowledge.
-    pub(super) fn resolved_ring_element_type(
-        &self,
-        ring: SyntaxNode<'_>,
-        source: &(impl SourceNavigation + ?Sized),
-        scope_idx: usize,
-        knowledge: &(impl TypeKnowledge + ?Sized),
-        visited: &mut HashSet<BindingId>,
-    ) -> Option<ObjectName> {
-        let ring = parenthesized_value(ring)?;
-        let name = symbol_node_text(ring)?;
-        let position = source.position_for_node(ring);
-        let Some(binding) =
-            self.visible_source_binding_from_scope(name, scope_idx, position, knowledge)
-        else {
-            let name = ObjectName::new(name);
-            self.resolve_type_id_at(&name, position, knowledge)?;
-            return Some(name);
-        };
-        if !visited.insert(binding.binding_id) {
-            return None;
-        }
-
-        let value_range = binding.state.value_range?;
-        let root = ring.root();
-        let value = root.descendant_for_point_range(
-            source.point_for_position(value_range.start)?,
-            source.point_for_position(value_range.end)?,
-        )?;
-        if source.range_for_node(value) != value_range {
-            return None;
-        }
-        let value_scope_idx = self
-            .find_scope_at(source.position_for_node(value))
-            .unwrap_or(binding.state.scope_idx);
-        if symbol_node_text(parenthesized_value(value)?).is_some() {
-            return self.resolved_ring_element_type(
-                value,
-                source,
-                value_scope_idx,
-                knowledge,
-                visited,
-            );
-        }
-
-        (binding.scope_idx == 0
-            && self.expression_introduces_ring_identity(value, source, value_scope_idx, knowledge))
-        .then(|| binding.name.clone())
-        .filter(|_| binding.state.source_type.is_some())
-    }
-
-    /// Whether evaluating this expression creates a distinct ring rather than forwarding an existing one.
-    fn expression_introduces_ring_identity(
-        &self,
-        expression: SyntaxNode<'_>,
-        source: &(impl SourceNavigation + ?Sized),
-        scope_idx: usize,
-        knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> bool {
-        let Some(expression) = parenthesized_value(expression) else {
-            return false;
-        };
-        if expression.is::<NewStatement>() {
-            return true;
-        }
-        let introduces_identity =
-            expression.is_space_application() || expression.has_binary_operator::<Token![/]>();
-        let operand = introduces_identity
-            .then(|| expression.binary_parts().map(|parts| parts.left))
-            .flatten();
-        operand.is_some_and(|operand| {
-            self.type_of(operand, source, scope_idx)
-                .single()
-                .is_some_and(|type_name| {
-                    knowledge.has_type_role(type_name, TypeRole::Ring)
-                        || knowledge.is_subtype(type_name, &ObjectName::new(INEXACT_FIELD_FAMILY))
-                })
-        })
     }
 }
 

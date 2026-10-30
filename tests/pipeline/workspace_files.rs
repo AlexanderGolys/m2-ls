@@ -635,3 +635,62 @@ async fn files_becoming_readable_or_vanishing_on_disk_update_their_loaders() {
 
     server.shutdown().await;
 }
+
+/// Catalog failures preserve source navigation, imported package completion,
+/// diagnostics publication, and the ordinary protocol lifecycle.
+#[tokio::test]
+async fn unavailable_catalog_uses_installed_package_sources() {
+    let source = "needsPackage \"FallbackPkg\"\nanswer = fallbackFunction 1\n";
+    let workspace = TestWorkspace::new(source);
+    let package_uri = workspace.write_file(
+        "installed/FallbackPkg.m2",
+        concat!(
+            "newPackage \"FallbackPkg\"\n",
+            "export {\"fallbackFunction\"}\n",
+            "load \"implementation.m2\"\n",
+            "endPackage \"FallbackPkg\"\n",
+        ),
+    );
+    let implementation =
+        workspace.write_file("installed/implementation.m2", "fallbackFunction = x -> x\n");
+    let package_path = Url::parse(&package_uri).unwrap().to_file_path().unwrap();
+    let sources = package_path.parent().unwrap();
+    let invalid_uri = workspace.write_file("invalid-catalog.jsonl", "not JSON\n");
+    let invalid_path = Url::parse(&invalid_uri).unwrap().to_file_path().unwrap();
+    let missing_path = sources.join("absent-catalog.jsonl");
+    for catalog in [
+        Some(missing_path.as_path()),
+        Some(invalid_path.as_path()),
+        None,
+    ] {
+        let mut server = LspProcess::spawn_with_catalog(catalog).await;
+        server
+            .initialize_with_options(
+                &workspace.root_uri(),
+                json!({
+                    "sources": {"paths": [sources], "initFile": false}
+                }),
+            )
+            .await;
+        let opened = server.open_document(&workspace.uri, source).await;
+        assert_eq!(opened["params"]["uri"], workspace.uri);
+        let definition = server
+            .request(
+                "textDocument/definition",
+                document_position(&workspace.uri, position(source, "fallbackFunction", 0)),
+            )
+            .await;
+        assert_eq!(definition["uri"], implementation, "{definition}");
+        let labels = completion_labels(
+            &mut server,
+            &workspace.uri,
+            cursor_after(source, "fallbackFunction", 0),
+        )
+        .await;
+        assert!(
+            labels.iter().any(|label| label == "fallbackFunction"),
+            "{labels:?}"
+        );
+        server.shutdown().await;
+    }
+}

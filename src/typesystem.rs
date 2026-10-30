@@ -21,6 +21,24 @@ pub type InferredType = TypeRange;
 /// A runtime class whose identity gives a value special semantic behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypeRole {
+    /// Integer literals, represented by the runtime ZZ class.
+    Integer,
+    /// Floating-point literals, represented by the runtime RR class.
+    Real,
+    /// A closure created by a source lambda or function-dependent operator.
+    FunctionClosure,
+    /// A brace-delimited list value.
+    List,
+    /// A bracket-delimited array value.
+    Array,
+    /// An angle-bar-delimited collection value.
+    AngleBarList,
+    /// A sequence or packed group of values.
+    Sequence,
+    /// The result of a muted statement or absent branch value.
+    Nothing,
+    /// An option key/value pair.
+    Option,
     /// The runtime Boolean class.
     Boolean,
     /// An ordinary callable name or its source expression.
@@ -65,6 +83,15 @@ impl TypeRole {
     /// Runtime class name associated with this semantic type role.
     pub fn object_name(self) -> ObjectName {
         ObjectName::new(match self {
+            Self::Integer => "ZZ",
+            Self::Real => "RR",
+            Self::FunctionClosure => "FunctionClosure",
+            Self::List => "List",
+            Self::Array => "Array",
+            Self::AngleBarList => "AngleBarList",
+            Self::Sequence => "Sequence",
+            Self::Nothing => "Nothing",
+            Self::Option => "Option",
             Self::Boolean => "Boolean",
             Self::Function => "Function",
             Self::MethodFunction => "MethodFunction",

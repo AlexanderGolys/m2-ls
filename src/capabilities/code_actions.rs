@@ -7,7 +7,7 @@ use m2_syn::Token;
 use tower_lsp::lsp_types::Range as TextRange;
 use tower_lsp::lsp_types::*;
 
-use crate::analysis::{MethodCodomainEdit, OptionMisuse, TypeChecker};
+use crate::analysis::{CallOptionIssue, MethodCodomainEdit, TypeChecker};
 use crate::diagnostics::rewrites::{
     ambiguous_float_member_access_rewrite, coalescence_rewrite, else_if_chain_rewrite,
     if_condition_rewrite, if_null_branch_rewrite, redundant_control_parentheses_inner,
@@ -229,10 +229,10 @@ fn unknown_option_action(context: &CodeActionContext<'_, '_>) -> Option<CodeActi
         .object_registry()
         .at(context.document.position_for_node(call));
     let suggestion = TypeChecker::new(context.document.analysis(), &knowledge)
-        .call_option_misuses(call, context.document, &knowledge)
+        .call_option_issues(call, context.document, &knowledge)
         .into_iter()
-        .find_map(|misuse| match misuse {
-            OptionMisuse::UnknownName {
+        .find_map(|issue| match issue {
+            CallOptionIssue::UnknownName {
                 key,
                 suggestion: Some(suggestion),
                 ..

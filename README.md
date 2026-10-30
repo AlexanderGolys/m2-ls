@@ -68,6 +68,24 @@ and verify it against the SHA-256 checksum published with it. Later starts use
 the cached copy and work offline. The server checks for a new M2Book release in
 the background and uses its catalog from the next start; upgrading the server
 itself reuses the cache.
+Set `M2_LS_CATALOG_VERSION` before starting the editor to restrict M2Book
+releases. The default is `latest` (also written `*`). Cargo-style requirements
+include `=0.1.1` for an exact pin, `^0.1.1`, and `>=0.1.1, <0.2` for a range.
+The newest published matching semantic version is selected; prereleases need
+an explicit prerelease requirement. Each constraint uses a separate cache.
+For example:
+
+```sh
+M2_LS_CATALOG_VERSION='=0.1.1' m2-ls --download-catalog
+```
+
+If no usable catalog can be loaded, the server and linter report the failure
+and continue with source analysis. The server follows imported installed
+package sources as it does user code, providing the definitions it can find.
+Builtin documentation and catalog-dependent type information remain unavailable
+until a catalog can be loaded on a later start. A failed background update
+keeps the current session and its working cache.
+
 `m2-fmt` does not need the catalog or network access.
 
 To download the catalog before opening your editor, run:
@@ -137,7 +155,9 @@ to the importing file makes only the names `P` exports visible, and the code of
 each `TEST` block is analyzed like the session `check` runs it in.
 Workspace indexing follows opened files and user-package dependencies instead
 of scanning entire folders. Installed packages use the precomputed catalog;
-opening their source does not index their dependency trees. Core source opens
+opening their source does not index their dependency trees. When the catalog
+is unavailable, imported installed packages are analyzed from source as well.
+Core source opens
 in `primaryCode` mode, without automatic imports of prelude packages.
 
 ## Configuration

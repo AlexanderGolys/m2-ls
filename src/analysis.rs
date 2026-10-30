@@ -12,6 +12,7 @@
 
 use crate::node_metadata::TypedSource;
 mod first_pass;
+mod inference;
 mod known_value;
 mod ring;
 mod syntax_roles;
@@ -20,11 +21,10 @@ mod typechecker;
 pub use ring::RingVariableError;
 
 use m2_syn::nodes::{
-    ElseClause, Expr, ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
+    Expr, ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
     ExprNew as NewStatement, ExprOpBinIndex, ExprOpBinMember, ExprOpBinRegular as BinaryExpr,
     ExprOption as OptionExpression, ExprQuote as QuoteExpression, ExprWhile as WhileLoop,
-    FloatLiteral, IntegerLiteral, List, LoopBody, RawStringLiteral, Sequence, StringLiteral,
-    Symbol, ThenClause,
+    IntegerLiteral, List, LoopBody, RawStringLiteral, Sequence, StringLiteral, Symbol,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Spanned, Token};
@@ -51,6 +51,7 @@ use crate::typesystem::{
 };
 use crate::util::TextRangeExt;
 use first_pass::{nested_symbols, package_name_range, walk, BindingEffect, BindingFact, ScopeTree};
+use inference::syntax::MethodConstructor;
 pub(crate) use typechecker::TypeChecker;
 
 /// Identity of one scoped symbol binding within an immutable analysis snapshot.
@@ -77,6 +78,21 @@ pub struct Operator {
 }
 
 impl Operator {
+    /// Whether this operator's ordinary result is Boolean even without a catalog signature.
+    pub fn is_comparison(&self) -> bool {
+        [
+            <Token![==] as Token>::SPELLING,
+            <Token![===] as Token>::SPELLING,
+            <Token![!=] as Token>::SPELLING,
+            <Token![=!=] as Token>::SPELLING,
+            <Token![<] as Token>::SPELLING,
+            <Token![<=] as Token>::SPELLING,
+            <Token![>] as Token>::SPELLING,
+            <Token![>=] as Token>::SPELLING,
+        ]
+        .contains(&self.token.name())
+    }
+
     /// Recognizes an operator and its form from expression syntax.
     fn from_expression(node: SyntaxNode<'_>) -> Option<Self> {
         let form = if node.is_adjacent_expr() || node.is_binary_expr() {
@@ -269,11 +285,14 @@ impl From<OptionPassing> for MethodOptions {
     }
 }
 
-/// An option a call passes that the called function does not accept as
-/// given.
+/// A conflict between a supplied call option and the callable's accepted options.
+///
+/// Type checking produces these semantic facts for diagnostics and code actions.
+/// Consumers choose diagnostic rules, messages, and source edits from the retained
+/// option names, value types, and source nodes.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub enum OptionMisuse<'tree> {
+pub enum CallOptionIssue<'tree> {
     /// A name none of the function's options has.
     UnknownName {
         /// Option or member key written by the source.
@@ -868,33 +887,6 @@ impl OutputReference {
                 .and_then(NonZeroUsize::new)
                 .map_or(Self::MissingAbsolute, Self::Absolute),
         )
-    }
-
-    /// Value expression selected by this absolute or relative output reference.
-    pub fn referenced_value<'tree>(self, node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
-        let cell = source_cell(node)?;
-        if !is_value_cell(cell) {
-            return None;
-        }
-        let root = cell.root();
-        let preceding_cells = root
-            .named_children()
-            .filter(|candidate| {
-                is_value_cell(*candidate) && candidate.end_byte() <= cell.start_byte()
-            })
-            .collect::<Vec<_>>();
-
-        match self {
-            Self::Relative(distance) => preceding_cells
-                .iter()
-                .rev()
-                .filter_map(SyntaxNode::final_value_child)
-                .nth(distance.get() - 1),
-            Self::Absolute(number) => preceding_cells
-                .get(number.get() - 1)
-                .and_then(SyntaxNode::final_value_child),
-            Self::MissingAbsolute => None,
-        }
     }
 }
 
@@ -3258,54 +3250,10 @@ impl<'tree> MethodDeclaration<'tree> {
     /// The runtime class `method` picks: `Binary => true` first, then a single
     /// `Dispatch` of `Thing` or `Type`, then whether there are options.
     fn runtime_class(self) -> TypeRole {
-        let is_symbol = |option, role: TypeRole| {
-            self.option(option).and_then(symbol_node_text) == Some(role.object_name().name())
-        };
-        if self
-            .option(MethodDeclarationOption::Binary)
-            .and_then(symbol_node_text)
-            == Some("true")
-        {
-            TypeRole::MethodFunctionBinary
-        } else if is_symbol(MethodDeclarationOption::Dispatch, TypeRole::Thing)
-            || is_symbol(MethodDeclarationOption::Dispatch, TypeRole::Type)
-        {
-            TypeRole::MethodFunctionSingle
-        } else if self.options() != MethodOptions::Absent {
-            TypeRole::MethodFunctionWithOptions
-        } else {
-            TypeRole::MethodFunction
-        }
-    }
-}
-
-/// Recognizes an option key and statically readable literal value.
-fn literal_option_assignment(node: SyntaxNode) -> Option<LiteralOption> {
-    if !node.is_option_assignment() {
-        return None;
-    }
-
-    let left = node.binary_parts().map(|parts| parts.left)?;
-    let right = node.binary_parts().map(|parts| parts.right)?;
-    let key = symbol_node_text(left)?;
-    let value = literal_option_value(right)?;
-    Some(LiteralOption {
-        option: ObjectName::new(key),
-        value: ObjectName::new(value),
-    })
-}
-
-/// Literal spelling accepted as a statically known option value.
-fn literal_option_value(node: SyntaxNode<'_>) -> Option<&str> {
-    if symbol_node_text(node).is_some()
-        || node.is::<IntegerLiteral>()
-        || node.is::<FloatLiteral>()
-        || node.is::<StringLiteral>()
-        || node.is::<RawStringLiteral>()
-    {
-        Some(node.text())
-    } else {
-        None
+        self.call
+            .get::<m2_syn::nodes::ExprOpBinAdj>()
+            .and_then(MethodConstructor::method_class)
+            .unwrap_or(TypeRole::MethodFunction)
     }
 }
 

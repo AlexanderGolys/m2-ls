@@ -2,8 +2,9 @@
 //!
 //! The catalog is generated and published by the M2Book package: every M2Book
 //! release carries it as a release asset, next to a SHA-256 checksum asset.
-//! The server follows M2Book's latest release. A catalog is downloaded on first
-//! use (or by `m2-ls --download-catalog`) and again only when M2Book publishes
+//! The server follows M2Book's latest release by default;
+//! `M2_LS_CATALOG_VERSION` can restrict it with a Cargo-style version requirement.
+//! A catalog is downloaded on first use (or by `m2-ls --download-catalog`) and again only when M2Book publishes
 //! a new release; otherwise the cached copy is used offline. The cache holds a
 //! single file named by the checksum its content must match.
 
@@ -14,6 +15,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use semver::{Version, VersionReq};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use ureq::ResponseExt;
 
@@ -21,6 +24,14 @@ use crate::builtin_index::BuiltinIndex;
 
 /// M2Book release page used to discover the latest catalog version.
 const RELEASES_URL: &str = "https://github.com/AlexanderGolys/M2Book/releases";
+/// Environment variable selecting a Cargo-style M2Book release requirement.
+const CATALOG_VERSION_ENV: &str = "M2_LS_CATALOG_VERSION";
+/// API listing published releases for constrained version selection.
+const RELEASES_API: &str = "https://api.github.com/repos/AlexanderGolys/M2Book/releases";
+/// Maximum release metadata page size supported by GitHub.
+const RELEASES_PER_PAGE: usize = 100;
+/// Maximum accepted release-list response size.
+const MAX_RELEASE_METADATA_BYTES: u64 = 8 * 1024 * 1024;
 /// Path prefix identifying a redirected release-tag page.
 const RELEASE_TAG_PATH: &str = "/releases/tag/";
 /// Release asset containing builtin metadata and documentation.
@@ -60,7 +71,8 @@ impl CatalogSource {
     ///
     /// # Errors
     ///
-    /// Returns an error when no platform cache directory can be determined.
+    /// Returns an error when no platform cache directory can be determined or
+    /// `M2_LS_CATALOG_VERSION` is not a valid Cargo-style requirement.
     ///
     /// # Examples
     ///
@@ -73,7 +85,25 @@ impl CatalogSource {
     pub fn current() -> io::Result<Self> {
         match env::var_os(CATALOG_ENV) {
             Some(path) => Ok(Self::Override(PathBuf::from(path))),
-            None => CatalogCache::user().map(Self::Cache),
+            None => {
+                let requirement = match env::var(CATALOG_VERSION_ENV) {
+                    Ok(requirement) => requirement,
+                    Err(env::VarError::NotPresent) => "*".to_owned(),
+                    Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+                };
+                let requirement = if requirement == "latest" {
+                    "*"
+                } else {
+                    &requirement
+                };
+                let requirement = VersionReq::parse(requirement).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{CATALOG_VERSION_ENV}: {error}"),
+                    )
+                })?;
+                CatalogCache::user().map(|cache| Self::Cache(cache.with_requirement(requirement)))
+            }
         }
     }
 
@@ -111,22 +141,40 @@ impl CatalogSource {
         }
     }
 
-    /// Read the catalog for semantic analysis and hover docs, downloading
-    /// M2Book's latest one when nothing is cached yet.
+    /// Read and validate the catalog for semantic analysis and hover docs,
+    /// downloading the selected M2Book release when nothing is cached yet.
     ///
     /// # Errors
     ///
     /// Returns the lookup, download, or verification errors from [`Self::path`],
-    /// or an error when the catalog cannot be read as UTF-8 text.
+    /// or an error when the catalog is not UTF-8 or has an unsupported wire format.
     pub fn load(&self) -> io::Result<String> {
-        match self {
+        let corpus = match self {
             Self::Override(path) => fs::read_to_string(Self::resolve_override(path)?),
             Self::Cache(cache) => match cache.verified()? {
                 Some(cached) => String::from_utf8(cached.bytes)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
                 None => fs::read_to_string(cache.update()?),
             },
-        }
+        }?;
+        BuiltinIndex::validate(&corpus)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(corpus)
+    }
+
+    /// Load the configured catalog, or continue without builtin metadata.
+    ///
+    /// Failures are reported on stderr. Source analysis remains available when
+    /// the cache, local override, or network is unavailable or incompatible.
+    pub fn load_available() -> String {
+        Self::current()
+            .and_then(|source| source.load())
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "m2-ls: builtin catalog unavailable: {error}; continuing with source analysis"
+                );
+                String::new()
+            })
     }
 
     /// Validates an explicitly configured catalog path before opening it.
@@ -217,6 +265,40 @@ impl CatalogRelease {
     }
 }
 
+/// Published release metadata used for SemVer selection.
+#[derive(Debug, Deserialize)]
+struct PublishedRelease {
+    /// Tag from which both catalog assets will be downloaded.
+    tag_name: String,
+    /// Unpublished releases cannot provide a selected catalog.
+    draft: bool,
+}
+
+impl PublishedRelease {
+    /// Highest published semantic version satisfying the requirement.
+    fn select(
+        releases: impl IntoIterator<Item = Self>,
+        requirement: &VersionReq,
+    ) -> Option<(Version, String)> {
+        releases
+            .into_iter()
+            .filter(|release| !release.draft)
+            .filter_map(|release| {
+                let version = Version::parse(
+                    release
+                        .tag_name
+                        .strip_prefix('v')
+                        .unwrap_or(&release.tag_name),
+                )
+                .ok()?;
+                requirement
+                    .matches(&version)
+                    .then_some((version, release.tag_name))
+            })
+            .max_by(|left, right| left.0.cmp(&right.0))
+    }
+}
+
 /// M2Book's GitHub releases, which publish the catalog as a release asset.
 struct M2BookReleases {
     /// HTTP client configured for catalog requests.
@@ -243,6 +325,58 @@ impl M2BookReleases {
             .call()
             .map_err(io::Error::other)?;
         let tag = Self::tag_of_release_page(response.get_uri().path())?;
+        self.release(tag)
+    }
+
+    /// Resolve the highest published version satisfying a Cargo-style requirement.
+    fn matching(&self, requirement: &VersionReq) -> io::Result<CatalogRelease> {
+        if *requirement == VersionReq::STAR {
+            return self.latest();
+        }
+        let mut selected: Option<(Version, String)> = None;
+        for page in 1.. {
+            let bytes = self
+                .agent
+                .get(format!(
+                    "{RELEASES_API}?per_page={RELEASES_PER_PAGE}&page={page}"
+                ))
+                .header(
+                    "User-Agent",
+                    concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")),
+                )
+                .call()
+                .map_err(io::Error::other)?
+                .body_mut()
+                .with_config()
+                .limit(MAX_RELEASE_METADATA_BYTES)
+                .read_to_vec()
+                .map_err(io::Error::other)?;
+            let releases: Vec<PublishedRelease> =
+                serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            let last_page = releases.len() < RELEASES_PER_PAGE;
+            if let Some(candidate) = PublishedRelease::select(releases, requirement) {
+                if selected
+                    .as_ref()
+                    .is_none_or(|previous| candidate.0 > previous.0)
+                {
+                    selected = Some(candidate);
+                }
+            }
+            if last_page {
+                break;
+            }
+        }
+        let (_, tag) = selected.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no published M2Book release matches {requirement}"),
+            )
+        })?;
+        self.release(tag)
+    }
+
+    /// Read the checksum asset of a selected release.
+    fn release(&self, tag: String) -> io::Result<CatalogRelease> {
         let checksum = self.asset(&tag, CHECKSUM_ASSET, MAX_CHECKSUM_BYTES)?;
         let digest =
             CatalogDigest::parse(&String::from_utf8_lossy(&checksum)).ok_or_else(|| {
@@ -296,11 +430,14 @@ struct VerifiedCatalog {
     bytes: Vec<u8>,
 }
 
-/// Directory holding the downloaded catalog: one file, named by its digest.
+/// Directory holding one downloaded catalog, named by its digest.
+/// Constrained release selections use separate subdirectories.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CatalogCache {
     /// Directory holding the downloaded catalog cache.
     directory: PathBuf,
+    /// Release constraint associated with this isolated cache directory.
+    requirement: VersionReq,
 }
 
 impl CatalogCache {
@@ -329,7 +466,24 @@ impl CatalogCache {
     /// assert_eq!(cache.directory(), Path::new("catalog-cache"));
     /// ```
     pub fn new(directory: PathBuf) -> Self {
-        Self { directory }
+        Self {
+            directory,
+            requirement: VersionReq::STAR,
+        }
+    }
+
+    /// Isolate a constrained catalog from the default latest-release cache.
+    ///
+    /// Use a fresh cache value when choosing a different requirement. Equivalent
+    /// requirements share the directory derived from their normalized spelling.
+    pub fn with_requirement(mut self, requirement: VersionReq) -> Self {
+        if requirement != VersionReq::STAR {
+            self.directory = self
+                .directory
+                .join(CatalogDigest::of(requirement.to_string().as_bytes()).to_string());
+        }
+        self.requirement = requirement;
+        self
     }
 
     /// The directory holding the cached catalog.
@@ -337,7 +491,7 @@ impl CatalogCache {
         &self.directory
     }
 
-    /// Download M2Book's latest catalog unless it is already the cached one,
+    /// Download the newest matching M2Book catalog unless it is already cached,
     /// and return the path of the verified catalog in use.
     ///
     /// The download is validated before replacing the previous cached catalog.
@@ -357,7 +511,7 @@ impl CatalogCache {
 
     /// Fetches the current release and stores its verified catalog in the cache.
     fn fetch_latest(&self, releases: &M2BookReleases) -> io::Result<PathBuf> {
-        let release = releases.latest()?;
+        let release = releases.matching(&self.requirement)?;
         if let Some(cached) = self.verified()? {
             if cached.digest == release.digest {
                 return Ok(cached.path);
@@ -372,7 +526,7 @@ impl CatalogCache {
         self.store(&release, &catalog)
     }
 
-    /// The cached catalog after checking it against the digest in its name.
+    /// The cached catalog after checking its checksum, UTF-8, and wire format.
     /// A damaged catalog is removed and counts as missing, so it is
     /// downloaded again.
     fn verified(&self) -> io::Result<Option<VerifiedCatalog>> {
@@ -380,9 +534,12 @@ impl CatalogCache {
             return Ok(None);
         };
         let bytes = fs::read(&path)?;
-        if !digest.matches(&bytes) {
+        let valid_format = std::str::from_utf8(&bytes)
+            .ok()
+            .is_some_and(|text| BuiltinIndex::validate(text).is_ok());
+        if !digest.matches(&bytes) || !valid_format {
             eprintln!(
-                "Removing the damaged builtin catalog {}: its content does not match its checksum",
+                "Removing the damaged builtin catalog {}: checksum or catalog format validation failed",
                 path.display()
             );
             Self::remove(&path)?;
@@ -513,6 +670,60 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn constraints_select_the_highest_published_matching_version() {
+        let select = |requirement: &str| {
+            let releases = ["v0.1.1", "0.1.3", "v0.2.0", "v0.1.4-beta.1", "not-semver"]
+                .map(|tag| PublishedRelease {
+                    tag_name: tag.to_owned(),
+                    draft: false,
+                })
+                .into_iter()
+                .chain([PublishedRelease {
+                    tag_name: "v0.1.9".to_owned(),
+                    draft: true,
+                }]);
+            PublishedRelease::select(releases, &VersionReq::parse(requirement).unwrap())
+                .map(|(_, tag)| tag)
+        };
+        assert_eq!(select(">=0.1.1, <0.2"), Some("0.1.3".to_owned()));
+        assert_eq!(select("=0.1.1"), Some("v0.1.1".to_owned()));
+        assert_eq!(select("^0.1.1"), Some("0.1.3".to_owned()));
+        assert_eq!(select("=0.1.4-beta.1"), Some("v0.1.4-beta.1".to_owned()));
+        assert_eq!(select(">=1"), None);
+    }
+
+    #[test]
+    fn constrained_caches_cannot_reuse_an_unrelated_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let latest = CatalogCache::new(directory.path().to_owned());
+        let pinned = latest
+            .clone()
+            .with_requirement(VersionReq::parse("=0.1.1").unwrap());
+        let corpus = b"{\"kind\":\"meta\"}\n";
+        let release = release_of("v0.1.1", corpus);
+        let latest_path = latest.store(&release, corpus).unwrap();
+        assert!(pinned.verified().unwrap().is_none());
+        let pinned_path = pinned.store(&release, corpus).unwrap();
+        assert_ne!(latest_path, pinned_path);
+        assert!(latest_path.exists());
+        let broken = b"not JSON";
+        assert!(pinned.store(&release_of("v0.1.2", broken), broken).is_err());
+        assert_eq!(pinned.verified().unwrap().unwrap().path, pinned_path);
+        assert!(CatalogSource::Cache(pinned).load().is_ok());
+    }
+
+    #[test]
+    fn malformed_local_catalogs_are_reported_before_analysis() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.jsonl");
+        fs::write(&path, "invalid JSON").unwrap();
+        assert_eq!(
+            io::Error::kind(&CatalogSource::Override(path).load().unwrap_err()),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

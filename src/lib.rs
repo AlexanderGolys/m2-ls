@@ -113,7 +113,9 @@ use crate::diagnostics::DiagnosticCode;
 use crate::object_registry::ObjectRegistry;
 use crate::semantic_token::M2SemanticToken;
 use crate::settings::{ServerSettings, SettingProblem, SettingsStore, SourceSettings};
-use crate::workspace_index::{WorkspaceIndex, WorkspaceView};
+use crate::workspace_index::{
+    WorkspaceDefinitionKnowledge, WorkspaceIndex, WorkspaceSymbolKnowledge, WorkspaceView,
+};
 
 /// The language server's state for one client session: the open documents, the
 /// indexes built from them and the library, and the settings.
@@ -164,6 +166,10 @@ impl Backend {
         let environment = Macaulay2Environment::current();
         let registry = ObjectRegistry::load(corpus);
         let library = configured_library(&environment, &registry, &SourceSettings::default());
+        let workspace_index = Arc::new(WorkspaceIndex::default());
+        if !registry.has_catalog() {
+            workspace_index.configure_fallback_sources(Some(library.source_resolver().clone()));
+        }
         Backend {
             client,
             library: SettingsStore::new(library),
@@ -171,7 +177,7 @@ impl Backend {
             environment,
             documents: DashMap::new(),
             document_versions: DashMap::new(),
-            workspace_index: Arc::new(WorkspaceIndex::default()),
+            workspace_index,
             settings: SettingsStore::default(),
             semantic_tokens_augment_syntax: ClientSupport::default(),
             type_hierarchy_dynamic_registration: ClientSupport::default(),
@@ -452,11 +458,12 @@ impl Backend {
 
     /// Point library navigation at the sources `sources` configures.
     fn configure_library(&self, sources: &SourceSettings) {
-        self.library.replace(configured_library(
-            &self.environment,
-            &self.registry,
-            sources,
-        ));
+        let library = configured_library(&self.environment, &self.registry, sources);
+        if !self.registry.has_catalog() {
+            self.workspace_index
+                .configure_fallback_sources(Some(library.source_resolver().clone()));
+        }
+        self.library.replace(library);
     }
 
     /// Analyze again each open document whose location implies other
@@ -874,7 +881,7 @@ impl Backend {
                     .package_of_source_file(&path)
                     .is_some()
             });
-            if !library_file {
+            if !library_file || !self.registry.has_catalog() {
                 self.workspace_index
                     .index_snapshot(&uri, document.value(), &self.registry);
             }
@@ -897,12 +904,13 @@ impl Backend {
         let library = self.library.snapshot();
         task::spawn_blocking(move || {
             index.index_files_from_disk_where(loaded, &registry, |file| {
-                file.to_file_path().is_ok_and(|path| {
-                    library
-                        .source_resolver()
-                        .package_of_source_file(&path)
-                        .is_none()
-                })
+                !registry.has_catalog()
+                    || file.to_file_path().is_ok_and(|path| {
+                        library
+                            .source_resolver()
+                            .package_of_source_file(&path)
+                            .is_none()
+                    })
             });
         })
         .await
@@ -1292,8 +1300,23 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         Ok(self
-            .with_source_at(uri, position, |document, knowledge, _| {
-                completion_response(document, uri, position, &knowledge.at(position))
+            .with_source_at(uri, position, |document, knowledge, workspace| {
+                let source_symbols = if self.registry.has_catalog() {
+                    Vec::new()
+                } else {
+                    self.workspace_index
+                        .matching_symbols("")
+                        .into_iter()
+                        .filter(|symbol| workspace.is_defined(symbol.name.name(), uri))
+                        .collect()
+                };
+                completion_response(
+                    document,
+                    uri,
+                    position,
+                    &knowledge.at(position),
+                    &source_symbols,
+                )
             })
             .flatten())
     }
@@ -1774,7 +1797,7 @@ pub const RUNTIME_THREAD_STACK_BYTES: usize = 1 << 30;
 
 /// Starts the stdio language server and runs until the protocol session ends.
 ///
-/// Catalog initialization failures print an error and exit with status 2.
+/// Catalog failures are reported on stderr; the session continues with source analysis.
 /// The completed protocol session terminates the process with its session status.
 ///
 /// # Panics
@@ -1787,19 +1810,16 @@ pub const RUNTIME_THREAD_STACK_BYTES: usize = 1 << 30;
 /// m2_ls::run_server();
 /// ```
 pub fn run_server() {
-    let (source, corpus) = CatalogSource::current()
-        .and_then(|source| source.load().map(|corpus| (source, corpus)))
-        .unwrap_or_else(|error| {
-            eprintln!("m2-ls: could not load builtin catalog: {error}");
-            std::process::exit(2);
-        });
-    // A newer M2Book catalog is fetched in the background and used from the next start.
-    if let CatalogSource::Cache(_) = source {
-        thread::spawn(move || {
-            if let Err(error) = source.update() {
-                eprintln!("m2-ls: builtin catalog not updated: {error}");
-            }
-        });
+    let corpus = CatalogSource::load_available();
+    // A newer matching catalog is fetched in the background for the next start.
+    if !corpus.is_empty() {
+        if let Ok(source @ CatalogSource::Cache(_)) = CatalogSource::current() {
+            thread::spawn(move || {
+                if let Err(error) = source.update() {
+                    eprintln!("m2-ls: builtin catalog not updated: {error}");
+                }
+            });
+        }
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(RUNTIME_THREAD_STACK_BYTES)

@@ -7,6 +7,9 @@
 pub struct Macaulay2Conventions;
 
 impl Macaulay2Conventions {
+    /// Runtime operator name used to dispatch application by juxtaposition.
+    pub const APPLICATION_OPERATOR: &str = "SPACE";
+
     /// Quiet startup skips user initialization and prints the installation prefix.
     pub const INSTALLATION_QUERY_ARGUMENTS: [&str; 7] = [
         "-q",

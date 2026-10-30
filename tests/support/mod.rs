@@ -27,16 +27,21 @@ pub(crate) struct LspProcess {
 
 impl LspProcess {
     pub(crate) async fn spawn() -> Self {
-        // An empty environment keeps the server from discovering the machine's
-        // Macaulay2 installation, so results do not depend on where tests run.
-        let mut child = Command::new(env!("CARGO_BIN_EXE_m2-ls"))
-            .env_clear()
-            .env(
-                "M2_LS_CATALOG",
-                m2_ls::catalog::CatalogSource::current()
-                    .and_then(|source| source.path())
-                    .expect("test catalog must be available"),
-            )
+        let catalog = m2_ls::catalog::CatalogSource::current()
+            .and_then(|source| source.path())
+            .expect("test catalog must be available");
+        Self::spawn_with_catalog(Some(&catalog)).await
+    }
+
+    /// Starts with a selected catalog, or without any configured cache location.
+    pub(crate) async fn spawn_with_catalog(catalog: Option<&std::path::Path>) -> Self {
+        // Keep discovery independent of the machine running the tests.
+        let mut command = Command::new(env!("CARGO_BIN_EXE_m2-ls"));
+        command.env_clear();
+        if let Some(catalog) = catalog {
+            command.env("M2_LS_CATALOG", catalog);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

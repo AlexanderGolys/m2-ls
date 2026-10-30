@@ -5,9 +5,9 @@ use super::*;
 #[cfg(test)]
 mod native_syntax_compliance_gate {
     //! Build gate enforcing the repo rule that the rest of the crate must reach
-    //! the syntax tree only through `SyntaxNode` and m2-syn types, never raw
-    //! tree-sitter node names or the raw source buffer. Reading raw code
-    //! re-derives parser logic and is banned.
+    //! Macaulay2 syntax through generated m2-syn types, never raw Tree-sitter
+    //! nodes or handwritten parsing. Navigation adapters remain confined to
+    //! consumers awaiting migration; typed inference must not depend on them.
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -18,7 +18,7 @@ mod native_syntax_compliance_gate {
     const BANNED: &[(&str, &str)] = &[
         (
             ".kind()",
-            "raw tree-sitter node-type name; use `node.is::<Syntax>()` instead",
+            "raw tree-sitter node-type name; use generated m2-syn types instead",
         ),
         (
             ".raw_kind()",
@@ -27,7 +27,7 @@ mod native_syntax_compliance_gate {
         (".utf8_text(", "reads raw bytes; use `node.text()`"),
         (
             "tree_sitter::Node",
-            "raw node type; pass `SyntaxNode` instead",
+            "raw node type; use generated m2-syn types instead",
         ),
         (
             "starts_with('\"')",
@@ -54,6 +54,34 @@ mod native_syntax_compliance_gate {
                 rust_sources(&path, out);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
                 out.push(path);
+            }
+        }
+    }
+
+    /// Typed rules and recursion cannot recover behavior by casting navigation nodes.
+    #[test]
+    fn inference_core_uses_generated_operands_without_runtime_type_reflection() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for relative in [
+            "src/analysis/inference.rs",
+            "src/analysis/inference/session.rs",
+            "src/analysis/inference/syntax.rs",
+            "src/analysis/ring/syntax.rs",
+            "src/analysis/ring/values.rs",
+        ] {
+            let source = fs::read_to_string(root.join(relative)).unwrap();
+            for forbidden in [
+                "SyntaxNode",
+                "SyntaxRef",
+                "SyntaxType",
+                "TypeId",
+                ".get::<",
+                "InferenceNavigation",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{relative} contains erased syntax access: {forbidden}"
+                );
             }
         }
     }

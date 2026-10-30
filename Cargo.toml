@@ -29,6 +29,7 @@ ropey = "1.6.1"
 serde_path_to_error = "0.1"
 strum = { version = "0.28.0", features = ["derive"] }
 these-macros-should-be-illegal = "0.12.2"
+semver = "1"
 sha2 = "0.10"
 tempfile = "3"
 ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }

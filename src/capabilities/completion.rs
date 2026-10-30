@@ -9,6 +9,7 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::builtin_index::{CallableKind, Record};
+use crate::capabilities::document_symbols::WorkspaceSourceSymbol;
 use crate::document::DocumentSnapshot;
 use crate::file_load::FileLoad;
 use crate::macaulay2::Macaulay2Conventions;
@@ -110,6 +111,8 @@ pub struct CompletionContext<'a> {
     symbol: Option<SyntaxNode<'a>>,
     /// Entered symbol text and the range completion will replace.
     symbol_prefix: Option<CompletionPrefix>,
+    /// Visible definitions found in package sources when no builtin catalog is available.
+    source_symbols: &'a [WorkspaceSourceSymbol],
 }
 
 /// Recognizes a cursor context and selects completion sources for it.
@@ -282,13 +285,16 @@ pub fn completion_options() -> CompletionOptions {
 }
 
 /// Recognizes the cursor context and returns ranked completion items with replacement ranges.
+/// `source_symbols` supplements builtin metadata with visible source definitions.
 pub fn completion_response<Knowledge: LspKnowledge>(
     document: &DocumentSnapshot,
     uri: &Url,
     position: Position,
     knowledge: &Knowledge,
+    source_symbols: &[WorkspaceSourceSymbol],
 ) -> Option<CompletionResponse> {
-    let context = CompletionContext::new(document, uri, position)?;
+    let mut context = CompletionContext::new(document, uri, position)?;
+    context.source_symbols = source_symbols;
     let knowledge: &dyn CompletionKnowledge = knowledge;
     COMPLETION_PATTERNS
         .iter()
@@ -323,6 +329,7 @@ impl<'a> CompletionContext<'a> {
             node,
             symbol,
             symbol_prefix,
+            source_symbols: &[],
         })
     }
 
@@ -547,7 +554,15 @@ impl CompletionSource for KnownSymbols {
                     .with_detail(detail)
                     .with_priority(2)
             });
-        local.chain(external).take(limit).collect()
+        let source = context
+            .source_symbols
+            .iter()
+            .filter(|symbol| self.required_type.is_none() && symbol.name.name().starts_with(prefix))
+            .map(|symbol| {
+                CompletionCandidate::new(symbol.name.name(), completion_item_kind(symbol.kind))
+                    .with_priority(2)
+            });
+        local.chain(external).chain(source).take(limit).collect()
     }
 }
 
@@ -851,7 +866,7 @@ mod tests {
             DocumentSnapshot::from_text(text.to_string(), &index).expect("fixture should parse");
         let scoped = index.with_source_imports(text);
         let uri = Url::parse("file:///fixture.m2").expect("fixture uri");
-        match completion_response(&document, &uri, position, &scoped) {
+        match completion_response(&document, &uri, position, &scoped, &[]) {
             Some(CompletionResponse::Array(items)) => items,
             Some(CompletionResponse::List(list)) => list.items,
             None => Vec::new(),

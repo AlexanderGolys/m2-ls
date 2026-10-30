@@ -246,9 +246,7 @@ impl Tool {
     /// the init file `settings` and its directive select. Returns the exit
     /// status: `1` for an error, or a warning under `--deny-warnings`.
     fn lint(options: &Options, settings: &ServerSettings, text: String) -> Result<u8, String> {
-        let corpus = CatalogSource::current()
-            .and_then(|source| source.load())
-            .map_err(|error| error.to_string())?;
+        let corpus = CatalogSource::load_available();
         let environment = Macaulay2Environment::current();
         let registry = ObjectRegistry::load(&corpus);
         let uri = options.input.uri()?;

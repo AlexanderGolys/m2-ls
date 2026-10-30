@@ -3834,3 +3834,94 @@ async fn ring_subscripts_evaluate_to_inline_values_and_bound_errors() {
         "unexpected message: {messages:?}"
     );
 }
+
+/// Typed operands retain scope and output-history semantics when shared cells move
+/// and later revisions change the type of a preceding binding.
+#[tokio::test]
+async fn typed_inference_tracks_scope_output_history_and_revisions() {
+    let source = concat!(
+        "label = \"α\"\n",
+        "number = 7\n",
+        "first = oo\n",
+        "muted = false;\n",
+        "second = oo\n",
+        "quoted = symbol number\n",
+        "inside = \"inner\"\n",
+        "readLocal = input -> (inside := false; inside)\n",
+        "outside = inside\n",
+        "branch = if true then number else first\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    for (line, expected) in [
+        (2, "ZZ"),
+        (4, "ZZ"),
+        (5, "Symbol"),
+        (6, "String"),
+        (8, "String"),
+        (9, "ZZ"),
+    ] {
+        assert_eq!(hover_type_at(&mut session, line, 1).await, expected);
+    }
+
+    let relocated = source.replacen("\"α\"", "\"αβγδε\"", 1);
+    session.replace(&relocated).await;
+    assert_eq!(hover_type_at(&mut session, 4, 1).await, "ZZ");
+    assert_eq!(hover_type_at(&mut session, 8, 1).await, "String");
+
+    session
+        .replace(&relocated.replacen("number = 7", "number = false", 1))
+        .await;
+    for (line, expected) in [
+        (2, "Boolean"),
+        (4, "Boolean"),
+        (5, "Symbol"),
+        (8, "String"),
+        (9, "Boolean"),
+    ] {
+        assert_eq!(hover_type_at(&mut session, line, 1).await, expected);
+    }
+}
+
+/// Retained ring lookups follow shifted cells, aliases, changed generators, and
+/// newly invalid indices rather than reusing a previous revision's value.
+#[tokio::test]
+async fn typed_ring_values_follow_aliases_across_document_revisions() {
+    let body = concat!(
+        "A = R\n",
+        "selected := A_1\n",
+        "promoted := 1_A\n",
+        "selected\n",
+        "promoted\n",
+    );
+    let mut session = DocumentSession::open(&format!("R = QQ[x_0..x_2]\n{body}")).await;
+    for (prefix, variables, expected) in [
+        ("", "x_0..x_2", "x_1"),
+        ("-- α\n", "x_0..x_2", "x_1"),
+        ("-- α\n", "y_0..y_2", "y_1"),
+    ] {
+        session
+            .replace(&format!("{prefix}R = QQ[{variables}]\n{body}"))
+            .await;
+        let shift = prefix.lines().count() as u64;
+        assert_eq!(hover_type_at(&mut session, shift + 4, 0).await, "R");
+        assert_eq!(hover_type_at(&mut session, shift + 5, 0).await, "R");
+        let values = session.request("textDocument/inlineValue", json!({
+            "textDocument": {"uri": session.uri()},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 100, "character": 0}},
+            "context": {"frameId": 0, "stoppedLocation": {
+                "start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}
+            }}
+        })).await;
+        assert!(
+            response_array(&values)
+                .iter()
+                .any(|value| value["text"] == format!("A_1 = {expected}")
+                    && value["range"]["start"]["line"] == shift + 2),
+            "{values}"
+        );
+        assert!(diagnostic_lines(&session, "E14").is_empty());
+    }
+    session.replace(&format!("-- α\nR = QQ[y_0]\n{body}")).await;
+    assert_eq!(diagnostic_lines(&session, "E14"), vec![3]);
+    session.shutdown().await;
+}

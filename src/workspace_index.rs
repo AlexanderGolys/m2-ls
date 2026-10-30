@@ -26,11 +26,14 @@ use crate::analysis::AssignmentFactKind;
 use crate::capabilities::document_symbols::{collect_workspace_symbols, WorkspaceSourceSymbol};
 use crate::document::DocumentSnapshot;
 use crate::file_load::FileLoad;
+use crate::macaulay2::Macaulay2Conventions;
 use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::package_documentation::DocumentedSubject;
+use crate::package_index::SourceResolver;
 use crate::semantic_token::{
     local_symbol_semantic_token, M2SemanticToken, M2SemanticTokenModifier, M2SemanticTokenType,
 };
+use crate::settings::SettingsStore;
 use crate::source_package::{ExportAccess, PackageDeclaration, PackageExport};
 
 /// Where one global is bound at the top level of an indexed file, with what
@@ -284,6 +287,8 @@ pub struct WorkspaceIndex {
     init_file_of_document: DashMap<Url, Url>,
     /// Whether files outside a package see only its exports.
     privacy: PackagePrivacy,
+    /// Installed sources analyzed as workspace code when builtin metadata is unavailable.
+    fallback_sources: SettingsStore<Option<SourceResolver>>,
 }
 
 /// The workspace as the source a request is analyzed in sees it.
@@ -303,6 +308,15 @@ impl WorkspaceIndex {
             privacy: PackagePrivacy::Waived,
             ..Self::default()
         }
+    }
+
+    /// Set installed-source lookup for sessions without builtin metadata.
+    ///
+    /// Normal catalog-backed sessions pass `None` and keep installed packages
+    /// out of this index. Source-only sessions include imported package files
+    /// and Core, following ordinary loads with the existing parser.
+    pub fn configure_fallback_sources(&self, sources: Option<SourceResolver>) {
+        self.fallback_sources.replace(sources);
     }
 
     /// Index `uri` from `text`, then every file it loads and every user
@@ -418,11 +432,21 @@ impl WorkspaceIndex {
                 .insert(uri.clone(), declarations);
         }
         let mut loads = self.record_loaded_files(uri, snapshot);
+        let fallback = self.fallback_sources.snapshot();
         loads.extend(imported_user_package_files(
             uri,
             snapshot,
             knowledge_provider,
+            fallback.as_ref(),
         ));
+        if let Some(core) = fallback
+            .as_ref()
+            .and_then(|sources| sources.resolve_package_file(Macaulay2Conventions::CORE))
+            .and_then(|path| Url::from_file_path(path).ok())
+            .filter(|core| core != uri)
+        {
+            loads.push(core);
+        }
         self.loads_by_file.insert(uri.clone(), loads.clone());
         let definitions = top_level_definitions(uri, snapshot);
         let implementations = top_level_implementations(snapshot);
@@ -489,8 +513,14 @@ impl WorkspaceIndex {
     /// is recorded as belonging to that package.
     fn record_loaded_files(&self, uri: &Url, snapshot: &DocumentSnapshot) -> Vec<Url> {
         let mut loaded_files = Vec::new();
+        let search_paths = self
+            .fallback_sources
+            .snapshot()
+            .as_ref()
+            .map(SourceResolver::fallback_load_paths)
+            .unwrap_or_default();
         for load in snapshot.file_loads() {
-            let Some(loaded) = load.resolve(uri, &[]).file().cloned() else {
+            let Some(loaded) = load.resolve(uri, &search_paths).file().cloned() else {
                 continue;
             };
             if let Some(package) = self.package_at(uri, load.call) {
@@ -1090,11 +1120,13 @@ fn file_directory(uri: &Url) -> Option<PathBuf> {
 /// imports: a package the corpus does not know, found as `P.m2` in the
 /// directory of `uri`. Macaulay2 searches its `path`, which starts with the
 /// session's current directory, and a document's own directory is where its
-/// session runs.
+/// session runs. Without a catalog, installed packages are resolved through
+/// `fallback_sources` and analyzed in the same index.
 fn imported_user_package_files(
     uri: &Url,
     snapshot: &DocumentSnapshot,
     knowledge_provider: &ObjectRegistry,
+    fallback_sources: Option<&SourceResolver>,
 ) -> Vec<Url> {
     let Some(directory) = file_directory(uri) else {
         return Vec::new();
@@ -1107,8 +1139,15 @@ fn imported_user_package_files(
                 .catalog_package_id(&import.package)
                 .is_none()
         })
-        .map(|import| directory.join(format!("{}.m2", import.package)))
-        .filter(|path| path.is_file())
+        .filter_map(|import| {
+            let local = directory.join(format!("{}.m2", import.package));
+            if local.is_file() {
+                Some(local)
+            } else {
+                fallback_sources
+                    .and_then(|sources| sources.resolve_package_file(import.package.name()))
+            }
+        })
         .filter_map(|path| Url::from_file_path(path).ok())
         .collect()
 }

@@ -698,7 +698,7 @@ impl<'tree> SyntaxNode<'tree> {
     pub fn binary_operator(&self) -> Option<&'tree str> {
         let parts = self.binary_parts()?;
         Some(if self.is_adjacent_expr() {
-            "SPACE"
+            crate::macaulay2::Macaulay2Conventions::APPLICATION_OPERATOR
         } else {
             parts.operator.text()
         })

@@ -483,6 +483,22 @@ impl SourceResolver {
         &self.path
     }
 
+    /// Source search directories for analysis without a builtin catalog.
+    ///
+    /// Core loads its implementation from `corepath`; package loads also need
+    /// the ordinary `path`. Each directory occurs once, in search order.
+    pub fn fallback_load_paths(&self) -> Vec<PathBuf> {
+        self.core_path
+            .iter()
+            .chain(&self.path)
+            .fold(Vec::new(), |mut paths, path| {
+                if !paths.contains(path) {
+                    paths.push(path.clone());
+                }
+                paths
+            })
+    }
+
     /// The directories of `search_list` that exist, each once, in order: the
     /// directories Macaulay2 keeps of a search list it builds.
     fn existing_directories(search_list: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {

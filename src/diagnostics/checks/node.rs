@@ -8,9 +8,8 @@ use m2_syn::Token;
 
 use super::{DiagnosticSink, NodeContext};
 use crate::analysis::{
-    assigned_lambda, parenthesized_value, CallableHeadKind, ControlTransferTarget,
-    MethodCodomainEdit, MethodHead, OptionDeclaration, OptionMisuse, RingVariableError,
-    TypeChecker,
+    assigned_lambda, parenthesized_value, CallOptionIssue, CallableHeadKind, ControlTransferTarget,
+    MethodCodomainEdit, MethodHead, OptionDeclaration, RingVariableError, TypeChecker,
 };
 use crate::diagnostics::rewrites::{
     ambiguous_float_member_access_rewrite, coalescence_rewrite, else_if_chain_rewrite,
@@ -880,8 +879,8 @@ fn call_domain(context: &NodeContext, sink: &mut DiagnosticSink) {
 fn call_options(context: &NodeContext, sink: &mut DiagnosticSink) {
     let node = context.node;
     let checker = TypeChecker::new(context.analysis, context.knowledge);
-    let misuses = checker.call_option_misuses(node, context.source, context.knowledge);
-    if misuses.is_empty() {
+    let issues = checker.call_option_issues(node, context.source, context.knowledge);
+    if issues.is_empty() {
         return;
     }
     let function = node.binary_parts().map_or("", |parts| parts.left.text());
@@ -892,9 +891,9 @@ fn call_options(context: &NodeContext, sink: &mut DiagnosticSink) {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    for misuse in misuses {
-        let (rule, range, message) = match misuse {
-            OptionMisuse::UnknownName {
+    for issue in issues {
+        let (rule, range, message) = match issue {
+            CallOptionIssue::UnknownName {
                 key,
                 suggestion,
                 accepted,
@@ -920,7 +919,7 @@ fn call_options(context: &NodeContext, sink: &mut DiagnosticSink) {
                     ),
                 },
             ),
-            OptionMisuse::ValueType {
+            CallOptionIssue::ValueType {
                 value,
                 option,
                 actual,
@@ -935,7 +934,7 @@ fn call_options(context: &NodeContext, sink: &mut DiagnosticSink) {
                     actual.label().unwrap_or_else(|| "unknown".to_string())
                 ),
             ),
-            OptionMisuse::ValueNotPossible {
+            CallOptionIssue::ValueNotPossible {
                 value,
                 option,
                 possible,
