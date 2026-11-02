@@ -112,9 +112,12 @@ use session::{ClientInput, ExitNotificationService, SessionEnd};
 use crate::catalog::CatalogSource;
 use crate::config_file::{ConfigFile, SettingsSources};
 use crate::diagnostics::DiagnosticCode;
+use crate::library_index::LibraryLimits;
 use crate::object_registry::ObjectRegistry;
 use crate::semantic_token::M2SemanticToken;
-use crate::settings::{ServerSettings, SettingProblem, SettingsStore, SourceSettings};
+use crate::settings::{
+    LibraryIndexing, LibrarySettings, ServerSettings, SettingProblem, SettingsStore, SourceSettings,
+};
 use crate::workspace_index::{WorkspaceIndex, WorkspaceView};
 
 /// The language server's state for one client session: the open documents, the
@@ -167,7 +170,12 @@ impl Backend {
     fn new(client: Client, corpus: &str) -> Self {
         let environment = Macaulay2Environment::current();
         let registry = ObjectRegistry::load(corpus);
-        let library = configured_library(&environment, &registry, &SourceSettings::default());
+        let library = configured_library(
+            &environment,
+            &registry,
+            &SourceSettings::default(),
+            &LibrarySettings::default(),
+        );
         Backend {
             client,
             library: SettingsStore::new(library),
@@ -499,13 +507,34 @@ impl Backend {
         TypeHierarchyContext::new(&self.registry, library.source_resolver())
     }
 
-    /// Point library navigation at the sources `sources` configures.
-    fn configure_library(&self, sources: &SourceSettings) {
+    /// Point library navigation at the sources `sources` configures,
+    /// indexed as `library` says.
+    fn configure_library(&self, sources: &SourceSettings, library: &LibrarySettings) {
         self.library.replace(configured_library(
             &self.environment,
             &self.registry,
             sources,
+            library,
         ));
+    }
+
+    /// Under `library.indexing = "loaded"`, index the library sources of the
+    /// packages the open document `uri` imports, in the background.
+    fn index_imported_library_packages(&self, uri: &Url) {
+        if self.settings.snapshot().library.indexing != LibraryIndexing::Loaded {
+            return;
+        }
+        let Some(packages) = self.documents.get(uri).map(|document| {
+            document
+                .imported_packages()
+                .iter()
+                .map(|import| import.package.clone())
+                .collect::<Vec<_>>()
+        }) else {
+            return;
+        };
+        let library = self.library.snapshot();
+        tokio::spawn(async move { library.index_loaded_packages(packages).await });
     }
 
     /// Analyze again each open document whose location implies other
@@ -810,8 +839,19 @@ impl Backend {
     ) -> Result<()> {
         let previous = self.settings.replace(settings.clone());
         let mut reanalyzed = false;
+        if previous.library != settings.library && previous.sources == settings.sources {
+            self.configure_library(&settings.sources, &settings.library);
+            let open = self
+                .documents
+                .iter()
+                .map(|document| document.key().clone())
+                .collect::<Vec<_>>();
+            for uri in open {
+                self.index_imported_library_packages(&uri);
+            }
+        }
         if previous.sources != settings.sources {
-            self.configure_library(&settings.sources);
+            self.configure_library(&settings.sources, &settings.library);
             reanalyzed = self.imply_document_properties();
             if self.configure_init_file(&settings.sources).await {
                 reanalyzed = true;
@@ -885,6 +925,7 @@ impl Backend {
         self.document_versions.insert(uri.clone(), params.version);
         self.documents.insert(uri.clone(), document);
         self.index_loaded_in_background(loaded).await;
+        self.index_imported_library_packages(&uri);
         self.adopt_started_init_file(&started).await;
         if let Some(document) = self.documents.get(&uri) {
             self.publish_document_diagnostics(uri, document.value())
@@ -1048,7 +1089,7 @@ impl LanguageServer for Backend {
         self.editor_settings.replace(editor.clone());
         let sources = self.settings_sources(editor);
         let parsed = sources.parse();
-        self.configure_library(&parsed.settings.sources);
+        self.configure_library(&parsed.settings.sources, &parsed.settings.library);
         self.settings.replace(parsed.settings);
         self.report_unreadable_settings_files(&sources.unreadable)
             .await;
@@ -1815,9 +1856,14 @@ fn configured_library(
     environment: &Macaulay2Environment,
     registry: &ObjectRegistry,
     sources: &SourceSettings,
+    library: &LibrarySettings,
 ) -> Arc<LibraryIndex> {
     let source_resolver = SourceResolver::configured(environment, sources);
-    Arc::new(LibraryIndex::new(source_resolver, registry.clone()))
+    Arc::new(LibraryIndex::with_limits(
+        source_resolver,
+        registry.clone(),
+        LibraryLimits::from(library),
+    ))
 }
 
 /// The name and version the server reports to the client.

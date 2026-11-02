@@ -14,18 +14,44 @@ use tower_lsp::lsp_types::{Location, Url};
 use crate::document::DocumentSnapshot;
 use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::package_index::SourceResolver;
+use crate::settings::{LibraryIndexing, LibrarySettings};
 use crate::workspace_index::WorkspaceIndex;
 
 /// Installed package file listing the source files to index.
 const LOAD_SEQUENCE: &str = "loadsequence";
-/// Maximum number of library packages retained in the source cache.
-const MAX_CACHED_PACKAGES: usize = 8;
 /// Bound on unresolved package names retained to suppress repeated lookups.
 const MAX_MISSING_PACKAGES: usize = 128;
-/// Maximum source-file count indexed for one library package.
-const MAX_PACKAGE_FILES: usize = 64;
-/// Maximum cumulative source bytes indexed for one library package.
-const MAX_PACKAGE_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// When library sources are indexed and how much of them, as the
+/// `library.*` settings say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LibraryLimits {
+    /// When package sources are indexed.
+    indexing: LibraryIndexing,
+    /// Maximum number of library packages retained in the source cache.
+    max_packages: usize,
+    /// Maximum source-file count indexed for one library package.
+    max_files: usize,
+    /// Maximum cumulative source bytes indexed for one library package.
+    max_bytes: u64,
+}
+
+impl From<&LibrarySettings> for LibraryLimits {
+    fn from(settings: &LibrarySettings) -> Self {
+        Self {
+            indexing: settings.indexing,
+            max_packages: settings.max_packages.max(1) as usize,
+            max_files: settings.max_files_per_package as usize,
+            max_bytes: u64::from(settings.max_megabytes_per_package) * 1024 * 1024,
+        }
+    }
+}
+
+impl Default for LibraryLimits {
+    fn default() -> Self {
+        Self::from(&LibrarySettings::default())
+    }
+}
 
 /// Indexed files and synchronized progress for one lazily loaded library package.
 #[derive(Debug)]
@@ -36,6 +62,8 @@ struct PackageSources {
     progress: Mutex<PackageProgress>,
     /// Logical access time used to evict the least recently requested package.
     last_used: AtomicU64,
+    /// How much of the package may be indexed.
+    limits: LibraryLimits,
 }
 
 /// Pending files, visited locations, and resource usage for library indexing.
@@ -64,6 +92,8 @@ pub struct LibraryIndex {
     clock: AtomicU64,
     /// Async exclusion preventing concurrent library indexing passes.
     indexing: AsyncMutex<()>,
+    /// When sources are indexed, and how much of them.
+    limits: LibraryLimits,
 }
 
 /// A navigation request's view of the cached sources and the packages for
@@ -78,7 +108,17 @@ pub struct LibrarySources<'library> {
 
 impl LibraryIndex {
     /// Creates an empty lazy library index using the supplied resolver and builtin registry.
+    #[cfg(test)]
     pub fn new(source_resolver: SourceResolver, registry: ObjectRegistry) -> Self {
+        Self::with_limits(source_resolver, registry, LibraryLimits::default())
+    }
+
+    /// An empty library index indexing as much as `limits` allows.
+    pub fn with_limits(
+        source_resolver: SourceResolver,
+        registry: ObjectRegistry,
+        limits: LibraryLimits,
+    ) -> Self {
         Self {
             source_resolver,
             registry,
@@ -86,6 +126,7 @@ impl LibraryIndex {
             missing_packages: Mutex::default(),
             clock: AtomicU64::new(0),
             indexing: AsyncMutex::new(()),
+            limits,
         }
     }
 
@@ -105,6 +146,9 @@ impl LibraryIndex {
     /// Advance each requested package by one file, sharing a single worker
     /// across requests. Dependencies stay queued until navigation needs them.
     pub async fn index_packages(&self, packages: Vec<ObjectName>) {
+        if self.limits.indexing == LibraryIndexing::Off {
+            return;
+        }
         let queue_timing = crate::telemetry::Timing::start(
             "library.queue",
             serde_json::json!({"packages": packages.iter().map(ObjectName::name).collect::<Vec<_>>()}),
@@ -119,6 +163,34 @@ impl LibraryIndex {
             task::spawn_blocking(move || package.index_next_file(&registry))
                 .await
                 .expect("library indexing task panicked");
+        }
+    }
+
+    /// Under `library.indexing = "loaded"`, index every file of `packages`,
+    /// as far as the limits allow, a file per package at a time so requests
+    /// can interleave. Otherwise nothing: files are indexed as navigation
+    /// needs them.
+    pub async fn index_loaded_packages(&self, packages: Vec<ObjectName>) {
+        if self.limits.indexing != LibraryIndexing::Loaded {
+            return;
+        }
+        let packages = packages
+            .into_iter()
+            .take(self.limits.max_packages)
+            .collect::<Vec<_>>();
+        loop {
+            let pending = packages
+                .iter()
+                .filter(|name| {
+                    self.package(name, true)
+                        .is_some_and(|package| package.has_pending_files())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if pending.is_empty() {
+                return;
+            }
+            self.index_packages(pending).await;
         }
     }
 
@@ -164,7 +236,7 @@ impl LibraryIndex {
             missing.insert(name.clone());
             return None;
         };
-        if packages.len() == MAX_CACHED_PACKAGES {
+        if packages.len() >= self.limits.max_packages {
             if let Some(oldest) = packages
                 .iter()
                 .min_by_key(|(_, package)| package.last_used.load(Ordering::Relaxed))
@@ -178,7 +250,7 @@ impl LibraryIndex {
         }
         let pending = std::iter::once(main_file.clone())
             .chain(load_sequence_files(&main_file))
-            .take(MAX_PACKAGE_FILES)
+            .take(self.limits.max_files)
             .filter_map(|path| Url::from_file_path(path).ok())
             .collect();
         let package = Arc::new(PackageSources {
@@ -188,6 +260,7 @@ impl LibraryIndex {
                 ..PackageProgress::default()
             }),
             last_used: AtomicU64::new(tick),
+            limits: self.limits,
         });
         packages.insert(name.clone(), Arc::clone(&package));
         Some(package)
@@ -210,7 +283,7 @@ impl PackageSources {
         loop {
             let (uri, remaining) = {
                 let mut progress = self.progress.lock().expect("package progress lock");
-                if progress.visited.len() >= MAX_PACKAGE_FILES {
+                if progress.visited.len() >= self.limits.max_files {
                     progress.pending.clear();
                     crate::telemetry::event(
                         serde_json::json!({"operation": "library.limit", "limit": "files", "files": progress.visited.len()}),
@@ -225,7 +298,7 @@ impl PackageSources {
                 }
                 (
                     uri,
-                    MAX_PACKAGE_SOURCE_BYTES.saturating_sub(progress.source_bytes),
+                    self.limits.max_bytes.saturating_sub(progress.source_bytes),
                 )
             };
             let mut timing = crate::telemetry::Timing::start(
@@ -268,7 +341,7 @@ impl PackageSources {
             let loaded = self.sources.index_snapshot(&uri, &snapshot, registry);
             let mut progress = self.progress.lock().expect("package progress lock");
             progress.pending.extend(loaded);
-            let remaining_files = MAX_PACKAGE_FILES.saturating_sub(progress.visited.len());
+            let remaining_files = self.limits.max_files.saturating_sub(progress.visited.len());
             progress.pending.truncate(remaining_files);
             timing.record("pending_files", progress.pending.len());
             timing.record("cached_files", progress.visited.len());
@@ -476,9 +549,10 @@ mod tests {
     #[tokio::test]
     async fn oversized_sources_are_skipped_and_the_package_cache_evicts_old_entries() {
         let fixture = LibraryFixture::new("bounded");
+        let limits = LibraryLimits::default();
         fs::write(
             fixture.source("Oversized.m2"),
-            vec![b' '; MAX_PACKAGE_SOURCE_BYTES as usize + 1],
+            vec![b' '; limits.max_bytes as usize + 1],
         )
         .unwrap();
         let oversized = ObjectName::new("Oversized");
@@ -486,7 +560,7 @@ mod tests {
         let package = fixture.index.package(&oversized, false).unwrap();
         assert_eq!(package.progress.lock().unwrap().source_bytes, 0);
         assert!(!package.has_pending_files());
-        for number in 0..MAX_CACHED_PACKAGES {
+        for number in 0..limits.max_packages {
             let name = format!("Pkg{number}");
             fs::write(fixture.source(&format!("{name}.m2")), "value = 1\n").unwrap();
             fixture
@@ -496,8 +570,40 @@ mod tests {
         }
         assert_eq!(
             fixture.index.packages.lock().unwrap().len(),
-            MAX_CACHED_PACKAGES
+            limits.max_packages
         );
         assert!(fixture.index.package(&oversized, false).is_none());
+    }
+
+    #[tokio::test]
+    async fn indexing_can_be_off_or_index_whole_loaded_packages() {
+        let fixture = LibraryFixture::new("modes");
+        fs::write(fixture.source("Whole.m2"), "value = 1\n").unwrap();
+        let whole = ObjectName::new("Whole");
+        let index = |indexing| {
+            LibraryIndex::with_limits(
+                fixture.index.source_resolver().clone(),
+                ObjectRegistry::default(),
+                LibraryLimits {
+                    indexing,
+                    ..LibraryLimits::default()
+                },
+            )
+        };
+
+        let off = index(LibraryIndexing::Off);
+        off.index_packages(vec![whole.clone()]).await;
+        off.index_loaded_packages(vec![whole.clone()]).await;
+        assert!(off.package(&whole, false).is_none());
+
+        let on_demand = index(LibraryIndexing::OnDemand);
+        on_demand.index_loaded_packages(vec![whole.clone()]).await;
+        assert!(on_demand.package(&whole, false).is_none());
+
+        let loaded = index(LibraryIndexing::Loaded);
+        loaded.index_loaded_packages(vec![whole.clone()]).await;
+        let package = loaded.package(&whole, false).unwrap();
+        assert!(!package.has_pending_files());
+        assert_eq!(package.progress.lock().unwrap().visited.len(), 1);
     }
 }
