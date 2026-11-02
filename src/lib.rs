@@ -46,6 +46,7 @@ pub mod cli;
 /// The optional client capabilities the server negotiates, such as refresh
 /// requests, and acting on them only when the client supports them.
 mod client_capabilities;
+mod config_file;
 mod diagnostics;
 mod document;
 mod documentation;
@@ -109,6 +110,7 @@ use package_index::{Macaulay2Environment, SourceResolver};
 use session::{ClientInput, ExitNotificationService, SessionEnd};
 
 use crate::catalog::CatalogSource;
+use crate::config_file::{ConfigFile, SettingsSources};
 use crate::diagnostics::DiagnosticCode;
 use crate::object_registry::ObjectRegistry;
 use crate::semantic_token::M2SemanticToken;
@@ -139,8 +141,10 @@ struct Backend {
     /// The library sources navigation enters, replaced when `sources.*`
     /// changes.
     library: SettingsStore<Arc<LibraryIndex>>,
-    /// The settings the client sent last.
+    /// The settings in effect: the settings files and the editor's.
     settings: SettingsStore<ServerSettings>,
+    /// The settings the client sent last, as sent.
+    editor_settings: SettingsStore<serde_json::Value>,
     /// Whether the client keeps its syntax highlighting under semantic tokens.
     semantic_tokens_augment_syntax: ClientSupport<SemanticTokensAugmentSyntax>,
     /// Whether the client registers the type hierarchy dynamically.
@@ -173,12 +177,57 @@ impl Backend {
             document_versions: DashMap::new(),
             workspace_index: Arc::new(WorkspaceIndex::default()),
             settings: SettingsStore::default(),
+            editor_settings: SettingsStore::default(),
             semantic_tokens_augment_syntax: ClientSupport::default(),
             type_hierarchy_dynamic_registration: ClientSupport::default(),
             inlay_hint_refresh: ClientSupport::default(),
             semantic_tokens_refresh: ClientSupport::default(),
             init_files: InitFiles::default(),
             workspace_folders: DashSet::new(),
+        }
+    }
+
+    /// The settings sources for the editor's settings `editor`: the user's
+    /// settings file and the nearest project settings file of the first
+    /// workspace folder that has one.
+    fn settings_sources(&self, editor: serde_json::Value) -> SettingsSources {
+        let mut folders = self.workspace_folder_paths();
+        folders.sort();
+        let project_directory = folders
+            .iter()
+            .find(|folder| ConfigFile::find_project_path(folder).is_some())
+            .or(folders.first())
+            .cloned();
+        SettingsSources::read(editor, project_directory.as_deref())
+    }
+
+    /// Read the settings files again and apply them over the editor's
+    /// settings, reporting what could not be read.
+    async fn reload_settings(&self) {
+        let sources = self.settings_sources(self.editor_settings.snapshot());
+        self.report_unreadable_settings_files(&sources.unreadable)
+            .await;
+        let parsed = sources.parse();
+        self.report_setting_problems(&parsed.problems).await;
+        if let Err(error) = self.apply_settings(parsed.settings, &self.client).await {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("Failed to refresh Macaulay2 inlay hints or semantic tokens: {error}"),
+                )
+                .await;
+        }
+    }
+
+    /// Tell the user which settings files exist but could not be read.
+    async fn report_unreadable_settings_files(&self, unreadable: &[String]) {
+        for problem in unreadable {
+            self.client
+                .show_message(
+                    MessageType::WARNING,
+                    format!("m2-ls could not read a settings file: {problem}"),
+                )
+                .await;
         }
     }
 
@@ -992,12 +1041,18 @@ impl LanguageServer for Backend {
         self.inlay_hint_refresh.negotiate(&params.capabilities);
         self.semantic_tokens_refresh.negotiate(&params.capabilities);
 
-        if let Some(options) = params.initialization_options.as_ref() {
-            let parsed = ServerSettings::from_value(options);
-            self.configure_library(&parsed.settings.sources);
-            self.settings.replace(parsed.settings);
-            self.report_setting_problems(&parsed.problems).await;
-        }
+        let editor = params
+            .initialization_options
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
+        self.editor_settings.replace(editor.clone());
+        let sources = self.settings_sources(editor);
+        let parsed = sources.parse();
+        self.configure_library(&parsed.settings.sources);
+        self.settings.replace(parsed.settings);
+        self.report_unreadable_settings_files(&sources.unreadable)
+            .await;
+        self.report_setting_problems(&parsed.problems).await;
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -1102,7 +1157,11 @@ impl LanguageServer for Backend {
                 id: "m2-ls-watch-m2-files".to_string(),
                 method: "workspace/didChangeWatchedFiles".to_string(),
                 register_options: Some(serde_json::json!({
-                    "watchers": [{ "globPattern": "**/*.m2" }]
+                    "watchers": [
+                        { "globPattern": "**/*.m2" },
+                        { "globPattern": "**/m2-ls.toml" },
+                        { "globPattern": "**/.m2-ls.toml" }
+                    ]
                 })),
             }])
             .await;
@@ -1147,16 +1206,8 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
-        let parsed = ServerSettings::from_value(&params.settings);
-        self.report_setting_problems(&parsed.problems).await;
-        if let Err(error) = self.apply_settings(parsed.settings, &self.client).await {
-            self.client
-                .log_message(
-                    MessageType::WARNING,
-                    format!("Failed to refresh Macaulay2 inlay hints or semantic tokens: {error}"),
-                )
-                .await;
-        }
+        self.editor_settings.replace(params.settings);
+        self.reload_settings().await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -1178,6 +1229,15 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let user_settings_file = ConfigFile::user_path();
+        if params.changes.iter().any(|change| {
+            change.uri.to_file_path().is_ok_and(|path| {
+                ConfigFile::is_settings_file_name(&path)
+                    || user_settings_file.as_ref() == Some(&path)
+            })
+        }) {
+            self.reload_settings().await;
+        }
         for change in params.changes {
             let Ok(path) = change.uri.to_file_path() else {
                 continue;
@@ -1219,6 +1279,8 @@ impl LanguageServer for Backend {
         for folder in params.event.added {
             self.workspace_folders.insert(folder.uri);
         }
+        // Another folder may hold the project settings file.
+        self.reload_settings().await;
         // A relative `sources.initFile` names a file of the first folder,
         // and which init files are the user's project changed.
         if self

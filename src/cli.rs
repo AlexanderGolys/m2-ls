@@ -11,20 +11,21 @@
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString, Url};
 
 use crate::capabilities::formatting::{format_document_with_options, FormatOptions};
 use crate::catalog::CatalogSource;
+use crate::config_file::{ConfigFile, SettingsSources};
 use crate::diagnostics::visible_diagnostics;
 use crate::document::{DocumentSnapshot, FileProperties};
 use crate::init_file::InitFiles;
 use crate::node_metadata::SyntaxParser;
 use crate::object_registry::ObjectRegistry;
 use crate::package_index::{Macaulay2Environment, SourceResolver};
-use crate::settings::{ServerSettings, SettingProblem};
+use crate::settings::{ServerSettings, SettingProblem, SettingsLayer};
 
 /// The standalone tool to execute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,9 +90,11 @@ struct Options {
     stdout: bool,
     /// `--deny-warnings`: fail on warnings as well as errors.
     deny_warnings: bool,
-    /// `--config`: the JSON settings file, read as the server reads its
-    /// settings.
+    /// `--config`: the settings file, TOML or JSON, read instead of the
+    /// discovered ones.
     config: Option<PathBuf>,
+    /// `--no-config`: read no settings file at all.
+    no_config: bool,
 }
 
 impl Tool {
@@ -133,7 +136,7 @@ impl Tool {
             Self::Linter => "    --deny-warnings  Exit 1 for warnings as well as errors\n",
         };
         format!(
-            "Usage: {} [OPTIONS] <FILE | ->\n\nReads one .m2 file, or stdin for -.\n\n{specific}    --config FILE    Read JSON settings (same format as m2-ls)\n    -h, --help       Show help\n    -V, --version    Show version\n    --               Treat the next argument as the file\n\nExit codes: 0 success, 1 findings/check failure, 2 usage or I/O error.\n",
+            "Usage: {} [OPTIONS] <FILE | ->\n\nReads one .m2 file, or stdin for -.\n\n{specific}    --config FILE    Read settings from FILE (TOML, or JSON for .json) instead of\n                     the user's m2-ls.toml and the nearest project m2-ls.toml\n    --no-config      Read no settings file; use the defaults\n    -h, --help       Show help\n    -V, --version    Show version\n    --               Treat the next argument as the file\n\nExit codes: 0 success, 1 findings/check failure, 2 usage or I/O error.\n",
             self.name()
         )
     }
@@ -146,6 +149,7 @@ impl Tool {
         let mut stdout = false;
         let mut deny_warnings = false;
         let mut config = None;
+        let mut no_config = false;
         let mut args = std::env::args_os().skip(1);
         while let Some(arg) = args.next() {
             match arg.to_str() {
@@ -160,6 +164,7 @@ impl Tool {
                 Some("--check") if self == Self::Formatter => check = true,
                 Some("--stdout") if self == Self::Formatter => stdout = true,
                 Some("--deny-warnings") if self == Self::Linter => deny_warnings = true,
+                Some("--no-config") => no_config = true,
                 Some("--config") => {
                     config = Some(PathBuf::from(args.next().ok_or("--config needs a file")?));
                 }
@@ -172,6 +177,9 @@ impl Tool {
                 }
                 _ => paths.push(PathBuf::from(arg)),
             }
+        }
+        if no_config && config.is_some() {
+            return Err("--config and --no-config cannot be combined".into());
         }
         if check && stdout {
             return Err("--check and --stdout cannot be combined".into());
@@ -189,6 +197,7 @@ impl Tool {
             stdout,
             deny_warnings,
             config,
+            no_config,
         }))
     }
 
@@ -320,17 +329,34 @@ impl Tool {
 }
 
 impl Options {
-    /// The settings `--config` names, or the defaults; an invalid value fails
-    /// the command, a deprecated key only warns.
+    /// The settings the command runs with: the file `--config` names, none
+    /// under `--no-config`, or else the user's settings file under the
+    /// nearest project settings file above the input (the current directory
+    /// for stdin). An invalid value fails the command, a deprecated key only
+    /// warns.
     fn settings(&self) -> Result<ServerSettings, String> {
-        let Some(path) = &self.config else {
+        if self.no_config {
             return Ok(ServerSettings::default());
+        }
+        let parsed = if let Some(path) = &self.config {
+            let file = ConfigFile::read(path)?;
+            ServerSettings::from_layers([SettingsLayer {
+                origin: Some(path.display().to_string()),
+                value: file.value,
+            }])
+        } else {
+            let directory = match &self.input {
+                Input::File(path) => fs::canonicalize(path)
+                    .ok()
+                    .and_then(|path| path.parent().map(Path::to_path_buf)),
+                Input::Stdin => env::current_dir().ok(),
+            };
+            let sources = SettingsSources::read(serde_json::Value::Null, directory.as_deref());
+            if let Some(problem) = sources.unreadable.first() {
+                return Err(problem.clone());
+            }
+            sources.parse()
         };
-        let text =
-            fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-        let value =
-            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-        let parsed = ServerSettings::from_value(&value);
         let listed = parsed
             .problems
             .iter()
@@ -341,7 +367,7 @@ impl Options {
             return Err(listed);
         }
         if !listed.is_empty() {
-            eprintln!("{}: warning: {listed}", path.display());
+            eprintln!("warning: {listed}");
         }
         Ok(parsed.settings)
     }

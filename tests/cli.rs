@@ -26,6 +26,8 @@ impl Workspace {
             .args(args)
             .current_dir(&self.0)
             .env("HOME", &self.0)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("M2_LS_CONFIG")
             .env(
                 "M2_LS_CATALOG",
                 m2_ls::catalog::CatalogSource::current()
@@ -285,6 +287,41 @@ fn lint_warning_policy_and_formatter_configuration() {
         String::from_utf8_lossy(&formatted.stdout).contains("\n  x + 1\n"),
         "{formatted:?}"
     );
+}
+
+#[test]
+fn tools_read_the_user_and_the_nearest_project_settings_file() {
+    let workspace = Workspace::new();
+    let source = "f = x -> (\nx+1\n)\n";
+    let format = |args: &[&str]| {
+        let output = workspace.run(FMT, args, source);
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert!(format(&["-"]).contains("\n    x + 1\n)"));
+    fs::create_dir_all(workspace.0.join(".config/m2-ls")).unwrap();
+    fs::write(
+        workspace.0.join(".config/m2-ls/m2-ls.toml"),
+        "[formatting]\nindent = 3\n",
+    )
+    .unwrap();
+    assert!(format(&["-"]).contains("\n   x + 1\n)"));
+    fs::write(
+        workspace.0.join("m2-ls.toml"),
+        "[formatting]\npreset = \"macaulay2\"\n",
+    )
+    .unwrap();
+    assert!(
+        format(&["-"]).contains("\n    x + 1\n    )"),
+        "{}",
+        format(&["-"])
+    );
+    fs::create_dir(workspace.0.join("src")).unwrap();
+    fs::write(workspace.0.join("src/a.m2"), source).unwrap();
+    assert!(format(&["--stdout", "src/a.m2"]).contains("\n    x + 1\n    )"));
+    assert!(format(&["--no-config", "-"]).contains("\n    x + 1\n)"));
+    fs::write(workspace.0.join("m2-ls.toml"), "[formatting\n").unwrap();
+    assert_eq!(workspace.run(FMT, &["-"], source).status.code(), Some(2));
 }
 
 #[test]

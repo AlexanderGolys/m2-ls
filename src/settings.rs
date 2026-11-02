@@ -23,7 +23,7 @@ use serde_json::{Map, Value};
 use serde_path_to_error::{Path, Segment};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-use crate::capabilities::formatting::ControlFlowLayout;
+use crate::capabilities::formatting::{CloserIndent, ControlFlowLayout};
 use crate::diagnostics::DiagnosticCode;
 use crate::init_file::InitFileChoice;
 use crate::object_registry::ObjectName;
@@ -81,6 +81,8 @@ pub struct ServerSettings {
     pub semantic_tokens: SemanticTokenSettings,
     /// `sources.*`: where the library sources and the init file are.
     pub sources: SourceSettings,
+    /// `library.*`: how much of the installed library's source is indexed.
+    pub library: LibrarySettings,
 }
 
 /// `diagnostics.*`: which diagnostics are published, and how prominently.
@@ -102,6 +104,10 @@ pub struct DiagnosticSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct FormattingSettings {
+    /// The style the other formatting settings start from; a setting given
+    /// beside it in the same place wins. Only read while the settings are
+    /// layered, where [`FormattingPreset::values`] fills in its settings.
+    pub preset: Option<FormattingPreset>,
     /// Spaces per indentation level; the editor's tab size when unset.
     pub indent: Option<u32>,
     /// Whether to indent with tabs; the editor's choice when unset.
@@ -123,6 +129,78 @@ pub struct FormattingSettings {
     pub keep_line_breaks: bool,
     /// `{ b }` when `true`, `{b}` when `false`; as written when unset.
     pub space_in_braces: Option<bool>,
+    /// Where a closing bracket that starts its own line is indented:
+    /// `opener` at the opening line's level, `body` at its contents'.
+    pub closer_indent: CloserIndent,
+    /// Whether a hash-table construction, `{a => 1, b => 2}`, is laid out
+    /// one option per line. Default `true`.
+    pub break_option_lists: bool,
+}
+
+/// A named formatting style: values for every formatting setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, strum::EnumIter, strum::IntoStaticStr)]
+#[serde(rename_all = "camelCase")]
+#[strum(serialize_all = "camelCase")]
+pub enum FormattingPreset {
+    /// The server's defaults.
+    Default,
+    /// Close to the Macaulay2 sources and community packages: four-space
+    /// indentation, closing brackets at the level of the body they close,
+    /// `if c then a else b` kept on one line when it fits, `{a, b}` without
+    /// inner spaces, hash tables left as written, about 90 columns.
+    Macaulay2,
+    /// Close to Lua and similar languages as their usual formatters (StyLua)
+    /// write them: closing brackets at the opener's level, `then` and `else`
+    /// bodies on their own lines, `2 * x` and `{ a, b }` with spaces, hash
+    /// tables one option per line, 120 columns.
+    Lua,
+}
+
+impl FormattingPreset {
+    /// The formatting settings this style stands for, as JSON values.
+    pub fn values(self) -> Value {
+        match self {
+            Self::Default => serde_json::json!({
+                "indent": null,
+                "useTabs": null,
+                "softLineWidth": 78,
+                "hardLineWidth": 90,
+                "controlFlowLayout": "multilineCompactElse",
+                "compactFactorOperators": true,
+                "breakAfterSemicolon": false,
+                "keepLineBreaks": false,
+                "spaceInBraces": null,
+                "closerIndent": "opener",
+                "breakOptionLists": true,
+            }),
+            Self::Macaulay2 => serde_json::json!({
+                "indent": 4,
+                "useTabs": false,
+                "softLineWidth": 85,
+                "hardLineWidth": 100,
+                "controlFlowLayout": "compact",
+                "compactFactorOperators": true,
+                "breakAfterSemicolon": false,
+                "keepLineBreaks": false,
+                "spaceInBraces": false,
+                "closerIndent": "body",
+                "breakOptionLists": false,
+            }),
+            Self::Lua => serde_json::json!({
+                "indent": 4,
+                "useTabs": false,
+                "softLineWidth": 100,
+                "hardLineWidth": 120,
+                "controlFlowLayout": "multiline",
+                "compactFactorOperators": false,
+                "breakAfterSemicolon": false,
+                "keepLineBreaks": false,
+                "spaceInBraces": true,
+                "closerIndent": "opener",
+                "breakOptionLists": true,
+            }),
+        }
+    }
 }
 
 /// `inlayHints.*`: which inferred types are shown inline, and where.
@@ -201,6 +279,32 @@ pub struct SemanticTokenSettings {
     /// Which values receive `defaultLibrary`: a named policy or a list of
     /// defining packages. Default `"CompiledFunction"`.
     pub default_library: DefaultLibrarySetting,
+    /// How an indexed variable of a ring, `x_1` of `QQ[x_0 .. x_2]`, is
+    /// highlighted. Default `"declared"`.
+    pub indexed_variables: IndexedVariableHighlight,
+}
+
+/// How `semanticTokens.indexedVariables` highlights the indexed variables
+/// of a ring, `x_1` of `QQ[x_0 .. x_2]`, and other subscripts of their table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IndexedVariableHighlight {
+    /// `x_1` is one ring-variable token when the ring declared that index;
+    /// `x_i` and undeclared indices keep their parts.
+    #[default]
+    Declared,
+    /// Also `x_i` and `x_n` are one ring-variable token: any subscript of a
+    /// table of ring variables by a number or a single name, so the
+    /// variables of a loop read like the ones written out. A longer index,
+    /// `x_(i+1)`, keeps its parts.
+    Simple,
+    /// Never one token: in every subscript of a table of ring variables the
+    /// name `x` is a ring variable, `_` an access operator, and the index
+    /// keeps its own colour, as in `R_0`.
+    Base,
+    /// No ring-variable highlighting of indexed variables: `x_1` reads as
+    /// any other subscript.
+    None,
 }
 
 /// Selects `defaultLibrary` by runtime implementation or defining package.
@@ -265,6 +369,49 @@ pub struct SourceSettings {
     pub init_file: InitFileChoice,
 }
 
+/// `library.*`: how much of the installed Macaulay2 library's source m2-ls
+/// reads, beyond the precomputed catalog, for navigation into it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct LibrarySettings {
+    /// When library package sources are indexed. Default `"onDemand"`.
+    pub indexing: LibraryIndexing,
+    /// The most library packages whose indexed sources are kept at once;
+    /// the least recently used one is dropped first. Default `8`.
+    pub max_packages: u32,
+    /// The most source files indexed for one package. Default `64`.
+    pub max_files_per_package: u32,
+    /// The most source mebibytes indexed for one package. Default `4`.
+    pub max_megabytes_per_package: u32,
+}
+
+/// When `library.indexing` reads library package sources.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LibraryIndexing {
+    /// Never: navigation into the library uses only the catalog's source
+    /// locations, and implementations or references inside library
+    /// sources are not found.
+    Off,
+    /// A file at a time, as navigation needs it.
+    #[default]
+    OnDemand,
+    /// Every package a document loads, in the background, as soon as the
+    /// document is opened, within the limits below.
+    Loaded,
+}
+
+impl Default for LibrarySettings {
+    fn default() -> Self {
+        Self {
+            indexing: LibraryIndexing::OnDemand,
+            max_packages: 8,
+            max_files_per_package: 64,
+            max_megabytes_per_package: 4,
+        }
+    }
+}
+
 impl Default for DiagnosticSettings {
     fn default() -> Self {
         Self {
@@ -288,6 +435,9 @@ impl Default for FormattingSettings {
             break_after_semicolon: false,
             keep_line_breaks: false,
             space_in_braces: None,
+            closer_indent: CloserIndent::Opener,
+            break_option_lists: true,
+            preset: None,
         }
     }
 }
@@ -341,6 +491,8 @@ pub struct ParsedSettings {
 /// One setting the server could not read as given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingProblem {
+    /// The file the value was read from; `None` for the editor's settings.
+    origin: Option<String>,
     /// Where the value sits in the section, e.g. `diagnostics.disabled[1]`.
     path: String,
     /// What is wrong with the value.
@@ -367,6 +519,9 @@ impl SettingProblem {
 
 impl fmt::Display for SettingProblem {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(origin) = &self.origin {
+            write!(formatter, "{origin}: ")?;
+        }
         match &self.issue {
             SettingIssue::Invalid(reason) => {
                 write!(formatter, "`{}`: {reason}; default kept", self.path)
@@ -382,6 +537,29 @@ impl fmt::Display for SettingProblem {
     }
 }
 
+/// One place settings are read from. Layered, a later layer's values win
+/// over an earlier one's, group by group and key by key; a list is replaced
+/// whole.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsLayer {
+    /// The file the settings were read from, named in the problems found in
+    /// them; `None` for the editor's settings.
+    pub origin: Option<String>,
+    /// The settings: the section itself, or an object holding it under
+    /// `m2-ls` or `macaulay2`.
+    pub value: Value,
+}
+
+impl SettingsLayer {
+    /// The settings the editor sent.
+    pub fn editor(value: Value) -> Self {
+        Self {
+            origin: None,
+            value,
+        }
+    }
+}
+
 impl ServerSettings {
     /// The names the client may send the settings section under.
     const SECTIONS: [&str; 2] = ["m2-ls", "macaulay2"];
@@ -389,22 +567,51 @@ impl ServerSettings {
     /// Read the settings in `value`, either the section itself or an object
     /// holding it. Each value that fails to deserialize is reported, removed,
     /// and the rest read again, until what remains reads cleanly.
+    #[cfg(test)]
     pub fn from_value(value: &Value) -> ParsedSettings {
-        let mut section = Self::SECTIONS
-            .iter()
-            .find_map(|name| value.get(name))
-            .unwrap_or(value)
-            .clone();
+        Self::from_layers([SettingsLayer::editor(value.clone())])
+    }
+
+    /// Read `layers`, lowest precedence first. Each layer is read on its own,
+    /// as [`Self::from_value`] reads one, its formatting preset expanded into
+    /// the settings it stands for, and what remains is laid over the layers
+    /// before it: a value one layer cannot use leaves the one below in
+    /// effect.
+    pub fn from_layers(layers: impl IntoIterator<Item = SettingsLayer>) -> ParsedSettings {
+        let mut merged = Value::Object(Map::new());
+        let mut problems = Vec::new();
+        for layer in layers {
+            let section = Self::SECTIONS
+                .iter()
+                .find_map(|name| layer.value.get(name))
+                .unwrap_or(&layer.value)
+                .clone();
+            let (section, layer_problems) = Self::sanitize(section, layer.origin.as_deref());
+            merge_settings(&mut merged, section);
+            problems.extend(layer_problems);
+        }
+        let (merged, merge_problems) = Self::sanitize(merged, None);
+        problems.extend(merge_problems);
+        let settings = serde_json::from_value(merged).unwrap_or_default();
+        ParsedSettings { settings, problems }
+    }
+
+    /// `section` without the values that do not deserialize, with deprecated
+    /// keys and a formatting preset rewritten into the settings they stand
+    /// for, and the problems found, each naming `origin`.
+    fn sanitize(mut section: Value, origin: Option<&str>) -> (Value, Vec<SettingProblem>) {
         if section.is_null() {
             section = Value::Object(Default::default());
         }
         let mut problems = InlayHintSettings::upgrade_deprecated_keys(&mut section);
+        FormattingSettings::expand_preset(&mut section);
         loop {
             match serde_path_to_error::deserialize::<_, Self>(&section) {
-                Ok(settings) => return ParsedSettings { settings, problems },
+                Ok(_) => break,
                 Err(error) => {
                     let removed = Self::remove_value(&mut section, error.path());
                     problems.push(SettingProblem {
+                        origin: None,
                         path: if error.path().iter().next().is_some() {
                             error.path().to_string()
                         } else {
@@ -413,14 +620,16 @@ impl ServerSettings {
                         issue: SettingIssue::Invalid(error.into_inner().to_string()),
                     });
                     if !removed {
-                        return ParsedSettings {
-                            settings: Self::default(),
-                            problems,
-                        };
+                        section = Value::Object(Default::default());
+                        break;
                     }
                 }
             }
         }
+        for problem in &mut problems {
+            problem.origin = origin.map(str::to_string);
+        }
+        (section, problems)
     }
 
     /// Remove the value at `path` from `section`; `false` when the path does
@@ -525,9 +734,55 @@ impl InlayHintSettings {
             group.entry(replacing_key).or_insert(replacing_value);
         }
         Some(SettingProblem {
+            origin: None,
             path: format!("{}.{key}", Self::SECTION_KEY),
             issue: SettingIssue::Deprecated(replacement),
         })
+    }
+}
+
+/// Lay `overlay` over `base`: objects key by key, anything else replaced.
+fn merge_settings(base: &mut Value, overlay: Value) {
+    match (base, overlay) {
+        (Value::Object(base), Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_settings(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+impl FormattingSettings {
+    /// The group's key in the settings section.
+    const SECTION_KEY: &str = "formatting";
+
+    /// Fill in the settings of the `formatting.preset` named in `section`
+    /// that the same group does not give itself. An unknown preset is left
+    /// for deserialization to report.
+    fn expand_preset(section: &mut Value) {
+        let Some(group) = section
+            .get_mut(Self::SECTION_KEY)
+            .and_then(Value::as_object_mut)
+        else {
+            return;
+        };
+        let Some(preset) = group
+            .get("preset")
+            .and_then(|preset| FormattingPreset::deserialize(preset).ok())
+        else {
+            return;
+        };
+        if let Value::Object(values) = preset.values() {
+            for (key, value) in values {
+                group.entry(key).or_insert(value);
+            }
+        }
     }
 }
 

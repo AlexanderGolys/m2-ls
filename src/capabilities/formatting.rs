@@ -47,6 +47,20 @@ pub enum ControlFlowLayout {
     LeadingKeywords,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Where a closing bracket that starts its own line is indented.
+#[non_exhaustive]
+pub enum CloserIndent {
+    /// At the level of the line that opened the bracket, as in Lua or C:
+    /// `f = x -> (` … `)`.
+    #[default]
+    Opener,
+    /// At the level of the bracket's contents, as Macaulay2's own sources
+    /// and its Emacs mode write it: `f = x -> (` … `    )`.
+    Body,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatOptions {
     /// Whitespace unit inserted for each indentation level.
@@ -67,6 +81,10 @@ pub struct FormatOptions {
     keep_line_breaks: bool,
     /// Explicit brace-spacing preference, absent to preserve the existing style.
     space_in_braces: Option<bool>,
+    /// Indentation of a closing bracket starting its own line.
+    closer_indent: CloserIndent,
+    /// Whether a hash-table construction is laid out one option per line.
+    break_option_lists: bool,
 }
 
 impl Default for FormatOptions {
@@ -117,6 +135,8 @@ impl FormatOptions {
             break_after_semicolon: settings.break_after_semicolon && !keep_line_breaks,
             keep_line_breaks,
             space_in_braces: settings.space_in_braces,
+            closer_indent: settings.closer_indent,
+            break_option_lists: settings.break_option_lists && !keep_line_breaks,
         }
     }
 }
@@ -235,6 +255,7 @@ fn formatted_layout(root: SyntaxNode<'_>, options: &FormatOptions) -> LayoutSour
         let edits = match pass {
             FormatPass::Spacing => normalize_whitespace(node, options),
             FormatPass::LeadingOperators => lead_rows_with_operators(node, options, newline),
+            FormatPass::Options if !options.break_option_lists => Vec::new(),
             FormatPass::Options => break_option_tables(node, newline),
             FormatPass::EmptyBodies => inline_empty_bodies(node),
             FormatPass::ControlFlow => format_control_flow(node, options, newline),
@@ -751,7 +772,11 @@ fn push_control_flow_break(
 /// comments. Copy all other bytes, including literal contents and line endings.
 fn reindent_from_tree(root: LayoutNode<'_>, options: &FormatOptions) -> Vec<FormatEdit> {
     let text = root.source_text();
-    let layout = TreeIndentLayout::from_root(root, options.compact_factor_operators);
+    let layout = TreeIndentLayout::from_root(
+        root,
+        options.compact_factor_operators,
+        options.closer_indent,
+    );
     let protected = root
         .descendants()
         .filter(|node| node.is_string_literal() || node.is_comment())
@@ -1063,7 +1088,7 @@ fn folding_ranges_for_syntax(root: SyntaxNode<'_>) -> Vec<FormatFoldRange> {
     let source = LayoutSource::new(root);
     let root = LayoutNode::new(root, &source);
     let text = root.source_text();
-    let layout = TreeIndentLayout::from_root(root, false);
+    let layout = TreeIndentLayout::from_root(root, false, CloserIndent::Opener);
     let indented_lines = text
         .lines()
         .enumerate()
@@ -1100,7 +1125,11 @@ struct TreeIndentLayout {
 
 impl TreeIndentLayout {
     /// Collects line indentation and folding information from the parsed layout.
-    fn from_root(root: LayoutNode<'_>, compact_factor_operators: bool) -> Self {
+    fn from_root(
+        root: LayoutNode<'_>,
+        compact_factor_operators: bool,
+        closer_indent: CloserIndent,
+    ) -> Self {
         let text = root.source_text();
         let line_count = text.lines().count().max(1);
         let brackets = collect_bracket_groups(root, line_count);
@@ -1119,7 +1148,9 @@ impl TreeIndentLayout {
         for row in 0..line_count {
             let bracket_base = innermost_open_bracket_row(row, &brackets).map_or(0, |open_row| {
                 let opener_depth = depths[open_row];
-                if closes_at_line_start(row, open_row, &brackets, &line_leads) {
+                if closes_at_line_start(row, open_row, &brackets, &line_leads)
+                    && closer_indent == CloserIndent::Opener
+                {
                     opener_depth
                 } else {
                     opener_depth + 1
@@ -2213,6 +2244,7 @@ mod tests {
             break_after_semicolon: true,
             keep_line_breaks: false,
             space_in_braces: None,
+            ..FormattingSettings::default()
         })
     }
 
@@ -2221,6 +2253,47 @@ mod tests {
         let tree = parser.parse_tree(text, None).expect("fixture should parse");
         let root = tree.root(text);
         format_document_with_options(root, options)
+    }
+
+    #[test]
+    fn closers_indent_at_the_opener_or_the_body_level() {
+        let text = "f = x -> (\n    y := x + 1;\n    {y,\n     2}\n)\n";
+        let at = |closer_indent| {
+            format_fixture_with_options(
+                text,
+                &FormatOptions::from(&FormattingSettings {
+                    closer_indent,
+                    ..FormattingSettings::default()
+                }),
+            )
+        };
+        assert_eq!(
+            at(CloserIndent::Opener),
+            "f = x -> (\n    y := x + 1;\n    {y,\n        2}\n)\n"
+        );
+        assert_eq!(
+            at(CloserIndent::Body),
+            "f = x -> (\n    y := x + 1;\n    {y,\n        2}\n    )\n"
+        );
+    }
+
+    #[test]
+    fn hash_tables_can_keep_their_layout() {
+        let text = "T = new HashTable from {a => 1, b => 2}\n";
+        let format = |break_option_lists| {
+            format_fixture_with_options(
+                text,
+                &FormatOptions::from(&FormattingSettings {
+                    break_option_lists,
+                    ..FormattingSettings::default()
+                }),
+            )
+        };
+        assert_eq!(format(false), text);
+        assert_eq!(
+            format(true),
+            "T = new HashTable from {\n    a => 1,\n    b => 2\n}\n"
+        );
     }
 
     fn fold_fixture(text: &str) -> Vec<FormatFoldRange> {
