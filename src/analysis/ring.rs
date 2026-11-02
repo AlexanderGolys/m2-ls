@@ -1245,6 +1245,43 @@ impl Analysis {
             .then_some((binding.binding_id, index))
     }
 
+    /// The subscript `node`, `x_k`, of a table some ring constructor wrote
+    /// variables into, `x` of `QQ[x_0 .. x_2]`: whether the ring declared
+    /// that index, and whether it is one number or one name.
+    pub(super) fn indexed_variable_access(
+        &self,
+        node: SyntaxNode<'_>,
+        source: &(impl SourceNavigation + ?Sized),
+    ) -> Option<IndexedVariableAccess> {
+        if !node.has_binary_operator::<Token![_]>() {
+            return None;
+        }
+        let parts = node.binary_parts()?;
+        let base = RingGeneratorBinding::name_node(parts.left)?;
+        let position = source.position_for_node(base);
+        let binding = self.get_binding_from_scope(
+            base.text(),
+            self.find_scope_at(position).unwrap_or(0),
+            position,
+        )?;
+        let writes = binding.state.indexed_element_type.as_ref()?;
+        if !writes
+            .writes
+            .iter()
+            .any(|write| write.writer == IndexedWriter::RingConstructor)
+        {
+            return None;
+        }
+        let span = source.span_for_bytes(Self::indexed_ring_generator_bytes(node));
+        Some(IndexedVariableAccess {
+            declares: self.declares_ring_generators(span.range()),
+            span,
+            base: base.start_byte()..base.end_byte(),
+            declared: self.is_indexed_ring_generator(node, source),
+            simple_index: parts.right.is::<IntegerLiteral>() || parts.right.is::<Symbol>(),
+        })
+    }
+
     /// The role of a subscript that is one object spelled with `_`, the same
     /// kind of object as one of its parts, so it reads as a single token:
     /// `3_R`, a number promoted into the ring `R`; `RR_53`, the real field of

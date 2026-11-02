@@ -1,19 +1,22 @@
 //! LSP encoding of semantic-token candidates registered in document analysis.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 
 use crate::analysis::BindingView;
 use crate::document::{DocumentSnapshot, PackageSession};
 use crate::documentation::DocumentationSnippet;
 use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry};
 use crate::package_documentation::{DocumentationMarkupKind, TextStyle};
+use crate::semantic_token::IndexedVariableAccess;
 use crate::semantic_token::{
     classify_source_semantic_token, local_symbol_semantic_token, CompiledCallableKind,
     M2SemanticToken, M2SemanticTokenModifier, M2SemanticTokenType, SemanticTokenKnowledge,
     SourceSemanticToken, SourceSemanticTokenContext,
 };
-use crate::settings::{DefaultLibraryMode, DefaultLibrarySetting, SemanticTokenSettings};
+use crate::settings::{
+    DefaultLibraryMode, DefaultLibrarySetting, IndexedVariableHighlight, SemanticTokenSettings,
+};
 use crate::source::{ByteRange, DocumentSpan, SourceNavigation, SymbolMention};
 use crate::source_package::{CodeFragment, ExportAccess};
 use crate::workspace_index::{WorkspaceDefinitionKnowledge, WorkspaceIndex, WorkspaceView};
@@ -55,8 +58,17 @@ pub fn collect_semantic_tokens(
     string_spans.extend(classifier.documentation_spans());
     string_spans.sort_by_key(|span| span.bytes().start);
     let mut emitter = SemanticTokenEmitter::new(document, settings);
+    let mut indexed_variables = IndexedVariableTokens::new(document, settings.indexed_variables);
 
     for source_token in document.analysis().source_semantic_tokens() {
+        match indexed_variables.replace(source_token.span.bytes()) {
+            IndexedVariableToken::Keep => {}
+            IndexedVariableToken::Skip => continue,
+            IndexedVariableToken::Emit(span) => {
+                emitter.push(span);
+                continue;
+            }
+        }
         if emitter.emit_embedded_tokens(
             source_token,
             &session_classifiers,
@@ -82,6 +94,97 @@ pub fn collect_semantic_tokens(
     }
 
     emitter.finish()
+}
+
+/// What [`IndexedVariableTokens::replace`] makes of one source token.
+enum IndexedVariableToken {
+    /// Classify and emit it as any other.
+    Keep,
+    /// Emit nothing for it: it is part of an indexed variable already
+    /// emitted whole.
+    Skip,
+    /// Emit this ring-variable token in its place.
+    Emit(SemanticSpan),
+}
+
+/// The subscripts of tables of ring variables, `x_1` of `QQ[x_0 .. x_2]`,
+/// as `semanticTokens.indexedVariables` highlights them: some whole, as one
+/// ring variable, some with only their table's name a ring variable, the
+/// rest as any other subscript.
+struct IndexedVariableTokens<'a> {
+    /// The document whose spans the tokens cover.
+    document: &'a DocumentSnapshot,
+    /// The subscripts highlighted whole, in source order; they never nest.
+    whole: Vec<&'a IndexedVariableAccess>,
+    /// The subscripts whose table's name is highlighted as a ring variable,
+    /// by that name's bytes.
+    bases: HashMap<ByteRange, &'a IndexedVariableAccess>,
+    /// The entry of `whole` emitted last.
+    emitted: Option<usize>,
+}
+
+impl<'a> IndexedVariableTokens<'a> {
+    /// The subscripts of `document` highlighted as `highlight` says.
+    fn new(document: &'a DocumentSnapshot, highlight: IndexedVariableHighlight) -> Self {
+        let accesses = document.analysis().indexed_variable_accesses();
+        let whole = accesses
+            .iter()
+            .filter(|access| match highlight {
+                IndexedVariableHighlight::Declared => access.declared,
+                IndexedVariableHighlight::Simple => access.declared || access.simple_index,
+                IndexedVariableHighlight::Base | IndexedVariableHighlight::None => false,
+            })
+            .collect::<Vec<_>>();
+        let bases = if highlight == IndexedVariableHighlight::Base {
+            accesses
+                .iter()
+                .map(|access| (access.base.clone(), access))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        Self {
+            document,
+            whole,
+            bases,
+            emitted: None,
+        }
+    }
+
+    /// The ring-variable token of `access`, from `bytes`.
+    fn ring_variable(&self, access: &IndexedVariableAccess, bytes: ByteRange) -> SemanticSpan {
+        let mut token = M2SemanticToken::new(M2SemanticTokenType::Variable)
+            .with_modifier(M2SemanticTokenModifier::Algebraic);
+        if access.declares {
+            token = token.with_modifier(M2SemanticTokenModifier::Declaration);
+        }
+        SemanticSpan {
+            source: self.document.span_for_bytes(bytes),
+            token,
+        }
+    }
+
+    /// What to emit for the source token over `bytes`; tokens come in
+    /// source order.
+    fn replace(&mut self, bytes: ByteRange) -> IndexedVariableToken {
+        let after = self
+            .whole
+            .partition_point(|access| access.span.bytes().start <= bytes.start);
+        if let Some(index) = after.checked_sub(1) {
+            let access = self.whole[index];
+            if bytes.end <= access.span.bytes().end {
+                if self.emitted == Some(index) {
+                    return IndexedVariableToken::Skip;
+                }
+                self.emitted = Some(index);
+                return IndexedVariableToken::Emit(self.ring_variable(access, access.span.bytes()));
+            }
+        }
+        if let Some(access) = self.bases.get(&bytes) {
+            return IndexedVariableToken::Emit(self.ring_variable(access, bytes));
+        }
+        IndexedVariableToken::Keep
+    }
 }
 
 /// The classifier of one package session's code, whose own analysis decides
@@ -2042,6 +2145,54 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             token_at(&standard_tokens, 1, 0).map(|token| token.token_type),
             Some(M2SemanticTokenType::Variable as u32)
         );
+    }
+
+    #[test]
+    fn indexed_variables_are_highlighted_as_the_setting_chooses() {
+        let text = "R = QQ[x_0 .. x_2]\nx_1\nx_i\nx_(i+1)\n";
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
+        let document = document(text, &builtins);
+        let algebraic = M2SemanticTokenModifier::Algebraic.bit();
+        // (line, length of the token at its start, whether it is algebraic)
+        for (highlight, expected) in [
+            (
+                IndexedVariableHighlight::Declared,
+                [(1, 3, true), (2, 1, false), (3, 1, false)],
+            ),
+            (
+                IndexedVariableHighlight::Simple,
+                [(1, 3, true), (2, 3, true), (3, 1, false)],
+            ),
+            (
+                IndexedVariableHighlight::Base,
+                [(1, 1, true), (2, 1, true), (3, 1, true)],
+            ),
+            (
+                IndexedVariableHighlight::None,
+                [(1, 1, false), (2, 1, false), (3, 1, false)],
+            ),
+        ] {
+            let tokens = collect_semantic_tokens(
+                &document,
+                &builtins,
+                &WorkspaceIndex::default(),
+                &Url::parse("file:///fixture.m2").unwrap(),
+                &SemanticTokenSettings {
+                    indexed_variables: highlight,
+                    ..SemanticTokenSettings::default()
+                },
+                false,
+            );
+            for (line, length, is_algebraic) in expected {
+                let token = token_at(&tokens, line, 0).expect("the table is highlighted");
+                assert_eq!(token.length, length, "{highlight:?} line {line}");
+                assert_eq!(
+                    token.token_modifiers_bitset & algebraic != 0,
+                    is_algebraic,
+                    "{highlight:?} line {line}"
+                );
+            }
+        }
     }
 
     /// A subscript spelling one object of the kind of one of its parts reads

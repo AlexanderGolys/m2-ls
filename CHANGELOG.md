@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- Read settings from `m2-ls.toml` files: the user's, in the user
+  configuration directory, and the project's, the nearest `m2-ls.toml` or
+  `.m2-ls.toml` in or above the workspace folder. Layered as defaults, user
+  file, editor settings, project file. The server rereads them when they
+  change; the editor setting `configFile` turns the project file off or names
+  another. `m2-fmt` and `m2-lint` discover the same files, `--config` now also
+  reads TOML, and `--no-config` reads none.
+- Add `formatting.preset`: `default`, `macaulay2` (close to the Macaulay2
+  sources and community packages) and `lua` (close to Lua formatters).
+- Add `formatting.closerIndent` (`opener` or `body`) and
+  `formatting.breakOptionLists`.
+- Add `library.indexing` (`off`, `onDemand`, `loaded`) and the limits
+  `library.maxPackages`, `library.maxFilesPerPackage` and
+  `library.maxMegabytesPerPackage`, replacing fixed limits.
+- Add `semanticTokens.indexedVariables` (`declared`, `simple`, `base`,
+  `none`) to choose how indexed ring variables such as `x_1` and `x_i` are
+  highlighted.
+- Name the settings file a problem was found in when reporting it.
+
 ## 2.2.0 - 2026-10-29
 
 - Keep installed package dependencies out of the workspace index when opening

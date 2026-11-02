@@ -99,10 +99,12 @@ m2-fmt --stdout file.m2         # Print the formatted file
 cat file.m2 | m2-fmt -          # Format stdin to stdout
 ```
 
-Each command takes exactly one file, or `-` alone to read stdin. The
-`--config settings.json` option reads the same JSON settings as the server,
-including `diagnostics` and `formatting`; invalid values fail the command. No
-configuration file is loaded automatically.
+Each command takes exactly one file, or `-` alone to read stdin. Both read the
+same [settings files](#settings-files) as the server: the user's `m2-ls.toml`
+and the nearest project `m2-ls.toml` above the file (above the current
+directory for stdin). `--config FILE` reads that file instead (TOML, or JSON
+for a `.json` name), and `--no-config` reads none. Invalid values fail the
+command.
 
 Exit status is `0` on success, `1` for lint errors (also warnings with
 `--deny-warnings`) or formatting differences with `--check`, and `2` for usage,
@@ -142,8 +144,9 @@ in `primaryCode` mode, without automatic imports of prelude packages.
 
 ## Configuration
 
-Every setting is optional and applies without a restart. Send them under the
-`m2-ls` section of your client's settings (or as `initializationOptions`):
+Every setting is optional and applies without a restart. Write them in a
+[settings file](#settings-files), or send them under the `m2-ls` section of
+your client's settings (or as `initializationOptions`):
 
 ```json
 {
@@ -160,6 +163,7 @@ Every setting is optional and applies without a restart. Send them under the
 | `diagnostics.enabled` | `true` | Shows or hides all diagnostics. |
 | `diagnostics.disabled` | `[]` | Hides rules by name or code, e.g. `unused-binding` or `T02`. |
 | `diagnostics.warningsAsHint`, `diagnostics.warningsAsInfo` | `[]` | Shows these rules' warnings as hints or information instead. |
+| `formatting.preset` | none | A whole formatting style to start from: `default`, `macaulay2` or `lua`; see [Formatting presets](#formatting-presets). Settings given beside it win. |
 | `formatting.indent`, `formatting.useTabs` | See source | Indentation used by the formatter. |
 | `formatting.softLineWidth`, `formatting.hardLineWidth` | See source | Preferred and forced wrapping widths; `0` disables. |
 | `formatting.controlFlowLayout` | See source | `compact`, `multiline`, `multilineCompactElse`, or `leadingKeywords` (`then` and `else` start lines under their `if`). |
@@ -167,6 +171,8 @@ Every setting is optional and applies without a restart. Send them under the
 | `formatting.breakAfterSemicolon` | See source | Starts the next statement on a new line. |
 | `formatting.keepLineBreaks` | `false` | Keeps every line break as written; only spacing and indentation change. |
 | `formatting.spaceInBraces` | `null` | `{ b }` when `true`, `{b}` when `false`, as written when `null`. |
+| `formatting.closerIndent` | `"opener"` | Where a closing bracket on its own line goes: `opener`, at the level of the line that opened it, or `body`, at the level of what it closes, as Macaulay2's own sources write it. |
+| `formatting.breakOptionLists` | `true` | Lays out each hash table, `{a => 1, b => 2}`, one option per line. |
 | `inlayHints.afterCall` | `false` | After each call with bracketed arguments, `f(x)`, `f()` or `f(x, y)` (not `f x`): the type it returns. |
 | `inlayHints.afterLineEnd` | `true` | At each line end: the type of the last expression complete on it, so `2+` shows `2` and the next line `2` shows `2+2`. |
 | `inlayHints.afterCell` | `true` | After each top-level value, as Macaulay2's `oN : T` line. |
@@ -187,9 +193,16 @@ Every setting is optional and applies without a restart. Send them under the
 | `inlayHints.excludedCalls` | `[]` | Functions whose calls and arguments get no hints, e.g. `["print"]`. |
 | `semanticTokens.standardOnly` | `false` | Drops the custom semantic token modifiers. Token types are always LSP-standard. |
 | `semanticTokens.defaultLibrary` | `"CompiledFunction"` | Selects which bindings carry `defaultLibrary`; accepts a policy name or an array of package names. |
+| `semanticTokens.indexedVariables` | `"declared"` | How indexed ring variables such as `x_1` are highlighted; see [Indexed variables](#indexed-variables). |
 | `sources.enabled` | `true` | Lets navigation enter the Macaulay2 library source. |
 | `sources.paths` | `[]` | Extra places to find it: an `M2` executable, an installation prefix (a build tree's `usr-dist` included), or a directory to add to Macaulay2's `path`. |
 | `sources.primaryCodePaths` | `[]` | Directories whose files implement the library itself, analyzed as if each declared `-- m2-ls: primaryCode`; the discovered Core sources are included automatically. |
+| `sources.initFile` | `true` | The init file every document starts with: `true` for the discovered `init.m2`, `false` for none, or a path. |
+| `library.indexing` | `"onDemand"` | When the installed library's package sources are read for navigation: `off` (only the catalog's locations), `onDemand` (a file at a time, as navigation needs them) or `loaded` (every package an open document imports, in the background, when it opens). |
+| `library.maxPackages` | `8` | The most library packages kept indexed; the least recently used is dropped. |
+| `library.maxFilesPerPackage` | `64` | The most source files indexed per package. |
+| `library.maxMegabytesPerPackage` | `4` | The most source MiB indexed per package. |
+| `configFile` | `true` | Editor settings only: whether to read the project's `m2-ls.toml` (`false` to ignore it), or another file to read in its place, relative to the workspace folder. |
 
 The 2.0.0 inlay hint keys are deprecated but still read, with a warning:
 `expressionTypes` as `everywhere`, `allKnownTypes` as `everywhere` with
@@ -295,6 +308,92 @@ plain variable tokens, without a separate unresolved modifier.
 
 Formatting defaults are defined in [`FormattingSettings::default()`](src/settings.rs);
 omitted settings use those values.
+
+### Settings files
+
+Settings can also live in TOML files with the same groups and keys:
+
+```toml
+# m2-ls.toml
+[formatting]
+preset = "macaulay2"
+hardLineWidth = 100
+
+[diagnostics]
+disabled = ["unused-binding"]
+
+[semanticTokens]
+indexedVariables = "simple"
+```
+
+- **User file:** `m2-ls/m2-ls.toml` in the user configuration directory:
+  `$XDG_CONFIG_HOME` (normally `~/.config`) on Linux and macOS, `%APPDATA%`
+  on Windows. `M2_LS_CONFIG` names another file; set it empty for none.
+- **Project file:** `m2-ls.toml` or `.m2-ls.toml`, the nearest one in the
+  workspace folder or a folder above it.
+
+Settings are layered, each layer overriding the ones before it group by group
+and key by key: the defaults, the user file, the editor's settings, the
+project file. The project file comes last so that everyone formatting a
+project, in any editor or with `m2-fmt`, gets the same result. The editor
+setting `configFile` turns the project file off or names another one. The
+server reads the files again when they change; a file it cannot read is
+reported in a message, and an invalid value in it names the file.
+
+### Formatting presets
+
+`formatting.preset` sets every formatting setting at once; settings given
+beside it, in the same file or settings, override it.
+
+| Setting | `default` | `macaulay2` | `lua` |
+| --- | --- | --- | --- |
+| `indent` | editor's | 4 | 4 |
+| `softLineWidth`, `hardLineWidth` | 78, 90 | 85, 100 | 100, 120 |
+| `controlFlowLayout` | `multilineCompactElse` | `compact` | `multiline` |
+| `compactFactorOperators` | `true` (`2*x`) | `true` | `false` (`2 * x`) |
+| `spaceInBraces` | as written | `false` (`{a, b}`) | `true` (`{ a, b }`) |
+| `closerIndent` | `opener` | `body` | `opener` |
+| `breakOptionLists` | `true` | `false` | `true` |
+
+`macaulay2` follows the Macaulay2 sources and community packages: closing
+parentheses at the level of the body they close, as Macaulay2's Emacs mode
+indents them, and short conditionals and hash tables kept on one line.
+
+```m2
+f = x -> (
+    if x > 0 then x else -x
+    )
+```
+
+`lua` follows Lua and similar languages as their formatters (StyLua, for
+instance) write them: closers back at the opener's level and each clause body
+on its own line.
+
+```m2
+f = x -> (
+    if x > 0 then
+        x
+    else
+        -x
+)
+```
+
+### Indexed variables
+
+The variables of a ring declared as `QQ[x_0 .. x_3]` are written `x_0`,
+`x_1`, …, but also `x_i` in a loop, or `x_(i+1)`. No highlighting suits every
+kind of code, so `semanticTokens.indexedVariables` chooses:
+
+| Value | `x_1` | `x_i` | `x_(i+1)` | Suits |
+| --- | --- | --- | --- | --- |
+| `"declared"` (default) | one ring variable | `x`, `_`, `i` apart | apart | polynomials written out |
+| `"simple"` | one ring variable | one ring variable | apart | loops over the variables |
+| `"base"` | `x` a ring variable, `_` and `1` apart | `x` a ring variable | `x` a ring variable | code mixing both; matches `R_0` |
+| `"none"` | apart, no ring-variable highlight | apart | apart | themes where `algebraic` is loud |
+
+"Apart" means the parts keep their own colors: the table's name, the `_`
+access operator, and the index. Only tables a ring constructor wrote
+variables into are affected.
 
 An invalid value only affects its own setting, which keeps its default; the
 server reports what it ignored in a warning message.

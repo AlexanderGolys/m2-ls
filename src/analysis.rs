@@ -41,7 +41,9 @@ use crate::node_metadata::{
 use crate::object_registry::ObjectName;
 use crate::object_registry::{ObjectId, OperatorForm, TypeData, TypeId};
 use crate::package_index::{declared_package_name, PackageLoadingOption};
-use crate::semantic_token::{syntax_semantic_token_type, SourceSemanticRole, SourceSemanticToken};
+use crate::semantic_token::{
+    syntax_semantic_token_type, IndexedVariableAccess, SourceSemanticRole, SourceSemanticToken,
+};
 use crate::source::{ByteRange, SourceNavigation};
 use crate::typesystem::{
     InferredType, LiteralOption, PositionedTypeKnowledge, SubtypeEvidence, Type, TypeKnowledge,
@@ -824,6 +826,8 @@ struct SemanticRegistry {
     pending_source_semantic_roles: Vec<(TextRange, SourceSemanticRole)>,
     /// Classified source spans retained for editor responses.
     source_semantic_tokens: Vec<SourceSemanticToken>,
+    /// Subscripts of tables of ring variables, in source order.
+    indexed_variable_accesses: Vec<IndexedVariableAccess>,
     /// Runtime classes and ancestry introduced by this source file.
     source_types: SourceTypeFacts,
     /// Generator bindings grouped by the ring that introduced them.
@@ -1396,6 +1400,12 @@ impl Analysis {
         &self.registry.source_semantic_tokens
     }
 
+    /// The subscripts of tables of ring variables, `x_1` or `x_i` of `x`
+    /// in `QQ[x_0 .. x_2]`, in source order.
+    pub fn indexed_variable_accesses(&self) -> &[IndexedVariableAccess] {
+        &self.registry.indexed_variable_accesses
+    }
+
     /// Binding views declared directly in the selected lexical scope.
     pub fn bindings_in_scope(&self, scope_idx: usize) -> impl Iterator<Item = BindingView<'_>> {
         self.bindings()
@@ -1503,28 +1513,18 @@ impl Analysis {
                 continue;
             }
             let knowledge = knowledge_provider.at_position(source.position_for_node(node));
-            if self.is_indexed_ring_generator(node, source) {
-                covered_until = node.end_byte();
-                if let Some(base) = node
-                    .binary_parts()
-                    .and_then(|parts| parenthesized_value(parts.left))
-                {
-                    if let Some((_, quote)) = base.quote_parts() {
-                        self.record_source_semantic_token(quote, source, &knowledge);
-                    }
+            if let Some(access) = self.indexed_variable_access(node, source) {
+                // Its parts are classified as any subscript's; which of them
+                // read as one ring variable is the semantic-token setting's
+                // choice.
+                self.registry.indexed_variable_accesses.push(access);
+                if let Some(parts) = node.binary_parts() {
+                    self.register_source_semantic_role(
+                        source.range_for_node(parts.operator),
+                        SourceSemanticRole::AccessOperator,
+                    );
                 }
-                let span = source.span_for_bytes(Self::indexed_ring_generator_bytes(node));
-                self.registry
-                    .source_semantic_tokens
-                    .push(SourceSemanticToken {
-                        source_role: Some(self.ring_generator_role(span.range())),
-                        span,
-                        syntax_token_type: None,
-                        is_symbol: false,
-                        is_unquoted_symbol: false,
-                        is_expression_symbol: false,
-                        is_condition_value: false,
-                    });
+                self.record_source_semantic_token(node, source, &knowledge);
                 continue;
             }
             if let Some(role) = self.constant_subscript_role(node, source, &knowledge) {

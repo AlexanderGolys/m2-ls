@@ -50,7 +50,7 @@ use crate::meta::{BindingRole, Metadata};
 use crate::node_metadata::SyntaxNode;
 use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry, ObjectRegistryView};
 use crate::settings::SemanticTokenSettings;
-use crate::source::DocumentSpan;
+use crate::source::{ByteRange, DocumentSpan};
 use crate::typesystem::TypeKnowledge;
 use m2_syn::nodes::{FloatLiteral, IntegerLiteral};
 use strum::{EnumIter, IntoEnumIterator};
@@ -428,6 +428,25 @@ pub struct SourceSemanticToken {
     pub is_expression_symbol: bool,
     /// Whether this expression supplies a control-flow condition.
     pub is_condition_value: bool,
+}
+
+/// A subscript `x_k` of a table some ring constructor wrote variables into,
+/// `x` of `QQ[x_0 .. x_2]`, whose highlighting
+/// `semanticTokens.indexedVariables` chooses. Its parts are recorded as
+/// [`SourceSemanticToken`]s of their own as well.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedVariableAccess {
+    /// From the table's name to the end of the index: `x_1`.
+    pub span: DocumentSpan,
+    /// The table's name, `x`.
+    pub base: ByteRange,
+    /// Whether the index is a literal the ring declared, so `x_k` is one
+    /// of its variables.
+    pub declared: bool,
+    /// Whether the index is one number or one name, `x_1` or `x_i`.
+    pub simple_index: bool,
+    /// Whether it is written among a ring constructor's variables.
+    pub declares: bool,
 }
 
 /// Positioned syntax and binding evidence used to classify a source token.
