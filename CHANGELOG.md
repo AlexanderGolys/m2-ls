@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.3.0 - 2026-11-03
+
+- Run analysis, diagnostics, editor queries, formatting and folding on one
+  typed syntax tree per document revision, with unchanged cells reused between
+  edits. Output, settings and idempotence are unchanged.
+
 ## 2.2.0 - 2026-10-29
 
 - Keep installed package dependencies out of the workspace index when opening
