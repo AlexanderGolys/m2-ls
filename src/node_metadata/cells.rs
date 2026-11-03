@@ -2,22 +2,13 @@
 
 use m2_syn::{
     frame_recovering, lex_str_recovering, nodes::Cell, CellStream, CellTokenStream, CommentTrivia,
-    File, LexError, NativeParseError, NativeParser, Parser, Spanned, Token, Trivia,
+    File, LexError, LexErrorKind, NativeParseError, NativeParser, Parser, Spanned, Token, Trivia,
 };
 use serde_json::json;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use std::{iter, ops::Range};
 
 use crate::telemetry::Timing;
-
-/// Stable identity shared by revisions retaining the same cell parse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CellId(u64);
-/// Process-wide counter allocating identities for newly parsed cells.
-static NEXT_CELL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A revision-specific location of an independently retained parse result.
 #[derive(Debug, Clone)]
@@ -31,8 +22,6 @@ pub struct ParsedCell {
 /// Shared ownership of one cell's source, parse result, trivia, and diagnostics.
 #[derive(Debug)]
 struct CellData {
-    /// Stable identity used to refer to this retained item.
-    id: CellId,
     /// Original UTF-8 source bytes retained for this cell or document snapshot.
     source: Arc<str>,
     /// Independently owned generated cell, without a source-file wrapper.
@@ -48,9 +37,10 @@ struct CellData {
 }
 
 impl ParsedCell {
-    /// Identity of this retained item, stable while its owning cell is reused.
-    pub fn id(&self) -> CellId {
-        self.data.id
+    /// Whether both locations retain the same parse allocation, as a reused cell does.
+    #[cfg(test)]
+    pub fn shares_parse_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.data, &other.data)
     }
     /// Original source bytes owned by this retained parse.
     pub fn source(&self) -> &str {
@@ -77,9 +67,45 @@ impl ParsedCell {
         self.data.parse_error.as_ref()
     }
 
+    /// Document byte ranges reported by this cell's lexer and parser.
+    pub fn error_ranges(&self) -> Vec<Range<usize>> {
+        let mut spans = self
+            .lexer_diagnostics()
+            .iter()
+            .filter_map(Spanned::try_span)
+            .collect::<Vec<_>>();
+        if let Some(error) = self.parse_error() {
+            let span = match error {
+                NativeParseError::Lex(error) => error.try_span(),
+                NativeParseError::Tokenize(error) => error.try_span(),
+                NativeParseError::Unexpected { span, .. }
+                | NativeParseError::MissingOperand { span, .. }
+                | NativeParseError::NewlineInApplication { span }
+                | NativeParseError::InvalidAssignmentTarget { span }
+                | NativeParseError::InvalidLambdaArguments { span }
+                | NativeParseError::Unsupported { span, .. } => Some(span.clone()),
+            };
+            spans.extend(span);
+        }
+        spans
+            .into_iter()
+            .filter_map(|span| span.range())
+            .map(|range| self.range.start + range.start..self.range.start + range.end)
+            .collect()
+    }
+
     /// Source identity used to relocate the retained cell's spans.
     pub fn file(&self) -> Option<File> {
         self.data.file
+    }
+
+    /// Source identities used by syntax, diagnostics, and recovered trivia.
+    pub fn files(&self) -> impl Iterator<Item = File> + '_ {
+        self.file().into_iter().chain(
+            self.trivia()
+                .iter()
+                .filter_map(|trivia| trivia.try_span().map(|span| span.file())),
+        )
     }
 
     /// Parses this framed source interval and retains lexical trivia even if grammar parsing fails.
@@ -89,7 +115,6 @@ impl ParsedCell {
             json!({"source_bytes": source.len(), "byte_start": range.start, "byte_end": range.end}),
         );
         let mut data = CellData {
-            id: CellId(NEXT_CELL_ID.fetch_add(1, Ordering::Relaxed)),
             source: Arc::from(source),
             syntax: None,
             file: None,
@@ -130,6 +155,17 @@ impl ParsedCell {
                 }
             }
             Err(error) => {
+                if let Some(end) = error.span().start() {
+                    if let Ok(prefix) = lex_str_recovering(&source[..end]) {
+                        let comments = CommentTrivia::of(&prefix.value);
+                        data.trivia = comments
+                            .outer()
+                            .iter()
+                            .chain(comments.inner())
+                            .cloned()
+                            .collect();
+                    }
+                }
                 data.file = Some(error.span().file());
                 data.lexer_diagnostics.push(error);
             }
@@ -153,6 +189,15 @@ pub struct SyntaxSnapshot {
 }
 
 impl SyntaxSnapshot {
+    /// Visits each successfully parsed cell using a generated syntax visitor.
+    pub fn visit<'a>(&'a self, visitor: &mut (impl m2_syn::visit::Visit<'a> + ?Sized)) {
+        for cell in self.cells() {
+            if let Some(syntax) = cell.syntax() {
+                visitor.visit_cell(syntax);
+            }
+        }
+    }
+
     /// Original source bytes owned by this retained parse.
     pub fn source(&self) -> &str {
         &self.source
@@ -161,9 +206,38 @@ impl SyntaxSnapshot {
     pub fn cells(&self) -> &[ParsedCell] {
         &self.cells
     }
+    /// Cells touching a byte interval, including either boundary for cursor queries.
+    ///
+    /// A zero-width interval selects the cells on both sides of a shared
+    /// boundary. An inverted interval selects no cells.
+    pub fn cells_intersecting(&self, bytes: Range<usize>) -> &[ParsedCell] {
+        if bytes.start > bytes.end {
+            return &self.cells[0..0];
+        }
+        let start = self
+            .cells
+            .partition_point(|cell| cell.range.end < bytes.start);
+        let end = self
+            .cells
+            .partition_point(|cell| cell.range.start <= bytes.end);
+        &self.cells[start..end.max(start)]
+    }
+    /// The parsed cells touching `byte`, for cursor queries.
+    pub fn cells_at(&self, byte: usize) -> impl Iterator<Item = &Cell> + Clone {
+        self.cells_intersecting(byte..byte)
+            .iter()
+            .filter_map(ParsedCell::syntax)
+    }
     /// Source ranges reparsed in the current document revision.
     pub fn changed_ranges(&self) -> &[Range<usize>] {
         &self.changed
+    }
+
+    /// Whether any cell has lexical or grammatical diagnostics.
+    pub fn has_error(&self) -> bool {
+        self.cells()
+            .iter()
+            .any(|cell| cell.parse_error().is_some() || !cell.lexer_diagnostics().is_empty())
     }
 
     /// Frames changed source regions and shares unaffected cell allocations with the previous revision.
@@ -285,6 +359,35 @@ fn frame_ranges(source: &str) -> Vec<Range<usize>> {
     let (tokens, failed_at) = match lex_str_recovering(source) {
         Ok(recovered) => (recovered.value, None),
         Err(error) => {
+            if error.kind() == LexErrorKind::UnexpectedClosingDelimiter {
+                let start = error.span().start().unwrap_or(0);
+                let end = error.span().end().unwrap_or(start);
+                if let Some(newline) = source[end..].find('\n') {
+                    let boundary = end + newline + 1;
+                    let safe = [&source[..start], &source[end..boundary]]
+                        .into_iter()
+                        .all(|part| {
+                            lex_str_recovering(part)
+                                .is_ok_and(|recovered| recovered.diagnostics.is_empty())
+                        });
+                    if safe {
+                        let mut ranges = frame_ranges(&source[..start]);
+                        if let Some(last) = ranges.last_mut().filter(|range| {
+                            range.end == start && !source[range.start..range.end].ends_with('\n')
+                        }) {
+                            last.end = boundary;
+                        } else {
+                            ranges.push(start..boundary);
+                        }
+                        ranges.extend(
+                            frame_ranges(&source[boundary..])
+                                .into_iter()
+                                .map(|range| boundary + range.start..boundary + range.end),
+                        );
+                        return ranges;
+                    }
+                }
+            }
             // Retain completed cells before a fatal lexical error without guessing
             // a restart point inside a string, comment, or delimiter group.
             let end = error.span().start().unwrap_or(0);
@@ -354,7 +457,7 @@ mod tests {
         assert_eq!(after.cells().len(), 2);
         assert_eq!(after.cells()[0].source(), "a+\nb\n");
         assert!(after.cells()[0].syntax().is_some());
-        assert_eq!(after.cells()[1].id(), before.cells()[2].id());
+        assert!(after.cells()[1].shares_parse_with(&before.cells()[2]));
     }
 
     #[test]
@@ -366,12 +469,73 @@ mod tests {
     }
 
     #[test]
+    fn intersecting_cells_include_boundaries_and_follow_relocations() {
+        let before = SyntaxSnapshot::parse("a\nb\nc\n", None);
+        let after = SyntaxSnapshot::parse("alpha\nb\nc\n", Some(&before));
+        let hit = before.cells_intersecting(2..2);
+        assert_eq!(hit.len(), 2);
+        assert!(hit[0].shares_parse_with(&before.cells()[0]));
+        assert!(hit[1].shares_parse_with(&before.cells()[1]));
+        let hit = after.cells_intersecting(6..6);
+        assert_eq!(hit.len(), 2);
+        assert!(hit[0].shares_parse_with(&after.cells()[0]));
+        assert!(hit[1].shares_parse_with(&before.cells()[1]));
+        assert!(after.cells_intersecting(99..100).is_empty());
+        assert!(after
+            .cells_intersecting(Range { start: 5, end: 2 })
+            .is_empty());
+    }
+
+    #[test]
     fn malformed_cell_preserves_valid_neighbors() {
         let snapshot = SyntaxSnapshot::parse("a = 1\nf = x -> (x + )\nb = 2\n", None);
         assert_eq!(snapshot.cells().len(), 3);
         assert!(snapshot.cells()[0].syntax().is_some());
         assert!(snapshot.cells()[1].parse_error().is_some());
         assert!(snapshot.cells()[2].syntax().is_some());
+    }
+
+    #[test]
+    fn unexpected_closer_preserves_following_cell() {
+        let snapshot = SyntaxSnapshot::parse("a = 1\nx = )\nb = 2\n", None);
+        assert_eq!(snapshot.cells().len(), 3);
+        assert!(snapshot.cells()[1].syntax().is_none());
+        assert_eq!(
+            snapshot.cells()[1].error_ranges().as_slice(),
+            std::slice::from_ref(&(10..11))
+        );
+        assert!(snapshot.cells()[2].syntax().is_some());
+    }
+
+    #[test]
+    fn unexpected_closer_recovery_matches_fresh_parse_after_edits() {
+        let before = SyntaxSnapshot::parse("a = 1\nx = 2\nb = 3\n", None);
+        let text = "a = 1\nx = )\nb = 3\n";
+        let after = SyntaxSnapshot::parse(text, Some(&before));
+        let fresh = SyntaxSnapshot::parse(text, None);
+        assert_eq!(
+            after
+                .cells()
+                .iter()
+                .map(ParsedCell::document_range)
+                .collect::<Vec<_>>(),
+            fresh
+                .cells()
+                .iter()
+                .map(ParsedCell::document_range)
+                .collect::<Vec<_>>()
+        );
+        assert!(after.cells()[2].shares_parse_with(&before.cells()[2]));
+        assert!(after.cells()[1].syntax().is_none());
+        assert!(after.cells()[2].syntax().is_some());
+    }
+
+    #[test]
+    fn unexpected_closer_does_not_split_an_unclosed_group_or_string() {
+        for text in ["x = (]\ny = 2\n", "x = ) \"unfinished\ny = 2\n"] {
+            let snapshot = SyntaxSnapshot::parse(text, None);
+            assert_eq!(snapshot.cells().len(), 1, "{text:?}");
+        }
     }
 
     #[test]

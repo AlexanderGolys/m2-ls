@@ -65,6 +65,7 @@ mod settings;
 mod source;
 mod source_package;
 mod string_literal;
+mod syntax;
 mod telemetry;
 #[cfg(test)]
 mod test_support;
@@ -1475,7 +1476,6 @@ impl LanguageServer for Backend {
             // An indexed generator `z_1` is its own variable, whose
             // references stay with the file that declares its ring.
             if let Some(ranges) = document.analysis().indexed_ring_generator_references(
-                document.root_node(),
                 position,
                 document.value(),
                 include_declaration,
@@ -1638,7 +1638,9 @@ impl LanguageServer for Backend {
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
         let uri = params.text_document.uri;
-        Ok(self.with_document(&uri, |document| folding_ranges(document.root_node())))
+        Ok(self.with_document(&uri, |document| {
+            folding_ranges(crate::source::SyntaxSource::syntax(document))
+        }))
     }
 
     #[allow(deprecated)]

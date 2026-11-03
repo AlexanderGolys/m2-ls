@@ -1,11 +1,12 @@
 //! Generated syntax used by ring values and generator specifications.
 
-use m2_syn::{nodes::*, Spanned};
+use m2_syn::{nodes::*, Spanned, Token};
 
 use super::{IndexKey, IndexSelection, RingGenerator, RingGeneratorKind};
-use crate::analysis::inference::syntax::{ExpressionSyntax, InfixSyntax, PackedArguments};
-use crate::analysis::syntax_roles::{OperatorSyntax, QuotedName};
+use crate::analysis::inference::syntax::InfixSyntax;
+use crate::analysis::syntax_roles::QuotedName;
 use crate::object_registry::ObjectName;
+use crate::syntax::{ExpressionSyntax, PackedArguments};
 
 /// Typed source anchor of a generator declaration.
 #[derive(Debug, Clone, Copy)]
@@ -15,6 +16,16 @@ pub enum GeneratorAnchor<'ast> {
     Symbol(&'ast Symbol),
     /// A range, string, or option value introducing generators.
     Expression(&'ast Expr),
+}
+
+impl<'ast> GeneratorAnchor<'ast> {
+    /// The anchoring syntax, whose span locates the declaration.
+    pub fn syntax(self) -> &'ast dyn Spanned {
+        match self {
+            Self::Symbol(symbol) => symbol,
+            Self::Expression(expression) => expression,
+        }
+    }
 }
 
 /// A generator specification together with its exact typed source anchor.
@@ -241,7 +252,7 @@ impl RingSyntax {
         }
         if let Some(parts) = expression
             .infix_operands()
-            .filter(|parts| matches!(parts.operator.as_str(), ".." | "..<"))
+            .filter(|parts| matches!(parts.operator, ".." | "..<"))
         {
             let indexed = Self::operands(parts.left, "_").zip(Self::operands(parts.right, "_"));
             let (left, right, kind, indices) = if let Some(((left, start), (right, end))) = indexed
@@ -345,7 +356,7 @@ impl IndexKey {
                 return bare(symbol).then(|| Self::Symbol(ObjectName::new(symbol.text())))
             }
             Expr::Op(ExprOp::Prefix(prefix))
-                if prefix.operator.operator_spelling().as_deref() == Some("-") =>
+                if prefix.operator.spelling() == <Token![-]>::SPELLING =>
             {
                 let Self::Integer(value) = Self::from_expression(&prefix.operand, bare)? else {
                     return None;

@@ -11,13 +11,18 @@
 //! the end of its file is closed by Macaulay2 from a file-exit hook, so its
 //! section then runs to the end of the file.
 
+use m2_syn::nodes::{Expr, ExprDebug, ExprLiteral, ExprOpBinAdj};
+use m2_syn::visit::{self, Visit};
 use strum::{Display, EnumString, IntoStaticStr};
 use tower_lsp::lsp_types::{Position, Range as TextRange};
 
-use crate::node_metadata::SyntaxNode;
+use crate::macaulay2::Macaulay2Conventions;
+use crate::node_metadata::SyntaxSnapshot;
 use crate::object_registry::ObjectName;
-use crate::package_index::{declared_package_name, first_call_argument, PackageLoadingOption};
+use crate::package_index::PackageLoadingOption;
 use crate::source::{ByteRange, SourceNavigation, SymbolMention};
+use crate::string_literal::LiteralSource;
+use crate::syntax::ExpressionSyntax;
 
 /// The function that closes the package a `newPackage` section declares.
 const PACKAGE_CLOSER: &str = "endPackage";
@@ -161,97 +166,113 @@ impl PackageSessionCode {
 
 /// The package-structure calls of a source file, in source order, before they
 /// are grouped into sections.
-enum PackageCall<'tree> {
-    /// Navigates to the declaration that introduces the selected object.
-    Declaration(SyntaxNode<'tree>, SyntaxNode<'tree>),
-    /// A source construct closing a package declaration.
-    Closing(SyntaxNode<'tree>, &'tree str),
-    /// A source declaration exporting names with the selected access policy.
-    Export(SyntaxNode<'tree>, ExportAccess),
-    /// A TEST block paired with its keyword and body.
-    Test(SyntaxNode<'tree>, SyntaxNode<'tree>),
+enum PackageCall {
+    /// A declaration and its exported package names.
+    Declaration {
+        /// Source bytes of the constructor call.
+        bytes: ByteRange,
+        /// Name of the package being opened.
+        name: ObjectName,
+        /// Packages exported by this declaration.
+        exported_packages: Vec<ObjectName>,
+    },
+    /// A package closing call and its name.
+    Closing {
+        /// Source bytes of the closing call.
+        bytes: ByteRange,
+        /// Name of the package being closed.
+        name: ObjectName,
+    },
+    /// A source declaration exporting names.
+    Export {
+        /// Position of the export argument.
+        start: Position,
+        /// Exported symbol facts.
+        exports: Vec<PackageExport>,
+    },
+    /// A TEST block and its literal body.
+    Test {
+        /// Position of the TEST keyword.
+        start: Position,
+        /// Source bytes containing the test code.
+        body: ByteRange,
+    },
 }
 
 impl SourcePackages {
-    /// The packages declared in the syntax tree under `root`.
-    pub fn collect(root: SyntaxNode<'_>, source: &(impl SourceNavigation + ?Sized)) -> Self {
-        let calls = root
-            .descendants()
-            .filter_map(PackageCall::recognize)
-            .collect::<Vec<_>>();
+    /// The packages declared in the retained typed syntax.
+    pub fn collect(syntax: &SyntaxSnapshot, source: &(impl SourceNavigation + ?Sized)) -> Self {
+        let mut collector = PackageCallCollector {
+            source,
+            calls: Vec::new(),
+        };
+        syntax.visit(&mut collector);
+        let calls = collector.calls;
         let declaration_starts = calls
             .iter()
             .filter_map(|call| match call {
-                PackageCall::Declaration(call, _) => Some(call.start_byte()),
+                PackageCall::Declaration { bytes, .. } => Some(bytes.start),
                 _ => None,
             })
             .chain(std::iter::once(source.text().len()))
             .collect::<Vec<_>>();
         let mut declarations = Vec::new();
-        for (call, name) in calls.iter().filter_map(|call| match call {
-            PackageCall::Declaration(call, name) => Some((*call, *name)),
-            _ => None,
-        }) {
+        for call in &calls {
+            let PackageCall::Declaration {
+                bytes,
+                name,
+                exported_packages,
+            } = call
+            else {
+                continue;
+            };
             let next_section_start = declaration_starts
                 .iter()
                 .copied()
-                .find(|start| *start > call.start_byte())
+                .find(|start| *start > bytes.start)
                 .expect("the end of the file follows every section");
-            let package_name = name
-                .string_literal_inner_text()
-                .expect("a declared package name is a string literal");
-            let closing = calls.iter().find_map(|closing| match closing {
-                PackageCall::Closing(closing, closed)
-                    if *closed == package_name
-                        && closing.start_byte() > call.start_byte()
-                        && closing.start_byte() < next_section_start =>
-                {
-                    Some(*closing)
-                }
-                _ => None,
-            });
-            let section_end = closing.map_or(next_section_start, |closing| closing.end_byte());
+            let section_end = calls
+                .iter()
+                .find_map(|closing| match closing {
+                    PackageCall::Closing {
+                        bytes: closing,
+                        name: closed,
+                    } if closed == name
+                        && closing.start > bytes.start
+                        && closing.start < next_section_start =>
+                    {
+                        Some(closing.end)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(next_section_start);
             declarations.push(PackageDeclaration {
-                name: ObjectName::new(package_name),
-                section: source.range_for_bytes(call.start_byte()..section_end),
+                name: name.clone(),
+                section: source.range_for_bytes(bytes.start..section_end),
                 exports: Vec::new(),
-                exported_packages: PackageLoadingOption::Exports
-                    .package_names(call)
-                    .into_iter()
-                    .filter_map(|package| package.string_literal_inner_text())
-                    .map(ObjectName::new)
-                    .collect(),
+                exported_packages: exported_packages.clone(),
             });
         }
-
         let mut packages = Self {
             declarations,
             tests: Vec::new(),
         };
-        for call in &calls {
+        for call in calls {
             match call {
-                PackageCall::Export(argument, access) => {
-                    let start = source.position_for_node(*argument);
-                    let exports = exported_symbols(*argument, *access, source);
+                PackageCall::Export { start, exports } => {
                     if let Some(declaration) = packages.declaration_at_mut(start) {
                         declaration.exports.extend(exports);
                     }
                 }
-                PackageCall::Test(clause, body) => {
-                    let Some(package) =
-                        packages.session_package_at(source.position_for_node(*clause))
-                    else {
-                        continue;
-                    };
-                    let Some(body) = body.string_literal_inner_bytes() else {
-                        continue;
-                    };
-                    packages.tests.push(PackageSessionCode {
-                        package,
-                        fragments: vec![CodeFragment::new(body, source)],
-                    });
+                PackageCall::Test { start, body } => {
+                    if let Some(package) = packages.session_package_at(start) {
+                        packages.tests.push(PackageSessionCode {
+                            package,
+                            fragments: vec![CodeFragment::new(body, source)],
+                        });
+                    }
                 }
-                PackageCall::Declaration(..) | PackageCall::Closing(..) => {}
+                PackageCall::Declaration { .. } | PackageCall::Closing { .. } => {}
             }
         }
         packages
@@ -315,106 +336,121 @@ impl PackageDeclaration {
     }
 }
 
-impl<'tree> PackageCall<'tree> {
-    /// Recognizes a supported package declaration, export, closing marker, or TEST block.
-    fn recognize(node: SyntaxNode<'tree>) -> Option<Self> {
-        if let Some(name) = declared_package_name(node) {
-            return Some(Self::Declaration(node, name));
-        }
-        if let Some(name) = first_call_argument(node, |callee| callee == PACKAGE_CLOSER)
-            .and_then(|argument| argument.string_literal_inner_text())
-        {
-            return Some(Self::Closing(node, name));
-        }
-        if let Some(access) = node
-            .applied_symbol_name()
-            .and_then(|callee| callee.parse::<ExportAccess>().ok())
-        {
-            let argument = first_call_argument(node, |callee| callee == <&str>::from(access))?;
-            return Some(Self::Export(argument, access));
-        }
-        test_body(node).map(|body| Self::Test(node, body))
-    }
+/// Collects package structure from generated call and TEST syntax.
+struct PackageCallCollector<'source, S: ?Sized> {
+    /// Text and coordinates for this syntax revision.
+    source: &'source S,
+    /// Recognized calls in traversal order.
+    calls: Vec<PackageCall>,
 }
 
-/// The raw string a `TEST ///…///` clause runs as code.
-fn test_body(clause: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
-    if !clause.is_debug_expr()
-        || !clause
-            .children()
-            .any(|child| child.is::<m2_syn::Token![TEST]>())
-    {
-        return None;
-    }
-    clause
-        .named_children()
-        .find(|child| child.is::<m2_syn::nodes::RawStringLiteral>())
-}
-
-/// The elements of a list argument, or the argument itself when it is a
-/// single element.
-fn string_list(argument: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
-    if argument.is_collection_expression() {
-        argument.collection_elements().collect()
-    } else {
-        vec![argument]
-    }
-}
-
-/// The symbols an `export`/`exportMutable` argument lists: strings, and
-/// `"synonym" => "name"` options. Anything else is computed when the package
-/// loads and cannot be known here.
-fn exported_symbols(
-    argument: SyntaxNode<'_>,
-    access: ExportAccess,
-    source: &(impl SourceNavigation + ?Sized),
-) -> Vec<PackageExport> {
-    let mention = |name: SyntaxNode<'_>| {
-        Some(SymbolMention::new(
-            source.span_for_bytes(name.string_literal_inner_bytes()?),
-        ))
-    };
-    string_list(argument)
-        .into_iter()
-        .filter_map(|element| {
-            if let Some(name) = element.string_literal_inner_text() {
-                return Some(PackageExport {
-                    name: ObjectName::new(name),
-                    definition: ObjectName::new(name),
-                    range: source.range_for_node(element),
-                    name_mention: mention(element)?,
-                    definition_mention: mention(element)?,
+impl<S: SourceNavigation + ?Sized> PackageCallCollector<'_, S> {
+    /// The export entries denoted by a typed argument.
+    fn exported_symbols(&self, argument: &Expr, access: ExportAccess) -> Vec<PackageExport> {
+        let elements = argument
+            .collection_elements()
+            .unwrap_or_else(|| vec![Some(argument)]);
+        elements
+            .into_iter()
+            .flatten()
+            .filter_map(|element| {
+                let (name, definition) = match element {
+                    Expr::Option(option) => (option.key.as_ref(), option.value.as_ref()),
+                    _ => (element, element),
+                };
+                let mention = |literal: &Expr| {
+                    Some(SymbolMention::new(
+                        self.source
+                            .span_for_bytes(literal.literal_content_bytes(self.source)?),
+                    ))
+                };
+                Some(PackageExport {
+                    name: ObjectName::new(name.literal_source(self.source)?),
+                    definition: ObjectName::new(definition.literal_source(self.source)?),
+                    range: self.source.range_for_syntax(name)?,
+                    name_mention: mention(name)?,
+                    definition_mention: mention(definition)?,
                     access,
-                });
-            }
-            if !element.is_option_assignment() {
-                return None;
-            }
-            let synonym = element.binary_parts().map(|parts| parts.left)?;
-            let definition = element.binary_parts().map(|parts| parts.right)?;
-            Some(PackageExport {
-                name: ObjectName::new(synonym.string_literal_inner_text()?),
-                definition: ObjectName::new(definition.string_literal_inner_text()?),
-                range: source.range_for_node(synonym),
-                name_mention: mention(synonym)?,
-                definition_mention: mention(definition)?,
-                access,
+                })
             })
-        })
-        .collect()
+            .collect()
+    }
+}
+
+impl<'ast, S: SourceNavigation + ?Sized> Visit<'ast> for PackageCallCollector<'_, S> {
+    fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
+        if let (Some(head), Some(bytes)) = (
+            call.left_operand.symbol_name(),
+            self.source.syntax_bytes(call),
+        ) {
+            let argument = call.right_operand.arguments().into_iter().next().flatten();
+            if let Some(argument) = argument {
+                if head == Macaulay2Conventions::PACKAGE_CONSTRUCTOR {
+                    if let Some(name) = argument
+                        .literal_source(self.source)
+                        .filter(|name| !name.is_empty())
+                    {
+                        let exported_packages = PackageLoadingOption::Exports
+                            .typed_package_names(call, self.source)
+                            .into_iter()
+                            .filter_map(|literal| literal.literal_source(self.source))
+                            .map(ObjectName::new)
+                            .collect();
+                        self.calls.push(PackageCall::Declaration {
+                            bytes,
+                            name: ObjectName::new(name),
+                            exported_packages,
+                        });
+                    }
+                } else if head == PACKAGE_CLOSER {
+                    if let Some(name) = argument.literal_source(self.source) {
+                        self.calls.push(PackageCall::Closing {
+                            bytes,
+                            name: ObjectName::new(name),
+                        });
+                    }
+                } else if let Ok(access) = head.parse::<ExportAccess>() {
+                    if let Some(range) = self.source.range_for_syntax(argument) {
+                        self.calls.push(PackageCall::Export {
+                            start: range.start,
+                            exports: self.exported_symbols(argument, access),
+                        });
+                    }
+                }
+            }
+        }
+        visit::visit_expr_op_bin_adj(self, call);
+    }
+
+    fn visit_expr_debug(&mut self, debug: &'ast ExprDebug) {
+        if let ExprDebug::Test(test) = debug {
+            if let Some(body @ Expr::Literal(ExprLiteral::RawString(_))) = test.value.as_deref() {
+                if let (Some(range), Some(body)) = (
+                    self.source.range_for_syntax(debug),
+                    body.literal_content_bytes(self.source),
+                ) {
+                    self.calls.push(PackageCall::Test {
+                        start: range.start,
+                        body,
+                    });
+                }
+            }
+        }
+        visit::visit_expr_debug(self, debug);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::SourcePackages;
-    use crate::node_metadata::SyntaxParser;
+    use crate::node_metadata::SyntaxSnapshot;
     use crate::source::DocumentSource;
 
     fn packages(text: &str) -> SourcePackages {
-        let source = DocumentSource::new(text.to_string());
-        let mut parser = SyntaxParser::new().expect("parser");
-        let root = parser.parse(text).expect("parse");
-        SourcePackages::collect(root, &source)
+        let mut source = DocumentSource::new(text.to_string());
+        let tree = SyntaxSnapshot::parse(text, None);
+        source.register_syntax(&tree);
+        SourcePackages::collect(&tree, &source)
     }
 
     #[test]

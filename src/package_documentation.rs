@@ -35,7 +35,9 @@
 mod hypertext;
 mod simple_doc;
 
-use m2_syn::nodes::{Array, Sequence, Symbol};
+use m2_syn::nodes::{Expr, ExprCollection, ExprOpBinAdj, PackedContent, Symbol};
+use m2_syn::visit::{self, Visit};
+use m2_syn::{Lex, Spanned, TokenTree};
 use strum::{Display, EnumString, IntoStaticStr};
 use tower_lsp::lsp_types::Range as TextRange;
 
@@ -43,14 +45,16 @@ use crate::analysis::Analysis;
 use crate::documentation::{DocumentationBlock, DocumentationTarget};
 use crate::macaulay2::Macaulay2Conventions;
 use crate::meta::BindingRole;
-use crate::node_metadata::{SyntaxNode, SyntaxParser};
+use crate::node_metadata::SyntaxSnapshot;
 use crate::object_registry::ObjectName;
-use crate::semantic_token::{syntax_semantic_token_type, M2SemanticTokenType};
-use crate::source::{ByteRange, DocumentSpan, SourceNavigation, SymbolMention};
+use crate::semantic_token::{lexical_semantic_token_type, M2SemanticTokenType};
+use crate::source::{ByteRange, DocumentSource, DocumentSpan, SourceNavigation, SymbolMention};
 use crate::source_package::{CodeFragment, PackageSessionCode, SourcePackages};
+use crate::string_literal::{LiteralSource, StringDelimiter};
+use crate::syntax::{Applications, BindingReferences, ExpressionSyntax};
 
 pub use hypertext::DocumentOption;
-use hypertext::HypertextMarkdown;
+use hypertext::{HypertextMarkdown, SemanticMarkup, TexStrings};
 pub use simple_doc::SimpleDocKeyword;
 
 /// The functions that read SimpleDoc or hypertext documentation, as they are
@@ -305,30 +309,29 @@ pub enum DocumentationFaultKind {
 }
 
 impl PackageDocumentation {
-    /// The documentation written in the syntax tree under `root`, a file that
+    /// The documentation written in the syntax of `source`, a file that
     /// declares `packages`, as `analysis` characterized it.
     pub fn collect(
-        root: SyntaxNode<'_>,
+        syntax: &SyntaxSnapshot,
         source: &(impl SourceNavigation + ?Sized),
         packages: &SourcePackages,
     ) -> Self {
         let mut collector = DocumentationCollector {
             source,
-            parser: SyntaxParser::new().expect("the Macaulay2 grammar loads"),
             documentation: Self::default(),
             evaluated_examples: Vec::new(),
         };
-        for call in root.descendants() {
+        let mut applications = Applications::default();
+        syntax.visit(&mut applications);
+        for call in applications.0 {
             let Some(function) = call
-                .applied_symbol_name()
+                .left_operand
+                .symbol_name()
                 .and_then(|name| name.parse::<DocumentationFunction>().ok())
             else {
                 continue;
             };
-            let Some(argument) = call.binary_parts().map(|parts| parts.right) else {
-                continue;
-            };
-            collector.read_call(call, function, argument);
+            collector.read_call(call, function, &call.right_operand);
         }
         let mut documentation = collector.documentation;
         for fragment in collector.evaluated_examples {
@@ -433,11 +436,11 @@ impl PackageDocumentation {
 
 impl DocumentedSubject {
     /// What a key written as `expression` names.
-    fn of_expression(expression: SyntaxNode<'_>) -> Self {
-        if expression.is::<Symbol>() {
-            return Self::Name(ObjectName::new(expression.text()));
+    fn of_expression<N: SourceNavigation + ?Sized>(code: &Code<'_, N>, expression: &Expr) -> Self {
+        if let Expr::Symbol(symbol) = expression {
+            return Self::Name(ObjectName::new(symbol.text()));
         }
-        if let Some(name) = expression.string_literal_inner_text() {
+        if let Some(name) = code.content_text(expression) {
             return Self::Name(ObjectName::new(name));
         }
         if let Some((function, option)) = Self::optional_argument_parts(expression) {
@@ -446,12 +449,12 @@ impl DocumentedSubject {
                 option: ObjectName::new(option.text()),
             };
         }
-        if expression.is::<Sequence>() {
-            let mut elements = expression.collection_elements();
-            let function = elements.next().filter(|function| function.is::<Symbol>());
-            let domain = elements.collect::<Vec<_>>();
-            if let Some(function) = function {
-                if !domain.is_empty() && domain.iter().all(|parameter| parameter.is::<Symbol>()) {
+        if let Expr::Collection(ExprCollection::Sequence(_)) = expression {
+            let mut elements = expression.contained_expressions().into_iter();
+            let function = elements.next().and_then(Self::symbol);
+            let domain = elements.map(Self::symbol).collect::<Option<Vec<_>>>();
+            if let (Some(function), Some(domain)) = (function, domain) {
+                if !domain.is_empty() {
                     return Self::Method {
                         function: ObjectName::new(function.text()),
                         domain: domain
@@ -462,21 +465,25 @@ impl DocumentedSubject {
                 }
             }
         }
-        Self::Expression(expression.text().split_whitespace().collect())
+        Self::Expression(code.text(expression).split_whitespace().collect())
+    }
+
+    /// The symbol `expression` is, if it is exactly one.
+    fn symbol(expression: &Expr) -> Option<&Symbol> {
+        match expression {
+            Expr::Symbol(symbol) => Some(symbol),
+            _ => None,
+        }
     }
 
     /// The function and the option of `expression` when it is a key of an
     /// optional argument, the array `[f, Limit]`.
-    fn optional_argument_parts(
-        expression: SyntaxNode<'_>,
-    ) -> Option<(SyntaxNode<'_>, SyntaxNode<'_>)> {
-        if !expression.is::<Array>() {
+    fn optional_argument_parts(expression: &Expr) -> Option<(&Symbol, &Symbol)> {
+        let Expr::Collection(ExprCollection::Array(_)) = expression else {
             return None;
-        }
-        match expression.collection_elements().collect::<Vec<_>>()[..] {
-            [function, option] if function.is::<Symbol>() && option.is::<Symbol>() => {
-                Some((function, option))
-            }
+        };
+        match expression.contained_expressions()[..] {
+            [function, option] => Some((Self::symbol(function)?, Self::symbol(option)?)),
             _ => None,
         }
     }
@@ -670,8 +677,6 @@ impl DocumentTag {
 struct DocumentationCollector<'source, S: SourceNavigation + ?Sized> {
     /// Source data supplying text and coordinate conversions.
     source: &'source S,
-    /// Parses the expressions SimpleDoc strings embed.
-    parser: SyntaxParser,
     /// Documentation extracted from the current document or selected object.
     documentation: PackageDocumentation,
     /// EXAMPLE applications evaluated inside SimpleDoc expressions.
@@ -680,19 +685,16 @@ struct DocumentationCollector<'source, S: SourceNavigation + ?Sized> {
 
 impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// Read one call of a documentation `function` on `argument`.
-    fn read_call(
-        &mut self,
-        call: SyntaxNode<'_>,
-        function: DocumentationFunction,
-        argument: SyntaxNode<'_>,
-    ) {
+    fn read_call(&mut self, call: &ExprOpBinAdj, function: DocumentationFunction, argument: &Expr) {
+        let source = self.source;
+        let code = Code::in_document(source);
         if function != DocumentationFunction::Undocumented {
             self.documentation
                 .documentation_ranges
-                .push(call.start_byte()..call.end_byte());
+                .push(code.bytes(call));
         }
-        let argument = if argument.is_holder() {
-            let Some(inner) = argument.collection_elements().next() else {
+        let argument = if matches!(argument, Expr::Holder(_)) {
+            let Some(inner) = argument.contained_expressions().into_iter().next() else {
                 return;
             };
             inner
@@ -703,52 +705,55 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             function,
             DocumentationFunction::Doc | DocumentationFunction::Multidoc
         ) {
-            if let Some(callee) = call.binary_parts().map(|parts| parts.left) {
-                let range = self.source.range_for_node(callee);
-                self.documentation.simple_doc_functions.push(range);
-            }
+            let range = source.range_for_bytes(code.bytes(&*call.left_operand));
+            self.documentation.simple_doc_functions.push(range);
         }
         match function {
             DocumentationFunction::Undocumented => {
-                let keys = if argument.is_collection_expression() {
-                    argument.collection_elements().collect()
+                let keys = if argument.collection_elements().is_some() {
+                    argument.contained_expressions()
                 } else {
                     vec![argument]
                 };
                 for key in keys {
                     self.documentation.undocumented.push(DocumentationKey {
-                        range: self.source.range_for_node(key),
-                        subject: DocumentedSubject::of_expression(key),
+                        range: source.range_for_bytes(code.bytes(key)),
+                        subject: DocumentedSubject::of_expression(&code, key),
                     });
                 }
             }
             DocumentationFunction::Doc
             | DocumentationFunction::Multidoc
             | DocumentationFunction::Document
-                if argument.is_string_literal() =>
+                if code.content_bytes(argument).is_some() =>
             {
                 // A plain string's escapes would shift every position, so
                 // only one written without them maps back to the source.
-                let Some(body) = argument.string_literal_inner_bytes() else {
+                let Some(body) = code.content_bytes(argument) else {
                     return;
                 };
-                if argument.is::<m2_syn::nodes::StringLiteral>()
-                    && self.source.text()[body.clone()].contains('\\')
+                if StringDelimiter::of_expression(argument) == Some(StringDelimiter::Quote)
+                    && source.text()[body.clone()].contains('\\')
                 {
                     return;
                 }
                 self.read_simple_doc(call, body);
             }
-            DocumentationFunction::Document if argument.is::<m2_syn::nodes::List>() => {
+            DocumentationFunction::Document
+                if matches!(argument, Expr::Collection(ExprCollection::List(_))) =>
+            {
                 self.read_hypertext_list(call, argument);
             }
-            DocumentationFunction::Document if argument.is::<Sequence>() => {
+            DocumentationFunction::Document
+                if matches!(argument, Expr::Collection(ExprCollection::Sequence(_))) =>
+            {
                 if argument
-                    .collection_elements()
-                    .any(|element| element.is_option_assignment())
+                    .contained_expressions()
+                    .into_iter()
+                    .any(|element| matches!(element, Expr::Option(_)))
                 {
                     self.fault(
-                        self.source.range_for_node(argument),
+                        source.range_for_bytes(code.bytes(argument)),
                         DocumentationFaultKind::OptionsOutsideList,
                     );
                 }
@@ -766,31 +771,38 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             .push(DocumentationFault { range, kind });
     }
 
-    /// Record the symbols under `expression`, a node of the file's own syntax
-    /// tree, as names the documentation evaluates.
-    fn reference_code_names(&mut self, expression: SyntaxNode<'_>) {
-        for symbol in expression.binding_references() {
+    /// Record the symbols under `expression`, written in `code`, as names the
+    /// documentation evaluates.
+    fn reference_code_names<N: SourceNavigation + ?Sized>(
+        &mut self,
+        code: &Code<'_, N>,
+        expression: &Expr,
+        site: NameSite,
+    ) {
+        let mut references = BindingReferences::default();
+        references.visit_expr(expression);
+        for symbol in references.0 {
             self.documentation.referenced_names.push(ReferencedName {
-                span: self.source.span_for_node(symbol),
-                site: NameSite::Code,
+                span: self.source.span_for_bytes(code.bytes(symbol)),
+                site,
             });
         }
     }
 
     /// Evaluate the Macaulay2 expression at `bytes` of a SimpleDoc string,
     /// standing for `role`, as SimpleDoc does, inside parentheses, and hand
-    /// its syntax tree to `inspect`. Its names are recorded as names the
+    /// its syntax to `inspect`. Its names are recorded as names the
     /// documentation evaluates and its tokens are marked; one that does not
     /// parse is a fault and is not inspected.
     fn evaluate_simple_doc_expression<R>(
         &mut self,
         bytes: ByteRange,
         role: EvaluatedExpression,
-        inspect: impl FnOnce(SyntaxNode<'_>) -> R,
+        inspect: impl FnOnce(&Code<'_, DocumentSource>, &Expr) -> R,
     ) -> Option<R> {
         let parenthesized = format!("({})", &self.source.text()[bytes.clone()]);
-        let root = self.parser.parse(&parenthesized)?;
-        let Some(expression) = Self::parsed_expression(root) else {
+        let embedded = EmbeddedCode::parse(parenthesized);
+        let Some(expression) = embedded.expression() else {
             let range = self.source.range_for_bytes(bytes);
             self.documentation.faults.push(DocumentationFault {
                 range,
@@ -798,53 +810,39 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             });
             return None;
         };
-        let origin = ParsedOrigin {
+        let code = embedded.code(ParsedOrigin {
             source: bytes.start,
             added: 1,
-        };
-        for symbol in expression.binding_references() {
-            let span = self.source.span_for_bytes(origin.source_bytes(symbol));
-            self.documentation.referenced_names.push(ReferencedName {
-                span,
-                site: NameSite::SimpleDoc,
-            });
-        }
-        let inner = if expression.is_holder() {
-            expression
-                .collection_elements()
-                .next()
-                .unwrap_or(expression)
-        } else {
-            expression
+        });
+        self.reference_code_names(&code, expression, NameSite::SimpleDoc);
+        let inner = match expression.contained_expressions()[..] {
+            [inner] if matches!(expression, Expr::Holder(_)) => inner,
+            _ => expression,
         };
         let key = (role == EvaluatedExpression::Key).then_some(inner);
-        let code = CodeMarkup::of_tree(expression, key, origin);
-        let inspected = inspect(inner);
-        let tex_strings = HypertextMarkdown::tex_strings(expression)
-            .into_iter()
-            .map(|bytes| origin.source_range(bytes))
-            .collect::<Vec<_>>();
-        let hypertext = HypertextMarkdown::semantic_markup(expression);
-        for mut markup in hypertext {
-            markup.bytes = origin.source_range(markup.bytes);
-            self.documentation.markup.push(markup);
-        }
-        for node in expression.descendants() {
-            if let Some(argument) = HypertextMarkdown::example_argument(node) {
-                self.documentation
-                    .example_ranges
-                    .push(origin.source_bytes(node));
+        let marks = CodeMarkup::of_syntax(&embedded.syntax, key, &code);
+        let inspected = inspect(&code, inner);
+        let mut applications = Applications::default();
+        embedded.syntax.visit(&mut applications);
+        let mut tex_strings = TexStrings::new(&code);
+        tex_strings.visit_expr(expression);
+        let mut semantic = SemanticMarkup::new(&code);
+        semantic.visit_expr(expression);
+        self.documentation.markup.extend(semantic.markup);
+        for call in applications.0 {
+            if let Some(argument) = HypertextMarkdown::example_argument(call) {
+                self.documentation.example_ranges.push(code.bytes(call));
                 self.evaluated_examples.extend(Self::example_fragments(
                     argument,
+                    &code,
                     self.source,
-                    Some(origin),
                 ));
             }
         }
-        for bytes in tex_strings {
+        for bytes in tex_strings.strings {
             self.render_tex(bytes);
         }
-        self.record_code_markup(code);
+        self.record_code_markup(marks);
         Some(inspected)
     }
 
@@ -852,37 +850,33 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// SimpleDoc only shows, never evaluates — a `Usage` line, a line of a
     /// `CannedExample`. Code that does not parse stays prose.
     fn mark_shown_code(&mut self, bytes: ByteRange) {
-        let source = self.source;
-        let Some(root) = self.parser.parse(&source.text()[bytes.clone()]) else {
-            return;
-        };
-        if root.has_error() {
+        let embedded = EmbeddedCode::parse(self.source.text()[bytes.clone()].to_string());
+        if !embedded.parsed_cleanly() {
             return;
         }
-        let origin = ParsedOrigin {
+        let code = embedded.code(ParsedOrigin {
             source: bytes.start,
             added: 0,
-        };
-        let code = CodeMarkup::of_tree(root, None, origin);
-        self.record_code_markup(code);
+        });
+        let marks = CodeMarkup::of_syntax(&embedded.syntax, None, &code);
+        self.record_code_markup(marks);
     }
 
-    /// Record `node`, a node of the file's own syntax tree that is a
-    /// documentation key or a link to one: as naming its key when it is a
-    /// string holding a symbol's name, and its option when it names an
-    /// optional argument.
-    fn record_key(&mut self, node: SyntaxNode<'_>) {
-        let code = CodeMarkup {
-            markup: DocumentedSubject::optional_argument_parts(node)
+    /// Record `key`, written in `code`, that is a documentation key or a link
+    /// to one: as naming its key when it is a string holding a symbol's name,
+    /// and its option when it names an optional argument.
+    fn record_key<N: SourceNavigation + ?Sized>(&mut self, code: &Code<'_, N>, key: &Expr) {
+        let marks = CodeMarkup {
+            markup: DocumentedSubject::optional_argument_parts(key)
                 .map(|(_, option)| DocumentationMarkup {
-                    bytes: option.start_byte()..option.end_byte(),
+                    bytes: code.bytes(option),
                     kind: DocumentationMarkupKind::OptionName,
                 })
                 .into_iter()
                 .collect(),
-            key_string_candidates: node.string_literal_inner_bytes().into_iter().collect(),
+            key_string_candidates: code.content_bytes(key).into_iter().collect(),
         };
-        self.record_code_markup(code);
+        self.record_code_markup(marks);
     }
 
     /// Record the marks of `code`, once its syntax tree is gone: its strings
@@ -906,18 +900,16 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
 
     /// Whether `text` is the name of a symbol, as Macaulay2 parses it.
     fn names_symbol(&mut self, text: &str) -> bool {
-        self.parser
-            .parse(text)
-            .and_then(Self::parsed_expression)
-            .is_some_and(|expression| expression.is::<Symbol>() && expression.text() == text)
-    }
-
-    /// The one expression a separately parsed `root` holds, when it parses.
-    fn parsed_expression(root: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
-        root.named_children()
-            .find(|cell| cell.is_source_cell())
-            .and_then(|cell| cell.named_children().find(|child| !child.is_comment()))
-            .filter(|_| !root.has_error())
+        let syntax = crate::node_metadata::SyntaxSnapshot::parse(text, None);
+        let [cell] = syntax.cells() else {
+            return false;
+        };
+        if cell.parse_error().is_some() || !cell.lexer_diagnostics().is_empty() {
+            return false;
+        }
+        matches!(cell.syntax().map(|cell| &cell.content),
+            Some(m2_syn::nodes::PackedContent::Expr(expression))
+                if matches!(expression.as_ref(), m2_syn::nodes::Expr::Symbol(symbol) if symbol.text() == text))
     }
 }
 
@@ -943,20 +935,115 @@ struct ParsedOrigin {
 }
 
 impl ParsedOrigin {
-    /// The document bytes of `node`.
-    fn source_bytes(self, node: SyntaxNode<'_>) -> ByteRange {
-        self.source_range(node.start_byte()..node.end_byte())
-    }
-
     /// The document bytes of the parsed bytes `parsed`.
     fn source_range(self, parsed: ByteRange) -> ByteRange {
         self.source + parsed.start - self.added..self.source + parsed.end - self.added
     }
 }
 
+/// A separately parsed fragment of code a documentation string embeds, with
+/// the coordinates of its own text.
+struct EmbeddedCode {
+    /// Syntax of the fragment.
+    syntax: SyntaxSnapshot,
+    /// The fragment's text and the provenance of its syntax.
+    source: DocumentSource,
+}
+
+impl EmbeddedCode {
+    /// Parses `text` on its own.
+    fn parse(text: String) -> Self {
+        let syntax = SyntaxSnapshot::parse(&text, None);
+        let mut source = DocumentSource::new(text);
+        source.register_syntax(&syntax);
+        Self { syntax, source }
+    }
+
+    /// Whether the fragment lexed and parsed without error.
+    fn parsed_cleanly(&self) -> bool {
+        self.syntax.cells().iter().all(|cell| {
+            cell.parse_error().is_none()
+                && cell.lexer_diagnostics().is_empty()
+                && cell.syntax().is_some()
+        })
+    }
+
+    /// The one expression the fragment holds, when it parses.
+    fn expression(&self) -> Option<&Expr> {
+        let [cell] = self.syntax.cells() else {
+            return None;
+        };
+        if !self.parsed_cleanly() {
+            return None;
+        }
+        match &cell.syntax()?.content {
+            PackedContent::Expr(expression) => Some(expression),
+            PackedContent::Pack(_) => None,
+        }
+    }
+
+    /// The fragment's syntax with its place in the document.
+    fn code(&self, origin: ParsedOrigin) -> Code<'_, DocumentSource> {
+        Code {
+            navigation: &self.source,
+            origin,
+        }
+    }
+}
+
+/// Syntax together with the coordinates it was parsed in and where those
+/// lie in the document.
+pub(super) struct Code<'text, Navigation: ?Sized> {
+    /// Coordinates and text the syntax was registered with.
+    navigation: &'text Navigation,
+    /// Where the navigation's bytes lie in the document.
+    origin: ParsedOrigin,
+}
+
+impl<'text, Navigation: SourceNavigation + ?Sized> Code<'text, Navigation> {
+    /// Syntax written in the document itself.
+    fn in_document(navigation: &'text Navigation) -> Self {
+        Self {
+            navigation,
+            origin: ParsedOrigin {
+                source: 0,
+                added: 0,
+            },
+        }
+    }
+
+    /// The text of `syntax`.
+    fn text(&self, syntax: &(impl Spanned + ?Sized)) -> &'text str {
+        self.navigation
+            .text_for_syntax(syntax)
+            .expect("syntax is registered with the text it was parsed from")
+    }
+
+    /// The document bytes of `syntax`.
+    fn bytes(&self, syntax: &(impl Spanned + ?Sized)) -> ByteRange {
+        self.origin.source_range(
+            self.navigation
+                .syntax_bytes(syntax)
+                .expect("syntax is registered with the text it was parsed from"),
+        )
+    }
+
+    /// The document bytes of the content of the string literal `expression`.
+    fn content_bytes(&self, expression: &Expr) -> Option<ByteRange> {
+        expression
+            .literal_content_bytes(self.navigation)
+            .map(|bytes| self.origin.source_range(bytes))
+    }
+
+    /// The content of the string literal `expression`, as written.
+    fn content_text(&self, expression: &Expr) -> Option<&'text str> {
+        expression.literal_source(self.navigation)
+    }
+}
+
 /// The marks of one piece of code a documentation string embeds, taken while
-/// its syntax tree is alive. Whether a string in a key position names a key
-/// is decided after, by parsing its content.
+/// its syntax is alive. Whether a string in a key position names a key is
+/// decided after, by parsing its content.
 #[derive(Debug, Default)]
 struct CodeMarkup {
     /// Source spans classified as documentation markup.
@@ -967,52 +1054,118 @@ struct CodeMarkup {
 }
 
 impl CodeMarkup {
-    /// The marks of the tokens under `root`, placed at `origin`. `key` is the
-    /// node of the tree that is a documentation key, if any.
-    fn of_tree(root: SyntaxNode<'_>, key: Option<SyntaxNode<'_>>, origin: ParsedOrigin) -> Self {
-        let link_keys = root
-            .descendants()
+    /// The marks of the tokens of `syntax`, written in `code`. `key` is the
+    /// expression of the syntax that is a documentation key, if any.
+    fn of_syntax<N: SourceNavigation + ?Sized>(
+        syntax: &SyntaxSnapshot,
+        key: Option<&Expr>,
+        code: &Code<'_, N>,
+    ) -> Self {
+        let mut applications = Applications::default();
+        syntax.visit(&mut applications);
+        let link_keys = applications
+            .0
+            .into_iter()
             .filter_map(HypertextMarkdown::link_key)
             .chain(key)
             .collect::<Vec<_>>();
         let option_names = link_keys
             .iter()
-            .filter_map(|key| DocumentedSubject::optional_argument_parts(*key))
-            .map(|(_, option)| option.id())
+            .filter_map(|key| DocumentedSubject::optional_argument_parts(key))
+            .map(|(_, option)| code.bytes(option))
             .collect::<Vec<_>>();
-        let link_keys = link_keys.iter().map(|key| key.id()).collect::<Vec<_>>();
-        let mut code = Self::default();
-        for node in root.descendants() {
-            let bytes = origin.source_bytes(node);
-            if bytes.is_empty() {
+        let link_key_bytes = link_keys
+            .iter()
+            .map(|key| code.bytes(*key))
+            .collect::<Vec<_>>();
+        let mut marks = Self::default();
+        let mut symbols = SymbolMarks {
+            code,
+            option_names: &option_names,
+            link_key_bytes: &link_key_bytes,
+            marks: &mut marks,
+            symbol_starts: Vec::new(),
+        };
+        syntax.visit(&mut symbols);
+        let symbol_starts = symbols.symbol_starts;
+        for cell in syntax.cells().iter().filter_map(|cell| cell.syntax()) {
+            marks.tokens(&cell.to_token_stream(), &symbol_starts, code);
+        }
+        marks
+    }
+
+    /// Marks the tokens of a stream that no symbol covers, descending into groups.
+    fn tokens<N: SourceNavigation + ?Sized>(
+        &mut self,
+        stream: &m2_syn::TokenStream,
+        symbol_starts: &[usize],
+        code: &Code<'_, N>,
+    ) {
+        for token in stream {
+            if let TokenTree::Group(group) = token {
+                self.tokens(group.stream(), symbol_starts, code);
                 continue;
             }
-            if node.is::<Symbol>() {
-                code.markup.push(DocumentationMarkup {
-                    bytes,
-                    kind: if option_names.contains(&node.id()) {
-                        DocumentationMarkupKind::OptionName
-                    } else {
-                        HypertextMarkdown::constructor_markup(node.text())
-                            .unwrap_or(DocumentationMarkupKind::Name)
-                    },
-                });
-            } else if node.is_string_literal() {
-                if link_keys.contains(&node.id()) {
-                    code.key_string_candidates.extend(
-                        node.string_literal_inner_bytes()
-                            .map(|inner| origin.source_range(inner)),
-                    );
-                }
-            } else if let Some(token_type) = syntax_semantic_token_type(node)
-                .filter(|token_type| *token_type != M2SemanticTokenType::Comment)
-            {
-                code.markup.push(DocumentationMarkup {
-                    bytes,
-                    kind: DocumentationMarkupKind::Syntax(token_type),
-                });
+            let Some(token_type) = lexical_semantic_token_type(token).filter(|token_type| {
+                !matches!(
+                    token_type,
+                    M2SemanticTokenType::Comment | M2SemanticTokenType::String
+                )
+            }) else {
+                continue;
+            };
+            let bytes = code.bytes(token);
+            if bytes.is_empty() || symbol_starts.contains(&bytes.start) {
+                continue;
             }
+            self.markup.push(DocumentationMarkup {
+                bytes,
+                kind: DocumentationMarkupKind::Syntax(token_type),
+            });
         }
-        code
+    }
+}
+
+/// Marks the symbols of code and finds the strings in key positions.
+struct SymbolMarks<'a, 'text, N: ?Sized> {
+    /// Coordinates of the visited syntax.
+    code: &'a Code<'text, N>,
+    /// The document bytes of symbols naming an optional argument.
+    option_names: &'a [ByteRange],
+    /// The document bytes of the documentation keys and link targets.
+    link_key_bytes: &'a [ByteRange],
+    /// Marks collected so far.
+    marks: &'a mut CodeMarkup,
+    /// The document bytes where symbols start.
+    symbol_starts: Vec<usize>,
+}
+
+impl<'ast, N: SourceNavigation + ?Sized> Visit<'ast> for SymbolMarks<'_, '_, N> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if self.code.content_bytes(expression).is_some()
+            && self.link_key_bytes.contains(&self.code.bytes(expression))
+        {
+            self.marks
+                .key_string_candidates
+                .extend(self.code.content_bytes(expression));
+        }
+        visit::visit_expr(self, expression);
+    }
+
+    fn visit_symbol(&mut self, symbol: &'ast Symbol) {
+        let bytes = self.code.bytes(symbol);
+        if bytes.is_empty() {
+            return;
+        }
+        self.symbol_starts.push(bytes.start);
+        self.marks.markup.push(DocumentationMarkup {
+            kind: if self.option_names.contains(&bytes) {
+                DocumentationMarkupKind::OptionName
+            } else {
+                HypertextMarkdown::constructor_markup(symbol.text())
+                    .unwrap_or(DocumentationMarkupKind::Name)
+            },
+            bytes,
+        });
     }
 }

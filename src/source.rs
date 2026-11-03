@@ -21,7 +21,6 @@ impl SourcePoint {
 }
 use SourcePoint as Point;
 
-use crate::node_metadata::SyntaxNode;
 use crate::node_metadata::SyntaxSnapshot;
 use crate::util::TextRangeExt;
 
@@ -131,7 +130,7 @@ impl DocumentSource {
     pub fn register_syntax(&mut self, syntax: &SyntaxSnapshot) {
         self.syntax_offsets.clear();
         for cell in syntax.cells() {
-            if let Some(file) = cell.file() {
+            for file in cell.files() {
                 self.syntax_offsets
                     .insert(file, cell.document_range().start);
             }
@@ -165,6 +164,16 @@ pub trait SourceNavigation {
     /// Maps generated syntax directly to an LSP range in this revision.
     fn range_for_syntax(&self, syntax: &(impl m2_syn::Spanned + ?Sized)) -> Option<TextRange> {
         Some(self.range_for_bytes(self.syntax_bytes(syntax)?))
+    }
+
+    /// LSP position where generated syntax starts in this revision.
+    fn position_for_syntax(&self, syntax: &(impl m2_syn::Spanned + ?Sized)) -> Option<Position> {
+        Some(self.position_for_byte(self.syntax_bytes(syntax)?.start))
+    }
+
+    /// Source text covered by generated syntax in this revision.
+    fn text_for_syntax(&self, syntax: &(impl m2_syn::Spanned + ?Sized)) -> Option<&str> {
+        self.text().get(self.syntax_bytes(syntax)?)
     }
 
     /// The original source text.
@@ -207,12 +216,6 @@ pub trait SourceNavigation {
         Point::new(line_index, byte_index - line.start)
     }
 
-    /// Convert an LSP UTF-16 position to a UTF-8 byte-column point.
-    fn point_for_position(&self, position: Position) -> Option<Point> {
-        let byte_index = self.byte_for_position(position)?;
-        Some(self.point_for_byte(byte_index))
-    }
-
     /// Convert a byte range once and retain both coordinate representations.
     fn span_for_bytes(&self, bytes: ByteRange) -> DocumentSpan {
         DocumentSpan {
@@ -224,24 +227,9 @@ pub trait SourceNavigation {
         }
     }
 
-    /// Convert one parser node to a dual-coordinate source span.
-    fn span_for_node(&self, node: SyntaxNode<'_>) -> DocumentSpan {
-        self.span_for_bytes(node.start_byte()..node.end_byte())
-    }
-
-    /// Convert one byte range to its LSP UTF-16 range.
+    /// The LSP range covering a byte range.
     fn range_for_bytes(&self, bytes: ByteRange) -> TextRange {
         self.span_for_bytes(bytes).range()
-    }
-
-    /// Convert one parser node to its LSP UTF-16 range.
-    fn range_for_node(&self, node: SyntaxNode<'_>) -> TextRange {
-        self.span_for_node(node).range()
-    }
-
-    /// Convert one parser node's start to an LSP UTF-16 position.
-    fn position_for_node(&self, node: SyntaxNode<'_>) -> Position {
-        self.position_for_byte(node.start_byte())
     }
 
     /// The full LSP range of the indexed source snapshot.
@@ -362,23 +350,45 @@ fn utf16_len(text: &str) -> u32 {
     text.encode_utf16().count() as u32
 }
 
+/// Source navigation over one retained syntax revision.
+///
+/// Typed operations that infer types need the revision owning the syntax
+/// they read, for example to find earlier output values; this pairs that
+/// revision with the coordinates mapping its cell-local spans.
+pub trait SyntaxSource: SourceNavigation {
+    /// The syntax revision whose typed spans this navigator maps.
+    fn syntax(&self) -> &SyntaxSnapshot;
+}
+
 /// Source coordinates paired with the native snapshot supplying typed spans.
 pub struct SyntaxNavigation<'a, S: ?Sized> {
     /// Original source navigator supplying unchanged text coordinates.
     original: &'a S,
+    /// The syntax revision whose cell-local spans are mapped.
+    snapshot: &'a SyntaxSnapshot,
     /// Cell-local source identities mapped to revision-specific offsets.
     offsets: HashMap<m2_syn::File, usize>,
 }
 
 impl<'a, S: SourceNavigation + ?Sized> SyntaxNavigation<'a, S> {
     /// Associates a source navigator with the cell offsets of this syntax revision.
-    pub fn new(original: &'a S, snapshot: &SyntaxSnapshot) -> Self {
+    pub fn new(original: &'a S, snapshot: &'a SyntaxSnapshot) -> Self {
         let offsets = snapshot
             .cells()
             .iter()
-            .filter_map(|cell| Some((cell.file()?, cell.document_range().start)))
+            .flat_map(|cell| cell.files().map(|file| (file, cell.document_range().start)))
             .collect();
-        Self { original, offsets }
+        Self {
+            original,
+            snapshot,
+            offsets,
+        }
+    }
+}
+
+impl<S: SourceNavigation + ?Sized> SyntaxSource for SyntaxNavigation<'_, S> {
+    fn syntax(&self) -> &SyntaxSnapshot {
+        self.snapshot
     }
 }
 
@@ -438,6 +448,35 @@ mod tests {
             }
         }
         assert_eq!(diagnostics, 1);
+    }
+
+    #[test]
+    fn fatal_lexer_error_retains_comment_provenance_after_relocation() {
+        let before = SyntaxSnapshot::parse("a = 1\n-- m2-ls: primaryCode\nx = )\nb = 2\n", None);
+        let after = SyntaxSnapshot::parse(
+            "a = 123\n-- m2-ls: primaryCode\nx = )\nb = 2\n",
+            Some(&before),
+        );
+        let mut source = DocumentSource::new(after.source().to_owned());
+        source.register_syntax(&after);
+        let failed = after
+            .cells()
+            .iter()
+            .find(|cell| !cell.lexer_diagnostics().is_empty())
+            .expect("failed cell");
+        let comment = failed
+            .trivia()
+            .first()
+            .expect("comment retained in failed cell");
+        assert_eq!(
+            source.text_for_syntax(comment).map(str::trim),
+            Some("-- m2-ls: primaryCode")
+        );
+        let navigation = SyntaxNavigation::new(&source, &after);
+        assert_eq!(
+            navigation.syntax_bytes(comment),
+            source.syntax_bytes(comment)
+        );
     }
 
     #[test]

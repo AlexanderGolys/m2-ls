@@ -6,7 +6,7 @@ use std::cell::OnceCell;
 
 use super::syntax::RingSyntax;
 use super::*;
-use crate::analysis::inference::syntax::ExpressionSyntax;
+use crate::syntax::ExpressionSyntax;
 
 /// Ring queries sharing one typed inference session and its expression lookup.
 pub struct RingValues<'ast, 'query, S: ?Sized, K: ?Sized, F> {

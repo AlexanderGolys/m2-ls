@@ -20,18 +20,20 @@
 //! renders as Markdown. `@…@` expressions in SimpleDoc text evaluate to the
 //! same hypertext.
 
-use m2_syn::nodes::{List, StringLiteral, Symbol};
+use m2_syn::nodes::{Expr, ExprCollection, ExprOp, ExprOpBin, ExprOpBinAdj};
+use m2_syn::visit::{self, Visit};
 use strum::{Display, EnumIter, EnumString, IntoStaticStr};
 
 use super::{
-    DocumentationCollector, DocumentationFaultKind, DocumentationKey, DocumentationMarkup,
-    DocumentationMarkupKind, DocumentationNode, DocumentedSubject, NodeMarkdown, ParsedOrigin,
+    Code, DocumentationCollector, DocumentationFaultKind, DocumentationKey, DocumentationMarkup,
+    DocumentationMarkupKind, DocumentationNode, DocumentedSubject, NameSite, NodeMarkdown,
     TextStyle,
 };
 use crate::macaulay2::Macaulay2Conventions;
-use crate::node_metadata::SyntaxNode;
-use crate::source::SourceNavigation;
+use crate::source::{ByteRange, SourceNavigation};
 use crate::source_package::CodeFragment;
+use crate::string_literal::StringDelimiter;
+use crate::syntax::{Applications, ExpressionSyntax};
 
 /// The options `document` accepts in its list (`documentOptions` in Core's
 /// `document.m2`). The description has no option: it is every element of the
@@ -319,136 +321,228 @@ impl HypertextMarkdown {
     }
 
     /// Code argument of a recognized example constructor, when present.
-    pub(super) fn example_argument(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
-        let (function, argument) = Self::markup_application(node)?;
+    pub(super) fn example_argument(call: &ExprOpBinAdj) -> Option<&Expr> {
+        let (function, argument) = markup_call(call)?;
         matches!(function.rendering(), MarkupRendering::Example).then_some(argument)
     }
 
-    /// Constructor names and styled string values, in the syntax tree's coordinates.
-    pub(super) fn semantic_markup(root: SyntaxNode<'_>) -> Vec<DocumentationMarkup> {
-        let mut markup = Vec::new();
-        for node in root.descendants() {
-            if let Some(kind) = node
-                .is::<Symbol>()
-                .then(|| Self::constructor_markup(node.text()))
-                .flatten()
-            {
-                markup.push(DocumentationMarkup {
-                    bytes: node.start_byte()..node.end_byte(),
-                    kind,
+    /// The key `call` links to, when it is a `TO`, `TOH`, or `TO2` link.
+    pub(super) fn link_key(call: &ExprOpBinAdj) -> Option<&Expr> {
+        let (function, argument) = markup_call(call)?;
+        matches!(function.rendering(), MarkupRendering::Link)
+            .then(|| Self::arguments(argument).first().copied())
+            .flatten()
+    }
+
+    /// The arguments of a markup application: the elements of a sequence or
+    /// parenthesized argument, or the argument itself, a list among them.
+    /// Options, such as `"class" => "x"`, set attributes and are skipped.
+    fn arguments(argument: &Expr) -> Vec<&Expr> {
+        if matches!(
+            argument,
+            Expr::Collection(ExprCollection::Sequence(_)) | Expr::Holder(_)
+        ) {
+            argument
+                .contained_expressions()
+                .into_iter()
+                .filter(|element| !matches!(element, Expr::Option(_)))
+                .collect()
+        } else {
+            vec![argument]
+        }
+    }
+
+    /// The elements of a collection argument, or the argument alone.
+    fn list_elements(argument: &Expr) -> Vec<&Expr> {
+        if argument.collection_elements().is_some() {
+            argument.contained_expressions()
+        } else {
+            vec![argument]
+        }
+    }
+
+    /// The elements of a list, or the expression alone.
+    fn list_elements_if_list(value: &Expr) -> Vec<&Expr> {
+        if matches!(value, Expr::Collection(ExprCollection::List(_))) {
+            value.contained_expressions()
+        } else {
+            vec![value]
+        }
+    }
+}
+
+/// The markup function `call` applies, and its argument.
+fn markup_call(call: &ExprOpBinAdj) -> Option<(MarkupFunction, &Expr)> {
+    let function = call.left_operand.symbol_name()?.parse().ok()?;
+    Some((function, &call.right_operand))
+}
+
+/// The markup function `expression` applies, and its argument.
+fn markup_application(expression: &Expr) -> Option<(MarkupFunction, &Expr)> {
+    match expression {
+        Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => markup_call(call),
+        _ => None,
+    }
+}
+
+/// The style a markup function gives the strings it encloses, if any.
+fn text_style(function: MarkupFunction) -> Option<TextStyle> {
+    match function.rendering() {
+        MarkupRendering::Code | MarkupRendering::Preformatted => Some(TextStyle::Monospace),
+        MarkupRendering::Bold | MarkupRendering::Heading => Some(TextStyle::Strong),
+        MarkupRendering::Italic => Some(TextStyle::Emphasis),
+        MarkupRendering::Hyperlink => Some(TextStyle::Link),
+        _ => None,
+    }
+}
+
+/// Collects constructor names and styled string values.
+pub(super) struct SemanticMarkup<'a, 'text, N: ?Sized> {
+    /// Coordinates of the visited syntax.
+    code: &'a Code<'text, N>,
+    /// The markup found so far, in document bytes.
+    pub(super) markup: Vec<DocumentationMarkup>,
+    /// The markup functions enclosing the visited expression, outermost first.
+    enclosing: Vec<MarkupFunction>,
+}
+
+impl<'a, 'text, N: ?Sized> SemanticMarkup<'a, 'text, N> {
+    /// A collector for syntax written in `code`.
+    pub(super) fn new(code: &'a Code<'text, N>) -> Self {
+        Self {
+            code,
+            markup: Vec::new(),
+            enclosing: Vec::new(),
+        }
+    }
+}
+
+impl<'ast, N: SourceNavigation + ?Sized> Visit<'ast> for SemanticMarkup<'_, '_, N> {
+    fn visit_symbol(&mut self, symbol: &'ast m2_syn::nodes::Symbol) {
+        if let Some(kind) = HypertextMarkdown::constructor_markup(symbol.text()) {
+            self.markup.push(DocumentationMarkup {
+                bytes: self.code.bytes(symbol),
+                kind,
+            });
+        }
+    }
+
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if let Some(bytes) = self.code.content_bytes(expression) {
+            if let Some(style) = self.enclosing.iter().rev().find_map(|f| text_style(*f)) {
+                self.markup.push(DocumentationMarkup {
+                    bytes,
+                    kind: DocumentationMarkupKind::Styled(style),
                 });
             }
-            let Some(bytes) = node.string_literal_inner_bytes() else {
-                continue;
-            };
-            let mut ancestor = node.parent();
-            while let Some(parent) = ancestor {
-                if let Some((function, _)) = Self::markup_application(parent) {
-                    let style = match function.rendering() {
-                        MarkupRendering::Code | MarkupRendering::Preformatted => {
-                            Some(TextStyle::Monospace)
-                        }
-                        MarkupRendering::Bold | MarkupRendering::Heading => Some(TextStyle::Strong),
-                        MarkupRendering::Italic => Some(TextStyle::Emphasis),
-                        MarkupRendering::Hyperlink => Some(TextStyle::Link),
-                        _ => None,
-                    };
-                    if let Some(style) = style {
-                        markup.push(DocumentationMarkup {
-                            bytes,
-                            kind: DocumentationMarkupKind::Styled(style),
-                        });
-                        break;
-                    }
-                }
-                if parent.id() == root.id() {
-                    break;
-                }
-                ancestor = parent.parent();
-            }
         }
-        markup
-    }
-
-    /// String bodies interpreted as TeX prose, excluding code and literal values.
-    pub(super) fn tex_strings(root: SyntaxNode<'_>) -> Vec<crate::source::ByteRange> {
-        root.descendants()
-            .filter_map(|node| {
-                let bytes = node.string_literal_inner_bytes()?;
-                let mut ancestor = node.parent();
-                while let Some(parent) = ancestor {
-                    if Self::markup_application(parent).is_some_and(|(function, _)| {
-                        matches!(
-                            function.rendering(),
-                            MarkupRendering::Code
-                                | MarkupRendering::Preformatted
-                                | MarkupRendering::Example
-                                | MarkupRendering::Link
-                                | MarkupRendering::Hyperlink
-                                | MarkupRendering::Hidden
-                        ) || function == MarkupFunction::LITERAL
-                    }) {
-                        return None;
-                    }
-                    if parent.is_option_assignment()
-                        && parent.binary_parts().is_some_and(|parts| {
-                            matches!(
-                                parts.left.text().parse::<DocumentOption>(),
-                                Ok(DocumentOption::Key
-                                    | DocumentOption::Usage
-                                    | DocumentOption::BaseFunction
-                                    | DocumentOption::SourceCode
-                                    | DocumentOption::ExampleFiles
-                                    | DocumentOption::SeeAlso)
-                            )
-                        })
-                    {
-                        return None;
-                    }
-                    if parent.id() == root.id() {
-                        break;
-                    }
-                    ancestor = parent.parent();
-                }
-                Some(bytes)
-            })
-            .collect()
-    }
-
-    /// The hypertext `node` builds, as Markdown.
-    pub(super) fn render(node: SyntaxNode<'_>) -> String {
-        if node.is_string_literal() {
-            return Self::string_value(node);
+        let function = markup_application(expression).map(|(function, _)| function);
+        self.enclosing.extend(function);
+        visit::visit_expr(self, expression);
+        if function.is_some() {
+            self.enclosing.pop();
         }
-        if node.is_collection_expression() || node.is_holder() {
-            return node
-                .collection_elements()
-                .filter(|element| !element.is_option_assignment())
-                .map(Self::render)
+    }
+}
+
+/// Collects string bodies interpreted as TeX prose, excluding code and
+/// literal values.
+pub(super) struct TexStrings<'a, 'text, N: ?Sized> {
+    /// Coordinates of the visited syntax.
+    code: &'a Code<'text, N>,
+    /// The document bytes of the prose strings found so far.
+    pub(super) strings: Vec<ByteRange>,
+    /// How many enclosing expressions make their strings code or values.
+    excluding: usize,
+}
+
+impl<'a, 'text, N: ?Sized> TexStrings<'a, 'text, N> {
+    /// A collector for syntax written in `code`.
+    pub(super) fn new(code: &'a Code<'text, N>) -> Self {
+        Self {
+            code,
+            strings: Vec::new(),
+            excluding: 0,
+        }
+    }
+}
+
+impl<N: SourceNavigation + ?Sized> TexStrings<'_, '_, N> {
+    /// Whether the strings under `expression` are code or literal values.
+    fn excludes(&self, expression: &Expr) -> bool {
+        if let Some((function, _)) = markup_application(expression) {
+            return matches!(
+                function.rendering(),
+                MarkupRendering::Code
+                    | MarkupRendering::Preformatted
+                    | MarkupRendering::Example
+                    | MarkupRendering::Link
+                    | MarkupRendering::Hyperlink
+                    | MarkupRendering::Hidden
+            ) || function == MarkupFunction::LITERAL;
+        }
+        match expression {
+            Expr::Option(option) => matches!(
+                self.code.text(&*option.key).parse::<DocumentOption>(),
+                Ok(DocumentOption::Key
+                    | DocumentOption::Usage
+                    | DocumentOption::BaseFunction
+                    | DocumentOption::SourceCode
+                    | DocumentOption::ExampleFiles
+                    | DocumentOption::SeeAlso)
+            ),
+            _ => false,
+        }
+    }
+}
+
+impl<'ast, N: SourceNavigation + ?Sized> Visit<'ast> for TexStrings<'_, '_, N> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if self.excluding == 0 {
+            self.strings.extend(self.code.content_bytes(expression));
+        }
+        let excludes = self.excludes(expression);
+        self.excluding += usize::from(excludes);
+        visit::visit_expr(self, expression);
+        self.excluding -= usize::from(excludes);
+    }
+}
+
+impl<N: SourceNavigation + ?Sized> Code<'_, N> {
+    /// The hypertext `expression` builds, as Markdown.
+    pub(super) fn render(&self, expression: &Expr) -> String {
+        if self.content_bytes(expression).is_some() {
+            return self.string_value(expression);
+        }
+        if matches!(expression, Expr::Holder(_)) || expression.collection_elements().is_some() {
+            return expression
+                .contained_expressions()
+                .into_iter()
+                .filter(|element| !matches!(element, Expr::Option(_)))
+                .map(|element| self.render(element))
                 .collect();
         }
-        let Some((function, argument)) = Self::markup_application(node) else {
-            return format!("`{}`", node.text());
+        let Some((function, argument)) = markup_application(expression) else {
+            return format!("`{}`", self.text(expression));
         };
-        let arguments = Self::arguments(argument);
+        let arguments = HypertextMarkdown::arguments(argument);
         let content = || {
             arguments
                 .iter()
-                .copied()
-                .map(Self::render)
+                .map(|argument| self.render(argument))
                 .collect::<String>()
         };
         match function.rendering() {
             MarkupRendering::Link => match (function, arguments.as_slice()) {
-                (MarkupFunction::TO2, [_, text, ..]) => Self::render(*text),
-                _ => Self::link_text(argument),
+                (MarkupFunction::TO2, [_, text, ..]) => self.render(text),
+                _ => self.link_text(argument),
             },
             MarkupRendering::Code => format!("`{}`", content()),
             MarkupRendering::Bold => format!("**{}**", content()),
             MarkupRendering::Italic => format!("*{}*", content()),
             MarkupRendering::Hyperlink => match arguments.as_slice() {
-                [url, text, ..] => format!("[{}]({})", Self::render(*text), Self::render(*url)),
-                [url] => format!("<{}>", Self::render(*url)),
+                [url, text, ..] => format!("[{}]({})", self.render(text), self.render(url)),
+                [url] => format!("<{}>", self.render(url)),
                 [] => String::new(),
             },
             MarkupRendering::Block => format!("\n\n{}\n\n", content().trim()),
@@ -456,14 +550,8 @@ impl HypertextMarkdown {
             MarkupRendering::List => {
                 let items = arguments
                     .iter()
-                    .flat_map(|argument| {
-                        if argument.is_collection_expression() {
-                            argument.collection_elements().collect()
-                        } else {
-                            vec![*argument]
-                        }
-                    })
-                    .map(|item| format!("- {}", Self::render(item).trim()))
+                    .flat_map(|argument| HypertextMarkdown::list_elements(argument))
+                    .map(|item| format!("- {}", self.render(item).trim()))
                     .collect::<Vec<_>>();
                 format!("\n\n{}\n\n", items.join("\n"))
             }
@@ -477,14 +565,8 @@ impl HypertextMarkdown {
             MarkupRendering::Example => {
                 let lines = arguments
                     .iter()
-                    .flat_map(|argument| {
-                        if argument.is_collection_expression() {
-                            argument.collection_elements().collect()
-                        } else {
-                            vec![*argument]
-                        }
-                    })
-                    .map(Self::render)
+                    .flat_map(|argument| HypertextMarkdown::list_elements(argument))
+                    .map(|line| self.render(line))
                     .collect::<Vec<_>>();
                 format!(
                     "\n\n{}\n\n",
@@ -502,56 +584,31 @@ impl HypertextMarkdown {
 
     /// The text of a link to the documentation key `key`, or of a link
     /// `key` builds itself, such as `TO2(f, "text")`.
-    pub(super) fn link_text(key: SyntaxNode<'_>) -> String {
-        if Self::markup_application(key).is_some() {
-            return Self::render(key);
+    pub(super) fn link_text(&self, key: &Expr) -> String {
+        if markup_application(key).is_some() {
+            return self.render(key);
         }
-        if key.is_holder() {
-            if let Some(inner) = key.collection_elements().next() {
-                return Self::link_text(inner);
-            }
+        if let (Expr::Holder(_), Some(inner)) =
+            (key, key.contained_expressions().into_iter().next())
+        {
+            return self.link_text(inner);
         }
-        let text = if key.is_string_literal() {
-            Self::string_value(key)
+        let text = if self.content_bytes(key).is_some() {
+            self.string_value(key)
         } else {
-            key.text().split_whitespace().collect::<Vec<_>>().join(" ")
+            self.text(key)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
         };
         format!("`{text}`")
     }
 
-    /// The key `node` links to, when it is a `TO`, `TOH`, or `TO2` link.
-    pub(super) fn link_key(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
-        let (function, argument) = Self::markup_application(node)?;
-        matches!(function.rendering(), MarkupRendering::Link)
-            .then(|| Self::arguments(argument).first().copied())
-            .flatten()
-    }
-
-    /// The markup function `node` applies, and its argument.
-    fn markup_application(node: SyntaxNode<'_>) -> Option<(MarkupFunction, SyntaxNode<'_>)> {
-        let function = node.applied_symbol_name()?.parse().ok()?;
-        Some((function, node.binary_parts().map(|parts| parts.right)?))
-    }
-
-    /// The arguments of a markup application: the elements of a sequence or
-    /// parenthesized argument, or the argument itself, a list among them.
-    /// Options, such as `"class" => "x"`, set attributes and are skipped.
-    fn arguments(argument: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
-        if argument.is::<m2_syn::nodes::Sequence>() || argument.is_holder() {
-            argument
-                .collection_elements()
-                .filter(|element| !element.is_option_assignment())
-                .collect()
-        } else {
-            vec![argument]
-        }
-    }
-
-    /// The value of the string literal `node`: a raw string as written, a
+    /// The value of the string literal `literal`: a raw string as written, a
     /// plain string with its escapes read.
-    fn string_value(node: SyntaxNode<'_>) -> String {
-        let text = node.string_literal_inner_text().unwrap_or_default();
-        if !node.is::<StringLiteral>() {
+    pub(super) fn string_value(&self, literal: &Expr) -> String {
+        let text = self.content_text(literal).unwrap_or_default();
+        if StringDelimiter::of_expression(literal) != Some(StringDelimiter::Quote) {
             return text.to_string();
         }
         let mut value = String::with_capacity(text.len());
@@ -589,36 +646,34 @@ struct HypertextPage {
 
 impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// Read the hypertext `list` passed to the `document` `call`.
-    pub(super) fn read_hypertext_list(&mut self, call: SyntaxNode<'_>, list: SyntaxNode<'_>) {
+    pub(super) fn read_hypertext_list(&mut self, call: &ExprOpBinAdj, list: &Expr) {
+        let source = self.source;
+        let code = Code::in_document(source);
         let mut page = HypertextPage::default();
-        for bytes in HypertextMarkdown::tex_strings(list) {
+        let mut tex_strings = TexStrings::new(&code);
+        tex_strings.visit_expr(list);
+        for bytes in tex_strings.strings {
             self.render_tex(bytes);
         }
-        self.documentation
-            .markup
-            .extend(HypertextMarkdown::semantic_markup(list));
-        for element in list.collection_elements() {
-            if !element.is_option_assignment() {
-                page.description
-                    .push_str(&HypertextMarkdown::render(element));
-                continue;
-            }
-            let (Some(option), Some(value)) = (
-                element.binary_parts().map(|parts| parts.left),
-                element.binary_parts().map(|parts| parts.right),
-            ) else {
+        let mut semantic = SemanticMarkup::new(&code);
+        semantic.visit_expr(list);
+        self.documentation.markup.extend(semantic.markup);
+        for element in list.contained_expressions() {
+            let Expr::Option(assignment) = element else {
+                page.description.push_str(&code.render(element));
                 continue;
             };
-            let option_range = self.source.range_for_node(option);
-            let Some(known) = option
-                .is::<Symbol>()
-                .then(|| option.text().parse::<DocumentOption>().ok())
-                .flatten()
-            else {
+            let (option, value) = (&*assignment.key, &*assignment.value);
+            let option_range = source.range_for_bytes(code.bytes(option));
+            let known = match option {
+                Expr::Symbol(symbol) => symbol.text().parse::<DocumentOption>().ok(),
+                _ => None,
+            };
+            let Some(known) = known else {
                 self.fault(
                     option_range,
                     DocumentationFaultKind::UnknownDocumentOption {
-                        option: option.text().to_string(),
+                        option: code.text(option).to_string(),
                     },
                 );
                 continue;
@@ -633,17 +688,16 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             }
             page.seen.push(known);
             self.documentation.markup.push(DocumentationMarkup {
-                bytes: option.start_byte()..option.end_byte(),
+                bytes: code.bytes(option),
                 kind: DocumentationMarkupKind::SectionKeyword,
             });
-            self.read_document_option(&mut page, known, value);
+            self.read_document_option(&code, &mut page, known, value);
         }
-        self.read_hypertext_links(list, &mut page);
+        self.read_hypertext_links(&code, list, &mut page);
 
         if !page.seen.contains(&DocumentOption::Key) {
-            let anchor = call.binary_parts().map(|parts| parts.left).unwrap_or(call);
             self.fault(
-                self.source.range_for_node(anchor),
+                source.range_for_bytes(code.bytes(&*call.left_operand)),
                 DocumentationFaultKind::MissingKey,
             );
         }
@@ -652,7 +706,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             page.markdown.description.insert(0, description.to_string());
         }
         self.documentation.nodes.push(DocumentationNode {
-            range: self.source.range_for_node(call),
+            range: source.range_for_bytes(code.bytes(call)),
             keys: page.keys,
             markdown: page.markdown.render(),
             examples: page.examples,
@@ -662,42 +716,36 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// Read the `value` of the documentation `option`.
     fn read_document_option(
         &mut self,
+        code: &Code<'_, S>,
         page: &mut HypertextPage,
         option: DocumentOption,
-        value: SyntaxNode<'_>,
+        value: &Expr,
     ) {
         use DocumentOption::*;
-        let elements = || {
-            if value.is::<List>() {
-                value.collection_elements().collect()
-            } else {
-                vec![value]
-            }
-        };
+        let source = self.source;
+        let elements = || HypertextMarkdown::list_elements_if_list(value);
         match option {
             Key => {
-                self.reference_code_names(value);
+                self.reference_code_names(code, value, NameSite::Code);
                 for key in elements() {
-                    self.record_key(key);
+                    self.record_key(code, key);
                     page.keys.push(DocumentationKey {
-                        range: self.source.range_for_node(key),
-                        subject: DocumentedSubject::of_expression(key),
+                        range: source.range_for_bytes(code.bytes(key)),
+                        subject: DocumentedSubject::of_expression(code, key),
                     });
                 }
             }
             Headline => {
-                if value.is_string_literal() {
-                    if let Some(bytes) = value.string_literal_inner_bytes() {
-                        self.documentation.markup.push(DocumentationMarkup {
-                            bytes,
-                            kind: DocumentationMarkupKind::Styled(TextStyle::Strong),
-                        });
-                    }
-                    let headline = HypertextMarkdown::string_value(value);
+                if let Some(bytes) = code.content_bytes(value) {
+                    self.documentation.markup.push(DocumentationMarkup {
+                        bytes,
+                        kind: DocumentationMarkupKind::Styled(TextStyle::Strong),
+                    });
+                    let headline = code.string_value(value);
                     let length = headline.chars().count();
                     if length > Macaulay2Conventions::HEADLINE_WARNING_LENGTH {
                         self.fault(
-                            self.source.range_for_node(value),
+                            source.range_for_bytes(code.bytes(value)),
                             DocumentationFaultKind::HeadlineTooLong { length },
                         );
                     }
@@ -705,15 +753,15 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 }
             }
             Usage => {
-                if value.is_string_literal() {
-                    if let Some(bytes) = value.string_literal_inner_bytes().filter(|bytes| {
-                        !value.is::<StringLiteral>()
-                            || !self.source.text()[bytes.clone()].contains('\\')
+                if code.content_bytes(value).is_some() {
+                    if let Some(bytes) = code.content_bytes(value).filter(|bytes| {
+                        StringDelimiter::of_expression(value) != Some(StringDelimiter::Quote)
+                            || !source.text()[bytes.clone()].contains('\\')
                     }) {
                         self.mark_shown_code(bytes);
                     }
                     page.markdown.usage.extend(
-                        HypertextMarkdown::string_value(value)
+                        code.string_value(value)
                             .lines()
                             .map(str::trim)
                             .filter(|line| !line.is_empty())
@@ -722,9 +770,9 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 }
             }
             Inputs | Outputs | Consequences => {
-                if value.is_string_literal() {
+                if code.content_bytes(value).is_some() {
                     self.fault(
-                        self.source.range_for_node(value),
+                        source.range_for_bytes(code.bytes(value)),
                         DocumentationFaultKind::ExpectedList {
                             option: option.to_string(),
                         },
@@ -732,25 +780,25 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                     return;
                 }
                 for item in elements() {
-                    self.read_hypertext_item(item, option, &mut page.markdown);
+                    self.read_hypertext_item(code, item, option, &mut page.markdown);
                 }
             }
             SeeAlso => {
-                self.reference_code_names(value);
+                self.reference_code_names(code, value, NameSite::Code);
                 for entry in elements() {
-                    self.record_key(entry);
+                    self.record_key(code, entry);
                 }
                 page.markdown
                     .see_also
-                    .extend(elements().into_iter().map(HypertextMarkdown::link_text));
+                    .extend(elements().into_iter().map(|entry| code.link_text(entry)));
             }
             Subnodes => page.markdown.subnodes.extend(
                 elements()
                     .into_iter()
-                    .map(|entry| format!("- {}", HypertextMarkdown::render(entry).trim())),
+                    .map(|entry| format!("- {}", code.render(entry).trim())),
             ),
             Acknowledgement | Contributors | References | Caveat => {
-                let rendered = HypertextMarkdown::render(value);
+                let rendered = code.render(value);
                 let rendered = rendered.trim();
                 if !rendered.is_empty() {
                     page.markdown
@@ -758,7 +806,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                         .push((option.to_string(), rendered.to_string()));
                 }
             }
-            BaseFunction | SourceCode => self.reference_code_names(value),
+            BaseFunction | SourceCode => self.reference_code_names(code, value, NameSite::Code),
             Citation | ExampleFiles => {}
         }
     }
@@ -769,54 +817,43 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// argument `Limit => …`, or plain hypertext.
     fn read_hypertext_item(
         &mut self,
-        item: SyntaxNode<'_>,
+        code: &Code<'_, S>,
+        item: &Expr,
         option: DocumentOption,
         markdown: &mut NodeMarkdown,
     ) {
-        let parts = item
-            .is_option_assignment()
-            .then(|| item.binary_parts())
-            .flatten()
-            .map(|parts| (parts.left, parts.right));
-        let (rendered, names_option) = match parts {
-            None => (HypertextMarkdown::render(item).trim().to_string(), false),
-            Some((name, description)) => {
+        let (rendered, names_option) = match item {
+            Expr::Option(assignment) => {
+                let (name, description) = (&*assignment.key, &*assignment.value);
                 if matches!(option, DocumentOption::Inputs | DocumentOption::Outputs) {
-                    if let Some(bytes) = name.string_literal_inner_bytes() {
+                    if let Some(bytes) = code.content_bytes(name) {
                         self.documentation.markup.push(DocumentationMarkup {
                             bytes,
                             kind: DocumentationMarkupKind::ItemName,
                         });
                     }
                 }
-                self.reference_code_names(description);
-                let parts = if description.is::<List>() {
-                    description.collection_elements().collect()
-                } else {
-                    vec![description]
-                };
-                let description = parts
+                self.reference_code_names(code, description, NameSite::Code);
+                let description = HypertextMarkdown::list_elements_if_list(description)
                     .into_iter()
-                    .map(|part| {
-                        if part.is::<Symbol>() {
-                            format!("`{}`", part.text())
-                        } else {
-                            HypertextMarkdown::render(part)
-                        }
+                    .map(|part| match part {
+                        Expr::Symbol(symbol) => format!("`{}`", symbol.text()),
+                        _ => code.render(part),
                     })
                     .collect::<Vec<_>>();
-                let rendered_name = if name.is_string_literal() {
-                    HypertextMarkdown::string_value(name)
+                let rendered_name = if code.content_bytes(name).is_some() {
+                    code.string_value(name)
                 } else {
-                    HypertextMarkdown::link_text(name)
+                    code.link_text(name)
                 };
                 let (item_type, text) = description.split_first().map_or_else(
                     || (String::new(), String::new()),
                     |(item_type, text)| (item_type.clone(), text.join(" ")),
                 );
                 let item = NodeMarkdown::item(Some(&rendered_name), [item_type, text]);
-                (item, name.is::<Symbol>())
+                (item, matches!(name, Expr::Symbol(_)))
             }
+            _ => (code.render(item).trim().to_string(), false),
         };
         match (option, names_option) {
             (DocumentOption::Inputs, true) => markdown.options.push(rendered),
@@ -829,19 +866,19 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// Record the keys `TO`, `TOH`, and `TO2` link to anywhere in `list` as
     /// names the documentation evaluates, or names a string links by, and
     /// the code of its `EXAMPLE`s as the page's examples.
-    fn read_hypertext_links(&mut self, list: SyntaxNode<'_>, page: &mut HypertextPage) {
-        for node in list.descendants() {
-            if HypertextMarkdown::example_argument(node).is_some() {
-                self.documentation
-                    .example_ranges
-                    .push(node.start_byte()..node.end_byte());
+    fn read_hypertext_links(&mut self, code: &Code<'_, S>, list: &Expr, page: &mut HypertextPage) {
+        let mut applications = Applications::default();
+        applications.visit_expr(list);
+        for call in applications.0 {
+            if HypertextMarkdown::example_argument(call).is_some() {
+                self.documentation.example_ranges.push(code.bytes(call));
             }
-            if let Some(key) = HypertextMarkdown::link_key(node) {
-                self.reference_code_names(key);
-                self.record_key(key);
-            } else if let Some(argument) = HypertextMarkdown::example_argument(node) {
+            if let Some(key) = HypertextMarkdown::link_key(call) {
+                self.reference_code_names(code, key, NameSite::Code);
+                self.record_key(code, key);
+            } else if let Some(argument) = HypertextMarkdown::example_argument(call) {
                 page.examples
-                    .extend(Self::example_fragments(argument, self.source, None));
+                    .extend(Self::example_fragments(argument, code, self.source));
             }
         }
     }
@@ -850,30 +887,33 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// strings, or `lines` of a string, each nonblank line of which is one
     /// input. A plain string's escapes would shift every position, so only
     /// one written without them maps back to the source.
-    pub(super) fn example_fragments(
-        argument: SyntaxNode<'_>,
+    pub(super) fn example_fragments<N: SourceNavigation + ?Sized>(
+        argument: &Expr,
+        code: &Code<'_, N>,
         source: &S,
-        origin: Option<ParsedOrigin>,
     ) -> Vec<CodeFragment> {
-        let strings = if argument.is::<List>() {
-            argument.collection_elements().collect()
-        } else if argument.applied_symbol_name() == Some("lines") {
-            argument
-                .binary_parts()
-                .map(|parts| parts.right)
-                .into_iter()
-                .collect()
+        let lines_argument = match argument {
+            Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call)))
+                if call.left_operand.symbol_name() == Some("lines") =>
+            {
+                Some(&*call.right_operand)
+            }
+            _ => None,
+        };
+        let strings = if matches!(argument, Expr::Collection(ExprCollection::List(_))) {
+            argument.contained_expressions()
         } else {
-            vec![argument]
+            vec![lines_argument.unwrap_or(argument)]
         };
         let mut fragments = Vec::new();
         for string in strings {
-            let Some(body) = string.string_literal_inner_bytes() else {
+            let Some(body) = code.content_bytes(string) else {
                 continue;
             };
-            let body = origin.map_or(body.clone(), |origin| origin.source_range(body));
             let text = &source.text()[body.clone()];
-            if string.is::<StringLiteral>() && text.contains('\\') {
+            if StringDelimiter::of_expression(string) == Some(StringDelimiter::Quote)
+                && text.contains('\\')
+            {
                 continue;
             }
             let mut offset = body.start;

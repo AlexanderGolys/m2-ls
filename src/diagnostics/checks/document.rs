@@ -3,12 +3,15 @@
 
 use std::collections::HashSet;
 
+use m2_syn::visit::Visit;
 use tower_lsp::lsp_types::SymbolKind;
 
 use super::{DiagnosticSink, DocumentContext};
 use crate::diagnostics::{catalog, Finding};
 use crate::meta::BindingRole;
+use crate::node_metadata::ParsedCell;
 use crate::source::SourceNavigation;
+use crate::syntax::BindingReferences;
 
 /// Spawns every diagnostic that needs the whole document.
 pub(super) fn spawn(context: &DocumentContext, sink: &mut DiagnosticSink) {
@@ -19,18 +22,22 @@ pub(super) fn spawn(context: &DocumentContext, sink: &mut DiagnosticSink) {
 fn unused_binding(context: &DocumentContext, sink: &mut DiagnosticSink) {
     let &DocumentContext {
         analysis,
-        root,
+        syntax,
         source,
-        ..
     } = context;
+    let mut references = BindingReferences::default();
+    for cell in syntax.cells().iter().filter_map(ParsedCell::syntax) {
+        references.visit_cell(cell);
+    }
     let mut used_bindings = HashSet::new();
-    for node in root.binding_references() {
-        let name = node.text();
-        let position = source.position_for_node(node);
-        if let Some(binding_id) = analysis.binding_id_at(name, position) {
-            if let Some(binding) = analysis.get_binding_at(name, position) {
-                let node_range = source.range_for_node(node);
-                if node_range != binding.range {
+    for symbol in references.0 {
+        let name = symbol.text();
+        let Some(range) = source.range_for_syntax(symbol) else {
+            continue;
+        };
+        if let Some(binding_id) = analysis.binding_id_at(name, range.start) {
+            if let Some(binding) = analysis.get_binding_at(name, range.start) {
+                if range != binding.range {
                     used_bindings.insert(binding_id);
                 }
             }

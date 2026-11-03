@@ -22,19 +22,6 @@ const MAX_STATISTICS_KEYS: usize = 128;
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 /// Process-wide counter allocating timing-event identities.
 static NEXT_SPAN: AtomicU64 = AtomicU64::new(1);
-/// Number of typed navigation lookups since process startup.
-static SYNTAX_LOOKUPS: AtomicU64 = AtomicU64::new(0);
-/// Number of syntax-child enumerations since process startup.
-static SYNTAX_CHILDREN: AtomicU64 = AtomicU64::new(0);
-
-/// Counts one navigation lookup for aggregate syntax telemetry.
-pub fn syntax_lookup() {
-    SYNTAX_LOOKUPS.fetch_add(1, Ordering::Relaxed);
-}
-/// Counts one syntax-child enumeration for aggregate telemetry.
-pub fn syntax_children() {
-    SYNTAX_CHILDREN.fetch_add(1, Ordering::Relaxed);
-}
 
 /// Bounded structured event writer with synchronized timing statistics.
 struct Logger {
@@ -187,7 +174,7 @@ impl Logger {
         });
         self.write(
             state,
-            json!({"operation": "timing_summary", "statistics": statistics, "syntax_lookups": SYNTAX_LOOKUPS.load(Ordering::Relaxed), "syntax_child_enumerations": SYNTAX_CHILDREN.load(Ordering::Relaxed)}),
+            json!({"operation": "timing_summary", "statistics": statistics}),
         );
         state.last_summary = Instant::now();
     }

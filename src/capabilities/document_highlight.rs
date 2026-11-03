@@ -1,15 +1,14 @@
 //! In-document highlighting for resolved symbols and compound-statement words.
 
-use m2_syn::nodes::{
-    ExprFor as ForLoop, ExprLambda as LambdaExpression, ExprWhile as WhileLoop, FromInstance,
-    OfClass,
-};
+use m2_syn::nodes::{Expr, ExprControl, ExprLambda};
+use m2_syn::{Lex, Span, Spanned, Token, TokenStream, TokenTree};
 
+use crate::analysis::{ControlTransfer, ControlTransferTarget, LoopStatement};
 use crate::capabilities::navigation::{reference_ranges_resolved, unbound_reference_ranges};
 use crate::document::DocumentSnapshot;
-use crate::node_metadata::SyntaxNode;
 use crate::object_registry::ObjectName;
-use crate::source::SourceNavigation;
+use crate::source::{SourceNavigation, SyntaxSource};
+use crate::syntax::{BindingReferences, StatementKeywords};
 use crate::typesystem::TypeKnowledge;
 use tower_lsp::lsp_types::{
     DocumentHighlight, DocumentHighlightKind, DocumentHighlightOptions, OneOf, Position,
@@ -97,20 +96,22 @@ fn package_reference_highlights(
         .filter(|mention| mention.name(document.text()) == name)
         .map(|mention| mention.range())
         .collect::<Vec<_>>();
+    let mut references = BindingReferences::default();
+    document.syntax().visit(&mut references);
     ranges.extend(
-        document
-            .root_node()
-            .binding_references()
-            .filter(|node| node.text() == name)
-            .filter(|node| {
+        references
+            .0
+            .into_iter()
+            .filter(|symbol| symbol.text() == name)
+            .filter_map(|symbol| document.range_for_syntax(symbol))
+            .filter(|range| {
                 document
-                    .source_binding_at(name, document.position_for_node(*node))
+                    .source_binding_at(name, range.start)
                     .is_none_or(|binding| {
                         binding.state.presentation_kind
                             == tower_lsp::lsp_types::SymbolKind::NAMESPACE
                     })
-            })
-            .map(|node| document.range_for_node(node)),
+            }),
     );
     ranges.extend(
         document
@@ -154,18 +155,8 @@ fn indexed_ring_generator_highlights(
     position: Position,
 ) -> Option<Vec<DocumentHighlight>> {
     let analysis = document.analysis();
-    let references = analysis.indexed_ring_generator_references(
-        document.root_node(),
-        position,
-        document,
-        true,
-    )?;
-    let declarations = analysis.indexed_ring_generator_references(
-        document.root_node(),
-        position,
-        document,
-        false,
-    )?;
+    let references = analysis.indexed_ring_generator_references(position, document, true)?;
+    let declarations = analysis.indexed_ring_generator_references(position, document, false)?;
     Some(
         references
             .into_iter()
@@ -187,12 +178,24 @@ fn position_preceding_semicolon(
     document: &DocumentSnapshot,
     position: Position,
 ) -> Option<Position> {
-    let semicolon = document
-        .node_at_position_minimal(position)
-        .filter(SyntaxNode::is_semicolon)?;
-    let start = document.range_for_node(semicolon).start;
-    let preceding_character = start.character.checked_sub(1)?;
-    Some(Position::new(start.line, preceding_character))
+    /// Whether `stream` holds a semicolon token starting at the document
+    /// byte `byte`.
+    fn has_semicolon_at(stream: TokenStream, document: &DocumentSnapshot, byte: usize) -> bool {
+        stream.into_iter().any(|token| match token {
+            TokenTree::Group(group) => has_semicolon_at(group.stream().clone(), document, byte),
+            TokenTree::Punct(punct) if punct.text() == <Token![;]>::SPELLING => document
+                .syntax_bytes(&punct)
+                .is_some_and(|bytes| bytes.start == byte),
+            _ => false,
+        })
+    }
+    let byte = document.byte_for_position(position)?;
+    let start = document
+        .syntax()
+        .cells_at(byte)
+        .any(|cell| has_semicolon_at(cell.to_token_stream(), document, byte))
+        .then_some(byte)?;
+    Some(document.position_for_byte(start.checked_sub(1)?))
 }
 
 /// Highlight an otherwise unresolved symbol by spelling alone, without
@@ -261,108 +264,142 @@ fn symbol_reference_highlights(
     )
 }
 
-/// Highlight ranges for control transfer in the current document.
+/// The control transfers of the cells at the cursor, with the construct
+/// receiving each, and the cursor byte.
+fn control_transfers_at<'a>(
+    document: &'a DocumentSnapshot,
+    position: Position,
+    knowledge: &(impl TypeKnowledge + ?Sized),
+) -> Option<(Vec<ControlTransfer<'a>>, usize)> {
+    let byte = document.byte_for_position(position)?;
+    let transfers = document.analysis().control_transfers(
+        document.syntax().cells_at(byte),
+        document,
+        knowledge,
+    );
+    Some((transfers, byte))
+}
+
+/// Highlight a `return`, `break`, or `continue` under the cursor with the
+/// construct receiving it and that construct's other transfers.
 fn control_transfer_highlights(
     document: &DocumentSnapshot,
     position: Position,
     knowledge: &(impl TypeKnowledge + ?Sized),
 ) -> Option<Vec<DocumentHighlight>> {
-    let cursor_node = document.node_at_position_minimal(position)?;
-    let transfer = enclosing_control_transfer(cursor_node)?;
-    let keyword = transfer.child(0)?;
-    if !keyword.contains(cursor_node) {
-        return None;
-    }
-    let target = document
-        .analysis()
-        .control_transfer_target(transfer, document, knowledge)?;
-    let owner = target.owner();
-
-    let mut nodes = match target {
-        crate::analysis::ControlTransferTarget::LoopCallback { callable, .. } => vec![callable],
-        crate::analysis::ControlTransferTarget::ListLoop(loop_statement)
-        | crate::analysis::ControlTransferTarget::DoLoop(loop_statement) => {
-            statement_keyword_tokens(loop_statement)
+    let (transfers, byte) = control_transfers_at(document, position, knowledge)?;
+    let transfer = transfers
+        .iter()
+        .rev()
+        .find(|transfer| spans_byte(document, transfer_keyword(transfer.transfer), byte))?;
+    let target = transfer.target?;
+    let mut keywords = match target {
+        ControlTransferTarget::LoopCallback { callable, .. } => {
+            callable.try_span().into_iter().collect()
         }
-        crate::analysis::ControlTransferTarget::Function(function) => {
-            function.operator_node().into_iter().collect()
+        ControlTransferTarget::ListLoop(statement) | ControlTransferTarget::DoLoop(statement) => {
+            match statement {
+                LoopStatement::For(node) => node.keywords(),
+                LoopStatement::While(node) => node.keywords(),
+            }
+        }
+        ControlTransferTarget::Function(function) => {
+            lambda_operator(function).into_iter().collect()
         }
     };
-    extend_control_transfer_nodes(&mut nodes, owner, document, knowledge);
-
-    Some(highlights_for_nodes(nodes, document))
+    keywords.extend(owned_transfer_keywords(
+        document,
+        &transfers,
+        target.owner(),
+    ));
+    Some(highlights_for_spans(keywords, document))
 }
 
-/// Highlight ranges for control owner in the current document.
+/// Highlight the arrow of a function or the keywords of a loop under the
+/// cursor with the transfers it receives.
 fn control_owner_highlights(
     document: &DocumentSnapshot,
     position: Position,
     knowledge: &(impl TypeKnowledge + ?Sized),
 ) -> Option<Vec<DocumentHighlight>> {
-    let cursor = document.node_at_position_minimal(position)?;
-    let mut current = cursor;
-    loop {
-        if current.is::<LambdaExpression>() {
-            let operator = current.operator_node()?;
-            if operator.contains(cursor) {
-                let mut nodes = vec![operator];
-                extend_control_transfer_nodes(&mut nodes, current, document, knowledge);
-                return Some(highlights_for_nodes(nodes, document));
-            }
-            return None;
-        }
-        if current.is::<ForLoop>() || current.is::<WhileLoop>() {
-            let mut nodes = statement_keyword_tokens(current);
-            if nodes.iter().any(|keyword| keyword.contains(cursor)) {
-                extend_control_transfer_nodes(&mut nodes, current, document, knowledge);
-                return Some(highlights_for_nodes(nodes, document));
-            }
-            return None;
-        }
-        current = current.parent()?;
+    let enclosing = document.enclosing_expressions(position);
+    let owner = enclosing
+        .iter()
+        .rev()
+        .find(|expression| matches!(expression, Expr::Lambda(_) | Expr::For(_) | Expr::While(_)))?;
+    let (transfers, byte) = control_transfers_at(document, position, knowledge)?;
+    let mut keywords = match owner {
+        Expr::Lambda(function) => lambda_operator(function).into_iter().collect(),
+        _ => owner.keywords(),
+    };
+    if !keywords
+        .iter()
+        .any(|keyword| spans_byte(document, keyword, byte))
+    {
+        return None;
     }
+    keywords.extend(owned_transfer_keywords(document, &transfers, *owner));
+    Some(highlights_for_spans(keywords, document))
 }
 
-/// Appends transfers owned by the selected callable or loop without crossing nested owners.
-fn extend_control_transfer_nodes<'tree>(
-    nodes: &mut Vec<SyntaxNode<'tree>>,
-    owner: SyntaxNode<'tree>,
-    document: &'tree DocumentSnapshot,
-    knowledge: &(impl TypeKnowledge + ?Sized),
-) {
-    document.analysis().for_each_control_transfer(
-        document.root_node(),
-        document.syntax(),
-        document,
-        knowledge,
-        |statement, target| {
-            if target.owner().id() == owner.id() {
-                nodes.extend(statement.child(0));
-            }
-        },
-    );
-}
-
-/// Builds for nodes using the selected source nodes and their ranges.
-fn highlights_for_nodes(
-    mut nodes: Vec<SyntaxNode<'_>>,
+/// The keywords of the transfers `owner` receives.
+fn owned_transfer_keywords(
     document: &DocumentSnapshot,
-) -> Vec<DocumentHighlight> {
-    nodes.sort_by_key(|node| (node.start_byte(), node.end_byte()));
-    nodes.dedup_by_key(|node| node.id());
-
-    nodes
-        .into_iter()
-        .map(|node| DocumentHighlight {
-            range: document.range_for_node(node),
-            kind: Some(DocumentHighlightKind::TEXT),
+    transfers: &[ControlTransfer<'_>],
+    owner: &(impl Spanned + ?Sized),
+) -> Vec<Span> {
+    let owner = document.syntax_bytes(owner);
+    transfers
+        .iter()
+        .filter(|transfer| {
+            transfer.target.is_some_and(|target| {
+                owner.is_some() && document.syntax_bytes(target.owner()) == owner
+            })
         })
+        .filter_map(|transfer| transfer_keyword(transfer.transfer).try_span())
         .collect()
 }
 
-/// Finds control transfer in the enclosing source constructs.
-fn enclosing_control_transfer(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
-    node.enclosing_node(SyntaxNode::is_control_transfer)
+/// The keyword of a `return`, `break`, or `continue`.
+fn transfer_keyword(transfer: &ExprControl) -> &dyn Spanned {
+    match transfer {
+        ExprControl::Return(node) => &node.return_token,
+        ExprControl::Break(node) => &node.break_token,
+        ExprControl::Continue(node) => &node.continue_token,
+    }
+}
+
+/// The `->` of a function.
+fn lambda_operator(function: &ExprLambda) -> Option<Span> {
+    match function {
+        ExprLambda::Variadic(node) => node.operator.try_span(),
+        ExprLambda::List(node) => node.operator.try_span(),
+    }
+}
+
+/// Whether `syntax` covers the document byte `byte`.
+fn spans_byte(document: &DocumentSnapshot, syntax: &(impl Spanned + ?Sized), byte: usize) -> bool {
+    document
+        .syntax_bytes(syntax)
+        .is_some_and(|bytes| bytes.start <= byte && byte < bytes.end)
+}
+
+/// Text highlights of `spans`, in source order without repeats.
+fn highlights_for_spans(spans: Vec<Span>, document: &DocumentSnapshot) -> Vec<DocumentHighlight> {
+    let mut ranges = spans
+        .iter()
+        .filter_map(|span| document.syntax_bytes(span))
+        .map(|bytes| (bytes.start, bytes.end))
+        .collect::<Vec<_>>();
+    ranges.sort_unstable();
+    ranges.dedup();
+    ranges
+        .into_iter()
+        .map(|(start, end)| DocumentHighlight {
+            range: document.range_for_bytes(start..end),
+            kind: Some(DocumentHighlightKind::TEXT),
+        })
+        .collect()
 }
 
 /// Highlight the keyword sequence of the compound statement under the cursor:
@@ -373,54 +410,17 @@ fn keyword_sequence_highlights(
     document: &DocumentSnapshot,
     position: Position,
 ) -> Option<Vec<DocumentHighlight>> {
-    let node = document.node_at_position_minimal(position)?;
-    let statement = enclosing_keyword_statement(node)?;
-    let keywords = statement_keyword_tokens(statement);
-
-    if !keywords.iter().any(|keyword| keyword.contains(node)) {
-        return None;
-    }
-
-    Some(
-        keywords
-            .into_iter()
-            .map(|keyword| DocumentHighlight {
-                range: document.range_for_node(keyword),
-                kind: Some(DocumentHighlightKind::TEXT),
-            })
-            .collect(),
-    )
-}
-
-/// Finds keyword statement in the enclosing source constructs.
-fn enclosing_keyword_statement(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
-    node.enclosing_node(SyntaxNode::is_keyword_statement)
-}
-
-/// Collect the keyword tokens of a compound statement: its own leading keyword
-/// plus the leading keyword of each direct clause child, including the `of` and
-/// `from` clauses of `new`. Nested statements are not descended into — they own
-/// their own sequence.
-fn statement_keyword_tokens(statement: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
-    if statement.is_keyword_statement() {
-        let mut keywords = statement
-            .children()
-            .filter(SyntaxNode::is_keyword_token)
-            .collect::<Vec<_>>();
-        for child in statement.named_children() {
-            if child.is_keyword_clause() || child.is::<OfClass>() || child.is::<FromInstance>() {
-                keywords.extend(child.children().filter(SyntaxNode::is_keyword_token));
-            }
-        }
-        return keywords;
-    }
-    if statement.is_keyword_clause() {
-        let Some(st) = enclosing_keyword_statement(statement) else {
-            return Vec::new();
-        };
-        return statement_keyword_tokens(st);
-    }
-    Vec::new()
+    let byte = document.byte_for_position(position)?;
+    let keywords = document
+        .enclosing_expressions(position)
+        .into_iter()
+        .rev()
+        .map(StatementKeywords::keywords)
+        .find(|keywords| !keywords.is_empty())?;
+    keywords
+        .iter()
+        .any(|keyword| spans_byte(document, keyword, byte))
+        .then(|| highlights_for_spans(keywords, document))
 }
 
 #[cfg(test)]

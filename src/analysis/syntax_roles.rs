@@ -4,7 +4,7 @@ use m2_syn::{
     nodes::{
         Expr, ExprLiteral, ExprOpBinIndex, ExprOpBinMember, ExprOpBinRegular, ExprQuote, Symbol,
     },
-    Lex, Token,
+    Token,
 };
 
 /// An access whose key denotes a property rather than a binding reference.
@@ -31,8 +31,7 @@ impl PropertyAccess for ExprOpBinIndex {
 
 impl PropertyAccess for ExprOpBinRegular {
     fn property_key(&self) -> Option<&Expr> {
-        let spelling = self.operator.operator_spelling()?;
-        (spelling == <m2_syn::Token![#?]>::SPELLING)
+        (self.operator.spelling() == <Token![#?]>::SPELLING)
             .then(|| self.right_operand.string_property_key())?
     }
 }
@@ -70,18 +69,3 @@ impl QuotedName for ExprQuote {
         }
     }
 }
-
-/// Canonical lexical spelling of a generated operator, excluding attached trivia.
-pub trait OperatorSyntax: Lex {
-    /// Projects the existing lexical token without parsing or scanning its source.
-    fn operator_spelling(&self) -> Option<String> {
-        self.to_token_stream()
-            .into_iter()
-            .next()?
-            .spelling()
-            .map(str::to_owned)
-    }
-}
-impl OperatorSyntax for m2_syn::nodes::BinaryOperator {}
-impl OperatorSyntax for m2_syn::nodes::PrefixOperator {}
-impl OperatorSyntax for m2_syn::nodes::PostfixOperator {}

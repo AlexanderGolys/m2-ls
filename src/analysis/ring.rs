@@ -1,10 +1,13 @@
 //! Ring construction, generator rebinding, and ring-specific type rules.
 
-use m2_syn::nodes::{FloatLiteral, IntegerLiteral, Symbol};
-use m2_syn::Token;
+use m2_syn::nodes::{ExprLiteral, ExprOp, ExprOpBin, ExprOpBinRegular, Symbol};
+use m2_syn::visit::{self, Visit};
+use m2_syn::{Spanned, Token};
 use std::fmt::{self, Display, Formatter};
 
-use crate::node_metadata::visit_expression_nodes;
+use super::first_pass::BindingFact;
+use crate::source::SyntaxSource;
+use crate::syntax::Applications;
 
 use super::inference::session::InferenceSession;
 use super::known_value::KnownValue;
@@ -54,19 +57,6 @@ pub enum RingGeneratorKind {
     Direct,
     /// Generator family represented by an indexed variable table.
     IndexedTable,
-}
-
-/// A ring-generator name and source node extracted from constructor syntax.
-#[derive(Debug, Clone)]
-struct RingGeneratorBinding<'tree> {
-    /// Name used to resolve and present this item.
-    name: String,
-    /// Semantic or presentation category of this item.
-    kind: RingGeneratorKind,
-    /// Syntax supplying this item's source and structure.
-    node: SyntaxNode<'tree>,
-    /// Known index selection, absent when no indexed selection was specified.
-    indices: Option<IndexSelection>,
 }
 
 /// Compact reference retained for later ring-generator rebinding.
@@ -153,7 +143,7 @@ impl IndexedVariableTypes {
 
 /// A statically known selector, including compound indices and quoted symbols.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum IndexKey {
+pub(super) enum IndexKey {
     /// An integer-valued selector or literal.
     Integer(i64),
     /// A string-valued selector or source literal.
@@ -173,26 +163,7 @@ enum IndexKey {
     },
 }
 
-/// Whether a symbol node evaluates to itself where an index spells it, so
-/// the index is the key it spells: `E` of `x_E` when nothing binds `E`.
-type BareSymbols<'resolver> = &'resolver dyn Fn(SyntaxNode<'_>) -> bool;
-
 impl IndexKey {
-    /// The key a literal index spells, with no symbol in it.
-    fn literal(node: SyntaxNode<'_>) -> Option<Self> {
-        Self::from_node(node, &|_| false)
-    }
-
-    /// The key the index `node` spells: a literal, or symbols that
-    /// `bare_symbols` says evaluate to themselves and indexed variables of
-    /// them.
-    fn from_node(node: SyntaxNode<'_>, bare_symbols: BareSymbols<'_>) -> Option<Self> {
-        let expression = node.get::<Expr>()?;
-        Self::from_expression(expression, &|symbol| {
-            node.related(symbol).is_some_and(bare_symbols)
-        })
-    }
-
     /// Tests whether this key falls within the specified endpoints and upper-bound policy.
     fn in_range(&self, start: &Self, end: &Self, exclusive: bool) -> bool {
         match (self, start, end) {
@@ -394,16 +365,6 @@ impl Display for RingVariable {
         match &self.index {
             Some(index) => write!(f, "{}_{}", self.base.name(), index.subscript()),
             None => f.write_str(self.base.name()),
-        }
-    }
-}
-
-impl From<&RingGeneratorBinding<'_>> for RingGenerator {
-    fn from(binding: &RingGeneratorBinding<'_>) -> Self {
-        Self {
-            name: ObjectName::new(&binding.name),
-            kind: binding.kind,
-            indices: binding.indices.clone(),
         }
     }
 }
@@ -696,75 +657,58 @@ impl RingSemantics {
 }
 
 impl Analysis {
-    /// Registers the statically recognizable generators introduced by a ring expression.
+    /// Registers the statically recognizable generators the ring value
+    /// assigned to `ring` declares, and the ring value itself.
     pub fn collect_ring_generator_bindings(
         &mut self,
-        ring_name: &str,
-        expression: (SyntaxNode, Option<&Expr>),
-        rebind_node: SyntaxNode,
+        ring: &Symbol,
+        value: &Expr,
         scope_idx: usize,
-        source: &(impl SourceNavigation + ?Sized),
+        source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) {
-        let (expression, syntax) = expression;
+        let ring_name = ring.text();
         // Generators rebound to a quotient are registered at the ring's own
         // target range, so its state is resolved before they take that key.
-        let ring_state = self
-            .registry
-            .binding_states_by_range
-            .get(&source_range_key(source.range_for_node(rebind_node)))
-            .copied();
-        let mut nodes = Vec::new();
-        visit_expression_nodes(expression, syntax, |node| nodes.push(node));
-        let mut specs = nodes
+        let ring_state = source.range_for_syntax(ring).and_then(|range| {
+            self.registry
+                .binding_states_by_range
+                .get(&source_range_key(range))
+                .copied()
+        });
+        let bare = |symbol: &Symbol| self.is_bare_symbol(symbol, source, knowledge);
+        let mut calls = Applications::default();
+        calls.visit_expr(value);
+        let mut specs = calls
+            .0
             .into_iter()
-            .filter_map(|node| self.ring_constructor_variables(node, source, knowledge, scope_idx))
-            .map(|variables| {
-                (
-                    variables,
-                    RingGeneratorBinding::collect(variables, &|symbol| {
-                        self.is_bare_symbol(symbol, source, knowledge)
-                    }),
-                )
-            })
+            .filter_map(|call| self.ring_constructor_variables(call, source, knowledge, scope_idx))
+            .map(|variables| (variables, syntax::RingSyntax::generators(variables, &bare)))
             .collect::<Vec<_>>();
-        specs.extend(RingGeneratorBinding::variable_option(
-            expression,
-            &|symbol| self.is_bare_symbol(symbol, source, knowledge),
-        ));
+        specs.extend(Self::variable_option(value, &bare));
 
         let mut generators = Vec::new();
-        for (spec, bindings) in specs {
-            self.registry
-                .ring_generator_specs
-                .push(source.range_for_node(spec));
-            for generator in bindings {
-                generators.push(RingGenerator::from(&generator));
+        for (spec, declared) in specs {
+            if let Some(range) = source.range_for_syntax(spec) {
+                self.registry.ring_generator_specs.push(range);
+            }
+            for generator in declared {
                 self.register_ring_generator(
                     ring_name,
-                    &generator.name,
-                    generator.kind,
-                    generator.indices,
-                    generator.node,
+                    &generator.generator,
+                    generator.anchor.syntax(),
                     source,
                 );
+                generators.push(generator.generator);
             }
         }
 
         if generators.is_empty() {
-            generators = self
-                .ring_source_symbol(expression)
+            generators = Self::ring_source_symbol(value)
                 .and_then(|source| self.registry.ring_generators.get(source).cloned())
                 .unwrap_or_default();
             for generator in &generators {
-                self.register_ring_generator(
-                    ring_name,
-                    generator.name.name(),
-                    generator.kind,
-                    generator.indices.clone(),
-                    rebind_node,
-                    source,
-                );
+                self.register_ring_generator(ring_name, generator, ring, source);
             }
         }
 
@@ -772,16 +716,9 @@ impl Analysis {
             .ring_generators
             .insert(ObjectName::new(ring_name), generators);
 
-        let value = syntax
-            .or_else(|| expression.get::<Expr>())
-            .and_then(|syntax| {
-                let checker = TypeChecker::new(self, knowledge);
-                let source =
-                    crate::source::SyntaxNavigation::new(source.source(), expression.snapshot());
-                let session = InferenceSession::new(&checker, &source, expression.snapshot());
-                let value = session.ring_values(scope_idx).value(syntax);
-                value
-            });
+        let checker = TypeChecker::new(self, knowledge);
+        let session = InferenceSession::new(&checker, source, source.syntax());
+        let value = session.ring_values(scope_idx).value(value);
         if let Some(state) = ring_state.and_then(|id| {
             self.registry
                 .bindings
@@ -793,43 +730,23 @@ impl Analysis {
         }
     }
 
-    /// The variable of a ring the program writes out that `expression`
-    /// selects, or why Macaulay2 rejects it: a subscript `S_6` by a literal
-    /// index, `z` after `S = RR_7[x_0..y_2, z, w_(1,1)]`, or a lookup by
-    /// name `"x"_A`, `x_1_A`, `S_0_A`. `None` when the program does not
-    /// determine either.
-    pub fn selected_ring_variable<'tree>(
-        &self,
-        expression: SyntaxNode<'tree>,
-        source: &(impl SourceNavigation + ?Sized),
-        knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> Option<Result<SelectedRingVariable<'tree>, RingVariableError>> {
-        let syntax = expression.get::<Expr>()?;
-        syntax::RingSyntax::operands(syntax, "_")?;
-        let checker = TypeChecker::new(self, knowledge);
-        let source = crate::source::SyntaxNavigation::new(source.source(), expression.snapshot());
-        let session = InferenceSession::new(&checker, &source, expression.snapshot());
-        let selected = session.ring_values(0).selected(syntax);
-        selected
-    }
-
     /// Whether `symbol` evaluates to itself: nothing the analysis sees binds
     /// it and no builtin object has its name, so as an index it is the key
     /// it spells, `E` of `x_E`.
     fn is_bare_symbol(
         &self,
-        symbol: SyntaxNode<'_>,
-        source: &(impl SourceNavigation + ?Sized),
+        symbol: &Symbol,
+        source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> bool {
-        let position = source.position_for_node(symbol);
+        let Some(position) = source.position_for_syntax(symbol) else {
+            return false;
+        };
         let scope_idx = self.find_scope_at(position).unwrap_or(0);
-        symbol.is::<Symbol>()
-            && self
-                .get_binding_from_scope(symbol.text(), scope_idx, position)
-                .is_none()
+        self.get_binding_from_scope(symbol.text(), scope_idx, position)
+            .is_none()
             && TypeChecker::new(self, knowledge)
-                .type_of(symbol, source, scope_idx)
+                .infer_type(symbol, source, scope_idx)
                 .single()
                 .is_some_and(|class| *class == TypeRole::Symbol.object_name())
     }
@@ -838,42 +755,41 @@ impl Analysis {
     /// yields `x` and `y`. Indexed families (`x_0`, `x_0..x_3`), generated tables
     /// (`Variables => 5`), and letter ranges (`a..d`) are not written as single
     /// symbols and are left out, so callers see exactly the names an author typed.
-    pub(crate) fn ring_constructor_symbol_variables<'tree>(
+    pub(crate) fn ring_constructor_symbol_variables<'ast>(
         &self,
-        node: SyntaxNode<'tree>,
-        source: &(impl SourceNavigation + ?Sized),
+        call: &'ast ExprOpBinAdj,
+        source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
         scope_idx: usize,
-    ) -> Vec<SyntaxNode<'tree>> {
-        let Some(variables) = self.ring_constructor_variables(node, source, knowledge, scope_idx)
+    ) -> Vec<&'ast Symbol> {
+        let Some(variables) = self.ring_constructor_variables(call, source, knowledge, scope_idx)
         else {
             return Vec::new();
         };
-        RingGeneratorBinding::collect(variables, &|symbol| {
+        syntax::RingSyntax::generators(variables, &|symbol| {
             self.is_bare_symbol(symbol, source, knowledge)
         })
         .into_iter()
-        .filter(|binding| binding.kind == RingGeneratorKind::Direct && binding.node.is::<Symbol>())
-        .map(|binding| binding.node)
+        .filter(|spec| spec.generator.kind == RingGeneratorKind::Direct)
+        .filter_map(|spec| match spec.anchor {
+            syntax::GeneratorAnchor::Symbol(symbol) => Some(symbol),
+            syntax::GeneratorAnchor::Expression(_) => None,
+        })
         .collect()
     }
 
-    /// The variable list of `node` when it constructs a ring, the `[x, y]` of
+    /// The variable list of `call` when it constructs a ring, the `[x, y]` of
     /// `QQ[x, y]`: an application of a ring or a family of inexact fields.
-    fn ring_constructor_variables<'tree>(
+    fn ring_constructor_variables<'ast>(
         &self,
-        node: SyntaxNode<'tree>,
-        source: &(impl SourceNavigation + ?Sized),
+        call: &'ast ExprOpBinAdj,
+        source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
         scope_idx: usize,
-    ) -> Option<SyntaxNode<'tree>> {
-        if !node.is_space_application() {
-            return None;
-        }
-        let head = node.binary_parts()?.left;
-        let variables = RingGeneratorBinding::constructor_variables(node)?;
+    ) -> Option<&'ast Expr> {
+        let variables = syntax::RingSyntax::constructor_variables(call)?;
         TypeChecker::new(self, knowledge)
-            .type_of(head, source, scope_idx)
+            .infer_type(call.left_operand.as_ref(), source, scope_idx)
             .single()
             .is_some_and(|head_type| {
                 knowledge.has_type_role(head_type, TypeRole::Ring)
@@ -882,36 +798,38 @@ impl Analysis {
             .then_some(variables)
     }
 
-    /// Bind the generators of the ring constructor `node` when no ring
+    /// Bind the generators of the ring constructor `call` when no ring
     /// assignment around it has: Macaulay2 assigns them as soon as the
     /// constructor runs, `QQ[x]` alone making `x` an element of that ring.
     pub fn bind_anonymous_ring_generators(
         &mut self,
-        node: SyntaxNode,
-        source: &(impl SourceNavigation + ?Sized),
+        call: &ExprOpBinAdj,
+        source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) {
-        let scope_idx = self
-            .find_scope_at(source.position_for_node(node))
+        let scope_idx = source
+            .position_for_syntax(call)
+            .and_then(|position| self.find_scope_at(position))
             .unwrap_or(0);
-        let Some(variables) = self.ring_constructor_variables(node, source, knowledge, scope_idx)
+        let Some(variables) = self.ring_constructor_variables(call, source, knowledge, scope_idx)
         else {
             return;
         };
-        let range = source.range_for_node(variables);
+        let Some(range) = source.range_for_syntax(variables) else {
+            return;
+        };
         if self.registry.ring_generator_specs.contains(&range) {
             return;
         }
         self.registry.ring_generator_specs.push(range);
-        for generator in RingGeneratorBinding::collect(variables, &|symbol| {
+        let generators = syntax::RingSyntax::generators(variables, &|symbol| {
             self.is_bare_symbol(symbol, source, knowledge)
-        }) {
+        });
+        for generator in generators {
             self.register_ring_generator(
                 ANONYMOUS_RING_ELEMENT,
-                &generator.name,
-                generator.kind,
-                generator.indices,
-                generator.node,
+                &generator.generator,
+                generator.anchor.syntax(),
                 source,
             );
         }
@@ -926,45 +844,51 @@ impl Analysis {
             .any(|spec| spec.start <= range.start && range.end <= spec.end)
     }
 
-    /// Name of the source binding supplying a ring identity, following parenthesized expressions.
-    fn ring_source_symbol<'tree>(&self, expression: SyntaxNode<'tree>) -> Option<&'tree str> {
-        let expression = parenthesized_value(expression).unwrap_or(expression);
-        if let Some(name) = symbol_node_text(expression) {
-            return Some(name);
-        }
-        if expression.has_binary_operator::<Token![/]>() {
-            return expression
-                .binary_parts()
-                .map(|parts| parts.left)
-                .and_then(symbol_node_text);
-        }
-        None
+    /// Name of the source binding supplying a ring identity, following
+    /// parentheses and the ring of a quotient `R/I`.
+    fn ring_source_symbol(expression: &Expr) -> Option<&str> {
+        let expression = expression.unparenthesized()?;
+        expression.symbol_name().or_else(|| {
+            syntax::RingSyntax::operands(expression, <Token![/]>::SPELLING)?
+                .0
+                .symbol_name()
+        })
     }
 
-    /// Whether an indexed access selects a generator recorded by a ring constructor.
-    pub(super) fn is_indexed_ring_generator(
-        &self,
-        node: SyntaxNode<'_>,
-        source: &(impl SourceNavigation + ?Sized),
-    ) -> bool {
-        self.indexed_ring_generator(node, source).is_some()
+    /// The generators named by the `Variable` option of the outermost call
+    /// of `expression`, the `g` of `GF(8, Variable => g)`, with that option's
+    /// value.
+    fn variable_option<'ast>(
+        expression: &'ast Expr,
+        bare: &dyn Fn(&Symbol) -> bool,
+    ) -> Option<(&'ast Expr, Vec<syntax::GeneratorSpec<'ast>>)> {
+        let Expr::Op(ExprOp::Bin(ExprOpBin::Adj(application))) = expression.unparenthesized()?
+        else {
+            return None;
+        };
+        let value = application
+            .right_operand
+            .arguments()
+            .into_iter()
+            .flatten()
+            .find_map(|argument| syntax::RingSyntax::option(argument, VARIABLE_OPTION))?;
+        Some((value, syntax::RingSyntax::specifications(value, bare)))
     }
 
     /// The generator an indexed access `z_k` selects, as the binding of its
     /// table and the literal index: the latest write to that index must be a
     /// ring constructor's.
-    fn indexed_ring_generator(
+    pub(super) fn indexed_ring_generator(
         &self,
-        node: SyntaxNode<'_>,
+        access: &ExprOpBinRegular,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<(BindingId, IndexKey)> {
-        if !node.has_binary_operator::<Token![_]>() {
+        if access.operator.spelling() != <Token![_]>::SPELLING {
             return None;
         }
-        let parts = node.binary_parts()?;
-        let base = RingGeneratorBinding::name_node(parts.left)?;
-        let index = IndexKey::literal(parts.right)?;
-        let position = source.position_for_node(base);
+        let base = syntax::RingSyntax::name(&access.left_operand)?;
+        let index = IndexKey::from_expression(&access.right_operand, &|_| false)?;
+        let position = source.position_for_syntax(base)?;
         let binding = self.get_binding_from_scope(
             base.text(),
             self.find_scope_at(position).unwrap_or(0),
@@ -979,87 +903,74 @@ impl Analysis {
             .then_some((binding.binding_id, index))
     }
 
+    /// The source of the indexed generator an access names, from its name
+    /// on: `z_0`, also in `symbol z_0`, whose quote is no part of the name.
+    pub(super) fn indexed_ring_generator_bytes(
+        access: &ExprOpBinRegular,
+        source: &(impl SourceNavigation + ?Sized),
+    ) -> Option<ByteRange> {
+        let end = source.syntax_bytes(access)?.end;
+        let start = match syntax::RingSyntax::name(&access.left_operand) {
+            Some(base) => source.syntax_bytes(base)?.start,
+            None => source.syntax_bytes(access)?.start,
+        };
+        Some(start..end)
+    }
+
     /// The role of a subscript that is one object spelled with `_`, the same
     /// kind of object as one of its parts, so it reads as a single token:
     /// `3_R`, a number promoted into the ring `R`; `RR_53`, the real field of
     /// that precision. Subscripts selecting something else, as `R_0` selects
-    /// a generator, keep their parts; see [`Self::selector_role`].
+    /// a generator, keep their parts.
     pub(super) fn constant_subscript_role(
         &self,
-        node: SyntaxNode<'_>,
-        source: &(impl SourceNavigation + ?Sized),
+        access: &ExprOpBinRegular,
+        source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<SourceSemanticRole> {
-        if !node.has_binary_operator::<Token![_]>() {
+        if access.operator.spelling() != <Token![_]>::SPELLING {
             return None;
         }
-        let parts = node.binary_parts()?;
-        if parts.left.is::<IntegerLiteral>() || parts.left.is::<FloatLiteral>() {
-            let ring = self.operand_type(
-                node,
-                parts.right.is::<Symbol>().then_some(parts.right)?,
-                source,
-                knowledge,
-            )?;
+        let (left, right) = (access.left_operand.as_ref(), access.right_operand.as_ref());
+        if matches!(
+            left,
+            Expr::Literal(ExprLiteral::Integer(_) | ExprLiteral::Float(_))
+        ) {
+            let Expr::Symbol(_) = right else {
+                return None;
+            };
+            let ring = self.operand_type(access, right, source, knowledge)?;
             return (knowledge.has_type_role(&ring, TypeRole::Ring)
                 || knowledge.is_subtype(&ring, &ObjectName::new(INEXACT_FIELD_FAMILY)))
             .then_some(SourceSemanticRole::RingLiteral);
         }
-        if !parts.left.is::<Symbol>() || !parts.right.is::<IntegerLiteral>() {
+        if !matches!(left, Expr::Symbol(_))
+            || !matches!(right, Expr::Literal(ExprLiteral::Integer(_)))
+        {
             return None;
         }
-        let base = self.operand_type(node, parts.left, source, knowledge)?;
+        let base = self.operand_type(access, left, source, knowledge)?;
         knowledge
             .is_subtype(&base, &ObjectName::new(INEXACT_FIELD_FAMILY))
             .then_some(SourceSemanticRole::PrecisionField)
     }
 
-    /// The role of the literal an access `node` selects with, named by what
-    /// it selects: a generator for `R_0` on a ring `R`, otherwise a member,
-    /// the `0` of `L_0` or `L#0`.
-    pub(super) fn selector_role(
-        &self,
-        node: SyntaxNode<'_>,
-        source: &(impl SourceNavigation + ?Sized),
-        knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> SourceSemanticRole {
-        let selects_generator = node.has_binary_operator::<Token![_]>()
-            && node
-                .binary_parts()
-                .and_then(|parts| self.operand_type(node, parts.left, source, knowledge))
-                .is_some_and(|base| knowledge.has_type_role(&base, TypeRole::Ring));
-        if selects_generator {
-            self.ring_generator_role(source.range_for_node(node))
-        } else {
-            SourceSemanticRole::PropertyKey
-        }
-    }
-
-    /// The one type inferred for `operand` of the expression `node`.
+    /// The one type inferred for `operand` in the scope of the expression `owner`.
     fn operand_type(
         &self,
-        node: SyntaxNode<'_>,
-        operand: SyntaxNode<'_>,
-        source: &(impl SourceNavigation + ?Sized),
+        owner: &(impl Spanned + ?Sized),
+        operand: &Expr,
+        source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<ObjectName> {
-        let scope_idx = self
-            .find_scope_at(source.position_for_node(node))
+        let scope_idx = source
+            .position_for_syntax(owner)
+            .and_then(|position| self.find_scope_at(position))
             .unwrap_or(0);
         TypeChecker::new(self, knowledge)
-            .type_of(operand, source, scope_idx)
+            .infer_type(operand, source, scope_idx)
             .single()
             .cloned()
-    }
-
-    /// The source of the indexed generator `node` names, from its name on:
-    /// `z_0`, also in `symbol z_0`, whose quote is no part of the name.
-    pub(super) fn indexed_ring_generator_bytes(node: SyntaxNode<'_>) -> ByteRange {
-        let start = node
-            .binary_parts()
-            .and_then(|parts| RingGeneratorBinding::name_node(parts.left))
-            .map_or(node.start_byte(), |base| base.start_byte());
-        start..node.end_byte()
     }
 
     /// The places naming the generator the indexed access at `position`
@@ -1069,20 +980,28 @@ impl Analysis {
     /// is not on an indexed generator.
     pub fn indexed_ring_generator_references(
         &self,
-        root: SyntaxNode<'_>,
         position: Position,
-        source: &(impl SourceNavigation + ?Sized),
+        source: &(impl SyntaxSource + ?Sized),
         include_declaration: bool,
     ) -> Option<Vec<TextRange>> {
-        let point = source.point_for_position(position)?;
-        let generator = root
-            .descendant_for_point_range(point, point)?
-            .enclosing_node(|node| self.is_indexed_ring_generator(*node, source))
-            .and_then(|node| self.indexed_ring_generator(node, source))?;
-        let mut ranges = root
-            .descendants()
-            .filter(|node| self.indexed_ring_generator(*node, source).as_ref() == Some(&generator))
-            .map(|node| source.range_for_bytes(Self::indexed_ring_generator_bytes(node)))
+        let cursor = source.byte_for_position(position)?;
+        let mut accesses = IndexedGenerators {
+            analysis: self,
+            source,
+            found: Vec::new(),
+        };
+        source.syntax().visit(&mut accesses);
+        let generator = accesses
+            .found
+            .iter()
+            .filter(|(bytes, _)| bytes.start <= cursor && cursor < bytes.end)
+            .min_by_key(|(bytes, _)| bytes.len())
+            .map(|(_, generator)| generator.clone())?;
+        let mut ranges = accesses
+            .found
+            .iter()
+            .filter(|(_, found)| *found == generator)
+            .map(|(bytes, _)| source.range_for_bytes(bytes.clone()))
             .collect::<Vec<_>>();
         let (binding_id, index) = generator;
         let declarations = self.registry.bindings[binding_id.0 as usize]
@@ -1112,34 +1031,37 @@ impl Analysis {
         Some(ranges)
     }
 
-    /// Registers ring generator in the current semantic index.
+    /// Registers a ring generator declared at `anchor`.
     fn register_ring_generator(
         &mut self,
         ring_name: &str,
-        generator_name: &str,
-        kind: RingGeneratorKind,
-        indices: Option<IndexSelection>,
-        node: SyntaxNode,
-        source: &(impl SourceNavigation + ?Sized),
+        generator: &RingGenerator,
+        anchor: &(impl Spanned + ?Sized),
+        source: &(impl SyntaxSource + ?Sized),
     ) {
-        match kind {
+        let generator_name = generator.name.name();
+        match generator.kind {
             RingGeneratorKind::Direct => {
                 self.register_dynamic_global(
                     generator_name,
-                    node,
+                    anchor,
                     ObjectName::new(ring_name),
                     None,
                     source,
                 );
             }
             RingGeneratorKind::IndexedTable => {
+                let Some(anchor_end) = source.range_for_syntax(anchor).map(|range| range.end)
+                else {
+                    return;
+                };
                 let mut elements = self
                     // Several disjoint specs can be rebound at the same anchor
                     // (for example by a quotient). Include earlier writes there.
-                    .get_binding_from_scope(generator_name, 0, source.range_for_node(node).end)
+                    .get_binding_from_scope(generator_name, 0, anchor_end)
                     .and_then(|binding| binding.state.indexed_element_type.clone())
                     .unwrap_or_default();
-                if let Some(selection) = indices {
+                if let Some(selection) = generator.indices.clone() {
                     elements.writes.push(IndexedWrite {
                         selection,
                         value_type: ObjectName::new(ring_name),
@@ -1148,7 +1070,7 @@ impl Analysis {
                 }
                 self.register_dynamic_global(
                     generator_name,
-                    node,
+                    anchor,
                     ObjectName::new(INDEXED_VARIABLE_TABLE),
                     Some(elements),
                     source,
@@ -1164,20 +1086,19 @@ impl Analysis {
     /// value of `x`.
     pub fn register_indexed_assignment(
         &mut self,
-        target: SyntaxNode,
+        target: &ExprOpBinRegular,
         value_type: ObjectName,
-        source: &(impl SourceNavigation + ?Sized),
+        source: &(impl SyntaxSource + ?Sized),
     ) {
-        let Some(parts) = target
-            .binary_parts()
-            .filter(|_| target.has_binary_operator::<Token![_]>())
-        else {
+        if target.operator.spelling() != <Token![_]>::SPELLING {
+            return;
+        }
+        let (Some(base), Some(position)) = (
+            syntax::RingSyntax::name(&target.left_operand),
+            source.position_for_syntax(target),
+        ) else {
             return;
         };
-        let Some(base) = RingGeneratorBinding::name_node(parts.left) else {
-            return;
-        };
-        let position = source.position_for_node(target);
         let visible = self.get_binding_from_scope(
             base.text(),
             self.find_scope_at(position).unwrap_or(0),
@@ -1192,7 +1113,7 @@ impl Analysis {
             .and_then(|binding| binding.state.indexed_element_type.clone())
             .unwrap_or_default();
         writes.writes.push(IndexedWrite {
-            selection: IndexKey::literal(parts.right)
+            selection: IndexKey::from_expression(&target.right_operand, &|_| false)
                 .map_or(IndexSelection::Unknown, IndexSelection::Exact),
             value_type,
             writer: IndexedWriter::Assignment,
@@ -1206,16 +1127,21 @@ impl Analysis {
         );
     }
 
-    /// Registers dynamic global in the current semantic index.
+    /// Registers a global the program creates while running, such as a ring
+    /// generator, at the syntax `anchor` declaring it.
     fn register_dynamic_global(
         &mut self,
         name: &str,
-        node: SyntaxNode,
+        anchor: &(impl Spanned + ?Sized),
         type_name: ObjectName,
         indexed_element_type: Option<IndexedVariableTypes>,
-        source: &(impl SourceNavigation + ?Sized),
+        source: &(impl SyntaxSource + ?Sized),
     ) {
-        let position = source.position_for_node(node);
+        let Some(fact) = BindingFact::dynamic_global(ObjectName::new(name), anchor, source) else {
+            return;
+        };
+        let position = fact.target.start;
+        let range = fact.target;
         let binding_id = self
             .binding_id_from_scope(name, 0, position)
             .filter(|binding_id| {
@@ -1223,18 +1149,6 @@ impl Analysis {
                     .is_some_and(|binding| binding.scope_idx == 0)
             })
             .or_else(|| self.future_assignment_binding(name, 0, position));
-        let fact = BindingFact {
-            name: ObjectName::new(name),
-            ..BindingFact::from_node(
-                node,
-                None,
-                BindingRole::Ordinary,
-                BindingEffect::Assign,
-                0,
-                true,
-                source,
-            )
-        };
         let enrichment = BindingEnrichment {
             presentation_kind: SymbolKind::VARIABLE,
             inferred_type: Some(InferredType::exact_from_id(type_name)),
@@ -1247,7 +1161,6 @@ impl Analysis {
                 return;
             };
             if let Some(binding) = self.registry.bindings.get_mut(binding_id.0 as usize) {
-                let range = source.range_for_node(node);
                 if range.start < binding.range.start {
                     binding.range = range;
                     let state = binding.states.remove(state_index);
@@ -1267,93 +1180,25 @@ impl Analysis {
     }
 }
 
-impl<'tree> RingGeneratorBinding<'tree> {
-    /// Variable specification supplied by a recognized polynomial-ring constructor.
-    fn constructor_variables(application: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
-        let syntax = application.get::<m2_syn::nodes::ExprOpBinAdj>()?;
-        application.related(syntax::RingSyntax::constructor_variables(syntax)?)
-    }
+/// Every indexed access selecting a ring generator, with its source bytes.
+struct IndexedGenerators<'analysis, 'source, Source: ?Sized> {
+    /// Analysis resolving each access's table binding.
+    analysis: &'analysis Analysis,
+    /// Source navigation over the visited revision.
+    source: &'source Source,
+    /// The accesses found, in source order.
+    found: Vec<(ByteRange, (BindingId, IndexKey))>,
+}
 
-    /// Collects ring-generator specifications, retaining the selected policy for bare symbols.
-    fn collect(container: SyntaxNode<'tree>, bare_symbols: BareSymbols<'_>) -> Vec<Self> {
-        let Some(expression) = container.get::<Expr>() else {
-            return Vec::new();
-        };
-        syntax::RingSyntax::generators(expression, &|symbol| {
-            container.related(symbol).is_some_and(bare_symbols)
-        })
-        .into_iter()
-        .filter_map(|spec| {
-            let node = match spec.anchor {
-                syntax::GeneratorAnchor::Symbol(symbol) => container.related(symbol),
-                syntax::GeneratorAnchor::Expression(expression) => container.related(expression),
-            }?;
-            Some(Self {
-                name: spec.generator.name.0,
-                kind: spec.generator.kind,
-                indices: spec.generator.indices,
-                node,
-            })
-        })
-        .collect()
-    }
-
-    /// Value of the named option in a recognized option assignment.
-    fn option_value(node: SyntaxNode<'tree>, key: &str) -> Option<SyntaxNode<'tree>> {
-        node.related(syntax::RingSyntax::option(node.get::<Expr>()?, key)?)
-    }
-
-    /// The generators named by the `Variable` option of the outermost call
-    /// of `expression`, the `g` of `GF(8, Variable => g)`, with that option's
-    /// value.
-    fn variable_option(
-        expression: SyntaxNode<'tree>,
-        bare_symbols: BareSymbols<'_>,
-    ) -> Option<(SyntaxNode<'tree>, Vec<Self>)> {
-        let application = parenthesized_value(expression)?;
-        if !application.is_space_application() {
-            return None;
+impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for IndexedGenerators<'_, '_, Source> {
+    fn visit_expr_op_bin_regular(&mut self, access: &'ast ExprOpBinRegular) {
+        if let (Some(generator), Some(bytes)) = (
+            self.analysis.indexed_ring_generator(access, self.source),
+            Analysis::indexed_ring_generator_bytes(access, self.source),
+        ) {
+            self.found.push((bytes, generator));
         }
-        let arguments = parenthesized_value(application.binary_parts()?.right)?;
-        let value = arguments
-            .collection_elements()
-            .find_map(|argument| Self::option_value(argument, VARIABLE_OPTION))?;
-        let mut bindings = Vec::new();
-        Self::collect_spec(value, &mut bindings, bare_symbols);
-        Some((value, bindings))
-    }
-
-    /// The name `node` gives a generator, unquoted: `x`, `symbol x`,
-    /// `local x`, or `(x)`.
-    fn name_node(node: SyntaxNode<'tree>) -> Option<SyntaxNode<'tree>> {
-        node.related(syntax::RingSyntax::name(node.get::<Expr>()?)?)
-    }
-
-    /// Collects spec from the supplied syntax and semantic context.
-    fn collect_spec(
-        node: SyntaxNode<'tree>,
-        bindings: &mut Vec<RingGeneratorBinding<'tree>>,
-        bare_symbols: BareSymbols<'_>,
-    ) {
-        let Some(expression) = node.get::<Expr>() else {
-            return;
-        };
-        for spec in syntax::RingSyntax::specifications(expression, &|symbol| {
-            node.related(symbol).is_some_and(bare_symbols)
-        }) {
-            let anchor = match spec.anchor {
-                syntax::GeneratorAnchor::Symbol(symbol) => node.related(symbol),
-                syntax::GeneratorAnchor::Expression(expression) => node.related(expression),
-            };
-            if let Some(anchor) = anchor {
-                bindings.push(Self {
-                    name: spec.generator.name.0,
-                    kind: spec.generator.kind,
-                    indices: spec.generator.indices,
-                    node: anchor,
-                });
-            }
-        }
+        visit::visit_expr_op_bin_regular(self, access);
     }
 }
 
@@ -1370,6 +1215,26 @@ mod tests {
         DocumentSnapshot::from_text(source.to_string(), builtins).expect("fixture should parse")
     }
 
+    /// Fails unless every cell of `document` parses cleanly.
+    fn assert_parses(document: &DocumentSnapshot, source: &str) {
+        assert!(
+            document
+                .syntax()
+                .cells()
+                .iter()
+                .all(|cell| cell.parse_error().is_none() && cell.lexer_diagnostics().is_empty()),
+            "invalid fixture: {source}"
+        );
+    }
+
+    /// Whether `expression` is the probe spelled `text` on `line`.
+    fn is_probe(document: &DocumentSnapshot, expression: &Expr, text: &str, line: u32) -> bool {
+        document.text_for_syntax(expression) == Some(text)
+            && document
+                .position_for_syntax(expression)
+                .is_some_and(|position| position.line == line)
+    }
+
     /// Check complete expressions, including indexed accesses, rather than the
     /// types of their symbol children or the presence of an unrelated inlay hint.
     fn assert_types(setup: &str, probes: &[(&str, &str)]) {
@@ -1382,23 +1247,19 @@ mod tests {
                 .join("\n")
         );
         let document = document(&source);
-        assert!(
-            !document.root_node().has_error(),
-            "invalid fixture: {source}"
+        assert_parses(&document, &source);
+        let typed = document.analysis().expression_types(
+            document.syntax(),
+            &document,
+            document.object_registry(),
         );
-        let checker = TypeChecker::new(document.analysis(), document.object_registry());
         let first_line = setup.lines().count();
         for (offset, (expression, expected)) in probes.iter().enumerate() {
             let line = (first_line + offset) as u32;
-            let node = document
-                .root_node()
-                .descendants()
-                .filter(|node| {
-                    node.text() == *expression && document.position_for_node(*node).line == line
-                })
-                .last()
+            let (_, inferred) = typed
+                .iter()
+                .find(|(probe, _)| is_probe(&document, probe, expression, line))
                 .unwrap_or_else(|| panic!("missing probe {expression:?} on line {line}: {source}"));
-            let inferred = checker.type_of(node, &document, 0);
             assert_eq!(
                 inferred.single().map(ObjectName::name),
                 Some(*expected),
@@ -1412,25 +1273,27 @@ mod tests {
     /// `error: `, or `None` when the program does not determine it.
     fn assert_ring_subscripts(source: &str, probes: &[(u32, &str, Option<&str>)]) {
         let document = document(source);
-        assert!(
-            !document.root_node().has_error(),
-            "invalid fixture: {source}"
+        let checker = TypeChecker::new(document.analysis(), document.object_registry());
+        let session = InferenceSession::new(&checker, &document, document.syntax());
+        assert_parses(&document, source);
+        let typed = document.analysis().expression_types(
+            document.syntax(),
+            &document,
+            document.object_registry(),
         );
         for (line, access, expected) in probes {
-            let node = document
-                .root_node()
-                .descendants()
-                .find(|node| {
-                    node.text() == *access && document.position_for_node(*node).line == *line
-                })
+            let (expression, _) = typed
+                .iter()
+                .find(|(probe, _)| is_probe(&document, probe, access, *line))
                 .unwrap_or_else(|| panic!("missing probe {access:?} on line {line}: {source}"));
-            let evaluated = document
-                .analysis()
-                .selected_ring_variable(node, &document, document.object_registry())
-                .map(|selected| match selected {
-                    Ok(selected) => selected.variable.to_string(),
-                    Err(error) => format!("error: {error}"),
-                });
+            let evaluated =
+                session
+                    .ring_values(0)
+                    .selected(expression)
+                    .map(|selected| match selected {
+                        Ok(selected) => selected.variable.to_string(),
+                        Err(error) => format!("error: {error}"),
+                    });
             assert_eq!(
                 evaluated.as_deref(),
                 *expected,
@@ -1812,22 +1675,24 @@ mod tests {
             ("P = QQ\nP = 1\nR = P[longName]", vec![]),
         ] {
             let document = document(source);
-            let found = document
-                .root_node()
-                .descendants()
-                .flat_map(|node| {
+            let mut applications = crate::syntax::Applications::default();
+            document.syntax().visit(&mut applications);
+            let found = applications
+                .0
+                .into_iter()
+                .flat_map(|call| {
                     let scope = document
-                        .analysis()
-                        .find_scope_at(document.position_for_node(node))
+                        .position_for_syntax(call)
+                        .and_then(|position| document.analysis().find_scope_at(position))
                         .unwrap_or(0);
                     document.analysis().ring_constructor_symbol_variables(
-                        node,
+                        call,
                         &document,
                         document.object_registry(),
                         scope,
                     )
                 })
-                .map(|node| node.text().to_string())
+                .map(|symbol| symbol.text().to_string())
                 .collect::<Vec<_>>();
             assert_eq!(found, expected, "wrong constructor symbols in {source:?}");
         }

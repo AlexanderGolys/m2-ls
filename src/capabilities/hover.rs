@@ -5,14 +5,15 @@ pub mod layout;
 /// What follows a signature in hover whose codomain is deduced, not stated.
 const DEDUCED_CODOMAIN_COMMENT: &str = "  -- deduced";
 
+use m2_syn::nodes::{Expr, ExprOp, ExprOpBin};
+use m2_syn::{Span, Spanned};
 use tower_lsp::lsp_types::*;
 
 use crate::analysis::{
-    Analysis, CallStaticFacts, CodomainOrigin, FunctionInfo, MethodInstallation,
+    Analysis, CallStaticFacts, CodomainOrigin, FunctionInfo, InfixSyntax, MethodInstallation,
 };
-use crate::document::DocumentSnapshot;
+use crate::document::{DocumentSnapshot, SymbolAt};
 use crate::meta::{BindingRole, Metadata};
-use crate::node_metadata::SyntaxNode;
 use crate::object_registry::ObjectName;
 use crate::record_lsp::{record_hover_with_package_and_usage, signature_usage_from_facts};
 use crate::record_lsp::{LspKnowledge, SignatureUsage};
@@ -67,17 +68,16 @@ where
         return Some(hover);
     }
 
-    let node = document.node_at_position_minimal(position)?;
-
-    if !hoverable_symbol_or_operator_node(node) {
-        return None;
-    }
-
-    let node_text = node.text();
+    let hovered = HoveredSyntax::at(document, position)?;
+    let node_text = hovered.text(document)?;
 
     if let Some(symbol) = document.source_symbol_at(node_text, position) {
         let local_installation_signature =
-            analysis.local_method_installation_signature_at(node, document);
+            document
+                .installing_assignment_at(position)
+                .and_then(|assignment| {
+                    analysis.local_method_installation_signature(assignment, document)
+                });
         let local_method = local_installation_signature
             .map(|(method, _)| method)
             .or_else(|| document.callable_at_position(position));
@@ -109,13 +109,74 @@ where
         return workspace_symbol_hover(node_text, uri, workspace);
     };
     let signature_usage =
-        call_signature_usage_for_hover(node, node_text, document, analysis, knowledge);
+        call_signature_usage_for_hover(&hovered, node_text, document, analysis, knowledge);
     Some(record_hover_with_package_and_usage(
         record,
         Some(&package),
         knowledge,
         signature_usage.as_ref(),
     ))
+}
+
+/// What the cursor rests on for hover, with the expression around it.
+enum HoveredSyntax<'a> {
+    /// A symbol reading or binding a name.
+    Symbol(SymbolAt<'a>),
+    /// The operator of a binary operation.
+    BinaryOperator {
+        /// The operation it combines operands with.
+        operation: &'a Expr,
+        /// Where the operator is written.
+        span: Span,
+    },
+    /// The operator of a prefix or postfix operation.
+    UnaryOperator(Span),
+}
+
+impl<'a> HoveredSyntax<'a> {
+    /// The hoverable syntax at `position`: a symbol that is no member key,
+    /// or an operator token.
+    fn at(document: &'a DocumentSnapshot, position: Position) -> Option<Self> {
+        if let Some(symbol) = document.reference_symbol_at(position) {
+            return Some(Self::Symbol(symbol));
+        }
+        let byte = document.byte_for_position(position)?;
+        let covers = |span: &Span| {
+            document
+                .syntax_bytes(span)
+                .is_some_and(|bytes| bytes.contains(&byte))
+        };
+        let innermost = *document.enclosing_expressions(position).last()?;
+        match innermost {
+            Expr::Op(ExprOp::Prefix(prefix)) => prefix
+                .operator
+                .try_span()
+                .filter(covers)
+                .map(Self::UnaryOperator),
+            Expr::Op(ExprOp::Postfix(postfix)) => postfix
+                .operator
+                .try_span()
+                .filter(covers)
+                .map(Self::UnaryOperator),
+            _ => {
+                let span = innermost.infix_operands()?.operator_span.filter(covers)?;
+                Some(Self::BinaryOperator {
+                    operation: innermost,
+                    span,
+                })
+            }
+        }
+    }
+
+    /// The hovered source text.
+    fn text<'source>(&self, document: &'source DocumentSnapshot) -> Option<&'source str> {
+        match self {
+            Self::Symbol(at) => document.text_for_syntax(at.symbol),
+            Self::BinaryOperator { span, .. } | Self::UnaryOperator(span) => {
+                document.text_for_syntax(span).map(str::trim)
+            }
+        }
+    }
 }
 
 /// The hover for a symbol resolved by the local analysis: the `code`
@@ -214,44 +275,42 @@ where
 /// The signature usage at a call site, for hover specialization: the argument
 /// types at the enclosing application/operator, resolved against the loaded scope.
 fn call_signature_usage_for_hover(
-    node: SyntaxNode,
+    hovered: &HoveredSyntax<'_>,
     node_text: &str,
-    source: &(impl SourceNavigation + ?Sized),
-    analysis: &crate::analysis::Analysis,
+    document: &DocumentSnapshot,
+    analysis: &Analysis,
     knowledge: &(impl LspKnowledge + ?Sized),
 ) -> Option<SignatureUsage> {
-    let parent = node.parent()?;
-
-    let facts = if parent.is_space_application() {
-        let callable = parent.binary_parts().map(|parts| parts.left)?;
-        if callable.id() != node.id() {
-            return None;
+    let (facts, context): (_, &dyn Spanned) = match *hovered {
+        HoveredSyntax::Symbol(SymbolAt {
+            expression: Some(symbol),
+            parent: Some(call @ Expr::Op(ExprOp::Bin(ExprOpBin::Adj(application)))),
+            ..
+        }) if std::ptr::eq(application.left_operand.as_ref(), symbol) => (
+            analysis.infer_call_static_facts(application, document, knowledge),
+            call,
+        ),
+        HoveredSyntax::BinaryOperator { operation, .. } => {
+            let operands = operation.infix_operands()?;
+            (
+                CallStaticFacts {
+                    argument_types: vec![
+                        analysis.infer_expression_type(operands.left, document, knowledge),
+                        analysis.infer_expression_type(operands.right, document, knowledge),
+                    ],
+                    literal_options: Vec::new(),
+                },
+                operation,
+            )
         }
-
-        let argument = parent.binary_parts().map(|parts| parts.right)?;
-        analysis.infer_call_static_facts(argument, source, knowledge)
-    } else if parent
-        .operator_node()
-        .is_some_and(|operator| operator.id() == node.id())
-    {
-        let left = parent.binary_parts().map(|parts| parts.left)?;
-        let right = parent.binary_parts().map(|parts| parts.right)?;
-        CallStaticFacts {
-            argument_types: vec![
-                analysis.infer_expression_type(left, source, knowledge),
-                analysis.infer_expression_type(right, source, knowledge),
-            ],
-            literal_options: Vec::new(),
-        }
-    } else {
-        return None;
+        _ => return None,
     };
 
     let callable = ObjectName::new(node_text);
     let signature_facts = analysis.infer_external_call_signature_facts(
         &callable,
         &facts,
-        source.position_for_node(parent),
+        document.position_for_syntax(context)?,
         knowledge,
     )?;
     signature_usage_from_facts(
@@ -263,14 +322,6 @@ fn call_signature_usage_for_hover(
 
 /// Whether a hover over this node is meaningful: a symbol-like leaf or an
 /// operator token of an expression.
-fn hoverable_symbol_or_operator_node(node: SyntaxNode) -> bool {
-    if node.is_symbol_like() {
-        return !node.is_member_key();
-    }
-
-    node.is_operator()
-}
-
 /// The method `installation` of the method function `name` as the Macaulay2
 /// code of a call, `f(ZZ) -> ZZ`; a codomain only deduced says so.
 fn local_method_signature_code(
@@ -302,9 +353,7 @@ fn local_method_signature_code(
 mod tests {
     use super::*;
     use crate::meta::{BindingRole, Meta};
-    use crate::node_metadata::SyntaxParser;
     use crate::object_registry::ObjectRegistry;
-    use crate::source::DocumentSource;
     use crate::test_support::analyze;
     use crate::workspace_index::WorkspaceIndex;
     use tower_lsp::lsp_types::{HoverContents, Range as TextRange, SymbolKind};
@@ -340,8 +389,7 @@ mod tests {
 
     #[test]
     fn local_hover_includes_known_static_type() {
-        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
-        let analysis = analyze(parser.parse("").expect("empty fixture should parse"));
+        let analysis = analyze("");
         let symbol = Meta {
             symbol_kind: Some(SymbolKind::VARIABLE),
             binding_role: Some(BindingRole::Ordinary),
@@ -366,8 +414,7 @@ mod tests {
     #[test]
     fn local_hover_includes_method_signatures() {
         let text = "p = method(TypicalValue => List)\np(ZZ, ZZ) := (i, j) -> {i, j}\n";
-        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
-        let analysis = analyze(parser.parse(text).expect("fixture should parse"));
+        let analysis = analyze(text);
         let symbol = analysis
             .get_binding_at("p", pos!(1, 0))
             .expect("method symbol should be visible");
@@ -389,29 +436,24 @@ mod tests {
     #[test]
     fn local_method_installation_hover_pins_installed_signature() {
         let text = "p = method(TypicalValue => List)\np(ZZ, ZZ) := (i, j) -> {i, j}\np(CC, CC) := Array => (i, j) -> [i, j]\n";
-        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
-        let tree = parser.parse_tree(text, None).expect("fixture should parse");
-        let root = tree.root(text);
-        let analysis = analyze(root);
-        let source = DocumentSource::new(text.to_string());
+        let document = DocumentSnapshot::from_text(text.to_string(), &ObjectRegistry::default())
+            .expect("fixture should parse");
+        let analysis = document.analysis();
         let position = pos!(1, 0);
-        let node = root
-            .descendant_for_point_range(
-                crate::source::SourcePoint::new(1, 0),
-                crate::source::SourcePoint::new(1, 0),
-            )
-            .expect("method name node should be found");
         let symbol = analysis
             .get_binding_at("p", position)
             .expect("method symbol should be visible");
-        let (method, pinned_signature) = analysis
-            .local_method_installation_signature_at(node, &source)
+        let (method, pinned_signature) = document
+            .installing_assignment_at(position)
+            .and_then(|assignment| {
+                analysis.local_method_installation_signature(assignment, &document)
+            })
             .expect("method installation should pin the installed signature");
 
         let hover = local_symbol_hover(
             "p",
             &symbol,
-            &analysis,
+            analysis,
             Some(method),
             Some(pinned_signature),
             None,
@@ -434,19 +476,16 @@ mod tests {
             "p ZZ := List => x -> x\n",
             "p ZZ := Array => x -> x\n",
         );
-        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
-        let tree = parser.parse_tree(text, None).expect("fixture should parse");
-        let root = tree.root(text);
-        let analysis = analyze(root);
-        let source = DocumentSource::new(text.to_string());
+        let document = DocumentSnapshot::from_text(text.to_string(), &ObjectRegistry::default())
+            .expect("fixture should parse");
+        let analysis = document.analysis();
 
         for (line, expected_codomain) in [(1, "List"), (2, "Array")] {
-            let point = crate::source::SourcePoint::new(line, 0);
-            let node = root
-                .descendant_for_point_range(point, point)
-                .expect("method name node should be found");
-            let (_, installation) = analysis
-                .local_method_installation_signature_at(node, &source)
+            let (_, installation) = document
+                .installing_assignment_at(pos!(line, 0))
+                .and_then(|assignment| {
+                    analysis.local_method_installation_signature(assignment, &document)
+                })
                 .expect("the source occurrence should resolve its installation identity");
             assert_eq!(
                 installation.method.codomain.as_ref().map(ObjectName::name),
@@ -543,20 +582,19 @@ mod tests {
         let text = "F := openOut \"test.oldvalues\"\n";
         let index = ObjectRegistry::load(crate::catalog::test_corpus());
         let scoped = index.with_source_imports("");
-        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
-        let tree = parser.parse_tree(text, None).expect("fixture should parse");
-        let root = tree.root(text);
-        let source = DocumentSource::new(text.to_string());
-        let analysis = Analysis::new_with_knowledge(root, None, &source, &scoped);
-        let node = root
-            .descendant_for_point_range(
-                crate::source::SourcePoint::new(0, 5),
-                crate::source::SourcePoint::new(0, 5),
-            )
-            .expect("openOut node should be found");
+        let document =
+            DocumentSnapshot::from_text(text.to_string(), &scoped).expect("fixture should parse");
+        let hovered =
+            HoveredSyntax::at(&document, pos!(0, 5)).expect("openOut should be hoverable");
 
-        let usage = call_signature_usage_for_hover(node, "openOut", &source, &analysis, &scoped)
-            .expect("openOut hover should resolve usage signatures");
+        let usage = call_signature_usage_for_hover(
+            &hovered,
+            "openOut",
+            &document,
+            document.analysis(),
+            &scoped,
+        )
+        .expect("openOut hover should resolve usage signatures");
         let signature = usage
             .pinned
             .expect("openOut hover should pin the String installation");
@@ -584,24 +622,14 @@ mod tests {
         let text = "x := 1\ny := 2\nz := x + y\n";
         let index = ObjectRegistry::load(crate::catalog::test_corpus());
         let scoped = index.with_source_imports("");
-        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
-        let tree = parser.parse_tree(text, None).expect("fixture should parse");
-        let root = tree.root(text);
-        let source = DocumentSource::new(text.to_string());
-        let analysis = Analysis::new_with_knowledge(root, None, &source, &scoped);
-        let node = root
-            .descendant_for_point_range(
-                crate::source::SourcePoint::new(2, 7),
-                crate::source::SourcePoint::new(2, 7),
-            )
-            .expect("+ node should be found");
-        assert!(
-            hoverable_symbol_or_operator_node(node),
-            "operator tokens should be hoverable"
-        );
+        let document =
+            DocumentSnapshot::from_text(text.to_string(), &scoped).expect("fixture should parse");
+        let hovered =
+            HoveredSyntax::at(&document, pos!(2, 7)).expect("operator tokens should be hoverable");
 
-        let usage = call_signature_usage_for_hover(node, "+", &source, &analysis, &scoped)
-            .expect("+ hover should resolve usage signatures");
+        let usage =
+            call_signature_usage_for_hover(&hovered, "+", &document, document.analysis(), &scoped)
+                .expect("+ hover should resolve usage signatures");
         let signature = usage
             .pinned
             .expect("+ hover should pin the ZZ, ZZ installation");

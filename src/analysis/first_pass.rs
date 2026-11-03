@@ -4,8 +4,7 @@
 //! The first pass walks the typed AST once and produces two things:
 //!
 //! - a [`ScopeTree`]: every region of source that changes where a name is
-//!   bound, with its parent and, for functions, the [`Dispatch`] shape of the
-//!   function;
+//!   bound, with its parent;
 //! - a stream of [`BindingFact`]s: every place a symbol is bound, with the
 //!   scope it lands in and whether it may be visible outside the file.
 //!
@@ -47,25 +46,24 @@
 //! that contains it.
 
 use m2_syn::nodes::{
-    ArgumentListContent, AssignmentArgument as AssignmentPackComponent,
-    AssignmentList as AssignmentPack, AssignmentListContent, Cell, Expr, ExprAssign as Assignment,
-    ExprAssignParallel as ParallelAssignment, ExprAssignSimple as SimpleBinding,
-    ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
-    ExprOpBinAdj as AdjacentExpr, ExprTry as TryStatement, ExprWhile as WhileLoop, LoopBody,
-    Symbol, TryFallback, WhenCondition,
+    Cell, Expr, ExprAssign as Assignment, ExprAssignParallel as ParallelAssignment,
+    ExprAssignSimple as SimpleBinding, ExprFor as ForLoop, ExprIf as IfStatement,
+    ExprLambda as LambdaExpression, ExprOpBinAdj as AdjacentExpr, ExprTry as TryStatement,
+    ExprWhile as WhileLoop, LoopBody, Symbol, TryFallback, WhenCondition,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::Spanned;
 use tower_lsp::lsp_types::{Position, Range as TextRange};
 
+use crate::macaulay2::Macaulay2Conventions;
 use crate::meta::BindingRole;
-use crate::node_metadata::{SyntaxNode, TypedSource};
+use crate::node_metadata::SyntaxSnapshot;
 use crate::object_registry::ObjectName;
-use crate::package_index::declared_package_name;
-use crate::source::SourceNavigation;
+use crate::source::{ByteRange, SourceNavigation, SyntaxSource};
+use crate::string_literal::LiteralSource;
 use crate::util::TextRangeExt;
 
-use super::{is_value_cell, source_cell, Dispatch};
+use crate::syntax::{BoundSymbols, ExpressionSyntax};
 
 /// Index of a scope inside its [`ScopeTree`].
 pub type ScopeId = usize;
@@ -111,48 +109,70 @@ pub struct BindingFact {
 }
 
 impl BindingFact {
-    /// A fact anchored on syntax-tree nodes rather than typed AST, for
-    /// bindings discovered after the first pass (e.g. ring generators).
+    /// The global a dynamically created binding makes, such as a ring
+    /// generator bound when its ring is constructed, anchored on the typed
+    /// `target` naming it.
     ///
     /// The definition is the enclosing top-level cell when that cell yields a
     /// value, else the target itself.
-    pub fn from_node(
-        target: SyntaxNode<'_>,
-        value: Option<SyntaxNode<'_>>,
-        role: BindingRole,
-        effect: BindingEffect,
-        scope: ScopeId,
-        potential_export: bool,
+    pub fn dynamic_global(
+        name: ObjectName,
+        target: &(impl Spanned + ?Sized),
+        source: &(impl SyntaxSource + ?Sized),
+    ) -> Option<Self> {
+        let bytes = source.syntax_bytes(target)?;
+        let cell = source
+            .syntax()
+            .cells_intersecting(bytes.start..bytes.start)
+            .iter()
+            .find(|cell| cell.document_range().contains(&bytes.start));
+        let definition = match cell.map(|cell| (cell, cell.syntax())) {
+            Some((_, Some(syntax))) if syntax.semicolon.is_none() => {
+                source.range_for_syntax(syntax)
+            }
+            Some((cell, None)) => Some(source.range_for_bytes(cell.document_range())),
+            _ => None,
+        };
+        let target = source.range_for_bytes(bytes);
+        Some(Self {
+            name,
+            target,
+            value: None,
+            definition: definition.unwrap_or(target),
+            role: BindingRole::Ordinary,
+            effect: BindingEffect::Assign,
+            scope: ROOT_SCOPE,
+            potential_export: true,
+        })
+    }
+
+    /// Where `newPackage "P"` anchors the binding of `P`: the text between
+    /// the quotes of its name string.
+    pub(super) fn package_name_bytes(
+        call: &AdjacentExpr,
         source: &(impl SourceNavigation + ?Sized),
-    ) -> Self {
-        Self {
-            name: ObjectName::new(target.text()),
-            target: source.range_for_node(target),
-            value: value.map(|value| source.range_for_node(value)),
-            definition: source.range_for_node(
-                source_cell(target)
-                    .filter(|cell| is_value_cell(*cell))
-                    .unwrap_or(target),
-            ),
-            role,
-            effect,
-            scope,
-            potential_export,
+    ) -> Option<ByteRange> {
+        if call.left_operand.symbol_name() != Some(Macaulay2Conventions::PACKAGE_CONSTRUCTOR) {
+            return None;
         }
+        let argument = call.right_operand.arguments().into_iter().next()??;
+        argument
+            .literal_content_bytes(source)
+            .filter(|content| !content.is_empty())
     }
 
     /// The global binding `newPackage "P"` makes of `P`, anchored on the text
     /// inside the name string.
     fn package_declaration(
-        name: SyntaxNode<'_>,
-        call: SyntaxNode<'_>,
+        call: &AdjacentExpr,
         definition: TextRange,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<Self> {
+        let content = Self::package_name_bytes(call, source)?;
         Some(Self {
-            name: ObjectName::new(name.string_literal_inner_text()?),
-            target: package_name_range(name, source)?,
-            value: Some(source.range_for_node(call)),
+            name: ObjectName::new(source.text().get(content.clone())?),
+            target: source.range_for_bytes(content),
+            value: source.range_for_syntax(call),
             definition,
             role: BindingRole::Ordinary,
             effect: BindingEffect::Assign,
@@ -162,16 +182,6 @@ impl BindingFact {
     }
 }
 
-/// Where the binding of a `newPackage` name string is anchored: the text
-/// between the quotes.
-pub(super) fn package_name_range(
-    name: SyntaxNode<'_>,
-    source: &(impl SourceNavigation + ?Sized),
-) -> Option<TextRange> {
-    name.string_literal_inner_bytes()
-        .map(|bytes| source.range_for_bytes(bytes))
-}
-
 /// Runs the first pass over `syntax`.
 ///
 /// Every collected [`BindingFact`] is handed to `collect` in source order,
@@ -179,35 +189,16 @@ pub(super) fn package_name_range(
 /// that open after the fact (e.g. a later assignment's owner). The tree is
 /// returned for the semantic pass to keep.
 pub fn walk(
-    syntax: &TypedSource,
-    root: SyntaxNode<'_>,
+    syntax: &SyntaxSnapshot,
     source: &(impl SourceNavigation + ?Sized),
     mut collect: impl FnMut(BindingFact, &ScopeTree),
 ) -> ScopeTree {
-    let mut walker = TypedWalker::new(root, source);
+    let mut walker = TypedWalker::new(source);
     syntax.visit(&mut walker);
     for fact in walker.bindings {
         collect(fact, &walker.scopes);
     }
     walker.scopes
-}
-
-/// The symbol nodes reachable from `node` through nodes that
-/// `contains_symbols` accepts: `node` itself when it is a symbol, else the
-/// symbols nested in the accepted containers below it.
-pub(super) fn nested_symbols<'tree>(
-    node: SyntaxNode<'tree>,
-    contains_symbols: impl Fn(&SyntaxNode<'tree>) -> bool + Copy,
-) -> Vec<SyntaxNode<'tree>> {
-    if node.is::<Symbol>() {
-        return vec![node];
-    }
-    if !contains_symbols(&node) {
-        return Vec::new();
-    }
-    node.children()
-        .flat_map(|child| nested_symbols(child, contains_symbols))
-        .collect()
 }
 
 /// One region of source that changes where names are bound.
@@ -217,9 +208,6 @@ struct Scope {
     range: TextRange,
     /// `None` only for [`ROOT_SCOPE`].
     parent: Option<ScopeId>,
-    /// The call shape of the function owning this scope; `None` for every
-    /// scope that is not a function.
-    function_dispatch: Option<Dispatch>,
 }
 
 /// Every scope of a file, indexed by [`ScopeId`] in pre-order.
@@ -236,7 +224,6 @@ impl Default for ScopeTree {
             scopes: vec![Scope {
                 range: TextRange::new(pos!(), pos_max!()),
                 parent: None,
-                function_dispatch: None,
             }],
         }
     }
@@ -244,48 +231,12 @@ impl Default for ScopeTree {
 
 impl ScopeTree {
     /// Appends a lexical scope and returns its index in traversal order.
-    fn push(
-        &mut self,
-        range: TextRange,
-        parent: ScopeId,
-        function_dispatch: Option<Dispatch>,
-    ) -> ScopeId {
+    fn push(&mut self, range: TextRange, parent: ScopeId) -> ScopeId {
         self.scopes.push(Scope {
             range,
             parent: Some(parent),
-            function_dispatch,
         });
         self.scopes.len() - 1
-    }
-
-    /// The scope opened by `node`.
-    ///
-    /// Typed AST spans can end before the syntax node's range (trailing
-    /// tokens are not part of the typed node), so when no scope matches the
-    /// node exactly, the widest scope starting at the node and ending within
-    /// it is taken.
-    ///
-    /// # Panics
-    ///
-    /// When `node` opened no scope during the first pass.
-    pub(super) fn owned_by(
-        &self,
-        node: SyntaxNode,
-        source: &(impl SourceNavigation + ?Sized),
-    ) -> ScopeId {
-        let range = source.range_for_node(node);
-        self.with_range(range)
-            .or_else(|| {
-                self.scopes
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, scope)| {
-                        scope.range.start == range.start && scope.range.end <= range.end
-                    })
-                    .max_by_key(|(_, scope)| scope.range.end)
-                    .map(|(scope, _)| scope)
-            })
-            .expect("scope owner should be registered before semantic collection")
     }
 
     /// The outermost scope spanning exactly `range`.
@@ -310,21 +261,12 @@ impl ScopeTree {
     pub(super) fn parent(&self, scope: ScopeId) -> Option<ScopeId> {
         self.scopes.get(scope)?.parent
     }
-
-    /// The call shape of the function whose lambda is `owner`.
-    pub(super) fn function_dispatch(
-        &self,
-        owner: SyntaxNode,
-        source: &(impl SourceNavigation + ?Sized),
-    ) -> Option<Dispatch> {
-        self.scopes[self.owned_by(owner, source)].function_dispatch
-    }
 }
 
 /// What a construct does to name binding; see the table in the module docs.
 enum ScopeKind {
     /// A lambda: owns a dictionary and collects the assignments in its body.
-    Function(Dispatch),
+    Function,
     /// A whole `for` loop: owns the dictionary of its loop variable.
     ForLoop,
     /// One clause of an `if` or `try`.
@@ -336,20 +278,12 @@ enum ScopeKind {
 impl ScopeKind {
     /// Whether `:=` inside this scope declares into it.
     fn owns_dictionary(&self) -> bool {
-        matches!(self, Self::Function(_) | Self::ForLoop)
+        matches!(self, Self::Function | Self::ForLoop)
     }
 
     /// Whether `=` inside this scope is recorded against it.
     fn owns_assignments(&self) -> bool {
-        matches!(self, Self::Function(_) | Self::Branch)
-    }
-
-    /// Argument shape of the function owning this scope, when one exists.
-    fn function_dispatch(&self) -> Option<Dispatch> {
-        match self {
-            Self::Function(dispatch) => Some(*dispatch),
-            Self::ForLoop | Self::Branch | Self::LoopClause => None,
-        }
+        matches!(self, Self::Function | Self::Branch)
     }
 }
 
@@ -391,56 +325,8 @@ impl TraversalContext {
     }
 }
 
-/// Syntax that binds a list of symbols at once.
-trait BoundSymbols {
-    /// The symbols bound, in source order.
-    fn bound_symbols(&self) -> Vec<&Symbol>;
-}
-
-impl BoundSymbols for LambdaExpression {
-    fn bound_symbols(&self) -> Vec<&Symbol> {
-        match self {
-            Self::Variadic(lambda) => vec![&lambda.argument],
-            Self::List(lambda) => match &lambda.arguments.contents {
-                None => Vec::new(),
-                Some(ArgumentListContent::Symbol(symbol)) => vec![symbol],
-                Some(ArgumentListContent::Pack(arguments)) => arguments.arguments.iter().collect(),
-            },
-        }
-    }
-}
-
-impl BoundSymbols for AssignmentPack {
-    /// The symbols of a parallel assignment target such as `(a, (b, c))`,
-    /// flattened through nested packs.
-    fn bound_symbols(&self) -> Vec<&Symbol> {
-        match &self.contents.contents {
-            None => Vec::new(),
-            Some(AssignmentListContent::Argument(component)) => component.bound_symbols(),
-            Some(AssignmentListContent::Pack(components)) => components
-                .arguments
-                .iter()
-                .flat_map(|component| component.bound_symbols())
-                .collect(),
-        }
-    }
-}
-
-impl BoundSymbols for AssignmentPackComponent {
-    /// Empty slots and operator or evaluated targets bind no symbol.
-    fn bound_symbols(&self) -> Vec<&Symbol> {
-        match self {
-            Self::Symbol(symbol) => vec![symbol],
-            Self::List(pack) => pack.bound_symbols(),
-            Self::Empty(_) | Self::Op(_) | Self::Evaluated(_) => Vec::new(),
-        }
-    }
-}
-
 /// The AST visitor behind [`walk`].
-struct TypedWalker<'tree, 'source, Source: ?Sized> {
-    /// Root of the syntax tree, used to map typed nodes back to syntax nodes.
-    root: SyntaxNode<'tree>,
+struct TypedWalker<'source, Source: ?Sized> {
     /// Source data supplying text and coordinate conversions.
     source: &'source Source,
     /// Lexical scopes collected in traversal order.
@@ -453,11 +339,10 @@ struct TypedWalker<'tree, 'source, Source: ?Sized> {
     definition: TextRange,
 }
 
-impl<'tree, 'source, Source: SourceNavigation + ?Sized> TypedWalker<'tree, 'source, Source> {
+impl<'source, Source: SourceNavigation + ?Sized> TypedWalker<'source, Source> {
     /// Starts syntax-only scope collection at the document root with an empty binding-fact stream.
-    fn new(root: SyntaxNode<'tree>, source: &'source Source) -> Self {
+    fn new(source: &'source Source) -> Self {
         Self {
-            root,
             source,
             scopes: ScopeTree::default(),
             bindings: Vec::new(),
@@ -491,9 +376,7 @@ impl<'tree, 'source, Source: SourceNavigation + ?Sized> TypedWalker<'tree, 'sour
             return visit(self);
         };
         let inherited = self.context;
-        let scope = self
-            .scopes
-            .push(range, inherited.scope, kind.function_dispatch());
+        let scope = self.scopes.push(range, inherited.scope);
         self.context = inherited.enter(scope, &kind);
         visit(self);
         self.context = inherited;
@@ -570,7 +453,7 @@ impl<'tree, 'source, Source: SourceNavigation + ?Sized> TypedWalker<'tree, 'sour
     }
 }
 
-impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, '_, Source> {
+impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, Source> {
     fn visit_cell(&mut self, node: &'ast Cell) {
         self.with_definition(node, |walker| visit::visit_cell(walker, node));
     }
@@ -614,14 +497,7 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, '_
 
     /// Juxtaposition covers calls such as `newPackage "P"`, which bind `P`.
     fn visit_expr_op_bin_adj(&mut self, node: &'ast AdjacentExpr) {
-        if let Some(fact) = self.root.related(node).and_then(|call| {
-            BindingFact::package_declaration(
-                declared_package_name(call)?,
-                call,
-                self.definition,
-                self.source,
-            )
-        }) {
+        if let Some(fact) = BindingFact::package_declaration(node, self.definition, self.source) {
             self.bindings.push(fact);
         }
         visit::visit_expr_op_bin_adj(self, node);
@@ -629,23 +505,15 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, '_
 
     fn visit_expr_lambda(&mut self, node: &'ast LambdaExpression) {
         let parameters = node.bound_symbols();
-        let dispatch = match node {
-            LambdaExpression::Variadic(_) => Dispatch::Variadic,
-            LambdaExpression::List(_) => Dispatch::Fixed(parameters.len()),
-        };
-        self.enter_scope(
-            self.range_of(node),
-            ScopeKind::Function(dispatch),
-            |walker| {
-                walker.bind(
-                    parameters,
-                    None,
-                    BindingRole::Parameter,
-                    BindingEffect::Declare,
-                );
-                visit::visit_expr_lambda(walker, node);
-            },
-        );
+        self.enter_scope(self.range_of(node), ScopeKind::Function, |walker| {
+            walker.bind(
+                parameters,
+                None,
+                BindingRole::Parameter,
+                BindingEffect::Declare,
+            );
+            visit::visit_expr_lambda(walker, node);
+        });
     }
 
     fn visit_expr_if(&mut self, node: &'ast IfStatement) {

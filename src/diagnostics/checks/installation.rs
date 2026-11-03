@@ -9,7 +9,6 @@ use crate::analysis::{
     MethodOptions, Operator,
 };
 use crate::diagnostics::{catalog, Finding};
-use crate::node_metadata::matches_token;
 use crate::object_registry::OperatorForm;
 use crate::typesystem::{TypeKnowledge, TypeRole};
 
@@ -28,7 +27,7 @@ fn install_no_effect(context: &InstallationContext, sink: &mut DiagnosticSink) {
     match &method.head {
         MethodHead::Operator(operator)
             if operator.form == OperatorForm::Binary
-                && matches_token::<Token![??]>(operator.token.name())
+                && operator.token.name() == <Token![??]>::SPELLING
                 && installation.expected_argument_arity() == method.domain.len() =>
         {
             sink.spawn(
@@ -39,7 +38,7 @@ fn install_no_effect(context: &InstallationContext, sink: &mut DiagnosticSink) {
                 ),
             );
         }
-        MethodHead::Operator(operator) if matches_token::<Token![<-]>(operator.token.name()) => {
+        MethodHead::Operator(operator) if operator.token.name() == <Token![<-]>::SPELLING => {
             if let Some(message) = left_arrow_install_without_effect(context) {
                 sink.spawn(
                     &catalog::INSTALL_NO_EFFECT,

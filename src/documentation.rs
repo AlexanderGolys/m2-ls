@@ -2,15 +2,21 @@
 
 use std::ops::Range;
 
-use m2_syn::nodes::{RawStringLiteral, Symbol};
+use m2_syn::nodes::{Expr, ExprCollection, ExprLiteral, PackedContent, Statement};
+use m2_syn::visit::{self, Visit};
+use m2_syn::{Trivia, TriviaKind};
 use tower_lsp::lsp_types::Range as TextRange;
 
 use crate::analysis::{Analysis, AssignmentFactKind, BindingId, BindingView, MethodInstallationId};
+use crate::macaulay2::Macaulay2Conventions;
 use crate::meta::BindingRole;
 use crate::node_metadata::markdown::MarkdownSyntaxParser;
-use crate::node_metadata::{SyntaxNode, SyntaxParser};
+use crate::node_metadata::SyntaxSnapshot;
 use crate::object_registry::ObjectName;
-use crate::source::{ByteRange, SourceNavigation, SymbolMention};
+use crate::source::{ByteRange, DocumentSource, SourceNavigation, SymbolMention};
+use crate::syntax::{
+    AssignmentSyntax, BindingReferences, ExpressionSyntax, LambdaSyntax, PackedArguments,
+};
 
 /// The semantic owner of one accepted documentation block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,47 +190,40 @@ impl DocumentationIndex {
     }
 }
 
-/// Classify documentation by CST position, parse its Markdown, and index its
-/// explicit references.
+/// Classify documentation by its position among typed statement lists, parse its
+/// Markdown, and index its explicit references.
 pub fn collect_documentation(
     source: &(impl SourceNavigation + ?Sized),
-    root: SyntaxNode<'_>,
+    syntax: &SyntaxSnapshot,
     analysis: &Analysis,
 ) -> DocumentationIndex {
     let mut index = DocumentationIndex::default();
-    let mut m2_parser = SyntaxParser::new();
     let mut markdown_parser = MarkdownSyntaxParser::default();
-    let comments = root
-        .descendants()
-        .filter(SyntaxNode::is_comment)
-        .collect::<Vec<_>>();
+    let lists = ItemLists::collect(source, syntax);
+    let sites = lists.comment_sites(source, syntax);
 
     collect_line_documentation(
-        &comments,
+        &sites,
+        &lists,
         source,
         analysis,
-        m2_parser.as_mut(),
         &mut markdown_parser,
         &mut index,
     );
     collect_inner_documentation(
-        &comments,
+        &sites,
+        &lists,
         source,
-        root,
         analysis,
-        m2_parser.as_mut(),
         &mut markdown_parser,
         &mut index,
     );
 
-    if let Some(parser) = m2_parser.as_mut() {
-        for node in root
-            .descendants()
-            .filter(|node| node.is::<RawStringLiteral>())
-        {
-            collect_legacy_backtick_snippets(node, source, parser, &mut index);
-        }
-    }
+    let mut snippets = LegacySnippets {
+        source,
+        index: &mut index,
+    };
+    syntax.visit(&mut snippets);
 
     index.references.sort_by_key(SymbolMention::byte_span);
     index
@@ -248,12 +247,12 @@ struct DocumentationText {
 
 impl DocumentationText {
     /// Constructs this representation from line comments.
-    fn from_line_comments(comments: &[SyntaxNode<'_>]) -> Self {
+    fn from_line_comments(comments: &[Comment<'_>]) -> Self {
         let mut markdown = String::new();
         let mut mappings = Vec::new();
         for comment in comments {
-            let mut offset = comment.start_byte();
-            for line in comment.text().split_inclusive('\n') {
+            let mut offset = comment.bytes.start;
+            for line in comment.text.split_inclusive('\n') {
                 if !markdown.is_empty() {
                     markdown.push('\n');
                 }
@@ -276,18 +275,18 @@ impl DocumentationText {
     }
 
     /// Constructs this representation from block comment.
-    fn from_block_comment(comment: SyntaxNode<'_>) -> Self {
+    fn from_block_comment(comment: &Comment<'_>) -> Self {
         // `-*` opens a block comment and `-**` a doc block comment, closing with
         // the mirrored `*-` / `**-`. Measuring the opening marker and mirroring
         // its width keeps a `*` that belongs to the text (`-* x**-`) while still
         // removing the whole doc marker.
-        let text = comment.text();
+        let text = comment.text;
         let opening = 1 + text[1..]
             .chars()
             .take_while(|marker| *marker == '*')
             .count();
         let closing = opening.min(text.len().saturating_sub(opening));
-        let content_start = comment.start_byte() + opening;
+        let content_start = comment.bytes.start + opening;
         let content = &text[opening..text.len() - closing];
         let lines = source_lines(content, content_start);
         let first = lines
@@ -400,53 +399,55 @@ fn source_lines(text: &str, source_start: usize) -> Vec<SourceLine<'_>> {
 
 /// Collects line documentation from the supplied syntax and semantic context.
 fn collect_line_documentation(
-    comments: &[SyntaxNode<'_>],
+    sites: &[CommentSite<'_>],
+    lists: &ItemLists<'_>,
     source: &(impl SourceNavigation + ?Sized),
     analysis: &Analysis,
-    m2_parser: Option<&mut SyntaxParser>,
     markdown_parser: &mut MarkdownSyntaxParser,
     index: &mut DocumentationIndex,
 ) {
-    let mut m2_parser = m2_parser;
+    let full_line_comment = |site: &CommentSite<'_>| {
+        site.comment.kind == TriviaKind::LineComment && site.comment.takes_full_line(source.text())
+    };
+    let row = |byte: usize| source.point_for_byte(byte).row;
     let mut cursor = 0;
-    while cursor < comments.len() {
-        let comment = comments[cursor];
-        if !comment.is_line_comment() || !takes_full_line(comment, source.text()) {
+    while cursor < sites.len() {
+        if !full_line_comment(&sites[cursor]) {
             cursor += 1;
             continue;
         }
         let mut end = cursor + 1;
-        while end < comments.len()
-            && comments[end].is_line_comment()
-            && takes_full_line(comments[end], source.text())
-            && same_parent(comments[end - 1], comments[end])
-            && comments[end].start_position().row == comments[end - 1].end_position().row + 1
+        while end < sites.len()
+            && full_line_comment(&sites[end])
+            && sites[end].list == sites[end - 1].list
+            && row(sites[end].comment.bytes.start) == row(sites[end - 1].comment.bytes.start) + 1
         {
             end += 1;
         }
-        let block_comments = &comments[cursor..end];
+        let block = &sites[cursor..end];
         cursor = end;
-        let last = *block_comments.last().expect("nonempty comment block");
-        let Some(item) = following_item(last) else {
+        let last = &block[block.len() - 1];
+        let Some(item) = lists.following_item(last) else {
             continue;
         };
-        if item.start_position().row != last.end_position().row + 1 {
+        if row(item.bytes.start) != row(last.comment.bytes.start) + 1 {
             continue;
         }
         let targets = targets_for_item(item, source, analysis);
         if targets.is_empty() {
             continue;
         }
-        index.comment_ranges.extend(
-            block_comments
-                .iter()
-                .map(|comment| comment.start_byte()..comment.end_byte()),
-        );
+        let comments = block
+            .iter()
+            .map(|site| site.comment.clone())
+            .collect::<Vec<_>>();
+        index
+            .comment_ranges
+            .extend(comments.iter().map(|comment| comment.bytes.clone()));
         collect_markdown_block(
-            DocumentationText::from_line_comments(block_comments),
+            DocumentationText::from_line_comments(&comments),
             targets,
             source,
-            m2_parser.as_deref_mut(),
             markdown_parser,
             index,
         );
@@ -455,44 +456,41 @@ fn collect_line_documentation(
 
 /// Collects inner documentation from the supplied syntax and semantic context.
 fn collect_inner_documentation(
-    comments: &[SyntaxNode<'_>],
+    sites: &[CommentSite<'_>],
+    lists: &ItemLists<'_>,
     source: &(impl SourceNavigation + ?Sized),
-    root: SyntaxNode<'_>,
     analysis: &Analysis,
-    m2_parser: Option<&mut SyntaxParser>,
     markdown_parser: &mut MarkdownSyntaxParser,
     index: &mut DocumentationIndex,
 ) {
-    let mut m2_parser = m2_parser;
-    for comment in comments
+    for site in sites
         .iter()
-        .copied()
-        .filter(SyntaxNode::is_block_comment)
+        .filter(|site| site.comment.kind == TriviaKind::BlockComment)
     {
-        let Some(parent) = comment.parent() else {
+        let list = &lists.lists[site.list];
+        let Some(following) = lists.following_item(site) else {
             continue;
         };
-        if !is_first_content(comment, parent) || following_item(comment).is_none() {
+        if list
+            .items
+            .iter()
+            .any(|item| item.bytes.start < site.comment.bytes.start)
+        {
             continue;
         }
-        let target = if parent.id() == root.id() || parent.is_source_cell() {
-            following_item(comment)
-                .is_some_and(is_new_package_declaration)
-                .then_some(DocumentationTarget::Package)
-        } else {
-            enclosing_scope_target(comment, parent, source, analysis)
+        let target = match &list.owner {
+            ListOwner::Document => is_new_package_declaration(following.expression)
+                .then_some(DocumentationTarget::Package),
+            ListOwner::Delimited { .. } => enclosing_scope_target(&list.owner, source, analysis),
         };
         let Some(target) = target else {
             continue;
         };
-        index
-            .comment_ranges
-            .push(comment.start_byte()..comment.end_byte());
+        index.comment_ranges.push(site.comment.bytes.clone());
         collect_markdown_block(
-            DocumentationText::from_block_comment(comment),
+            DocumentationText::from_block_comment(&site.comment),
             vec![target],
             source,
-            m2_parser.as_deref_mut(),
             markdown_parser,
             index,
         );
@@ -504,7 +502,6 @@ fn collect_markdown_block(
     text: DocumentationText,
     targets: Vec<DocumentationTarget>,
     source: &(impl SourceNavigation + ?Sized),
-    m2_parser: Option<&mut SyntaxParser>,
     markdown_parser: &mut MarkdownSyntaxParser,
     index: &mut DocumentationIndex,
 ) {
@@ -533,9 +530,9 @@ fn collect_markdown_block(
         );
     }
 
-    if let Some(parser) = m2_parser {
+    {
         for (_, target_range) in &wiki_links {
-            collect_mapped_m2_references(&text, target_range.clone(), source, parser, index);
+            collect_mapped_m2_references(&text, target_range.clone(), source, index);
             index.snippets.extend(
                 text.source_ranges(target_range.clone())
                     .into_iter()
@@ -562,15 +559,11 @@ fn collect_mapped_m2_references(
     text: &DocumentationText,
     target: ByteRange,
     source: &(impl SourceNavigation + ?Sized),
-    parser: &mut SyntaxParser,
     index: &mut DocumentationIndex,
 ) {
     let candidate = &text.markdown[target.clone()];
-    let Some(root) = parser.parse(candidate) else {
-        return;
-    };
-    for symbol in root.binding_references() {
-        let markdown_range = target.start + symbol.start_byte()..target.start + symbol.end_byte();
+    for symbol in snippet_binding_ranges(candidate) {
+        let markdown_range = target.start + symbol.start..target.start + symbol.end;
         if let Some(bytes) = text.source_range(markdown_range) {
             index
                 .references
@@ -579,14 +572,34 @@ fn collect_mapped_m2_references(
     }
 }
 
-/// Collects legacy backtick snippets from the supplied syntax and semantic context.
+/// Visits raw strings that may contain legacy documentation snippets.
+struct LegacySnippets<'a, Source: ?Sized> {
+    /// Source coordinates of the current revision.
+    source: &'a Source,
+    /// Documentation being collected.
+    index: &'a mut DocumentationIndex,
+}
+
+impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for LegacySnippets<'_, Source> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if matches!(expression, Expr::Literal(ExprLiteral::RawString(_))) {
+            if let Some(bytes) = self.source.syntax_bytes(expression) {
+                collect_legacy_backtick_snippets(bytes, self.source, self.index);
+            }
+        }
+        visit::visit_expr(self, expression);
+    }
+}
+
+/// Collects legacy backtick snippets from one raw string's source range.
 fn collect_legacy_backtick_snippets(
-    node: SyntaxNode<'_>,
+    range: ByteRange,
     source: &(impl SourceNavigation + ?Sized),
-    parser: &mut SyntaxParser,
     index: &mut DocumentationIndex,
 ) {
-    let container = node.text();
+    let Some(container) = source.text().get(range.clone()) else {
+        return;
+    };
     let bytes = container.as_bytes();
     let mut cursor = 0;
     while cursor < bytes.len() {
@@ -611,37 +624,48 @@ fn collect_legacy_backtick_snippets(
         if candidate.trim().is_empty() || candidate.contains(['`', '\n', '\r']) {
             continue;
         }
-        let source_start = node.start_byte() + content_start;
-        let Some(root) = parser.parse(candidate) else {
-            continue;
-        };
+        let source_start = range.start + content_start;
         index
             .references
-            .extend(root.binding_references().map(|symbol| {
-                SymbolMention::new(source.span_for_bytes(
-                    source_start + symbol.start_byte()..source_start + symbol.end_byte(),
-                ))
+            .extend(snippet_binding_ranges(candidate).into_iter().map(|symbol| {
+                SymbolMention::new(
+                    source.span_for_bytes(source_start + symbol.start..source_start + symbol.end),
+                )
             }));
         index.snippets.push(DocumentationSnippet {
-            bytes: source_start..node.start_byte() + close,
+            bytes: source_start..range.start + close,
         });
     }
 }
 
+/// Binding-reference ranges in a standalone documentation code fragment.
+fn snippet_binding_ranges(text: &str) -> Vec<ByteRange> {
+    let syntax = crate::node_metadata::SyntaxSnapshot::parse(text, None);
+    let mut source = DocumentSource::new(text.to_owned());
+    source.register_syntax(&syntax);
+    let mut references = BindingReferences::default();
+    syntax.visit(&mut references);
+    references
+        .0
+        .into_iter()
+        .filter_map(|symbol| source.syntax_bytes(symbol))
+        .collect()
+}
+
 /// Bindings, assignments, or installations to which this documented source item contributes.
 fn targets_for_item(
-    item: SyntaxNode<'_>,
+    item: &ListItem<'_>,
     source: &(impl SourceNavigation + ?Sized),
     analysis: &Analysis,
 ) -> Vec<DocumentationTarget> {
-    let Some(assignment) = first_item_expression(item).filter(SyntaxNode::is_assignment) else {
+    let Expr::Assign(assignment) = item.expression else {
         return Vec::new();
     };
-    let Some(target) = assignment.binary_parts().map(|parts| parts.left) else {
+    let Some(target) = assignment.parts().target.bytes(source) else {
         return Vec::new();
     };
-    let assignment_range = source.range_for_node(assignment);
-    let target_range = source.range_for_node(target);
+    let assignment_range = source.range_for_bytes(item.bytes.clone());
+    let target_range = source.range_for_bytes(target);
     let mut targets = Vec::new();
     for fact in analysis
         .assignment_facts()
@@ -682,30 +706,11 @@ fn targets_for_item(
     targets
 }
 
-/// Unwraps a source item to its first meaningful expression.
-fn first_item_expression(mut item: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
-    while item.is_source_cell() {
-        let next = {
-            let mut children = item.named_children();
-            children.find(|child| !child.is_comment())
-        }?;
-        item = next;
-    }
-    Some(item)
-}
-
-/// Whether this node is a new package declaration.
-fn is_new_package_declaration(item: SyntaxNode<'_>) -> bool {
-    let Some(application) = first_item_expression(item) else {
-        return false;
-    };
-    if !application.is_space_application() {
-        return false;
-    }
-    application
-        .binary_parts()
-        .map(|parts| parts.left)
-        .is_some_and(|callee| callee.is::<Symbol>() && callee.text() == "newPackage")
+/// Whether this expression is a new package declaration.
+fn is_new_package_declaration(item: &Expr) -> bool {
+    matches!(item,
+        Expr::Op(m2_syn::nodes::ExprOp::Bin(m2_syn::nodes::ExprOpBin::Adj(call)))
+            if call.left_operand.symbol_name() == Some(Macaulay2Conventions::PACKAGE_CONSTRUCTOR))
 }
 
 /// Tests whether the outer source range covers the complete inner range.
@@ -713,76 +718,296 @@ fn range_contains(outer: TextRange, inner: TextRange) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 
-/// Finds the source item documented by a preceding comment.
-fn following_item(comment: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
-    let parent = comment.parent()?;
-    let mut found = false;
-    for sibling in parent.named_children() {
-        if found && !sibling.is_comment() {
-            return Some(sibling);
-        }
-        found |= sibling.id() == comment.id();
-    }
-    None
-}
-
-/// Whether a comment is the first meaningful content of its enclosing construct.
-fn is_first_content(comment: SyntaxNode<'_>, parent: SyntaxNode<'_>) -> bool {
-    parent
-        .named_children()
-        .take_while(|child| child.id() != comment.id())
-        .all(|child| child.is_comment())
-}
-
-/// Finds scope target in the enclosing source constructs.
+/// The binding whose function body or scoped value is the list a block comment opens.
 fn enclosing_scope_target(
-    comment: SyntaxNode<'_>,
-    parent: SyntaxNode<'_>,
+    owner: &ListOwner,
     source: &(impl SourceNavigation + ?Sized),
     analysis: &Analysis,
 ) -> Option<DocumentationTarget> {
-    for owner in comment.ancestors() {
-        let owner_range = source.range_for_node(owner);
-        let Some(scope_idx) = analysis.scope_with_range(owner_range) else {
-            continue;
-        };
-        let owns_parent = owner.id() == parent.id()
-            || owner
-                .lambda_body()
-                .is_some_and(|body| body.id() == parent.id());
-        if owns_parent {
-            return analysis
-                .binding_states()
-                .find(|binding| {
-                    binding.role == BindingRole::Ordinary
-                        && binding.state.value_range == Some(owner_range)
-                        && binding.state.scope_idx != scope_idx
-                })
-                .map(|binding| DocumentationTarget::Binding {
-                    binding_id: binding.binding_id,
-                    state_span: binding.state.span,
-                    name: binding.name.clone(),
-                });
-        }
+    let ListOwner::Delimited { expression, lambda } = owner else {
         return None;
+    };
+    let own_range = source.range_for_bytes(expression.clone());
+    let (owner_range, scope_idx) = match analysis.scope_with_range(own_range) {
+        Some(scope_idx) => (own_range, scope_idx),
+        None => {
+            let lambda_range = source.range_for_bytes(lambda.clone()?);
+            (lambda_range, analysis.scope_with_range(lambda_range)?)
+        }
+    };
+    analysis
+        .binding_states()
+        .find(|binding| {
+            binding.role == BindingRole::Ordinary
+                && binding.state.value_range == Some(owner_range)
+                && binding.state.scope_idx != scope_idx
+        })
+        .map(|binding| DocumentationTarget::Binding {
+            binding_id: binding.binding_id,
+            state_span: binding.state.span,
+            name: binding.name.clone(),
+        })
+}
+
+/// A comment retained as trivia, in document coordinates.
+#[derive(Debug, Clone)]
+struct Comment<'a> {
+    /// Whether this is a line or a block comment.
+    kind: TriviaKind,
+    /// Extent of the comment in the document.
+    bytes: ByteRange,
+    /// Comment source text, including its markers.
+    text: &'a str,
+}
+
+impl Comment<'_> {
+    /// Whether the comment occupies the whole visible content of its source line.
+    fn takes_full_line(&self, source: &str) -> bool {
+        let line_start = source[..self.bytes.start]
+            .rfind('\n')
+            .map_or(0, |end| end + 1);
+        source[line_start..self.bytes.start].trim().is_empty()
     }
-    None
 }
 
-/// Whether a comment occupies the whole visible content of its source line.
-fn takes_full_line(comment: SyntaxNode<'_>, source: &str) -> bool {
-    let column = comment.start_position().column;
-    comment
-        .start_byte()
-        .checked_sub(column)
-        .is_some_and(|line_start| source[line_start..comment.start_byte()].trim().is_empty())
+/// A comment together with the statement list it sits directly in.
+struct CommentSite<'a> {
+    /// The comment.
+    comment: Comment<'a>,
+    /// Index of the innermost statement list containing the comment.
+    list: usize,
 }
 
-/// Whether both syntax nodes share the same enclosing navigation node.
-fn same_parent(left: SyntaxNode<'_>, right: SyntaxNode<'_>) -> bool {
-    left.parent()
-        .zip(right.parent())
-        .is_some_and(|(left, right)| left.id() == right.id())
+/// One expression in a statement list.
+struct ListItem<'ast> {
+    /// Extent of the expression in the document.
+    bytes: ByteRange,
+    /// The generated expression.
+    expression: &'ast Expr,
+}
+
+/// What a statement list belongs to.
+enum ListOwner {
+    /// The sequence of top-level cells.
+    Document,
+    /// A parenthesized or bracketed expression.
+    Delimited {
+        /// Extent of the delimited expression.
+        expression: ByteRange,
+        /// Extent of the function literal this expression is the body of.
+        lambda: Option<ByteRange>,
+    },
+}
+
+/// Ordered expressions that comments can document.
+struct ItemList<'ast> {
+    /// Extent enclosed by the list.
+    bytes: ByteRange,
+    /// Expressions in source order.
+    items: Vec<ListItem<'ast>>,
+    /// Construct the list belongs to.
+    owner: ListOwner,
+}
+
+/// Every statement list of a document; the document-level list comes first.
+struct ItemLists<'ast> {
+    /// The document list followed by delimited lists in visiting order.
+    lists: Vec<ItemList<'ast>>,
+}
+
+impl<'ast> ItemLists<'ast> {
+    /// Gathers the document list and every delimited list in the snapshot.
+    fn collect(source: &(impl SourceNavigation + ?Sized), syntax: &'ast SyntaxSnapshot) -> Self {
+        let document_items = syntax
+            .cells()
+            .iter()
+            .filter_map(|cell| cell.syntax())
+            .flat_map(|cell| cell.content.arguments())
+            .flatten()
+            .filter_map(|expression| ListItem::of(expression, source))
+            .collect();
+        let mut collector = ListCollector {
+            source,
+            ancestors: Vec::new(),
+            lists: vec![ItemList {
+                bytes: 0..source.text().len(),
+                items: document_items,
+                owner: ListOwner::Document,
+            }],
+        };
+        syntax.visit(&mut collector);
+        Self {
+            lists: collector.lists,
+        }
+    }
+
+    /// Comments of the snapshot that sit between the items of their innermost list.
+    fn comment_sites<'text>(
+        &self,
+        source: &'text (impl SourceNavigation + ?Sized),
+        syntax: &SyntaxSnapshot,
+    ) -> Vec<CommentSite<'text>> {
+        let mut sites = syntax
+            .cells()
+            .iter()
+            .flat_map(|cell| cell.trivia())
+            .flat_map(|trivia| self.sites_of(trivia, source))
+            .collect::<Vec<_>>();
+        sites.sort_by_key(|site| site.comment.bytes.start);
+        sites
+    }
+
+    /// Places each comment line of one trivia in its innermost list, skipping
+    /// those that sit inside an item.
+    ///
+    /// Lexing merges adjacent line comments into one trivia; they are documented
+    /// and attached line by line.
+    fn sites_of<'text>(
+        &self,
+        trivia: &Trivia,
+        source: &'text (impl SourceNavigation + ?Sized),
+    ) -> Vec<CommentSite<'text>> {
+        let Some(bytes) = source.syntax_bytes(trivia) else {
+            return Vec::new();
+        };
+        let Some((list, innermost)) = self
+            .lists
+            .iter()
+            .enumerate()
+            .filter(|(_, list)| list.bytes.start <= bytes.start && bytes.end <= list.bytes.end)
+            .min_by_key(|(_, list)| list.bytes.len())
+        else {
+            return Vec::new();
+        };
+        if innermost
+            .items
+            .iter()
+            .any(|item| item.bytes.start <= bytes.start && bytes.end <= item.bytes.end)
+        {
+            return Vec::new();
+        }
+        let text = &source.text()[bytes.clone()];
+        let comment = |kind, bytes: ByteRange| CommentSite {
+            comment: Comment {
+                kind,
+                text: &source.text()[bytes.clone()],
+                bytes,
+            },
+            list,
+        };
+        match trivia.kind() {
+            TriviaKind::BlockComment => vec![comment(TriviaKind::BlockComment, bytes)],
+            _ => {
+                let mut offset = bytes.start;
+                text.split_inclusive('\n')
+                    .map(|line| {
+                        let line_bytes = offset..offset + line.trim_end_matches(['\n', '\r']).len();
+                        offset += line.len();
+                        comment(TriviaKind::LineComment, line_bytes)
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// The first item starting after the comment, in the comment's own list.
+    fn following_item(&self, site: &CommentSite<'_>) -> Option<&ListItem<'ast>> {
+        self.lists[site.list]
+            .items
+            .iter()
+            .find(|item| item.bytes.start >= site.comment.bytes.end)
+    }
+}
+
+impl<'ast> ListItem<'ast> {
+    /// The item for an expression, absent when its extent is not registered.
+    fn of(expression: &'ast Expr, source: &(impl SourceNavigation + ?Sized)) -> Option<Self> {
+        Some(Self {
+            bytes: source.syntax_bytes(expression)?,
+            expression,
+        })
+    }
+}
+
+/// Collects the statement list of every delimited expression.
+struct ListCollector<'a, 'ast, Source: ?Sized> {
+    /// Source coordinates of the current revision.
+    source: &'a Source,
+    /// Expressions enclosing the one being visited, outermost first.
+    ancestors: Vec<&'ast Expr>,
+    /// Lists found so far.
+    lists: Vec<ItemList<'ast>>,
+}
+
+impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for ListCollector<'_, 'ast, Source> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if let (Some(items), Some(bytes)) = (
+            delimited_items(expression),
+            self.source.syntax_bytes(expression),
+        ) {
+            let lambda = match self.ancestors.last() {
+                Some(Expr::Lambda(lambda)) if std::ptr::eq(lambda.body(), expression) => self
+                    .ancestors
+                    .last()
+                    .and_then(|parent| self.source.syntax_bytes(*parent)),
+                _ => None,
+            };
+            self.lists.push(ItemList {
+                items: items
+                    .into_iter()
+                    .filter_map(|item| ListItem::of(item, self.source))
+                    .collect(),
+                owner: ListOwner::Delimited {
+                    expression: bytes.clone(),
+                    lambda,
+                },
+                bytes,
+            });
+        }
+        self.ancestors.push(expression);
+        visit::visit_expr(self, expression);
+        self.ancestors.pop();
+    }
+}
+
+/// Statement and trailing expressions of a delimited expression, in source order.
+fn delimited_items(expression: &Expr) -> Option<Vec<&Expr>> {
+    fn items<'ast>(
+        statements: &'ast [Statement],
+        elements: &'ast Option<PackedContent>,
+    ) -> Vec<&'ast Expr> {
+        statements
+            .iter()
+            .map(|statement| &statement.content)
+            .chain(elements)
+            .flat_map(|content| content.arguments())
+            .flatten()
+            .collect()
+    }
+    match expression {
+        Expr::Holder(holder) => Some(
+            holder
+                .muted
+                .iter()
+                .flat_map(|statement| statement.content.arguments())
+                .flatten()
+                .chain(holder.value.as_deref())
+                .collect(),
+        ),
+        Expr::Collection(ExprCollection::Array(node)) => {
+            Some(items(&node.statements, &node.elements))
+        }
+        Expr::Collection(ExprCollection::List(node)) => {
+            Some(items(&node.statements, &node.elements))
+        }
+        Expr::Collection(ExprCollection::Sequence(node)) => {
+            Some(items(&node.statements, &node.elements))
+        }
+        Expr::Collection(ExprCollection::AngleBar(node)) => {
+            Some(items(&node.statements, &node.elements))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

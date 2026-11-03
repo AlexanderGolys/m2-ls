@@ -1,9 +1,57 @@
 //! Macaulay2's two string literal forms, read into and written from the
 //! strings they denote.
 
-use m2_syn::nodes::{RawStringLiteral, StringLiteral};
+use m2_syn::nodes::{Expr, ExprLiteral};
+use m2_syn::Spanned;
 
-use crate::node_metadata::SyntaxNode;
+use crate::source::{ByteRange, SourceNavigation};
+
+/// Source contents of a generated string literal, excluding its delimiters.
+pub trait LiteralSource {
+    /// Returns the contents only when both delimiters and source provenance are present.
+    fn literal_content_bytes(&self, source: &(impl SourceNavigation + ?Sized))
+        -> Option<ByteRange>;
+
+    /// The original contents, retaining escape spelling.
+    fn literal_source<'source>(
+        &self,
+        source: &'source (impl SourceNavigation + ?Sized),
+    ) -> Option<&'source str> {
+        source.text().get(self.literal_content_bytes(source)?)
+    }
+}
+
+impl LiteralSource for Expr {
+    fn literal_content_bytes(
+        &self,
+        source: &(impl SourceNavigation + ?Sized),
+    ) -> Option<ByteRange> {
+        let (width, last): (usize, Option<&dyn Spanned>) = match self {
+            Expr::Literal(ExprLiteral::String(literal)) => (
+                1,
+                literal
+                    .elements
+                    .last()
+                    .map(|element| element as &dyn Spanned),
+            ),
+            Expr::Literal(ExprLiteral::RawString(literal)) => (
+                3,
+                literal
+                    .elements
+                    .last()
+                    .map(|element| element as &dyn Spanned),
+            ),
+            _ => return None,
+        };
+        let bytes = source.syntax_bytes(self)?;
+        let start = bytes.start.checked_add(width)?;
+        let end = match last {
+            Some(element) => source.syntax_bytes(element)?.end,
+            None => start,
+        };
+        (end.checked_add(width)? == bytes.end && start <= end).then_some(start..end)
+    }
+}
 
 /// The radix of an escape writing a byte by octal code, `\101`.
 const OCTAL_RADIX: u32 = 8;
@@ -27,14 +75,12 @@ pub enum StringDelimiter {
 }
 
 impl StringDelimiter {
-    /// The delimiter of the string literal `node`.
-    pub fn of(node: SyntaxNode<'_>) -> Option<Self> {
-        if node.is::<StringLiteral>() {
-            Some(Self::Quote)
-        } else if node.is::<RawStringLiteral>() {
-            Some(Self::TripleSlash)
-        } else {
-            None
+    /// The delimiter of a generated literal expression.
+    pub fn of_expression(expression: &Expr) -> Option<Self> {
+        match expression {
+            Expr::Literal(ExprLiteral::String(_)) => Some(Self::Quote),
+            Expr::Literal(ExprLiteral::RawString(_)) => Some(Self::TripleSlash),
+            _ => None,
         }
     }
 

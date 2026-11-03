@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use m2_syn::visit::Visit;
 use strum::IntoEnumIterator;
 
 use tower_lsp::lsp_types::Position;
@@ -22,7 +23,7 @@ use super::{DiagnosticSink, DocumentationContext};
 use crate::diagnostics::{catalog, Finding};
 use crate::file_load::FileLoad;
 use crate::macaulay2::Macaulay2Conventions;
-use crate::node_metadata::SyntaxNode;
+use crate::node_metadata::ParsedCell;
 use crate::object_registry::ObjectName;
 use crate::package_documentation::{
     DocumentOption, DocumentTag, DocumentationFault, DocumentationFaultKind, DocumentationKey,
@@ -31,6 +32,7 @@ use crate::package_documentation::{
 use crate::package_index::collect_imported_packages_in_tree;
 use crate::source::SourceNavigation;
 use crate::source_package::PackageDeclaration;
+use crate::syntax::{Applications, BindingReferences, ExpressionSyntax};
 
 /// The package that defines `doc` and the other SimpleDoc functions, which
 /// `beginDocumentation()` loads last.
@@ -227,12 +229,11 @@ fn documentation_outside_package(context: &DocumentationContext, sink: &mut Diag
 /// Report `doc` called in a package section before SimpleDoc is loaded there,
 /// by `beginDocumentation()` or by importing it.
 fn documentation_before_begin(context: &DocumentationContext, sink: &mut DiagnosticSink) {
-    let simple_doc_loads =
-        collect_imported_packages_in_tree(context.root, context.syntax, context.source)
-            .into_iter()
-            .filter(|import| import.package.name() == SIMPLE_DOC_PACKAGE)
-            .map(|import| import.effective_from)
-            .collect::<Vec<_>>();
+    let simple_doc_loads = collect_imported_packages_in_tree(context.syntax, context.source)
+        .into_iter()
+        .filter(|import| import.package.name() == SIMPLE_DOC_PACKAGE)
+        .map(|import| import.effective_from)
+        .collect::<Vec<_>>();
     for call in context.documentation.simple_doc_functions() {
         let Some(declaration) = context.packages.declaration_at(call.start) else {
             continue;
@@ -273,8 +274,8 @@ struct PackageFile<'context> {
 
 impl<'context> PackageFile<'context> {
     /// Builds the documentation-check context from the analyzed document and its loaded packages.
-    fn read(context: &DocumentationContext<'context, 'context>) -> Self {
-        let loads = FileLoad::collect(context.root, context.syntax, context.source)
+    fn read(context: &DocumentationContext<'context>) -> Self {
+        let loads = FileLoad::collect(context.syntax, context.source)
             .into_iter()
             .map(|load| load.call)
             .collect::<Vec<_>>();
@@ -291,19 +292,31 @@ impl<'context> PackageFile<'context> {
                 .iter()
                 .any(|node| node.range.start <= position && position <= node.range.end)
         };
-        let code_symbols = context
-            .root
-            .binding_references()
-            .filter(|symbol| !in_documentation(context.source.position_for_node(*symbol)))
-            .map(|symbol: SyntaxNode<'context>| symbol.text())
-            .collect();
-        let begin_documentation = context
-            .root
-            .descendants()
-            .filter(|call| {
-                call.applied_symbol_name() == Some(Macaulay2Conventions::BEGIN_DOCUMENTATION)
+        let mut references = BindingReferences::default();
+        let mut applications = Applications::default();
+        for cell in context.syntax.cells().iter().filter_map(ParsedCell::syntax) {
+            references.visit_cell(cell);
+            applications.visit_cell(cell);
+        }
+        let code_symbols = references
+            .0
+            .into_iter()
+            .filter(|symbol| {
+                context
+                    .source
+                    .position_for_syntax(*symbol)
+                    .is_some_and(|position| !in_documentation(position))
             })
-            .map(|call| context.source.range_for_node(call).end)
+            .map(|symbol| symbol.text())
+            .collect();
+        let begin_documentation = applications
+            .0
+            .into_iter()
+            .filter(|call| {
+                call.left_operand.symbol_name() == Some(Macaulay2Conventions::BEGIN_DOCUMENTATION)
+            })
+            .filter_map(|call| context.source.range_for_syntax(call))
+            .map(|range| range.end)
             .collect();
         Self {
             self_contained,

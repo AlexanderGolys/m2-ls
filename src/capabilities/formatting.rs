@@ -12,23 +12,25 @@
 use std::collections::VecDeque;
 
 use m2_syn::nodes::{
-    ElseClause, ExprFor as ForLoop, ExprIf as IfStatement, ExprLambda as LambdaExpression,
-    ExprTry as TryStatement, ExprWhile as WhileLoop, FloatLiteral, IntegerLiteral, List, LoopBody,
-    RawStringLiteral, Sequence, StringLiteral, Symbol, ThenClause,
+    Component, ElseClause, Expr, ExprFor as ForLoop, ExprIf as IfStatement,
+    ExprTry as TryStatement, ExprWhile as WhileLoop, List, LoopBody, PackedContent, Sequence,
+    Symbol, ThenClause,
 };
-use m2_syn::Token;
+use m2_syn::visit::{self, Visit};
+use m2_syn::{Delimiter, DelimiterValue, Token};
 use tower_lsp::lsp_types::{
     DocumentFormattingOptions, FoldingRange, FoldingRangeKind, FoldingRangeProviderCapability,
     OneOf, TextEdit,
 };
 
 use crate::document::DocumentSnapshot;
-use crate::node_metadata::{matches_token, SyntaxNode, SyntaxParser};
+use crate::node_metadata::{matches_token, SyntaxSnapshot};
 
 mod layout;
 use crate::settings::FormattingSettings;
-use crate::source::SourceNavigation;
-use layout::{LayoutNode, LayoutSource};
+use crate::source::{SourceNavigation, SyntaxSource};
+use crate::syntax::{AssignmentSyntax, ExpressionSyntax};
+use layout::LayoutSource;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -140,7 +142,7 @@ pub fn document_formatting_text_edits(
 ) -> Vec<TextEdit> {
     let text = source.text();
     let options = FormatOptions::from_settings(tab_size, insert_spaces, settings);
-    let formatted = format_document_with_options(source.root_node(), &options);
+    let formatted = format_document_with_options(source.syntax(), &options);
     if formatted == text {
         return Vec::new();
     }
@@ -152,8 +154,8 @@ pub fn document_formatting_text_edits(
 }
 
 /// Foldable code, literal, and comment regions derived from the document syntax.
-pub fn folding_ranges(root: SyntaxNode<'_>) -> Vec<FoldingRange> {
-    folding_ranges_for_syntax(root)
+pub fn folding_ranges(syntax: &SyntaxSnapshot) -> Vec<FoldingRange> {
+    folding_ranges_for_syntax(syntax)
         .into_iter()
         .map(|range| FoldingRange {
             start_line: range.start_line,
@@ -180,8 +182,8 @@ struct FormatEdit {
 /// Format the whole document: whitespace normalization around operators and
 /// punctuation, tree-derived indentation, and width-based wrapping at parsed
 /// syntax boundaries.
-pub fn format_document_with_options(root: SyntaxNode<'_>, options: &FormatOptions) -> String {
-    formatted_layout(root, options).into_text()
+pub fn format_document_with_options(syntax: &SyntaxSnapshot, options: &FormatOptions) -> String {
+    formatted_layout(syntax, options).into_text()
 }
 
 /// Format a replacement in its surrounding syntax, returning only the changed
@@ -201,21 +203,15 @@ pub(super) fn format_action_edit(
     let end = bytes.start + edit.new_text.len();
     let mut text = source.text().to_string();
     text.replace_range(bytes.clone(), &edit.new_text);
-    let Some(mut parser) = SyntaxParser::new() else {
-        return;
-    };
-    let Some(tree) = parser.parse_tree(&text, Some(source.syntax_tree())) else {
-        return;
-    };
-    let layout = formatted_layout(tree.root(&text), options);
+    let syntax = SyntaxSnapshot::parse(&text, Some(source.syntax()));
+    let layout = formatted_layout(&syntax, options);
     edit.new_text = layout.text_for_bytes(bytes.start..end).to_string();
 }
 
 /// Runs the ordered whitespace passes against one immutable syntax snapshot.
-fn formatted_layout(root: SyntaxNode<'_>, options: &FormatOptions) -> LayoutSource {
-    let root = root.root();
-    let newline = detect_line_ending(root.source_text());
-    let mut layout = LayoutSource::new(root);
+fn formatted_layout(syntax: &SyntaxSnapshot, options: &FormatOptions) -> LayoutSource {
+    let newline = detect_line_ending(syntax.source());
+    let mut layout = LayoutSource::new(syntax);
     let mut passes = VecDeque::from([
         FormatPass::Spacing,
         FormatPass::LeadingOperators,
@@ -231,16 +227,17 @@ fn formatted_layout(root: SyntaxNode<'_>, options: &FormatOptions) -> LayoutSour
         passes.retain(|pass| !pass.moves_line_breaks());
     }
     while let Some(pass) = passes.pop_front() {
-        let node = LayoutNode::new(root, &layout);
         let edits = match pass {
-            FormatPass::Spacing => normalize_whitespace(node, options),
-            FormatPass::LeadingOperators => lead_rows_with_operators(node, options, newline),
-            FormatPass::Options => break_option_tables(node, newline),
-            FormatPass::EmptyBodies => inline_empty_bodies(node),
-            FormatPass::ControlFlow => format_control_flow(node, options, newline),
-            FormatPass::Indent => reindent_from_tree(node, options),
-            FormatPass::Wrap => wrap_long_lines(node, options, newline),
-            FormatPass::Closers => separate_line_end_bracket_closers(node, newline),
+            FormatPass::Spacing => normalize_whitespace(syntax, &layout, options),
+            FormatPass::LeadingOperators => {
+                lead_rows_with_operators(syntax, &layout, options, newline)
+            }
+            FormatPass::Options => break_option_tables(syntax, &layout, newline),
+            FormatPass::EmptyBodies => inline_empty_bodies(syntax, &layout),
+            FormatPass::ControlFlow => format_control_flow(syntax, &layout, options, newline),
+            FormatPass::Indent => reindent_from_syntax(syntax, &layout, options),
+            FormatPass::Wrap => wrap_long_lines(syntax, &layout, options, newline),
+            FormatPass::Closers => separate_line_end_bracket_closers(syntax, &layout, newline),
         };
         if layout.apply(edits) && matches!(pass, FormatPass::Wrap) {
             passes.push_front(FormatPass::Wrap);
@@ -284,42 +281,75 @@ impl FormatPass {
 
 /// Separates line end bracket closers by inserting whitespace at permitted source boundaries.
 fn separate_line_end_bracket_closers(
-    root: LayoutNode<'_>,
+    syntax: &SyntaxSnapshot,
+    layout: &LayoutSource,
     newline: &'static str,
 ) -> Vec<FormatEdit> {
-    let text = root.source_text();
-    let mut edits = Vec::new();
-    for node in root
-        .descendants()
-        .filter(LayoutNode::is_delimited_expression)
-    {
-        let children = node.children().collect::<Vec<_>>();
-        let (Some(opener), Some(closer)) = (children.first(), children.last()) else {
-            continue;
+    let mut visitor = ClosingDelimiterBreaks {
+        layout,
+        newline,
+        edits: Vec::new(),
+    };
+    syntax.visit(&mut visitor);
+    visitor.edits
+}
+
+/// Separates typed closing delimiters from content when the opener ends a line.
+struct ClosingDelimiterBreaks<'a> {
+    /// Current source coordinate mapping.
+    layout: &'a LayoutSource,
+    /// Line ending of the document.
+    newline: &'static str,
+    /// Whitespace replacements discovered so far.
+    edits: Vec<FormatEdit>,
+}
+
+impl ClosingDelimiterBreaks<'_> {
+    /// Applies the layout rule to one generated delimiter pair.
+    fn consider(&mut self, delimiter: Delimiter) {
+        let Some(opener) = self.layout.syntax_range(&delimiter.opening_span()) else {
+            return;
         };
-        if opener.is_missing()
-            || closer.is_missing()
-            || !opener.is_opening_delimiter()
-            || !closer.is_closing_delimiter()
-            || opener.start_position().row >= closer.start_position().row
-            || !text[opener.end_byte()..]
+        let Some(closer) = delimiter
+            .closing_span()
+            .and_then(|span| self.layout.syntax_range(&span))
+        else {
+            return;
+        };
+        let text = self.layout.text();
+        if self.layout.point_for_byte(opener.start).row
+            >= self.layout.point_for_byte(closer.start).row
+            || !text[opener.end..]
                 .split(['\n', '\r'])
                 .next()
                 .is_some_and(|suffix| suffix.bytes().all(|byte| matches!(byte, b' ' | b'\t')))
         {
-            continue;
+            return;
         }
-        let Some(start_byte) = same_line_horizontal_whitespace_start(text, closer.start_byte())
-        else {
-            continue;
+        let Some(start_byte) = same_line_horizontal_whitespace_start(text, closer.start) else {
+            return;
         };
-        edits.push(FormatEdit {
+        self.edits.push(FormatEdit {
             start_byte,
-            end_byte: closer.start_byte(),
-            replacement: newline.to_string(),
+            end_byte: closer.start,
+            replacement: self.newline.to_string(),
         });
     }
-    edits
+}
+
+impl<'ast> Visit<'ast> for ClosingDelimiterBreaks<'_> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        let delimiter = expression.delimiter();
+        if let Some(delimiter) = delimiter {
+            self.consider(delimiter);
+        }
+        visit::visit_expr(self, expression);
+    }
+
+    fn visit_assignment_list(&mut self, list: &'ast m2_syn::nodes::AssignmentList) {
+        self.consider(list.contents.delimiter.delimiter());
+        visit::visit_assignment_list(self, list);
+    }
 }
 
 /// Lays out every hash-table construction, a `{…}` list of at least two
@@ -332,36 +362,52 @@ fn separate_line_end_bracket_closers(
 ///     y => 2
 /// }
 /// ```
-fn break_option_tables(root: LayoutNode<'_>, newline: &'static str) -> Vec<FormatEdit> {
-    let text = root.source_text();
-    let mut edits = Vec::new();
-    for table in root.descendants().filter(|node| is_option_table(*node)) {
-        let children = table.children().collect::<Vec<_>>();
-        for pair in children.windows(2) {
-            let [before, after] = pair else {
-                continue;
-            };
-            if before.is_opening_delimiter() || before.is_comma() || after.is_closing_delimiter() {
-                push_line_break_between(
-                    text,
-                    before.end_byte(),
-                    after.start_byte(),
-                    newline,
-                    &mut edits,
-                );
-            }
-        }
-    }
-    edits
+fn break_option_tables(
+    syntax: &SyntaxSnapshot,
+    layout: &LayoutSource,
+    newline: &'static str,
+) -> Vec<FormatEdit> {
+    let mut visitor = OptionTableBreaks {
+        layout,
+        newline,
+        edits: Vec::new(),
+    };
+    syntax.visit(&mut visitor);
+    visitor.edits
 }
 
-/// Whether `node` is a `{…}` list of at least two elements, all options.
-fn is_option_table(node: LayoutNode<'_>) -> bool {
-    if !node.is::<List>() {
-        return false;
+/// Adds breaks around the entries of typed option tables.
+struct OptionTableBreaks<'a> {
+    /// Current whitespace coordinates.
+    layout: &'a LayoutSource,
+    /// Line ending used by this document.
+    newline: &'static str,
+    /// Whitespace replacements gathered from visited lists.
+    edits: Vec<FormatEdit>,
+}
+
+impl<'ast> Visit<'ast> for OptionTableBreaks<'_> {
+    fn visit_list(&mut self, list: &'ast List) {
+        if let Some(PackedContent::Pack(pack)) = &list.elements {
+            if pack.pack.iter().all(|component| matches!(component, Component::Expr(value) if matches!(value.as_ref(), Expr::Option(_)))) {
+                let delimiter = list.delimiter.delimiter();
+                let first = list.statements.first().and_then(|statement| self.layout.syntax_range(statement)).or_else(|| self.layout.syntax_range(pack.pack.first()));
+                let opening = self.layout.syntax_range(&delimiter.opening_span());
+                let closing = delimiter.closing_span().and_then(|span| self.layout.syntax_range(&span));
+                let last = pack.pack.iter().last().and_then(|component| self.layout.syntax_range(component));
+                if let (Some(opening), Some(first), Some(last), Some(closing)) = (opening, first, last, closing) {
+                    push_line_break_between(self.layout.text(), opening.end, first.start, self.newline, &mut self.edits);
+                    for (comma, component) in pack.pack.pairs() {
+                        if let (Some(comma), Some(component)) = (self.layout.syntax_range(comma), self.layout.syntax_range(component)) {
+                            push_line_break_between(self.layout.text(), comma.end, component.start, self.newline, &mut self.edits);
+                        }
+                    }
+                    push_line_break_between(self.layout.text(), last.end, closing.start, self.newline, &mut self.edits);
+                }
+            }
+        }
+        visit::visit_list(self, list);
     }
-    let elements = node.collection_elements().collect::<Vec<_>>();
-    elements.len() >= 2 && elements.iter().all(LayoutNode::is_option_assignment)
 }
 
 /// Replaces the horizontal whitespace between two tokens on one line, possibly
@@ -408,318 +454,447 @@ fn detect_line_ending(text: &str) -> &'static str {
 ///     + third)
 /// ```
 fn lead_rows_with_operators(
-    root: LayoutNode<'_>,
+    syntax: &SyntaxSnapshot,
+    layout: &LayoutSource,
     options: &FormatOptions,
     newline: &'static str,
 ) -> Vec<FormatEdit> {
-    let text = root.source_text();
-    let mut edits = Vec::new();
-    for expression in root.descendants() {
-        let Some((parts, operator)) = expression.binary_parts().zip(expression.operator_node())
-        else {
-            continue;
-        };
-        if !breaks_before_operator(operator, options.compact_factor_operators) {
-            continue;
-        }
-        let before = &text[parts.left.end_byte()..operator.start_byte()];
-        let after = &text[operator.end_byte()..parts.right.start_byte()];
-        let dangles = before.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
-            && after.bytes().all(|byte| byte.is_ascii_whitespace())
-            && after.contains('\n');
-        if dangles {
-            edits.push(FormatEdit {
-                start_byte: parts.left.end_byte(),
-                end_byte: operator.start_byte(),
-                replacement: newline.to_string(),
-            });
-            edits.push(FormatEdit {
-                start_byte: operator.end_byte(),
-                end_byte: parts.right.start_byte(),
-                replacement: " ".to_string(),
-            });
-        }
+    let mut visitor = LeadingOperators {
+        layout,
+        options,
+        newline,
+        depth: 0,
+        edits: Vec::new(),
+    };
+    syntax.visit(&mut visitor);
+    visitor.edits
+}
+
+/// Moves eligible typed binary operators to the start of continuation lines.
+struct LeadingOperators<'a> {
+    /// Current whitespace coordinates.
+    layout: &'a LayoutSource,
+    /// Formatting choices controlling factor operators.
+    options: &'a FormatOptions,
+    /// Document line ending.
+    newline: &'static str,
+    /// Number of enclosing delimited expressions.
+    depth: usize,
+    /// Collected whitespace edits.
+    edits: Vec<FormatEdit>,
+}
+
+impl<'ast> Visit<'ast> for LeadingOperators<'_> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        let delimited = expression.delimiter().is_some();
+        self.depth += usize::from(delimited);
+        visit::visit_expr(self, expression);
+        self.depth -= usize::from(delimited);
     }
-    edits
+
+    fn visit_assignment_list(&mut self, list: &'ast m2_syn::nodes::AssignmentList) {
+        self.depth += 1;
+        visit::visit_assignment_list(self, list);
+        self.depth -= 1;
+    }
+
+    fn visit_expr_op_bin_regular(&mut self, expression: &'ast m2_syn::nodes::ExprOpBinRegular) {
+        let spans = (
+            self.layout.syntax_range(expression.left_operand.as_ref()),
+            self.layout.syntax_range(&expression.operator),
+            self.layout.syntax_range(expression.right_operand.as_ref()),
+        );
+        if let (Some(left), Some(operator), Some(right)) = spans {
+            let text = self.layout.text();
+            if self.depth > 0
+                && left.end <= operator.start
+                && operator.end <= right.start
+                && is_spaced_line_final_operator(
+                    &text[operator.clone()],
+                    self.options.compact_factor_operators,
+                )
+            {
+                let before = &text[left.end..operator.start];
+                let after = &text[operator.end..right.start];
+                let dangles = before.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+                    && after.bytes().all(|byte| byte.is_ascii_whitespace())
+                    && after.contains('\n');
+                if dangles {
+                    self.edits.push(FormatEdit {
+                        start_byte: left.end,
+                        end_byte: operator.start,
+                        replacement: self.newline.to_string(),
+                    });
+                    self.edits.push(FormatEdit {
+                        start_byte: operator.end,
+                        end_byte: right.start,
+                        replacement: " ".to_string(),
+                    });
+                }
+            }
+        }
+        visit::visit_expr_op_bin_regular(self, expression);
+    }
 }
 
 /// Whitespace edits that keep syntactically empty bodies on a single line.
-fn inline_empty_bodies(root: LayoutNode<'_>) -> Vec<FormatEdit> {
-    let text = root.source_text();
-    let mut edits = Vec::new();
-    for body in root.descendants().filter(|node| empty_body_role(*node)) {
-        let children = body.children().collect::<Vec<_>>();
-        let (Some(opener), Some(closer)) = (children.first(), children.last()) else {
-            continue;
+fn inline_empty_bodies(syntax: &SyntaxSnapshot, layout: &LayoutSource) -> Vec<FormatEdit> {
+    let mut visitor = EmptyBodyEdits {
+        layout,
+        edits: Vec::new(),
+    };
+    syntax.visit(&mut visitor);
+    visitor.edits
+}
+
+/// Whitespace edits for empty delimited bodies in typed clause contexts.
+struct EmptyBodyEdits<'a> {
+    /// Current formatter coordinate mapping.
+    layout: &'a LayoutSource,
+    /// Collected whitespace replacements.
+    edits: Vec<FormatEdit>,
+}
+
+impl EmptyBodyEdits<'_> {
+    /// Compacts one delimited body only when its contents are whitespace.
+    fn consider(&mut self, body: &Expr) {
+        let delimiter = body.delimiter();
+        let Some(delimiter) = delimiter else {
+            return;
         };
-        if opener.is_opening_delimiter()
-            && closer.is_closing_delimiter()
-            && text[opener.end_byte()..closer.start_byte()]
+        let Some(open) = self.layout.syntax_range(&delimiter.opening_span()) else {
+            return;
+        };
+        let Some(close) = delimiter
+            .closing_span()
+            .and_then(|span| self.layout.syntax_range(&span))
+        else {
+            return;
+        };
+        if open.end <= close.start
+            && self.layout.text()[open.end..close.start]
                 .bytes()
                 .all(|byte| byte.is_ascii_whitespace())
         {
-            edits.push(FormatEdit {
-                start_byte: opener.end_byte(),
-                end_byte: closer.start_byte(),
+            self.edits.push(FormatEdit {
+                start_byte: open.end,
+                end_byte: close.start,
                 replacement: String::new(),
             });
         }
     }
-    edits
 }
 
-/// Whether this node occupies a callable or clause body eligible for empty-body compaction.
-fn empty_body_role(node: LayoutNode<'_>) -> bool {
-    if !node.is_delimited_expression() {
-        return false;
+impl<'ast> Visit<'ast> for EmptyBodyEdits<'_> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        match expression {
+            Expr::Lambda(lambda) => self.consider(crate::syntax::LambdaSyntax::body(lambda)),
+            Expr::Try(node) => self.consider(&node.value),
+            _ => {}
+        }
+        visit::visit_expr(self, expression);
     }
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    if parent.is::<LambdaExpression>() {
-        return parent
-            .lambda_body()
-            .is_some_and(|body| body.id() == node.id());
+    fn visit_then_clause(&mut self, clause: &'ast ThenClause) {
+        self.consider(&clause.expr);
+        visit::visit_then_clause(self, clause);
     }
-    if parent.is_keyword_clause() {
-        return parent
-            .named_child(0)
-            .is_some_and(|body| body.id() == node.id());
+    fn visit_else_clause(&mut self, clause: &'ast ElseClause) {
+        self.consider(&clause.expr);
+        visit::visit_else_clause(self, clause);
     }
-    if parent.is::<LoopBody>() {
-        return [parent.listed_value(), parent.ignored_value()]
-            .into_iter()
-            .flatten()
-            .any(|body| body.id() == node.id());
+    fn visit_range_bound_from(&mut self, clause: &'ast m2_syn::nodes::RangeBoundFrom) {
+        self.consider(&clause.value);
+        visit::visit_range_bound_from(self, clause);
     }
-    parent.is::<TryStatement>()
+    fn visit_range_bound_to(&mut self, clause: &'ast m2_syn::nodes::RangeBoundTo) {
+        self.consider(&clause.value);
+        visit::visit_range_bound_to(self, clause);
+    }
+    fn visit_when_condition(&mut self, clause: &'ast m2_syn::nodes::WhenCondition) {
+        self.consider(&clause.condition);
+        visit::visit_when_condition(self, clause);
+    }
+    fn visit_list_step(&mut self, clause: &'ast m2_syn::nodes::ListStep) {
+        self.consider(&clause.expr);
+        visit::visit_list_step(self, clause);
+    }
+    fn visit_do_step(&mut self, clause: &'ast m2_syn::nodes::DoStep) {
+        self.consider(&clause.statement);
+        visit::visit_do_step(self, clause);
+    }
 }
 
 /// Formats control flow using the current layout settings and source coordinates.
 fn format_control_flow(
-    root: LayoutNode<'_>,
+    syntax: &SyntaxSnapshot,
+    layout: &LayoutSource,
     options: &FormatOptions,
     newline: &'static str,
 ) -> Vec<FormatEdit> {
-    let text = root.source_text();
     if options.control_flow_layout == ControlFlowLayout::Compact {
         return Vec::new();
     }
-
-    let mut edits = Vec::new();
-    for clause in root.descendants().filter(|node| {
-        node.is::<ThenClause>()
-            || node.is::<ElseClause>()
-            || node.is_except_clause()
-            || node.is::<LoopBody>()
-    }) {
-        if !control_clause_breaks_are_parseable(clause, text) {
-            continue;
-        }
-        if clause.is::<LoopBody>() {
-            for (keyword, body) in [
-                (
-                    direct_keyword::<Token![list]>(clause),
-                    clause.listed_value(),
-                ),
-                (direct_keyword::<Token![do]>(clause), clause.ignored_value()),
-            ] {
-                let Some((keyword, body)) = keyword.zip(body) else {
-                    continue;
-                };
-                push_control_clause_body_break(keyword, body, text, newline, &mut edits);
-            }
-            continue;
-        }
-        if clause.is_except_clause() {
-            push_control_flow_break(
-                text,
-                same_line_horizontal_whitespace_start(text, clause.start_byte()),
-                clause.start_byte(),
-                newline,
-                &mut edits,
-            );
-            if let Some((keyword, body)) =
-                direct_keyword::<Token![do]>(clause).zip(clause.clause_value())
-            {
-                push_control_clause_body_break(keyword, body, text, newline, &mut edits);
-            }
-            continue;
-        }
-        let Some(keyword) = clause.child(0) else {
-            continue;
-        };
-        let Some(body) = clause.named_child(0) else {
-            continue;
-        };
-
-        if options.control_flow_layout == ControlFlowLayout::LeadingKeywords
-            && clause
-                .parent()
-                .is_some_and(|owner| owner.is::<IfStatement>())
-        {
-            push_control_flow_break(
-                text,
-                same_line_horizontal_whitespace_start(text, clause.start_byte()),
-                clause.start_byte(),
-                newline,
-                &mut edits,
-            );
-            continue;
-        }
-
-        if clause.is::<ElseClause>() || clause.is_except_clause() {
-            if !clause.is::<ElseClause>() || !keep_else_after_closer(clause, text, &mut edits) {
-                push_control_flow_break(
-                    text,
-                    same_line_horizontal_whitespace_start(text, clause.start_byte()),
-                    clause.start_byte(),
-                    newline,
-                    &mut edits,
-                );
-            }
-            if clause.is_except_clause() {
-                continue;
-            }
-            if body.is::<IfStatement>()
-                || options.control_flow_layout == ControlFlowLayout::MultilineCompactElse
-            {
-                continue;
-            }
-        }
-
-        push_control_clause_body_break(keyword, body, text, newline, &mut edits);
-    }
-
-    edits
-}
-
-/// Direct child keyword of the requested generated token type.
-fn direct_keyword<'tree, Keyword: m2_syn::Token>(
-    node: LayoutNode<'tree>,
-) -> Option<LayoutNode<'tree>> {
-    node.children()
-        .find(|child| child.is_keyword_token() && matches_token::<Keyword>(child.text()))
-}
-
-/// Appends control clause body break to the current formatting edits or traversal results.
-fn push_control_clause_body_break(
-    keyword: LayoutNode<'_>,
-    body: LayoutNode<'_>,
-    text: &str,
-    newline: &'static str,
-    edits: &mut Vec<FormatEdit>,
-) {
-    if body
-        .child(0)
-        .is_some_and(|child| child.is_opening_delimiter())
-    {
-        return;
-    }
-    push_control_flow_break(
-        text,
-        Some(keyword.end_byte()),
-        body.start_byte(),
+    let mut visitor = ControlFlowEdits {
+        layout,
+        layout_kind: options.control_flow_layout,
         newline,
-        edits,
-    );
+        delimited_depth: 0,
+        control: None,
+        else_if_owner: None,
+        edits: Vec::new(),
+    };
+    syntax.visit(&mut visitor);
+    visitor.edits
 }
 
-/// Keeps an else keyword beside the preceding closer when that layout remains valid.
-fn keep_else_after_closer(clause: LayoutNode<'_>, text: &str, edits: &mut Vec<FormatEdit>) -> bool {
-    let Some(body) = clause.parent().and_then(|owner| {
-        owner
-            .children()
-            .filter(|candidate| {
-                candidate.is::<ThenClause>() && candidate.end_byte() <= clause.start_byte()
-            })
-            .max_by_key(LayoutNode::end_byte)
-            .and_then(|then_clause| then_clause.named_child(0))
-    }) else {
-        return false;
-    };
-    let children = body.children().collect::<Vec<_>>();
-    let (Some(opener), Some(closer)) = (children.first(), children.last()) else {
-        return false;
-    };
-    if !opener.is_opening_delimiter()
-        || !closer.is_closing_delimiter()
-        || !text[closer.end_byte()..clause.start_byte()]
-            .bytes()
-            .all(|byte| byte.is_ascii_whitespace())
-    {
-        return false;
+/// Line-break permissions of the control statement owning the clauses being visited.
+#[derive(Clone, Copy)]
+struct ControlContext {
+    /// Whether clause breaks keep the statement parseable.
+    breaks_are_parseable: bool,
+}
+
+/// Clause break edits collected while carrying the enclosing control statement.
+struct ControlFlowEdits<'a> {
+    /// Current formatter coordinate mapping.
+    layout: &'a LayoutSource,
+    /// Requested control-flow layout.
+    layout_kind: ControlFlowLayout,
+    /// Line ending inserted by clause breaks.
+    newline: &'static str,
+    /// Number of collections, holders, and argument lists enclosing the current node.
+    delimited_depth: usize,
+    /// Nearest enclosing control statement, absent outside any.
+    control: Option<ControlContext>,
+    /// Context inherited by an `else if` chain from its outer conditional.
+    else_if_owner: Option<ControlContext>,
+    /// Collected whitespace replacements.
+    edits: Vec<FormatEdit>,
+}
+
+impl ControlFlowEdits<'_> {
+    /// Whether clause breaks of a control statement starting here are parseable.
+    fn context_for(
+        &self,
+        statement: &impl m2_syn::Spanned,
+        has_alternative: bool,
+    ) -> ControlContext {
+        let text = self.layout.text();
+        let breaks_are_parseable = self.delimited_depth > 0
+            || self.layout.syntax_range(statement).is_some_and(|range| {
+                let line_start = text[..range.start].rfind('\n').map_or(0, |index| index + 1);
+                text[line_start..range.start]
+                    .bytes()
+                    .all(|byte| matches!(byte, b' ' | b'\t'))
+                    && !has_alternative
+            });
+        ControlContext {
+            breaks_are_parseable,
+        }
     }
-    if closer.end_position().row < clause.start_position().row {
-        edits.push(FormatEdit {
-            start_byte: closer.end_byte(),
-            end_byte: clause.start_byte(),
-            replacement: " ".to_string(),
+
+    /// Runs `visit` with the given control statement as the enclosing one.
+    fn within(&mut self, control: ControlContext, visit: impl FnOnce(&mut Self)) {
+        let previous = self.control.replace(control);
+        visit(self);
+        self.control = previous;
+    }
+
+    /// Whether clause breaks are allowed for the enclosing control statement.
+    fn breaks_are_parseable(&self) -> bool {
+        self.control
+            .is_none_or(|control| control.breaks_are_parseable)
+    }
+
+    /// Breaks the line before a clause keyword.
+    fn break_before(&mut self, keyword: &impl m2_syn::Spanned) {
+        let Some(range) = self.layout.syntax_range(keyword) else {
+            return;
+        };
+        let text = self.layout.text();
+        push_control_flow_break(
+            text,
+            same_line_horizontal_whitespace_start(text, range.start),
+            range.start,
+            self.newline,
+            &mut self.edits,
+        );
+    }
+
+    /// Breaks the line between a clause keyword and its body unless the body is delimited.
+    fn break_after(&mut self, keyword: &impl m2_syn::Spanned, body: &Expr) {
+        if body.delimiter().is_some() {
+            return;
+        }
+        let (Some(keyword), Some(body)) = (
+            self.layout.syntax_range(keyword),
+            self.layout.syntax_range(body),
+        ) else {
+            return;
+        };
+        push_control_flow_break(
+            self.layout.text(),
+            Some(keyword.end),
+            body.start,
+            self.newline,
+            &mut self.edits,
+        );
+    }
+
+    /// Keeps an else keyword beside the preceding closer when that layout remains valid.
+    fn keep_else_after_closer(
+        &mut self,
+        then_clause: &ThenClause,
+        else_clause: &ElseClause,
+    ) -> bool {
+        let Some(delimiter) = then_clause.expr.delimiter() else {
+            return false;
+        };
+        let (Some(closer), Some(keyword)) = (
+            delimiter
+                .closing_span()
+                .and_then(|span| self.layout.syntax_range(&span)),
+            self.layout.syntax_range(&else_clause.else_token),
+        ) else {
+            return false;
+        };
+        if closer.end > keyword.start
+            || !self.layout.text()[closer.end..keyword.start]
+                .bytes()
+                .all(|byte| byte.is_ascii_whitespace())
+        {
+            return false;
+        }
+        if self.layout.point_for_byte(closer.end).row
+            < self.layout.point_for_byte(keyword.start).row
+        {
+            self.edits.push(FormatEdit {
+                start_byte: closer.end,
+                end_byte: keyword.start,
+                replacement: " ".to_string(),
+            });
+        }
+        true
+    }
+
+    /// Whether the else keyword and an `if` body begin on the same row.
+    fn is_else_if(&self, clause: &ElseClause) -> bool {
+        let row = |node: &dyn m2_syn::Spanned| {
+            self.layout
+                .syntax_range(node)
+                .map(|range| self.layout.point_for_byte(range.start).row)
+        };
+        matches!(clause.expr.as_ref(), Expr::If(_))
+            && row(&clause.else_token) == row(clause.expr.as_ref())
+    }
+
+    /// Lays out the clauses of a then/else pair or a try's success and fallback clauses.
+    fn then_clause(&mut self, owner_is_if: bool, clause: &ThenClause) {
+        if !self.breaks_are_parseable() {
+            return;
+        }
+        if owner_is_if && self.layout_kind == ControlFlowLayout::LeadingKeywords {
+            self.break_before(&clause.then_token);
+        } else {
+            self.break_after(&clause.then_token, &clause.expr);
+        }
+    }
+
+    /// Lays out an else clause following the optional preceding then clause.
+    fn else_clause(
+        &mut self,
+        owner_is_if: bool,
+        then_clause: Option<&ThenClause>,
+        clause: &ElseClause,
+    ) {
+        if !self.breaks_are_parseable() {
+            return;
+        }
+        if owner_is_if && self.layout_kind == ControlFlowLayout::LeadingKeywords {
+            self.break_before(&clause.else_token);
+            return;
+        }
+        if !then_clause.is_some_and(|then_clause| self.keep_else_after_closer(then_clause, clause))
+        {
+            self.break_before(&clause.else_token);
+        }
+        if matches!(clause.expr.as_ref(), Expr::If(_))
+            || self.layout_kind == ControlFlowLayout::MultilineCompactElse
+        {
+            return;
+        }
+        self.break_after(&clause.else_token, &clause.expr);
+    }
+}
+
+impl<'ast> Visit<'ast> for ControlFlowEdits<'_> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        let delimited = expression.delimiter().is_some();
+        self.delimited_depth += usize::from(delimited);
+        visit::visit_expr(self, expression);
+        self.delimited_depth -= usize::from(delimited);
+    }
+    fn visit_assignment_list(&mut self, list: &'ast m2_syn::nodes::AssignmentList) {
+        self.delimited_depth += 1;
+        visit::visit_assignment_list(self, list);
+        self.delimited_depth -= 1;
+    }
+    fn visit_expr_if(&mut self, node: &'ast IfStatement) {
+        let else_if_owner = self.else_if_owner.take();
+        let control =
+            else_if_owner.unwrap_or_else(|| self.context_for(node, node.else_clause.is_some()));
+        self.within(control, |this| {
+            this.then_clause(true, &node.then_clause);
+            this.visit_expr(&node.condition);
+            this.visit_then_clause(&node.then_clause);
+            if let Some(clause) = &node.else_clause {
+                this.else_clause(true, Some(&node.then_clause), clause);
+                if this.is_else_if(clause) {
+                    this.else_if_owner = Some(control);
+                }
+                this.visit_else_clause(clause);
+                this.else_if_owner = None;
+            }
         });
     }
-    true
-}
-
-/// Clause breaks are parseable associated with the enclosing callable or loop.
-fn control_clause_breaks_are_parseable(clause: LayoutNode<'_>, text: &str) -> bool {
-    let mut current = clause;
-    let control = loop {
-        let Some(parent) = current.parent() else {
-            return true;
-        };
-        if parent.is::<IfStatement>()
-            || parent.is::<TryStatement>()
-            || parent.is::<ForLoop>()
-            || parent.is::<WhileLoop>()
-        {
-            break parent;
+    fn visit_expr_try(&mut self, node: &'ast TryStatement) {
+        let control = self.context_for(node, node.fallback.is_some());
+        self.within(control, |this| {
+            if let Some(clause) = &node.on_success {
+                this.then_clause(false, clause);
+            }
+            match &node.fallback {
+                Some(m2_syn::nodes::TryFallback::Else(clause)) => {
+                    this.else_clause(false, node.on_success.as_ref(), clause);
+                }
+                Some(m2_syn::nodes::TryFallback::Except(clause)) if this.breaks_are_parseable() => {
+                    this.break_before(&clause.except_token);
+                    this.break_after(&clause.do_token, &clause.value);
+                }
+                _ => {}
+            }
+            visit::visit_expr_try(this, node);
+        });
+    }
+    fn visit_expr_for(&mut self, node: &'ast ForLoop) {
+        let control = self.context_for(node, false);
+        self.within(control, |this| visit::visit_expr_for(this, node));
+    }
+    fn visit_expr_while(&mut self, node: &'ast WhileLoop) {
+        let control = self.context_for(node, false);
+        self.within(control, |this| visit::visit_expr_while(this, node));
+    }
+    fn visit_loop_body(&mut self, body: &'ast LoopBody) {
+        if self.breaks_are_parseable() {
+            if let Some(step) = &body.list_step {
+                self.break_after(&step.list_token, &step.expr);
+            }
+            if let Some(step) = &body.do_step {
+                self.break_after(&step.do_token, &step.statement);
+            }
         }
-        current = parent;
-    };
-
-    let mut layout_control = control;
-    while layout_control.is::<IfStatement>() && if_statement_is_else_if(layout_control) {
-        let Some(outer_if) = layout_control
-            .parent()
-            .and_then(|else_clause| else_clause.parent())
-            .filter(|parent| parent.is::<IfStatement>())
-        else {
-            break;
-        };
-        layout_control = outer_if;
+        visit::visit_loop_body(self, body);
     }
-
-    if std::iter::successors(layout_control.parent(), |node| node.parent())
-        .any(|node| node.is_delimited_expression())
-    {
-        return true;
-    }
-
-    let line_start = text[..layout_control.start_byte()]
-        .rfind('\n')
-        .map_or(0, |index| index + 1);
-    if !text[line_start..layout_control.start_byte()]
-        .bytes()
-        .all(|byte| matches!(byte, b' ' | b'\t'))
-    {
-        return false;
-    }
-
-    let has_alternative = layout_control
-        .children()
-        .any(|child| child.is::<ElseClause>() || child.is_except_clause());
-    if !has_alternative {
-        return true;
-    }
-
-    let mut ancestor = layout_control.parent();
-    while let Some(node) = ancestor {
-        if node.is_delimited_expression() {
-            return true;
-        }
-        ancestor = node.parent();
-    }
-    false
 }
 
 /// Appends control flow break to the current formatting edits or traversal results.
@@ -749,14 +924,14 @@ fn push_control_flow_break(
 
 /// Edit indentation and trailing whitespace outside syntax-owned strings and
 /// comments. Copy all other bytes, including literal contents and line endings.
-fn reindent_from_tree(root: LayoutNode<'_>, options: &FormatOptions) -> Vec<FormatEdit> {
-    let text = root.source_text();
-    let layout = TreeIndentLayout::from_root(root, options.compact_factor_operators);
-    let protected = root
-        .descendants()
-        .filter(|node| node.is_string_literal() || node.is_comment())
-        .map(|node| node.start_byte()..node.end_byte())
-        .collect::<Vec<_>>();
+fn reindent_from_syntax(
+    syntax: &SyntaxSnapshot,
+    source: &LayoutSource,
+    options: &FormatOptions,
+) -> Vec<FormatEdit> {
+    let text = source.text();
+    let layout = TreeIndentLayout::from_syntax(syntax, source, options.compact_factor_operators);
+    let protected = source.protected_ranges().collect::<Vec<_>>();
     let mut edits = Vec::new();
     for (row, line) in text_lines(text).into_iter().enumerate() {
         let content = &text[line.start_byte..line.end_byte];
@@ -802,135 +977,265 @@ struct LineBreakCandidate {
     end_byte: usize,
 }
 
-/// Selects syntactically valid line-break points in a layout node.
-trait LineBreakRule {
-    /// Adds line-break candidates recognized by this rule without changing expression grouping.
-    fn collect(
-        &self,
-        node: LayoutNode<'_>,
-        text: &str,
-        options: &FormatOptions,
-        candidates: &mut Vec<LineBreakCandidate>,
-    );
+/// Wrap candidates after typed delimiters enclosing content.
+struct DelimiterBreaks<'a> {
+    /// Current whitespace coordinates.
+    layout: &'a LayoutSource,
+    /// Candidate locations collected so far.
+    candidates: Vec<LineBreakCandidate>,
 }
 
-impl<A, B> LineBreakRule for (A, B)
-where
-    A: LineBreakRule,
-    B: LineBreakRule,
-{
-    fn collect(
-        &self,
-        node: LayoutNode<'_>,
-        text: &str,
-        options: &FormatOptions,
-        candidates: &mut Vec<LineBreakCandidate>,
-    ) {
-        self.0.collect(node, text, options, candidates);
-        self.1.collect(node, text, options, candidates);
-    }
-}
-
-/// Selects line breaks at collection delimiter boundaries.
-#[derive(Debug, Clone, Copy)]
-struct DelimiterBreakRule;
-
-impl LineBreakRule for DelimiterBreakRule {
-    fn collect(
-        &self,
-        node: LayoutNode<'_>,
-        text: &str,
-        _options: &FormatOptions,
-        candidates: &mut Vec<LineBreakCandidate>,
-    ) {
-        if !node.is_opening_delimiter() {
-            return;
-        }
-        let has_contents = node
-            .parent()
-            .is_some_and(|parent| parent.named_children().next().is_some());
-        if has_contents {
-            push_line_break_candidate_after(node, text, candidates);
-        }
-    }
-}
-
-/// Selects line breaks between comma-separated collection elements.
-#[derive(Debug, Clone, Copy)]
-struct CommaBreakRule;
-
-impl LineBreakRule for CommaBreakRule {
-    fn collect(
-        &self,
-        node: LayoutNode<'_>,
-        text: &str,
-        _options: &FormatOptions,
-        candidates: &mut Vec<LineBreakCandidate>,
-    ) {
-        if node.is_comma() && !node.comma_borders_empty_slot() {
-            push_line_break_candidate_after(node, text, candidates);
-        }
-    }
-}
-
-/// Selects line breaks around operators without changing expression grouping.
-#[derive(Debug, Clone, Copy)]
-struct OperatorBreakRule;
-
-impl LineBreakRule for OperatorBreakRule {
-    fn collect(
-        &self,
-        node: LayoutNode<'_>,
-        text: &str,
-        options: &FormatOptions,
-        candidates: &mut Vec<LineBreakCandidate>,
-    ) {
-        let Some(parent) = node.parent() else {
+impl DelimiterBreaks<'_> {
+    /// Records a break after an opening delimiter of a nonempty construct.
+    fn consider(&mut self, delimiter: Delimiter, has_contents: bool) {
+        let Some(open) = self.layout.syntax_range(&delimiter.opening_span()) else {
             return;
         };
-        if !node.is_operator() {
-            return;
+        if !has_contents {
+            let Some(close) = delimiter
+                .closing_span()
+                .and_then(|span| self.layout.syntax_range(&span))
+            else {
+                return;
+            };
+            if !self
+                .layout
+                .protected_ranges()
+                .any(|range| open.end <= range.start && range.end <= close.start)
+            {
+                return;
+            }
         }
-        if breaks_before_operator(node, options.compact_factor_operators) {
-            push_line_break_candidate_before(node, text, candidates);
-        } else if (parent.binary_operator().is_some() || parent.is::<LambdaExpression>())
-            && is_spaced_line_final_operator(node.text(), options.compact_factor_operators)
-        {
-            push_line_break_candidate_after(node, text, candidates);
+        let Some(end_byte) = same_line_horizontal_whitespace_end(self.layout.text(), open.end)
+        else {
+            return;
+        };
+        self.candidates.push(LineBreakCandidate {
+            start_byte: open.end,
+            end_byte,
+        });
+    }
+}
+
+impl<'ast> Visit<'ast> for DelimiterBreaks<'_> {
+    fn visit_list(&mut self, node: &'ast List) {
+        self.consider(
+            node.delimiter.delimiter(),
+            !node.statements.is_empty() || node.elements.is_some(),
+        );
+        visit::visit_list(self, node);
+    }
+    fn visit_array(&mut self, node: &'ast m2_syn::nodes::Array) {
+        self.consider(
+            node.delimiter.delimiter(),
+            !node.statements.is_empty() || node.elements.is_some(),
+        );
+        visit::visit_array(self, node);
+    }
+    fn visit_sequence(&mut self, node: &'ast Sequence) {
+        self.consider(
+            node.delimiter.delimiter(),
+            !node.statements.is_empty() || node.elements.is_some(),
+        );
+        visit::visit_sequence(self, node);
+    }
+    fn visit_angle_bar_list(&mut self, node: &'ast m2_syn::nodes::AngleBarList) {
+        self.consider(
+            node.delimiter.delimiter(),
+            !node.statements.is_empty() || node.elements.is_some(),
+        );
+        visit::visit_angle_bar_list(self, node);
+    }
+    fn visit_holder(&mut self, node: &'ast m2_syn::nodes::Holder) {
+        self.consider(
+            node.delimiter.delimiter(),
+            !node.muted.is_empty() || node.value.is_some(),
+        );
+        visit::visit_holder(self, node);
+    }
+    fn visit_assignment_list(&mut self, node: &'ast m2_syn::nodes::AssignmentList) {
+        self.consider(
+            node.contents.delimiter.delimiter(),
+            node.contents.contents.is_some(),
+        );
+        visit::visit_assignment_list(self, node);
+    }
+    fn visit_expr_lambda_list(&mut self, node: &'ast m2_syn::nodes::ExprLambdaList) {
+        self.consider(
+            node.arguments.delimiter.delimiter(),
+            node.arguments.contents.is_some(),
+        );
+        visit::visit_expr_lambda_list(self, node);
+    }
+}
+
+/// Wrap candidates after typed commas that do not border an empty slot.
+struct CommaBreaks<'a> {
+    /// Current formatter coordinates.
+    layout: &'a LayoutSource,
+    /// Candidate locations collected so far.
+    candidates: Vec<LineBreakCandidate>,
+    /// Whitespace normalization edits around commas.
+    spacing: Vec<FormatEdit>,
+}
+
+impl CommaBreaks<'_> {
+    /// Collects separators from one typed punctuated sequence.
+    fn collect<T: m2_syn::Spanned>(
+        &mut self,
+        values: &m2_syn::Punctuated<T>,
+        empty: impl Fn(&T) -> bool,
+    ) {
+        let mut previous = values.first();
+        for (comma, next) in values.pairs() {
+            let Some(bytes) = self.layout.syntax_range(comma) else {
+                previous = next;
+                continue;
+            };
+            let borders_empty = [previous, next]
+                .into_iter()
+                .filter(|value| empty(value))
+                .filter_map(|value| self.layout.syntax_range(value))
+                .any(|slot| slot.start == bytes.end || slot.end == bytes.start);
+            if let Some(start_byte) =
+                same_line_horizontal_whitespace_start(self.layout.text(), bytes.start)
+            {
+                self.spacing.push(FormatEdit {
+                    start_byte,
+                    end_byte: bytes.start,
+                    replacement: String::new(),
+                });
+            }
+            if let Some(end_byte) =
+                same_line_horizontal_whitespace_end(self.layout.text(), bytes.end)
+            {
+                let replacement = if borders_empty
+                    || matches!(
+                        self.layout.text().as_bytes().get(end_byte),
+                        Some(b')' | b']' | b'}' | b';') | None
+                    ) {
+                    ""
+                } else {
+                    " "
+                };
+                self.spacing.push(FormatEdit {
+                    start_byte: bytes.end,
+                    end_byte,
+                    replacement: replacement.to_string(),
+                });
+            }
+            if !borders_empty {
+                if let Some(end_byte) =
+                    same_line_horizontal_whitespace_end(self.layout.text(), bytes.end)
+                {
+                    self.candidates.push(LineBreakCandidate {
+                        start_byte: bytes.end,
+                        end_byte,
+                    });
+                }
+            }
+            previous = next;
         }
     }
 }
 
-/// Appends line break candidate before to the current formatting edits or traversal results.
-fn push_line_break_candidate_before(
-    node: LayoutNode<'_>,
-    text: &str,
-    candidates: &mut Vec<LineBreakCandidate>,
-) {
-    let end_byte = node.start_byte();
-    let Some(start_byte) = same_line_horizontal_whitespace_start(text, end_byte) else {
-        return;
-    };
-    candidates.push(LineBreakCandidate {
-        start_byte,
-        end_byte,
-    });
+impl<'ast> Visit<'ast> for CommaBreaks<'_> {
+    fn visit_expr_pack(&mut self, node: &'ast m2_syn::nodes::ExprPack) {
+        self.collect(&node.pack, |value| matches!(value, Component::Empty(_)));
+        visit::visit_expr_pack(self, node);
+    }
+    fn visit_assignment_list_content_pack(
+        &mut self,
+        node: &'ast m2_syn::nodes::AssignmentListContentPack,
+    ) {
+        self.collect(&node.arguments, |value| {
+            matches!(value, m2_syn::nodes::AssignmentArgument::Empty(_))
+        });
+        visit::visit_assignment_list_content_pack(self, node);
+    }
+    fn visit_argument_list_content_pack(
+        &mut self,
+        node: &'ast m2_syn::nodes::ArgumentListContentPack,
+    ) {
+        self.collect(&node.arguments, |_| false);
+        visit::visit_argument_list_content_pack(self, node);
+    }
 }
 
-/// Appends line break candidate after to the current formatting edits or traversal results.
-fn push_line_break_candidate_after(
-    node: LayoutNode<'_>,
-    text: &str,
-    candidates: &mut Vec<LineBreakCandidate>,
-) {
-    let start_byte = node.end_byte();
-    let Some(end_byte) = same_line_horizontal_whitespace_end(text, start_byte) else {
-        return;
-    };
-    candidates.push(LineBreakCandidate {
-        start_byte,
-        end_byte,
-    });
+/// Wrap points at typed operators, with enclosing delimiter context.
+struct OperatorBreaks<'a> {
+    /// Current formatter coordinates.
+    layout: &'a LayoutSource,
+    /// Whether factor operators stay compact.
+    compact_factors: bool,
+    /// Number of enclosing delimited constructs.
+    depth: usize,
+    /// Candidate locations.
+    candidates: Vec<LineBreakCandidate>,
+}
+
+impl OperatorBreaks<'_> {
+    /// Adds a candidate on the appropriate side of a spaced operator.
+    fn consider(&mut self, operator: &impl m2_syn::Spanned, before: bool) {
+        let Some(bytes) = self.layout.syntax_range(operator) else {
+            return;
+        };
+        let text = self.layout.text();
+        if !is_spaced_line_final_operator(&text[bytes.clone()], self.compact_factors) {
+            return;
+        }
+        let range = if before {
+            same_line_horizontal_whitespace_start(text, bytes.start).map(|start| start..bytes.start)
+        } else {
+            same_line_horizontal_whitespace_end(text, bytes.end).map(|end| bytes.end..end)
+        };
+        if let Some(range) = range {
+            self.candidates.push(LineBreakCandidate {
+                start_byte: range.start,
+                end_byte: range.end,
+            });
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for OperatorBreaks<'_> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        let delimited = expression.delimiter().is_some();
+        self.depth += usize::from(delimited);
+        visit::visit_expr(self, expression);
+        self.depth -= usize::from(delimited);
+    }
+    fn visit_assignment_list(&mut self, list: &'ast m2_syn::nodes::AssignmentList) {
+        self.depth += 1;
+        visit::visit_assignment_list(self, list);
+        self.depth -= 1;
+    }
+    fn visit_expr_op_bin_regular(&mut self, node: &'ast m2_syn::nodes::ExprOpBinRegular) {
+        self.consider(&node.operator, self.depth > 0);
+        visit::visit_expr_op_bin_regular(self, node);
+    }
+    fn visit_expr_assign(&mut self, node: &'ast m2_syn::nodes::ExprAssign) {
+        if let Some(span) = node.parts().operator_span {
+            self.consider(&span, false);
+        }
+        visit::visit_expr_assign(self, node);
+    }
+    fn visit_expr_assign_evaluated(&mut self, node: &'ast m2_syn::nodes::ExprAssignEvaluated) {
+        self.consider(&node.operator, false);
+        visit::visit_expr_assign_evaluated(self, node);
+    }
+    fn visit_expr_option(&mut self, node: &'ast m2_syn::nodes::ExprOption) {
+        self.consider(&node.operator, false);
+        visit::visit_expr_option(self, node);
+    }
+    fn visit_expr_lambda_variadic(&mut self, node: &'ast m2_syn::nodes::ExprLambdaVariadic) {
+        self.consider(&node.operator, false);
+        visit::visit_expr_lambda_variadic(self, node);
+    }
+    fn visit_expr_lambda_list(&mut self, node: &'ast m2_syn::nodes::ExprLambdaList) {
+        self.consider(&node.operator, false);
+        visit::visit_expr_lambda_list(self, node);
+    }
 }
 
 /// A source line with its byte extent and display-width information.
@@ -944,11 +1249,12 @@ struct TextLine {
 
 /// Wraps long lines at permitted syntax boundaries using the configured widths.
 fn wrap_long_lines(
-    root: LayoutNode<'_>,
+    syntax: &SyntaxSnapshot,
+    layout: &LayoutSource,
     options: &FormatOptions,
     newline: &'static str,
 ) -> Vec<FormatEdit> {
-    let text = root.source_text();
+    let text = layout.text();
     let Some(max_line_width) = options.max_line_width else {
         return Vec::new();
     };
@@ -956,8 +1262,29 @@ fn wrap_long_lines(
         .soft_line_width
         .unwrap_or(max_line_width)
         .min(max_line_width);
-    let rules = (DelimiterBreakRule, (CommaBreakRule, OperatorBreakRule));
-    let candidates = collect_line_break_candidates(root, options, &rules);
+    let mut operators = OperatorBreaks {
+        layout,
+        compact_factors: options.compact_factor_operators,
+        depth: 0,
+        candidates: Vec::new(),
+    };
+    syntax.visit(&mut operators);
+    let mut candidates = operators.candidates;
+    let mut delimiters = DelimiterBreaks {
+        layout,
+        candidates: Vec::new(),
+    };
+    syntax.visit(&mut delimiters);
+    candidates.extend(delimiters.candidates);
+    let mut commas = CommaBreaks {
+        layout,
+        candidates: Vec::new(),
+        spacing: Vec::new(),
+    };
+    syntax.visit(&mut commas);
+    candidates.extend(commas.candidates);
+    candidates.sort_by_key(|candidate| (candidate.start_byte, candidate.end_byte));
+    candidates.dedup();
     select_line_breaks(
         text,
         &candidates,
@@ -966,22 +1293,6 @@ fn wrap_long_lines(
         options.tab_width,
         newline,
     )
-}
-
-/// Collects line break candidates from the supplied syntax and semantic context.
-fn collect_line_break_candidates(
-    root: LayoutNode<'_>,
-    options: &FormatOptions,
-    rules: &(impl LineBreakRule + ?Sized),
-) -> Vec<LineBreakCandidate> {
-    let text = root.source_text();
-    let mut candidates = Vec::new();
-    for node in root.descendants() {
-        rules.collect(node, text, options, &mut candidates);
-    }
-    candidates.sort_by_key(|candidate| (candidate.start_byte, candidate.end_byte));
-    candidates.dedup();
-    candidates
 }
 
 /// Selects line breaks according to the syntax and configured layout constraints.
@@ -1059,11 +1370,10 @@ fn visual_width(text: &str, tab_width: usize) -> usize {
 
 /// The document's fold ranges: tree-based indentation blocks plus multiline
 /// comments and strings.
-fn folding_ranges_for_syntax(root: SyntaxNode<'_>) -> Vec<FormatFoldRange> {
-    let source = LayoutSource::new(root);
-    let root = LayoutNode::new(root, &source);
-    let text = root.source_text();
-    let layout = TreeIndentLayout::from_root(root, false);
+fn folding_ranges_for_syntax(syntax: &SyntaxSnapshot) -> Vec<FormatFoldRange> {
+    let source = LayoutSource::new(syntax);
+    let text = source.text();
+    let layout = TreeIndentLayout::from_syntax(syntax, &source, false);
     let indented_lines = text
         .lines()
         .enumerate()
@@ -1100,12 +1410,29 @@ struct TreeIndentLayout {
 
 impl TreeIndentLayout {
     /// Collects line indentation and folding information from the parsed layout.
-    fn from_root(root: LayoutNode<'_>, compact_factor_operators: bool) -> Self {
-        let text = root.source_text();
+    fn from_syntax(
+        syntax: &SyntaxSnapshot,
+        source: &LayoutSource,
+        compact_factor_operators: bool,
+    ) -> Self {
+        let text = source.text();
         let line_count = text.lines().count().max(1);
-        let brackets = collect_bracket_groups(root, line_count);
+        let brackets = collect_bracket_groups(syntax, source, line_count);
         let line_leads = line_leading_blank(text, line_count);
-        let literal_folds = collect_literal_fold_ranges(root, &line_leads);
+        let lines = text_lines(text);
+        let literal_folds = collect_literal_fold_ranges(syntax, source, &line_leads);
+        let mut right_operands = RightOperandContinuations {
+            layout: source,
+            compact_factors: compact_factor_operators,
+            values: Vec::new(),
+            leading_operators: Vec::new(),
+            clause_bodies: Vec::new(),
+            clause_keywords: Vec::new(),
+            line_leads: &line_leads,
+            inline_owner: None,
+            else_if: false,
+        };
+        syntax.visit(&mut right_operands);
         let leading_closer_rows = (0..line_count)
             .map(|row| {
                 brackets.iter().any(|group| {
@@ -1125,9 +1452,8 @@ impl TreeIndentLayout {
                     opener_depth + 1
                 }
             });
-            depths.push(
-                bracket_base + line_continuation(row, root, &line_leads, compact_factor_operators),
-            );
+            depths
+                .push(bracket_base + line_continuation(row, &line_leads, &lines, &right_operands));
         }
 
         Self {
@@ -1153,26 +1479,36 @@ impl TreeIndentLayout {
 /// block comment and each multiline string (`"..."` or `///...///`) is its own
 /// range. Keeping this tree-derived avoids mistaking comment markers inside
 /// strings for comments, and string delimiters inside comments for strings.
-fn collect_literal_fold_ranges(root: LayoutNode<'_>, line_leads: &[usize]) -> Vec<FormatFoldRange> {
+fn collect_literal_fold_ranges(
+    syntax: &SyntaxSnapshot,
+    layout: &LayoutSource,
+    line_leads: &[usize],
+) -> Vec<FormatFoldRange> {
     let mut line_comment_rows = Vec::new();
-    let mut ranges = Vec::new();
-
-    for node in root.descendants() {
-        let start = node.start_position();
-        let end = node.end_position();
-        if node.is_line_comment() && line_leads.get(start.row).copied() == Some(start.column) {
+    let mut strings = StringFolds {
+        layout,
+        ranges: Vec::new(),
+    };
+    syntax.visit(&mut strings);
+    let mut ranges = strings.ranges;
+    for comment in syntax.cells().iter().flat_map(|cell| cell.trivia()) {
+        let Some(mut bytes) = layout.syntax_range(comment) else {
+            continue;
+        };
+        let text = &layout.text()[bytes.clone()];
+        bytes.start += text.len() - text.trim_start_matches([' ', '\t']).len();
+        bytes.end -= text.len() - text.trim_end_matches(['\r', '\n']).len();
+        let start = layout.point_for_byte(bytes.start);
+        let end = layout.point_for_byte(bytes.end);
+        if comment.kind() == m2_syn::TriviaKind::LineComment
+            && line_leads.get(start.row).copied() == Some(start.column)
+        {
             line_comment_rows.extend((start.row..=end.row).map(|row| row as u32));
-        } else if node.is_block_comment() && start.row < end.row {
+        } else if comment.kind() == m2_syn::TriviaKind::BlockComment && start.row < end.row {
             ranges.push(FormatFoldRange {
                 start_line: start.row as u32,
                 end_line: end.row as u32,
                 kind: FormatFoldKind::Comment,
-            });
-        } else if node.is_string_literal() && start.row < end.row {
-            ranges.push(FormatFoldRange {
-                start_line: start.row as u32,
-                end_line: end.row as u32,
-                kind: FormatFoldKind::Region,
             });
         }
     }
@@ -1191,6 +1527,38 @@ fn collect_literal_fold_ranges(root: LayoutNode<'_>, line_leads: &[usize]) -> Ve
     append_line_comment_fold(&mut ranges, block_start, previous);
 
     ranges
+}
+
+/// Multiline string folds found by visiting typed literal expressions.
+struct StringFolds<'a> {
+    /// Current formatter coordinate mapping.
+    layout: &'a LayoutSource,
+    /// Fold ranges collected so far.
+    ranges: Vec<FormatFoldRange>,
+}
+
+impl<'ast> Visit<'ast> for StringFolds<'_> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if matches!(
+            expression,
+            Expr::Literal(
+                m2_syn::nodes::ExprLiteral::String(_) | m2_syn::nodes::ExprLiteral::RawString(_)
+            )
+        ) {
+            if let Some(bytes) = self.layout.syntax_range(expression) {
+                let start = self.layout.point_for_byte(bytes.start);
+                let end = self.layout.point_for_byte(bytes.end);
+                if start.row < end.row {
+                    self.ranges.push(FormatFoldRange {
+                        start_line: start.row as u32,
+                        end_line: end.row as u32,
+                        kind: FormatFoldKind::Region,
+                    });
+                }
+            }
+        }
+        visit::visit_expr(self, expression);
+    }
 }
 
 /// Appends line comment fold to the accumulated result in source order.
@@ -1227,58 +1595,73 @@ struct BracketGroup {
 /// Collect every multiline bracket node (`(…)`, `{…}`, `[…]`, `<|…|>`) spanning
 /// more than one row, keyed by open/close row for the depth computation. The
 /// closer's width (`)` is 1, `|>` is 2) does not matter; only its start column.
-fn collect_bracket_groups(root: LayoutNode<'_>, line_count: usize) -> Vec<BracketGroup> {
-    let mut groups = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        // A multiline parenthesized block `(\n …\n)` indents its body like a
-        // collection, though it is not a collection value.
-        if node.is_delimited_expression() {
-            let open_row = node.start_position().row;
-            let close_position = node.end_position();
-            if open_row < close_position.row {
-                groups.push(BracketGroup {
-                    open_row,
-                    close_row: close_position.row,
-                    closing_delimiter_column: close_position
-                        .column
-                        .saturating_sub(node.closing_delimiter_width()),
-                });
-            }
-        }
-        if node.is_error() {
-            collect_unclosed_error_brackets(node, line_count, &mut groups);
-        }
-        stack.extend(node.children());
-    }
-    groups
+fn collect_bracket_groups(
+    syntax: &SyntaxSnapshot,
+    layout: &LayoutSource,
+    line_count: usize,
+) -> Vec<BracketGroup> {
+    let mut visitor = BracketGroups {
+        layout,
+        line_count,
+        groups: Vec::new(),
+    };
+    syntax.visit(&mut visitor);
+    visitor.groups
 }
 
-/// Collect unmatched opener tokens retained inside an invalid syntax region.
-/// Each unmatched opener still indents its
-/// body, so it opens a group from its row to the last line of the document.
-fn collect_unclosed_error_brackets(
-    error: LayoutNode<'_>,
+/// Collects bracket indentation from generated delimiter fields.
+struct BracketGroups<'a> {
+    /// Current formatter coordinates.
+    layout: &'a LayoutSource,
+    /// Number of lines in the current layout.
     line_count: usize,
-    groups: &mut Vec<BracketGroup>,
-) {
-    let mut open_rows = Vec::new();
-    for child in error.children() {
-        if child.is_opening_delimiter() {
-            open_rows.push(child.start_position().row);
-        } else if child.is_closing_delimiter() {
-            open_rows.pop();
-        }
-    }
-    let last_row = line_count.saturating_sub(1);
-    for open_row in open_rows {
-        if open_row < last_row {
-            groups.push(BracketGroup {
-                open_row,
-                close_row: last_row,
-                closing_delimiter_column: usize::MAX,
+    /// Multiline delimiter pairs.
+    groups: Vec<BracketGroup>,
+}
+
+impl BracketGroups<'_> {
+    /// Records a complete multiline delimiter pair.
+    fn consider(&mut self, delimiter: Delimiter) {
+        let Some(open) = self.layout.syntax_range(&delimiter.opening_span()) else {
+            return;
+        };
+        let open = self.layout.point_for_byte(open.start);
+        let Some(close) = delimiter
+            .closing_span()
+            .and_then(|span| self.layout.syntax_range(&span))
+        else {
+            let last = self.line_count.saturating_sub(1);
+            if open.row < last {
+                self.groups.push(BracketGroup {
+                    open_row: open.row,
+                    close_row: last,
+                    closing_delimiter_column: usize::MAX,
+                });
+            }
+            return;
+        };
+        let close = self.layout.point_for_byte(close.start);
+        if open.row < close.row {
+            self.groups.push(BracketGroup {
+                open_row: open.row,
+                close_row: close.row,
+                closing_delimiter_column: close.column,
             });
         }
+    }
+}
+
+impl<'ast> Visit<'ast> for BracketGroups<'_> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        let delimiter = expression.delimiter();
+        if let Some(delimiter) = delimiter {
+            self.consider(delimiter);
+        }
+        visit::visit_expr(self, expression);
+    }
+    fn visit_assignment_list(&mut self, list: &'ast m2_syn::nodes::AssignmentList) {
+        self.consider(list.contents.delimiter.delimiter());
+        visit::visit_assignment_list(self, list);
     }
 }
 
@@ -1325,213 +1708,250 @@ fn closes_at_line_start(
 /// level so they sit deeper than the conditional's clause keywords.
 fn line_continuation(
     row: usize,
-    root: LayoutNode<'_>,
     line_leads: &[usize],
-    compact_factor_operators: bool,
+    lines: &[TextLine],
+    continuations: &RightOperandContinuations<'_>,
 ) -> usize {
-    let Some(first) = first_leaf_on_row(root, row) else {
+    let Some(start) = lines
+        .get(row)
+        .zip(line_leads.get(row))
+        .map(|(line, lead)| line.start_byte + lead)
+    else {
         return 0;
     };
 
     // (a) The first token is the start of the right operand of an infix
     // expression whose operator dangled on an earlier row (`a +\nb`,
     // `x ->\nbody`).
-    if is_right_operand_first_token(first, row, compact_factor_operators) {
+    if continuations
+        .values
+        .iter()
+        .any(|&(operand, operator_row)| operand == start && operator_row < row)
+    {
         return 1;
     }
 
     // (a') The first token is a binary operator leading the row, its left
     // operand on an earlier row (`(a\n+ b)`).
-    if first.is_operator()
-        && first
-            .parent()
-            .and_then(|parent| parent.binary_parts())
-            .is_some_and(|parts| parts.left.start_position().row < row)
+    if continuations
+        .leading_operators
+        .iter()
+        .any(|&(operator, left_row)| operator == start && left_row < row)
     {
         return 1;
     }
 
     // (b) The first token starts a clause body whose keyword is on an earlier row
     // (`then\n  f(x)`, `else\n  c`, `do\n  body`).
-    if is_clause_body_first_token(first, row) {
-        let inline_conditional = enclosing_clause_owner(first).is_some_and(|owner| {
-            !(control_statement_is_standalone(owner, line_leads)
-                || owner.is::<IfStatement>() && if_statement_is_else_if(owner))
-        });
+    if let Some(&(_, _, inline_conditional)) = continuations
+        .clause_bodies
+        .iter()
+        .find(|&&(body, keyword_row, _)| body == start && keyword_row < row)
+    {
         return 1 + usize::from(inline_conditional);
     }
 
     // (c) The first token is an `else`/`then` keyword whose controlling `if` is
     // not standalone (a ternary `x := if … then\n … else …`); a standalone `if`
     // aligns its `else` through its bracket instead.
-    if is_dangling_clause_keyword(first, row, line_leads) {
+    if continuations.clause_keywords.contains(&start) {
         return 1;
     }
 
     0
 }
 
-/// The leftmost leaf node starting on `row`.
-fn first_leaf_on_row(root: LayoutNode<'_>, row: usize) -> Option<LayoutNode<'_>> {
-    let mut best: Option<LayoutNode<'_>> = None;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.start_position().row > row || node.end_position().row < row {
-            continue;
-        }
-        let is_leaf = node.child(0).is_none();
-        if is_leaf && node.start_position().row == row && node.start_byte() < node.end_byte() {
-            best = match best {
-                Some(current) if current.start_byte() <= node.start_byte() => Some(current),
-                _ => Some(node),
-            };
-        }
-        stack.extend(node.children());
-    }
-    best
+/// Typed operands that can start a continuation line.
+struct RightOperandContinuations<'a> {
+    /// Current whitespace coordinates.
+    layout: &'a LayoutSource,
+    /// Whether factor operators are compact.
+    compact_factors: bool,
+    /// Operand start byte and operator row.
+    values: Vec<(usize, usize)>,
+    /// Operator start byte and the row where its left operand starts.
+    leading_operators: Vec<(usize, usize)>,
+    /// Clause body start and its keyword row.
+    clause_bodies: Vec<(usize, usize, bool)>,
+    /// Clause keywords continuing an inline or unowned expression.
+    clause_keywords: Vec<usize>,
+    /// Leading whitespace columns for determining standalone conditionals.
+    line_leads: &'a [usize],
+    /// Whether the nearest enclosing conditional is inline.
+    inline_owner: Option<bool>,
+    /// Whether the next conditional is the direct value of an else clause.
+    else_if: bool,
 }
 
-/// Whether `node` is the first token of the right operand of an infix expression
-/// whose operator dangled on a row before `row`. Only spaced operators carry a
-/// continuation: a compact operator like `*` left at line end (`a*\nb`) does not
-/// indent its continuation, matching the line-final-operator spacing pass.
-fn is_right_operand_first_token(
-    node: LayoutNode<'_>,
-    row: usize,
-    compact_factor_operators: bool,
-) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        let right = parent
-            .binary_parts()
-            .map(|parts| parts.right)
-            .or_else(|| parent.lambda_body());
-        if let Some((operator, right)) = parent.operator_node().zip(right) {
-            let assignment_conditional = parent.is_assignment() && right.is::<IfStatement>();
-            // Chained assignments share a value, so their heads align rather
-            // than looking like successively nested bodies.
-            let assignment_chain = parent.is_assignment() && right.is_assignment();
-            if right.start_byte() == node.start_byte()
-                && operator.start_position().row < row
-                && is_spaced_line_final_operator(operator.text(), compact_factor_operators)
-                && !assignment_conditional
-                && !assignment_chain
-            {
-                return true;
+impl RightOperandContinuations<'_> {
+    /// Records a clause keyword when its enclosing conditional is inline.
+    fn record_keyword(&mut self, keyword: &impl m2_syn::Spanned) {
+        if self.inline_owner.unwrap_or(true) {
+            if let Some(range) = self.layout.syntax_range(keyword) {
+                self.clause_keywords.push(range.start);
             }
         }
-        current = parent;
     }
-    false
+    /// Records the start of a clause body and its introducing keyword.
+    fn record_clause(&mut self, keyword: &impl m2_syn::Spanned, body: &Expr) {
+        if let (Some(keyword), Some(body)) = (
+            self.layout.syntax_range(keyword),
+            self.layout.syntax_range(body),
+        ) {
+            self.clause_bodies.push((
+                body.start,
+                self.layout.point_for_byte(keyword.start).row,
+                self.inline_owner.unwrap_or(false),
+            ));
+        }
+    }
+    /// Determines whether a conditional starts after other text on its line.
+    fn inline(&self, node: &impl m2_syn::Spanned) -> bool {
+        self.layout.syntax_range(node).is_some_and(|range| {
+            let point = self.layout.point_for_byte(range.start);
+            self.line_leads.get(point.row).copied().unwrap_or(0) < point.column
+        })
+    }
+    /// Records an operator and the beginning of its left operand.
+    fn record_leading(&mut self, operator: &impl m2_syn::Spanned, left: &impl m2_syn::Spanned) {
+        if let (Some(operator), Some(left)) = (
+            self.layout.syntax_range(operator),
+            self.layout.syntax_range(left),
+        ) {
+            self.leading_operators
+                .push((operator.start, self.layout.point_for_byte(left.start).row));
+        }
+    }
+    /// Records an operand when its operator uses continuation spacing.
+    fn record(&mut self, operator: &impl m2_syn::Spanned, value: &Expr) {
+        let (Some(operator), Some(value)) = (
+            self.layout.syntax_range(operator),
+            self.layout.syntax_range(value),
+        ) else {
+            return;
+        };
+        if is_spaced_line_final_operator(
+            &self.layout.text()[operator.clone()],
+            self.compact_factors,
+        ) {
+            self.values
+                .push((value.start, self.layout.point_for_byte(operator.start).row));
+        }
+    }
 }
 
-/// Whether `node` is the first token of a clause body (`then`/`else`/`do`/`list`)
-/// whose clause keyword is on a row before `row`.
-fn is_clause_body_first_token(node: LayoutNode<'_>, row: usize) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        if parent.is::<ThenClause>() || parent.is::<ElseClause>() {
-            if let (Some(keyword), Some(body)) = (parent.child(0), parent.named_child(0)) {
-                if body.start_byte() == node.start_byte() && keyword.start_position().row < row {
-                    return true;
-                }
+impl<'ast> Visit<'ast> for RightOperandContinuations<'_> {
+    fn visit_expr_if(&mut self, node: &'ast IfStatement) {
+        let previous = self.inline_owner;
+        let else_if = std::mem::take(&mut self.else_if);
+        self.inline_owner = Some(self.inline(node) && !else_if);
+        visit::visit_expr_if(self, node);
+        self.inline_owner = previous;
+    }
+    fn visit_expr_try(&mut self, node: &'ast TryStatement) {
+        let previous = self.inline_owner;
+        self.inline_owner = Some(self.inline(node));
+        visit::visit_expr_try(self, node);
+        self.inline_owner = previous;
+    }
+    fn visit_then_clause(&mut self, node: &'ast ThenClause) {
+        self.record_keyword(&node.then_token);
+        self.record_clause(&node.then_token, &node.expr);
+        visit::visit_then_clause(self, node);
+    }
+    fn visit_else_clause(&mut self, node: &'ast ElseClause) {
+        self.record_keyword(&node.else_token);
+        self.record_clause(&node.else_token, &node.expr);
+        let previous = self.else_if;
+        self.else_if = matches!(node.expr.as_ref(), Expr::If(_))
+            && self
+                .layout
+                .syntax_range(&node.else_token)
+                .zip(self.layout.syntax_range(node.expr.as_ref()))
+                .is_some_and(|(keyword, body)| {
+                    self.layout.point_for_byte(keyword.start).row
+                        == self.layout.point_for_byte(body.start).row
+                });
+        visit::visit_else_clause(self, node);
+        self.else_if = previous;
+    }
+    fn visit_symbol(&mut self, node: &'ast Symbol) {
+        if matches_token::<Token![then]>(node.text()) || matches_token::<Token![else]>(node.text())
+        {
+            self.record_keyword(node);
+        }
+        visit::visit_symbol(self, node);
+    }
+    fn visit_list_step(&mut self, node: &'ast m2_syn::nodes::ListStep) {
+        self.record_clause(&node.list_token, &node.expr);
+        visit::visit_list_step(self, node);
+    }
+    fn visit_do_step(&mut self, node: &'ast m2_syn::nodes::DoStep) {
+        self.record_clause(&node.do_token, &node.statement);
+        visit::visit_do_step(self, node);
+    }
+    fn visit_try_fallback(&mut self, node: &'ast m2_syn::nodes::TryFallback) {
+        if let m2_syn::nodes::TryFallback::Except(clause) = node {
+            self.record_clause(&clause.do_token, &clause.value);
+        }
+        visit::visit_try_fallback(self, node);
+    }
+    fn visit_expr_op_bin_regular(&mut self, node: &'ast m2_syn::nodes::ExprOpBinRegular) {
+        self.record(&node.operator, &node.right_operand);
+        self.record_leading(&node.operator, &node.left_operand);
+        visit::visit_expr_op_bin_regular(self, node);
+    }
+    fn visit_expr_op_bin_adj(&mut self, node: &'ast m2_syn::nodes::ExprOpBinAdj) {
+        self.record_leading(&node.operator, &node.left_operand);
+        visit::visit_expr_op_bin_adj(self, node);
+    }
+    fn visit_expr_op_bin_index(&mut self, node: &'ast m2_syn::nodes::ExprOpBinIndex) {
+        self.record_leading(&node.operator, &node.receiver);
+        visit::visit_expr_op_bin_index(self, node);
+    }
+    fn visit_expr_op_bin_member(&mut self, node: &'ast m2_syn::nodes::ExprOpBinMember) {
+        match node {
+            m2_syn::nodes::ExprOpBinMember::Dot(node) => {
+                self.record_leading(&node.operator, &node.receiver)
+            }
+            m2_syn::nodes::ExprOpBinMember::Optional(node) => {
+                self.record_leading(&node.operator, &node.receiver)
             }
         }
-        if parent.is::<LoopBody>() {
-            for (keyword, body) in [
-                (
-                    direct_keyword::<Token![list]>(parent),
-                    parent.listed_value(),
-                ),
-                (direct_keyword::<Token![do]>(parent), parent.ignored_value()),
-            ] {
-                let Some((keyword, body)) = keyword.zip(body) else {
-                    continue;
-                };
-                if body.start_byte() == node.start_byte() && keyword.start_position().row < row {
-                    return true;
-                }
+        visit::visit_expr_op_bin_member(self, node);
+    }
+    fn visit_expr_option(&mut self, node: &'ast m2_syn::nodes::ExprOption) {
+        self.record(&node.operator, &node.value);
+        self.record_leading(&node.operator, &node.key);
+        visit::visit_expr_option(self, node);
+    }
+    fn visit_expr_assign(&mut self, node: &'ast m2_syn::nodes::ExprAssign) {
+        let parts = node.parts();
+        if let Some(operator) = &parts.operator_span {
+            self.record_leading(operator, node);
+        }
+        if !matches!(parts.value, Expr::If(_) | Expr::Assign(_)) {
+            if let Some(operator) = parts.operator_span {
+                self.record(&operator, parts.value);
             }
         }
-        if parent.is_except_clause() {
-            let clause_body = direct_keyword::<Token![do]>(parent).zip(parent.clause_value());
-            if let Some((keyword, body)) = clause_body {
-                if body.start_byte() == node.start_byte() && keyword.start_position().row < row {
-                    return true;
-                }
-            }
+        visit::visit_expr_assign(self, node);
+    }
+    fn visit_expr_assign_evaluated(&mut self, node: &'ast m2_syn::nodes::ExprAssignEvaluated) {
+        self.record_leading(&node.operator, &node.evaluated_domain);
+        if !matches!(node.value.as_ref(), Expr::If(_) | Expr::Assign(_)) {
+            self.record(&node.operator, &node.value);
         }
-        current = parent;
+        visit::visit_expr_assign_evaluated(self, node);
     }
-    false
-}
-
-/// Whether `node` is an `else`/`then` clause keyword beginning `row` that
-/// continues a non-standalone conditional expression. Two parse shapes occur:
-///   * A proper clause keyword inside an `if` or `try`: a continuation only when
-///     its owner is not standalone (a standalone owner aligns the clause through
-///     bracket depth instead).
-///   * A retained clause keyword without an enclosing conditional owner:
-///     a continuation of the expression begun on an earlier line.
-fn is_dangling_clause_keyword(node: LayoutNode<'_>, row: usize, line_leads: &[usize]) -> bool {
-    if !is_clause_keyword_leaf(node) {
-        return false;
+    fn visit_expr_lambda_variadic(&mut self, node: &'ast m2_syn::nodes::ExprLambdaVariadic) {
+        self.record(&node.operator, &node.body);
+        visit::visit_expr_lambda_variadic(self, node);
     }
-    if node.start_position().row != row {
-        return false;
+    fn visit_expr_lambda_list(&mut self, node: &'ast m2_syn::nodes::ExprLambdaList) {
+        self.record(&node.operator, &node.body);
+        visit::visit_expr_lambda_list(self, node);
     }
-    match enclosing_clause_owner(node) {
-        Some(owner) => {
-            !(control_statement_is_standalone(owner, line_leads)
-                || owner.is::<IfStatement>() && if_statement_is_else_if(owner))
-        }
-        None => true,
-    }
-}
-
-/// Whether a leaf is an `else`/`then` clause keyword. Normally these are the
-/// keyword token kinds, but when a line-broken ternary is parsed the keyword is
-/// demoted to a bare `symbol`; since `else`/`then` are reserved words no real
-/// identifier carries that text, so a symbol spelled so is the misparsed keyword.
-fn is_clause_keyword_leaf(node: LayoutNode<'_>) -> bool {
-    if node.is_then_or_else_keyword() {
-        return true;
-    }
-    node.is::<Symbol>()
-        && (matches_token::<Token![else]>(node.text())
-            || matches_token::<Token![then]>(node.text()))
-}
-
-/// The nearest enclosing conditional owner of a clause keyword.
-fn enclosing_clause_owner(node: LayoutNode<'_>) -> Option<LayoutNode<'_>> {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        if parent.is::<IfStatement>() || parent.is::<TryStatement>() {
-            return Some(parent);
-        }
-        current = parent;
-    }
-    None
-}
-
-/// Whether a control statement begins its own line.
-fn control_statement_is_standalone(node: LayoutNode<'_>, line_leads: &[usize]) -> bool {
-    let row = node.start_position().row;
-    let column = node.start_position().column;
-    line_leads.get(row).copied().unwrap_or(0) >= column
-}
-
-/// Whether this conditional is the direct value of an enclosing else clause.
-fn if_statement_is_else_if(node: LayoutNode<'_>) -> bool {
-    let Some(parent) = node.parent().filter(|parent| parent.is::<ElseClause>()) else {
-        return false;
-    };
-    parent
-        .named_child(0)
-        .is_some_and(|body| body.id() == node.id())
-        && parent
-            .child(0)
-            .is_some_and(|keyword| keyword.start_position().row == node.start_position().row)
 }
 
 /// A foldable block of consecutive lines (0-based, both bounds inclusive as
@@ -1631,91 +2051,264 @@ fn close_fold_range(
 }
 
 /// Normalizes whitespace according to the resolved formatting settings.
-fn normalize_whitespace(root: LayoutNode<'_>, options: &FormatOptions) -> Vec<FormatEdit> {
-    let text = root.source_text();
-
+fn normalize_whitespace(
+    syntax: &SyntaxSnapshot,
+    layout: &LayoutSource,
+    options: &FormatOptions,
+) -> Vec<FormatEdit> {
     let mut edits = Vec::new();
-    collect_format_edits(root, text, options, &mut edits);
+    let mut commas = CommaBreaks {
+        layout,
+        candidates: Vec::new(),
+        spacing: Vec::new(),
+    };
+    syntax.visit(&mut commas);
+    edits.extend(commas.spacing);
+    let mut semicolons = SemicolonSpacing {
+        layout,
+        break_after: options.break_after_semicolon,
+        in_collection: false,
+        edits: Vec::new(),
+    };
+    syntax.visit(&mut semicolons);
+    edits.extend(semicolons.edits);
+    let mut braces = BraceSpacing {
+        layout,
+        space_in_braces: options.space_in_braces,
+        edits: Vec::new(),
+    };
+    syntax.visit(&mut braces);
+    edits.extend(braces.edits);
+    let mut prefixes = PrefixSpacing {
+        layout,
+        edits: Vec::new(),
+    };
+    syntax.visit(&mut prefixes);
+    edits.extend(prefixes.edits);
+    let mut binaries = BinarySpacing {
+        layout,
+        compact_factors: options.compact_factor_operators,
+        edits: Vec::new(),
+    };
+    syntax.visit(&mut binaries);
+    edits.extend(binaries.edits);
+    let mut calls = CallSpacing {
+        layout,
+        edits: Vec::new(),
+    };
+    syntax.visit(&mut calls);
+    edits.extend(calls.edits);
+    let mut assignments = AssignmentSpacing {
+        layout,
+        seen: std::collections::HashSet::new(),
+        edits: Vec::new(),
+    };
+    syntax.visit(&mut assignments);
+    edits.extend(assignments.edits);
     edits
 }
 
-/// Collects format edits from the supplied syntax and semantic context.
-fn collect_format_edits(
-    node: LayoutNode<'_>,
-    text: &str,
-    options: &FormatOptions,
-    edits: &mut Vec<FormatEdit>,
-) {
-    if node.is_missing() {
-        return;
-    }
+/// Spacing around assignment, option and lambda operators.
+struct AssignmentSpacing<'a> {
+    /// Current formatter coordinates.
+    layout: &'a LayoutSource,
+    /// Operator ranges already visited through generated enum variants.
+    seen: std::collections::HashSet<std::ops::Range<usize>>,
+    /// Collected whitespace edits.
+    edits: Vec<FormatEdit>,
+}
 
-    if !node.is_error() {
-        if let Some(parts) = node.method_installation_head() {
-            let start = parts.left.end_byte();
-            let end = parts.right.start_byte();
-            if text[start..end].bytes().all(|b| matches!(b, b' ' | b'\t')) {
-                edits.push(FormatEdit {
-                    start_byte: start,
-                    end_byte: end,
-                    replacement: " ".to_string(),
+impl AssignmentSpacing<'_> {
+    /// Applies the existing binary spacing policy to a typed operator.
+    fn consider(&mut self, operator: &impl m2_syn::Spanned) {
+        let Some(bytes) = self.layout.syntax_range(operator) else {
+            return;
+        };
+        if !self.seen.insert(bytes.clone()) {
+            return;
+        }
+        let text = self.layout.text();
+        let spacing = binary_operator_spacing(&text[bytes.clone()]);
+        let before = same_line_horizontal_whitespace_start(text, bytes.start);
+        let after = same_line_horizontal_whitespace_end(text, bytes.end);
+        if spacing == OperatorSpacing::Spaced
+            || (spacing == OperatorSpacing::Compact && before.is_some() && after.is_some())
+        {
+            let replacement = if spacing == OperatorSpacing::Spaced {
+                " "
+            } else {
+                ""
+            };
+            if let Some(start_byte) = before {
+                self.edits.push(FormatEdit {
+                    start_byte,
+                    end_byte: bytes.start,
+                    replacement: replacement.to_string(),
+                });
+            }
+            if let Some(end_byte) = after {
+                self.edits.push(FormatEdit {
+                    start_byte: bytes.end,
+                    end_byte,
+                    replacement: replacement.to_string(),
                 });
             }
         }
+    }
+}
 
-        if node.is_comma() {
-            push_comma_whitespace_edits(text, node, edits);
+impl<'ast> Visit<'ast> for AssignmentSpacing<'_> {
+    fn visit_expr_op_bin_index(&mut self, node: &'ast m2_syn::nodes::ExprOpBinIndex) {
+        self.consider(&node.operator);
+        visit::visit_expr_op_bin_index(self, node);
+    }
+    fn visit_expr_op_bin_member(&mut self, node: &'ast m2_syn::nodes::ExprOpBinMember) {
+        match node {
+            m2_syn::nodes::ExprOpBinMember::Dot(node) => self.consider(&node.operator),
+            m2_syn::nodes::ExprOpBinMember::Optional(node) => self.consider(&node.operator),
         }
-
-        if node.is::<List>() {
-            push_brace_whitespace_edits(text, node, options.space_in_braces, edits);
+        visit::visit_expr_op_bin_member(self, node);
+    }
+    fn visit_expr_assign(&mut self, node: &'ast m2_syn::nodes::ExprAssign) {
+        if let Some(span) = node.parts().operator_span {
+            self.consider(&span);
         }
+        visit::visit_expr_assign(self, node);
+    }
+    fn visit_expr_assign_evaluated(&mut self, node: &'ast m2_syn::nodes::ExprAssignEvaluated) {
+        self.consider(&node.operator);
+        visit::visit_expr_assign_evaluated(self, node);
+    }
+    fn visit_expr_option(&mut self, node: &'ast m2_syn::nodes::ExprOption) {
+        self.consider(&node.operator);
+        visit::visit_expr_option(self, node);
+    }
+    fn visit_expr_lambda_variadic(&mut self, node: &'ast m2_syn::nodes::ExprLambdaVariadic) {
+        self.consider(&node.operator);
+        visit::visit_expr_lambda_variadic(self, node);
+    }
+    fn visit_expr_lambda_list(&mut self, node: &'ast m2_syn::nodes::ExprLambdaList) {
+        self.consider(&node.operator);
+        visit::visit_expr_lambda_list(self, node);
+    }
+}
 
-        if node.is_semicolon() {
-            let break_after_semicolon =
-                options.break_after_semicolon && !semicolon_terminates_collection_entry(node);
-            push_semicolon_whitespace_edits(text, node, break_after_semicolon, edits);
+/// Spacing between typed call heads and argument or method-signature expressions.
+struct CallSpacing<'a> {
+    /// Current formatter coordinates.
+    layout: &'a LayoutSource,
+    /// Collected whitespace edits.
+    edits: Vec<FormatEdit>,
+}
+
+impl CallSpacing<'_> {
+    /// Replaces a horizontal gap between two typed expressions.
+    fn gap(&mut self, left: &Expr, right: &Expr, replacement: &str) {
+        let (Some(left), Some(right)) = (
+            self.layout.syntax_range(left),
+            self.layout.syntax_range(right),
+        ) else {
+            return;
+        };
+        if left.end <= right.start
+            && self.layout.text()[left.end..right.start]
+                .bytes()
+                .all(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            self.edits.push(FormatEdit {
+                start_byte: left.end,
+                end_byte: right.start,
+                replacement: replacement.to_string(),
+            });
         }
+    }
+}
 
-        if let Some(operator) = node.operator_node() {
-            if is_parenthesized_call(node) {
-                // A call `f(...)` that is the head of a `:=` install reads as
-                // installation syntax, so it is spaced (`f (Types) := …`); an
-                // ordinary call is compacted (`f(x)`).
-                if is_method_installation_call_head(node) {
-                    push_call_gap_whitespace_edit(node, text, edits, " ");
-                } else {
-                    push_call_gap_whitespace_edit(node, text, edits, "");
+impl<'ast> Visit<'ast> for CallSpacing<'_> {
+    fn visit_expr_op_bin_adj(&mut self, call: &'ast m2_syn::nodes::ExprOpBinAdj) {
+        if matches!(
+            call.right_operand.as_ref(),
+            Expr::Holder(_) | Expr::Collection(m2_syn::nodes::ExprCollection::Sequence(_))
+        ) {
+            self.gap(&call.left_operand, &call.right_operand, "");
+        }
+        visit::visit_expr_op_bin_adj(self, call);
+    }
+    fn visit_expr_assign_install_method(
+        &mut self,
+        installation: &'ast m2_syn::nodes::ExprAssignInstallMethod,
+    ) {
+        self.gap(&installation.method, &installation.signature, " ");
+        visit::visit_expr_assign_install_method(self, installation);
+    }
+}
+
+/// Spacing edits for generated regular binary expressions.
+struct BinarySpacing<'a> {
+    /// Current whitespace coordinates.
+    layout: &'a LayoutSource,
+    /// Whether adjacent factors use compact operators.
+    compact_factors: bool,
+    /// Collected whitespace replacements.
+    edits: Vec<FormatEdit>,
+}
+
+impl BinarySpacing<'_> {
+    /// Whether an expression can be written as an adjacent factor.
+    fn is_factor(expression: &Expr) -> bool {
+        matches!(
+            expression,
+            Expr::Symbol(_)
+                | Expr::Literal(_)
+                | Expr::Collection(_)
+                | Expr::Holder(_)
+                | Expr::Op(_)
+        )
+    }
+}
+
+impl<'ast> Visit<'ast> for BinarySpacing<'_> {
+    fn visit_expr_op_bin_regular(&mut self, expression: &'ast m2_syn::nodes::ExprOpBinRegular) {
+        if let Some(operator) = self.layout.syntax_range(&expression.operator) {
+            let text = self.layout.text();
+            let spacing = match binary_operator_spacing(&text[operator.clone()]) {
+                OperatorSpacing::Factor
+                    if self.compact_factors
+                        && Self::is_factor(&expression.left_operand)
+                        && Self::is_factor(&expression.right_operand) =>
+                {
+                    OperatorSpacing::Compact
                 }
-            } else {
-                match operator_spacing(node, operator.text()) {
-                    OperatorSpacing::Spaced => {
-                        push_operator_whitespace_edits(text, operator, edits)
-                    }
-                    OperatorSpacing::Compact => {
-                        push_compact_operator_whitespace_edits(text, operator, edits)
-                    }
-                    OperatorSpacing::Factor => {
-                        if options.compact_factor_operators && binary_operator_all_factors(node) {
-                            push_compact_operator_whitespace_edits(text, operator, edits);
-                        } else {
-                            push_operator_whitespace_edits(text, operator, edits);
-                        }
-                    }
-                    OperatorSpacing::Prefix => {
-                        push_prefix_operator_whitespace_edits(text, operator, edits, "")
-                    }
-                    OperatorSpacing::SpacedPrefix => {
-                        push_prefix_operator_whitespace_edits(text, operator, edits, " ")
-                    }
-                    OperatorSpacing::None => {}
+                OperatorSpacing::Factor => OperatorSpacing::Spaced,
+                spacing => spacing,
+            };
+            let before = same_line_horizontal_whitespace_start(text, operator.start);
+            let after = same_line_horizontal_whitespace_end(text, operator.end);
+            if spacing == OperatorSpacing::Spaced
+                || (spacing == OperatorSpacing::Compact && before.is_some() && after.is_some())
+            {
+                let replacement = if spacing == OperatorSpacing::Spaced {
+                    " "
+                } else {
+                    ""
+                };
+                if let Some(start_byte) = before {
+                    self.edits.push(FormatEdit {
+                        start_byte,
+                        end_byte: operator.start,
+                        replacement: replacement.to_string(),
+                    });
+                }
+                if let Some(end_byte) = after {
+                    self.edits.push(FormatEdit {
+                        start_byte: operator.end,
+                        end_byte,
+                        replacement: replacement.to_string(),
+                    });
                 }
             }
         }
-    }
-
-    for child in node.children() {
-        collect_format_edits(child, text, options, edits);
+        visit::visit_expr_op_bin_regular(self, expression);
     }
 }
 
@@ -1747,21 +2340,6 @@ macro_rules! matches_tokens {
     ($text:expr, $($token:ty),+ $(,)?) => {
         false $(|| matches_token::<$token>($text))+
     };
-}
-
-/// Spacing rule for the operator `node` carries, keyed by the parent's kind so
-/// the same spelling can route differently in binary vs prefix context
-/// (`-` in `BinaryExpr` is `Spaced`, in `PrefixExpr` is `Prefix`).
-/// `LambdaExpression` shares the binary table: its `->` operator reads as a
-/// spaced binary operator.
-fn operator_spacing(parent: LayoutNode<'_>, operator: &str) -> OperatorSpacing {
-    if parent.binary_operator().is_some() || parent.is::<LambdaExpression>() {
-        binary_operator_spacing(operator)
-    } else if parent.is_prefix_expr() {
-        prefix_operator_spacing(operator)
-    } else {
-        OperatorSpacing::None
-    }
 }
 
 /// Operator spacing required by an infix operator in the surrounding expression.
@@ -1858,20 +2436,6 @@ fn prefix_operator_spacing(operator: &str) -> OperatorSpacing {
     OperatorSpacing::None
 }
 
-/// Whether a `Factor`-classified binary operator collapses to compact form:
-/// `true` iff both operands are adjacent factors (atoms or sub-expressions),
-/// in which case spacing (`a * b`) would visually break a tight product such as
-/// `2*x*y`. Otherwise a space is required to separate the operands.
-fn binary_operator_all_factors(node: LayoutNode<'_>) -> bool {
-    let Some(left) = node.binary_parts().map(|parts| parts.left) else {
-        return false;
-    };
-    let Some(right) = node.binary_parts().map(|parts| parts.right) else {
-        return false;
-    };
-    is_adjacent_factor(left) && is_adjacent_factor(right)
-}
-
 /// Whether `operator`, when it dangles at the end of a line, takes a trailing
 /// space and so signals that the following row is an indented continuation.
 /// Used by the tree-driven indenter to decide right-operand indentation. The
@@ -1887,223 +2451,99 @@ fn is_spaced_line_final_operator(operator: &str, compact_factor_operators: bool)
     }
 }
 
-/// Whether a line break beside the binary `operator` goes before it, so the
-/// operator starts the continuation row (`a\n+ b`) rather than ending the
-/// previous one. Macaulay2 ends an expression at a newline whenever the text
-/// so far is complete, so a leading operator only continues the expression
-/// inside brackets, where a newline is always whitespace; elsewhere the break
-/// stays after the operator. Bindings (`:=`, `=`, `=>`) keep their value on
-/// the next row and so always end the line.
-fn breaks_before_operator(operator: LayoutNode<'_>, compact_factor_operators: bool) -> bool {
-    let Some(expression) = operator.parent() else {
-        return false;
-    };
-    expression.binary_operator().is_some()
-        && !expression.is_assignment()
-        && !expression.is_option_assignment()
-        && is_spaced_line_final_operator(operator.text(), compact_factor_operators)
-        && std::iter::successors(expression.parent(), |node| node.parent())
-            .any(|node| node.is_delimited_expression())
+/// Whitespace after generated prefix operators.
+struct PrefixSpacing<'a> {
+    /// Current whitespace coordinates.
+    layout: &'a LayoutSource,
+    /// Collected whitespace replacements.
+    edits: Vec<FormatEdit>,
 }
 
-/// Whether this node is a parenthesized call.
-fn is_parenthesized_call(node: LayoutNode<'_>) -> bool {
-    if node.binary_operator().is_none() {
-        return false;
-    }
-
-    let Some(operator) = node.operator_node() else {
-        return false;
-    };
-    let Some(right) = node.binary_parts().map(|parts| parts.right) else {
-        return false;
-    };
-
-    // A call's argument list is a `sequence` (`f(a, b)`, `f()`) or, for a single
-    // parenthesized argument, a `parenthesized_expression` (`f(x)`).
-    operator.is_implicit_application() && (right.is::<Sequence>() || right.is_holder())
-}
-
-/// Whether a parenthesized call `f(...)` is the head of a `:=` method install
-/// (`f(Types) := fn`) — i.e. it is the left operand of an enclosing `:=`. Such a
-/// head is installation syntax and is spaced rather than compacted.
-fn is_method_installation_call_head(node: LayoutNode<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    if parent.binary_operator().is_none() {
-        return false;
-    }
-    let Some(operator) = parent.operator_node() else {
-        return false;
-    };
-    if !operator.is::<Token![:=]>() {
-        return false;
-    }
-    parent
-        .binary_parts()
-        .map(|parts| parts.left)
-        .is_some_and(|left| {
-            left.start_byte() == node.start_byte() && left.end_byte() == node.end_byte()
-        })
-}
-
-/// Appends call gap whitespace edit to the current formatting edits or traversal results.
-fn push_call_gap_whitespace_edit(
-    node: LayoutNode<'_>,
-    text: &str,
-    edits: &mut Vec<FormatEdit>,
-    replacement: &'static str,
-) {
-    let Some(left) = node.binary_parts().map(|parts| parts.left) else {
-        return;
-    };
-    let Some(right) = node.binary_parts().map(|parts| parts.right) else {
-        return;
-    };
-    let gap = &text[left.end_byte()..right.start_byte()];
-    if !gap.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
-        return;
-    }
-    edits.push(FormatEdit {
-        start_byte: left.end_byte(),
-        end_byte: right.start_byte(),
-        replacement: replacement.to_string(),
-    });
-}
-
-/// Whether this node is a adjacent factor.
-fn is_adjacent_factor(node: LayoutNode<'_>) -> bool {
-    node.is::<Symbol>()
-        || node.is::<IntegerLiteral>()
-        || node.is::<FloatLiteral>()
-        || node.is::<StringLiteral>()
-        || node.is::<RawStringLiteral>()
-        || node.is_delimited_expression()
-        || node.is_prefix_expr()
-        || node.is_postfix_expr()
-        || node.binary_operator().is_some()
-}
-
-/// Appends operator whitespace edits to the current formatting edits or traversal results.
-fn push_operator_whitespace_edits(
-    text: &str,
-    operator: LayoutNode<'_>,
-    edits: &mut Vec<FormatEdit>,
-) {
-    if let Some(start_byte) = same_line_horizontal_whitespace_start(text, operator.start_byte()) {
-        edits.push(FormatEdit {
-            start_byte,
-            end_byte: operator.start_byte(),
-            replacement: " ".to_string(),
-        });
-    }
-    if let Some(end_byte) = same_line_horizontal_whitespace_end(text, operator.end_byte()) {
-        edits.push(FormatEdit {
-            start_byte: operator.end_byte(),
-            end_byte,
-            replacement: " ".to_string(),
-        });
-    }
-}
-
-/// Appends compact operator whitespace edits to the current formatting edits or traversal results.
-fn push_compact_operator_whitespace_edits(
-    text: &str,
-    operator: LayoutNode<'_>,
-    edits: &mut Vec<FormatEdit>,
-) {
-    let Some(start_byte) = same_line_horizontal_whitespace_start(text, operator.start_byte())
-    else {
-        return;
-    };
-    let Some(end_byte) = same_line_horizontal_whitespace_end(text, operator.end_byte()) else {
-        return;
-    };
-
-    edits.push(FormatEdit {
-        start_byte,
-        end_byte: operator.start_byte(),
-        replacement: String::new(),
-    });
-    edits.push(FormatEdit {
-        start_byte: operator.end_byte(),
-        end_byte,
-        replacement: String::new(),
-    });
-}
-
-/// Appends prefix operator whitespace edits to the current formatting edits or traversal results.
-fn push_prefix_operator_whitespace_edits(
-    text: &str,
-    operator: LayoutNode<'_>,
-    edits: &mut Vec<FormatEdit>,
-    separator: &str,
-) {
-    let Some(end_byte) = same_line_horizontal_whitespace_end(text, operator.end_byte()) else {
-        return;
-    };
-
-    edits.push(FormatEdit {
-        start_byte: operator.end_byte(),
-        end_byte,
-        replacement: separator.to_string(),
-    });
-}
-
-/// Appends comma whitespace edits to the current formatting edits or traversal results.
-fn push_comma_whitespace_edits(text: &str, comma: LayoutNode<'_>, edits: &mut Vec<FormatEdit>) {
-    if let Some(start_byte) = same_line_horizontal_whitespace_start(text, comma.start_byte()) {
-        edits.push(FormatEdit {
-            start_byte,
-            end_byte: comma.start_byte(),
-            replacement: String::new(),
-        });
-    }
-
-    let Some(end_byte) = same_line_horizontal_whitespace_end(text, comma.end_byte()) else {
-        return;
-    };
-    let replacement = if comma.comma_borders_empty_slot() {
-        ""
-    } else {
-        match text.as_bytes().get(end_byte) {
-            Some(b')' | b']' | b'}' | b';') | None => "",
-            _ => " ",
+impl<'ast> Visit<'ast> for PrefixSpacing<'_> {
+    fn visit_expr_op_prefix(&mut self, expression: &'ast m2_syn::nodes::ExprOpPrefix) {
+        if let Some(operator) = self.layout.syntax_range(&expression.operator) {
+            let text = self.layout.text();
+            let separator = match prefix_operator_spacing(&text[operator.clone()]) {
+                OperatorSpacing::Prefix => Some(""),
+                OperatorSpacing::SpacedPrefix => Some(" "),
+                _ => None,
+            };
+            if let (Some(separator), Some(end_byte)) = (
+                separator,
+                same_line_horizontal_whitespace_end(text, operator.end),
+            ) {
+                self.edits.push(FormatEdit {
+                    start_byte: operator.end,
+                    end_byte,
+                    replacement: separator.to_string(),
+                });
+            }
         }
-    };
-
-    edits.push(FormatEdit {
-        start_byte: comma.end_byte(),
-        end_byte,
-        replacement: replacement.to_string(),
-    });
+        visit::visit_expr_op_prefix(self, expression);
+    }
 }
 
-/// Whether the semicolon closes a statement inside a collection rather than a top-level cell.
-fn semicolon_terminates_collection_entry(semicolon: LayoutNode<'_>) -> bool {
-    semicolon
-        .parent()
-        .and_then(|muted| muted.parent())
-        .is_some_and(|container| container.is_collection_expression())
+/// Semicolon spacing with the enclosing collection context.
+struct SemicolonSpacing<'a> {
+    /// Current whitespace coordinates.
+    layout: &'a LayoutSource,
+    /// Whether statements normally end a line.
+    break_after: bool,
+    /// Whether the immediate statement container is a collection.
+    in_collection: bool,
+    /// Collected whitespace replacements.
+    edits: Vec<FormatEdit>,
+}
+
+impl<'ast> Visit<'ast> for SemicolonSpacing<'_> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        let previous = self.in_collection;
+        self.in_collection = matches!(expression, Expr::Collection(_));
+        visit::visit_expr(self, expression);
+        self.in_collection = previous;
+    }
+    fn visit_cell(&mut self, cell: &'ast m2_syn::nodes::Cell) {
+        if let Some(semicolon) = &cell.semicolon {
+            if let Some(bytes) = self.layout.syntax_range(semicolon) {
+                push_semicolon_whitespace_edits(
+                    self.layout.text(),
+                    bytes,
+                    self.break_after,
+                    &mut self.edits,
+                );
+            }
+        }
+        visit::visit_cell(self, cell);
+    }
+    fn visit_statement(&mut self, statement: &'ast m2_syn::nodes::Statement) {
+        if let Some(bytes) = self.layout.syntax_range(&statement.semicolon) {
+            push_semicolon_whitespace_edits(
+                self.layout.text(),
+                bytes,
+                self.break_after && !self.in_collection,
+                &mut self.edits,
+            );
+        }
+        visit::visit_statement(self, statement);
+    }
 }
 
 /// Appends semicolon whitespace edits to the current formatting edits or traversal results.
 fn push_semicolon_whitespace_edits(
     text: &str,
-    semicolon: LayoutNode<'_>,
+    semicolon: std::ops::Range<usize>,
     break_after_semicolon: bool,
     edits: &mut Vec<FormatEdit>,
 ) {
-    if let Some(start_byte) = same_line_horizontal_whitespace_start(text, semicolon.start_byte()) {
+    if let Some(start_byte) = same_line_horizontal_whitespace_start(text, semicolon.start) {
         edits.push(FormatEdit {
             start_byte,
-            end_byte: semicolon.start_byte(),
+            end_byte: semicolon.start,
             replacement: String::new(),
         });
     }
 
-    let Some(end_byte) = same_line_horizontal_whitespace_end(text, semicolon.end_byte()) else {
+    let Some(end_byte) = same_line_horizontal_whitespace_end(text, semicolon.end) else {
         return;
     };
     let Some(next_byte) = text.as_bytes().get(end_byte) else {
@@ -2118,59 +2558,72 @@ fn push_semicolon_whitespace_edits(
             " "
         };
         edits.push(FormatEdit {
-            start_byte: semicolon.end_byte(),
+            start_byte: semicolon.end,
             end_byte,
             replacement: replacement.to_string(),
         });
     }
 }
 
-/// Spacing just inside the braces of a `{…}` list: one space with
-/// `space_in_braces`, none without it, as written when unset. Empty braces
-/// are always `{}`, and a brace at a line break keeps its line layout.
-fn push_brace_whitespace_edits(
-    text: &str,
-    list: LayoutNode<'_>,
+/// Spacing just inside typed list braces.
+struct BraceSpacing<'a> {
+    /// Current whitespace coordinates.
+    layout: &'a LayoutSource,
+    /// Configured padding, or none to preserve it.
     space_in_braces: Option<bool>,
-    edits: &mut Vec<FormatEdit>,
-) {
-    let children = list.children().collect::<Vec<_>>();
-    let (Some(opener), Some(closer)) = (children.first(), children.last()) else {
-        return;
-    };
-    if opener.is_missing()
-        || closer.is_missing()
-        || !opener.is_opening_delimiter()
-        || !closer.is_closing_delimiter()
-    {
-        return;
+    /// Collected whitespace replacements.
+    edits: Vec<FormatEdit>,
+}
+
+impl<'ast> Visit<'ast> for BraceSpacing<'_> {
+    fn visit_list(&mut self, list: &'ast List) {
+        let delimiter = list.delimiter.delimiter();
+        if let (Some(opener), Some(closer)) = (
+            self.layout.syntax_range(&delimiter.opening_span()),
+            delimiter
+                .closing_span()
+                .and_then(|span| self.layout.syntax_range(&span)),
+        ) {
+            self.space(opener, closer);
+        }
+        visit::visit_list(self, list);
     }
-    let inside = &text[opener.end_byte()..closer.start_byte()];
-    if inside.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
-        edits.push(FormatEdit {
-            start_byte: opener.end_byte(),
-            end_byte: closer.start_byte(),
-            replacement: String::new(),
-        });
-        return;
-    }
-    let Some(space_in_braces) = space_in_braces else {
-        return;
-    };
-    let padding = if space_in_braces { " " } else { "" };
-    if let Some(end_byte) = same_line_horizontal_whitespace_end(text, opener.end_byte()) {
-        edits.push(FormatEdit {
-            start_byte: opener.end_byte(),
-            end_byte,
-            replacement: padding.to_string(),
-        });
-    }
-    if let Some(start_byte) = same_line_horizontal_whitespace_start(text, closer.start_byte()) {
-        edits.push(FormatEdit {
-            start_byte,
-            end_byte: closer.start_byte(),
-            replacement: padding.to_string(),
-        });
+}
+
+impl BraceSpacing<'_> {
+    /// Applies brace padding without crossing line breaks or literal contents.
+    fn space(&mut self, opener: std::ops::Range<usize>, closer: std::ops::Range<usize>) {
+        if opener.end > closer.start {
+            return;
+        }
+        let text = self.layout.text();
+        let inside = &text[opener.end..closer.start];
+        if inside.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
+            self.edits.push(FormatEdit {
+                start_byte: opener.end,
+                end_byte: closer.start,
+                replacement: String::new(),
+            });
+            return;
+        }
+        let Some(space_in_braces) = self.space_in_braces else {
+            return;
+        };
+        let padding = if space_in_braces { " " } else { "" };
+        if let Some(end_byte) = same_line_horizontal_whitespace_end(text, opener.end) {
+            self.edits.push(FormatEdit {
+                start_byte: opener.end,
+                end_byte,
+                replacement: padding.to_string(),
+            });
+        }
+        if let Some(start_byte) = same_line_horizontal_whitespace_start(text, closer.start) {
+            self.edits.push(FormatEdit {
+                start_byte,
+                end_byte: closer.start,
+                replacement: padding.to_string(),
+            });
+        }
     }
 }
 
@@ -2199,7 +2652,7 @@ fn same_line_horizontal_whitespace_end(text: &str, byte_index: usize) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node_metadata::SyntaxParser;
+    use crate::node_metadata::SyntaxSnapshot;
 
     // Exact-output fixtures specify a fixed style, independent of user defaults.
     fn fixture_options(tab_size: u32, insert_spaces: bool) -> FormatOptions {
@@ -2217,16 +2670,11 @@ mod tests {
     }
 
     fn format_fixture_with_options(text: &str, options: &FormatOptions) -> String {
-        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
-        let tree = parser.parse_tree(text, None).expect("fixture should parse");
-        let root = tree.root(text);
-        format_document_with_options(root, options)
+        format_document_with_options(&SyntaxSnapshot::parse(text, None), options)
     }
 
     fn fold_fixture(text: &str) -> Vec<FormatFoldRange> {
-        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
-        let tree = parser.parse_tree(text, None).expect("fixture should parse");
-        folding_ranges_for_syntax(tree.root(text))
+        folding_ranges_for_syntax(&SyntaxSnapshot::parse(text, None))
     }
 
     fn format_fixture(text: &str) -> String {
@@ -2236,33 +2684,21 @@ mod tests {
     #[test]
     fn layout_edits_keep_the_supplied_syntax_and_token_contents() {
         let input = "  x:= f (\"λ 😀  \",1+2)  \r\n";
-        let mut parser = SyntaxParser::new().unwrap();
-        let tree = parser.parse_tree(input, None).unwrap();
-        let root = tree.root(input);
-        let mut source = LayoutSource::new(root);
+        let syntax = SyntaxSnapshot::parse(input, None);
+        let mut source = LayoutSource::new(&syntax);
         let options = fixture_options(2, true);
-        let tokens = |node: LayoutNode<'_>| {
-            node.descendants()
-                .filter(|node| node.child_count() == 0 && !node.is_implicit_application())
-                .map(|node| (node.id(), node.text().to_string()))
-                .collect::<Vec<_>>()
-        };
-        let expected = tokens(LayoutNode::new(root, &source));
-        let spacing = normalize_whitespace(LayoutNode::new(root, &source), &options);
+        let spacing = normalize_whitespace(&syntax, &source, &options);
         assert!(source.apply(spacing));
-        let indentation = reindent_from_tree(LayoutNode::new(root, &source), &options);
+        let indentation = reindent_from_syntax(&syntax, &source, &options);
         assert!(source.apply(indentation));
-        assert_eq!(tokens(LayoutNode::new(root, &source)), expected);
         assert_eq!(source.into_text(), "x := f(\"λ 😀  \", 1 + 2)\r\n");
-        assert_eq!(root.source_text(), input);
+        assert_eq!(syntax.source(), input);
     }
 
     #[test]
     fn layout_rejects_edits_inside_literal_whitespace() {
         let input = "x = \"a  b\"\n";
-        let mut parser = SyntaxParser::new().unwrap();
-        let tree = parser.parse_tree(input, None).unwrap();
-        let mut source = LayoutSource::new(tree.root(input));
+        let mut source = LayoutSource::new(&SyntaxSnapshot::parse(input, None));
         assert!(!source.apply(vec![FormatEdit {
             start_byte: 6,
             end_byte: 8,
@@ -2331,6 +2767,106 @@ mod tests {
     }
 
     #[test]
+    fn comma_wrap_candidates_exclude_empty_argument_boundaries() {
+        let text = "f(a,,b,c)\n";
+        let tree = SyntaxSnapshot::parse(text, None);
+        let layout = LayoutSource::new(&tree);
+        let mut visitor = CommaBreaks {
+            layout: &layout,
+            candidates: Vec::new(),
+            spacing: Vec::new(),
+        };
+        tree.visit(&mut visitor);
+        assert_eq!(
+            visitor.candidates,
+            vec![LineBreakCandidate {
+                start_byte: 7,
+                end_byte: 7
+            }]
+        );
+    }
+
+    #[test]
+    fn operator_wrap_candidates_respect_delimiters_and_assignments() {
+        let text = "(a + b)\nx = y\n";
+        let tree = SyntaxSnapshot::parse(text, None);
+        let layout = LayoutSource::new(&tree);
+        let mut visitor = OperatorBreaks {
+            layout: &layout,
+            compact_factors: false,
+            depth: 0,
+            candidates: Vec::new(),
+        };
+        tree.visit(&mut visitor);
+        assert_eq!(
+            visitor.candidates,
+            vec![
+                LineBreakCandidate {
+                    start_byte: 2,
+                    end_byte: 3
+                },
+                LineBreakCandidate {
+                    start_byte: 11,
+                    end_byte: 12
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn operator_wrap_candidates_cover_evaluated_parallel_targets() {
+        let text = "(x <- y, z) = (1, 2)\n";
+        let tree = SyntaxSnapshot::parse(text, None);
+        let layout = LayoutSource::new(&tree);
+        let mut visitor = OperatorBreaks {
+            layout: &layout,
+            compact_factors: false,
+            depth: 0,
+            candidates: Vec::new(),
+        };
+        tree.visit(&mut visitor);
+        assert!(visitor
+            .candidates
+            .iter()
+            .any(|candidate| candidate.start_byte == 5 && candidate.end_byte == 6));
+    }
+
+    #[test]
+    fn semicolon_spacing_distinguishes_blocks_from_collections() {
+        let text = "f = () -> (a; b)\nx = {a; b}\n";
+        let tree = SyntaxSnapshot::parse(text, None);
+        let layout = LayoutSource::new(&tree);
+        let mut visitor = SemicolonSpacing {
+            layout: &layout,
+            break_after: true,
+            in_collection: false,
+            edits: Vec::new(),
+        };
+        tree.visit(&mut visitor);
+        let semicolons = text
+            .match_indices(';')
+            .map(|(index, _)| index + 1)
+            .collect::<Vec<_>>();
+        let replacement = |start| {
+            visitor
+                .edits
+                .iter()
+                .find(|edit| edit.start_byte == start)
+                .map(|edit| edit.replacement.as_str())
+        };
+        assert_eq!(replacement(semicolons[0]), Some("\n"));
+        assert_eq!(replacement(semicolons[1]), Some(" "));
+    }
+
+    #[test]
+    fn indents_comments_without_changing_their_contents() {
+        assert_eq!(
+            format_fixture("f = () -> (\n-- comment  \nx = 1\n)\n"),
+            "f = () -> (\n    -- comment  \n    x = 1\n)\n"
+        );
+    }
+
+    #[test]
     fn folds_consecutive_full_line_comments_as_one_range() {
         assert_eq!(
             fold_fixture("-- first line\n  -- second line\n-- third line\nx = 1\n-- lone line\n"),
@@ -2381,12 +2917,21 @@ mod tests {
     }
 
     #[test]
+    fn folds_comments_retained_before_a_fatal_lexical_error() {
+        assert_eq!(
+            fold_fixture("-- first\n-- second\nx = )\ny = 1\n"),
+            vec![FormatFoldRange {
+                start_line: 0,
+                end_line: 1,
+                kind: FormatFoldKind::Comment
+            }]
+        );
+    }
+
+    #[test]
     fn marks_comment_folds_for_lsp_clients() {
-        let mut parser = SyntaxParser::new().unwrap();
         let text = "-- first\n-- second\n";
-        let tree = parser.parse_tree(text, None).unwrap();
-        let root = tree.root(text);
-        let ranges = folding_ranges(root);
+        let ranges = folding_ranges(&SyntaxSnapshot::parse(text, None));
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].kind, Some(FoldingRangeKind::Comment));
@@ -2539,7 +3084,6 @@ mod tests {
 
     #[test]
     fn aligns_chained_method_installations() {
-        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
         for (input, expected) in [
             (
                 "plainText Option    :=\n    plainText Nothing := x -> \"\"\n",
@@ -2553,9 +3097,7 @@ mod tests {
         ] {
             let formatted = format_fixture(input);
             assert_eq!(formatted, expected);
-            assert!(parser
-                .parse_tree(&formatted, None)
-                .is_some_and(|tree| !tree.root(&formatted).has_error()));
+            assert!(!SyntaxSnapshot::parse(&formatted, None).has_error());
             assert_eq!(format_fixture(&formatted), formatted);
         }
     }
@@ -2718,7 +3260,6 @@ mod tests {
             max_line_width: Some(24),
             ..fixture_options(4, true)
         };
-        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
 
         for source in [
             "result = concatenate(alpha, beta, gamma)\n",
@@ -2727,10 +3268,7 @@ mod tests {
             "nested = outer(alpha, inner(beta, gamma), delta)\n",
         ] {
             let formatted = format_fixture_with_options(source, &options);
-            let has_error = parser
-                .parse_tree(&formatted, None)
-                .map(|tree| tree.root(&formatted).has_error())
-                .expect("formatted fixture should parse");
+            let has_error = SyntaxSnapshot::parse(&formatted, None).has_error();
             assert!(!has_error, "wrapped source should parse:\n{formatted}");
             assert_eq!(format_fixture_with_options(&formatted, &options), formatted);
         }
@@ -2867,13 +3405,12 @@ mod tests {
     #[test]
     fn preserves_literal_and_comment_bytes_with_mixed_line_endings() {
         fn protected_text(text: &str) -> Vec<String> {
-            let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
-            let tree = parser.parse_tree(text, None).expect("source should parse");
-            let root = tree.root(text);
-            assert!(!root.has_error(), "source should parse:\n{text}");
-            root.descendants()
-                .filter(|node| node.is_string_literal() || node.is_comment())
-                .map(|node| node.text().to_string())
+            let tree = SyntaxSnapshot::parse(text, None);
+            assert!(!tree.has_error(), "source should parse:\n{text}");
+            let layout = LayoutSource::new(&tree);
+            layout
+                .protected_ranges()
+                .map(|range| text[range].to_string())
                 .collect()
         }
 
@@ -3255,7 +3792,6 @@ mod tests {
             control_flow_layout: ControlFlowLayout::Multiline,
             ..fixture_options(4, true)
         };
-        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
 
         for (source, clause) in [
             ("value := (\nif ready then (\nwork\n)\n)\n", "then ("),
@@ -3278,9 +3814,7 @@ mod tests {
                 "the clause opener should remain inline:\n{formatted}"
             );
             assert!(
-                parser
-                    .parse_tree(&formatted, None)
-                    .is_some_and(|tree| !tree.root(&formatted).has_error()),
+                !SyntaxSnapshot::parse(&formatted, None).has_error(),
                 "the formatted control statement should parse:\n{formatted}"
             );
             assert_eq!(format_fixture_with_options(&formatted, &options), formatted);

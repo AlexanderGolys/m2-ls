@@ -3,12 +3,15 @@
 //! the analysis, which records them beyond types; nothing is evaluated by
 //! running Macaulay2.
 
+use m2_syn::nodes::Expr;
+use m2_syn::visit::{self, Visit};
 use tower_lsp::lsp_types::{
     InlineValue, InlineValueServerCapabilities, InlineValueText, OneOf, Range,
 };
 
+use crate::analysis::{InferenceSession, TypeChecker};
 use crate::document::DocumentSnapshot;
-use crate::source::SourceNavigation;
+use crate::source::{SourceNavigation, SyntaxSource};
 use crate::typesystem::TypeKnowledge;
 
 /// Protocol capability advertising support for inline values.
@@ -24,26 +27,70 @@ pub fn inline_values_response(
     range: Range,
     knowledge: &(impl TypeKnowledge + ?Sized),
 ) -> Vec<InlineValue> {
-    let analysis = document.analysis();
-    document
-        .root_node()
-        .descendants()
-        .filter_map(|node| {
-            // A holder such as `(S_6)` shares the value of the subscript in it.
-            if node.is_holder() {
-                return None;
+    let syntax = document.syntax();
+    let Some(start) = document.byte_for_position(range.start) else {
+        return Vec::new();
+    };
+    if range.start > range.end {
+        return Vec::new();
+    }
+    let end = document
+        .byte_for_position(range.end)
+        .unwrap_or(document.text().len());
+    let snapshot = syntax;
+    let checker = TypeChecker::new(document.analysis(), knowledge);
+    let session = InferenceSession::new(&checker, document, snapshot);
+    let mut collector = InlineValueCollector {
+        document,
+        range,
+        session: &session,
+        values: Vec::new(),
+    };
+    for cell in snapshot.cells_intersecting(start..end) {
+        if let Some(cell) = cell.syntax() {
+            collector.visit_cell(cell);
+        }
+    }
+    collector.values
+}
+
+/// Collects ring selections in the requested source range using typed expressions.
+struct InlineValueCollector<'ast, 'query, K: ?Sized> {
+    /// Source and coordinate mapping for the retained revision.
+    document: &'query DocumentSnapshot,
+    /// Client-requested range.
+    range: Range,
+    /// Shared inference cache for this request.
+    session: &'query InferenceSession<'ast, 'query, DocumentSnapshot, K>,
+    /// Values in source traversal order.
+    values: Vec<InlineValue>,
+}
+
+impl<'ast, K: TypeKnowledge + ?Sized> Visit<'ast> for InlineValueCollector<'ast, '_, K> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        let Some(range) = self.document.range_for_syntax(expression) else {
+            return;
+        };
+        if range.start > self.range.end || range.end < self.range.start {
+            return;
+        }
+        if !matches!(expression, Expr::Holder(_))
+            && self.range.start <= range.start
+            && range.end <= self.range.end
+        {
+            if let Some(Ok(selected)) = self.session.ring_values(0).selected(expression) {
+                if let Some(text) = self
+                    .document
+                    .syntax_bytes(expression)
+                    .and_then(|bytes| self.document.text().get(bytes))
+                {
+                    self.values.push(InlineValue::Text(InlineValueText {
+                        range,
+                        text: format!("{text} = {}", selected.variable),
+                    }));
+                }
             }
-            let node_range = document.range_for_node(node);
-            if node_range.start < range.start || range.end < node_range.end {
-                return None;
-            }
-            let selected = analysis
-                .selected_ring_variable(node, document, knowledge)?
-                .ok()?;
-            Some(InlineValue::Text(InlineValueText {
-                range: node_range,
-                text: format!("{} = {}", node.text(), selected.variable),
-            }))
-        })
-        .collect()
+        }
+        visit::visit_expr(self, expression);
+    }
 }

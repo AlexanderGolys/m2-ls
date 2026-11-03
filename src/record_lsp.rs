@@ -10,7 +10,7 @@ use crate::builtin_index::{MethodSignature, OperatorInfo, Record};
 use crate::capabilities::hover::layout::{HoverLayout, SectionContent};
 use crate::macaulay2::Macaulay2Conventions;
 use crate::node_metadata::matches_token;
-use crate::node_metadata::SyntaxParser;
+use crate::node_metadata::SyntaxSnapshot;
 use crate::object_registry::{
     ObjectId, ObjectKnowledge, ObjectName, ObjectRegistry, ObjectRegistryView, TypeId,
 };
@@ -569,7 +569,6 @@ fn record_signature_codes(
 /// above it, its code fenced as Macaulay2, and its aliases only those
 /// Macaulay2 can read back.
 fn published_documentation(markdown: &str) -> String {
-    let mut parser = SyntaxParser::new().expect("the Macaulay2 grammar loads");
     let mut lines = Vec::new();
     for line in markdown.lines() {
         let trimmed = line.trim_start();
@@ -587,7 +586,7 @@ fn published_documentation(markdown: &str) -> String {
                 .map(str::trim)
                 .filter(|alias| {
                     let code = alias.trim_matches('`');
-                    parser.parse(code).is_some_and(|root| !root.has_error())
+                    !SyntaxSnapshot::parse(code, None).has_error()
                 })
                 .collect::<Vec<_>>();
             if !readable.is_empty() {

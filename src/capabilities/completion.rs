@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use m2_syn::nodes::{ExprNew as NewStatement, ExprOption as OptionExpression, Symbol};
+use m2_syn::nodes::{Expr, ExprOption as OptionExpression, Symbol};
+use m2_syn::visit::{self, Visit};
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionResponse, CompletionTextEdit,
     Position, Range as TextRange, SymbolKind, TextEdit, Url,
@@ -13,12 +14,12 @@ use crate::capabilities::document_symbols::WorkspaceSourceSymbol;
 use crate::document::DocumentSnapshot;
 use crate::file_load::FileLoad;
 use crate::macaulay2::Macaulay2Conventions;
-use crate::node_metadata::SyntaxNode;
 use crate::object_registry::{ObjectKnowledge, ObjectName};
-use crate::package_index::is_package_import_string;
+use crate::package_index::{is_package_import_trigger, PackageLoadingOption};
 use crate::record_lsp::LspKnowledge;
-use crate::source::SourceNavigation;
-use crate::string_literal::StringDelimiter;
+use crate::source::{SourceNavigation, SyntaxSource};
+use crate::string_literal::{LiteralSource, StringDelimiter};
+use crate::syntax::ExpressionSyntax;
 use crate::typesystem::{SubtypeEvidence, TypeKnowledge, TypeRole};
 
 /// Language keywords offered alongside visible symbol completions.
@@ -105,10 +106,8 @@ pub struct CompletionContext<'a> {
     position: Position,
     /// Document UTF-8 byte offset corresponding to the requested LSP position.
     cursor: usize,
-    /// Syntax supplying this item's source and structure.
-    node: SyntaxNode<'a>,
     /// Recognized symbol under the cursor, when present.
-    symbol: Option<SyntaxNode<'a>>,
+    symbol: Option<&'a Symbol>,
     /// Entered symbol text and the range completion will replace.
     symbol_prefix: Option<CompletionPrefix>,
     /// Visible definitions found in package sources when no builtin catalog is available.
@@ -306,19 +305,12 @@ impl<'a> CompletionContext<'a> {
     /// Constructs this value from the supplied dependencies and initial state.
     fn new(document: &'a DocumentSnapshot, uri: &'a Url, position: Position) -> Option<Self> {
         let cursor = document.byte_for_position(position)?;
-        let node = document.node_at_position_minimal(position)?;
-        let symbol = node
-            .enclosing_node(|candidate| candidate.is::<Symbol>())
-            .or_else(|| {
-                let start = cursor.checked_sub(1)?;
-                document
-                    .root_node()
-                    .descendant_for_point_range(
-                        document.point_for_byte(start),
-                        document.point_for_byte(cursor),
-                    )?
-                    .enclosing_node(|candidate| candidate.is::<Symbol>())
-            });
+        let symbol = document.cursor_syntax(position).symbol.or_else(|| {
+            let start = cursor.checked_sub(1)?;
+            document
+                .cursor_syntax(document.position_for_byte(start))
+                .symbol
+        });
         let symbol_prefix =
             symbol.and_then(|symbol| CompletionPrefix::symbol(document, cursor, symbol));
         Some(Self {
@@ -326,7 +318,6 @@ impl<'a> CompletionContext<'a> {
             uri,
             position,
             cursor,
-            node,
             symbol,
             symbol_prefix,
             source_symbols: &[],
@@ -334,16 +325,55 @@ impl<'a> CompletionContext<'a> {
     }
 
     /// Recognized symbol syntax associated with this completion request.
-    fn symbol_node(&self) -> Option<SyntaxNode<'a>> {
+    fn symbol_node(&self) -> Option<&'a Symbol> {
         self.symbol
     }
 
     /// The text of `string` before the cursor, when the cursor is in it.
-    fn string_prefix(&self, string: SyntaxNode<'_>) -> Option<CompletionPrefix> {
-        let start = string.string_literal_inner_bytes()?.start;
-        (start <= self.cursor && self.cursor <= string.end_byte()).then(|| CompletionPrefix {
+    fn string_prefix(&self, string: &Expr) -> Option<CompletionPrefix> {
+        let start = string.literal_content_bytes(self.document)?.start;
+        let end = self.document.syntax_bytes(string)?.end;
+        (start <= self.cursor && self.cursor <= end).then(|| CompletionPrefix {
             text: self.document.text()[start..self.cursor].to_string(),
             replace: self.document.range_for_bytes(start..self.cursor),
+        })
+    }
+
+    /// The string containing the cursor and its enclosing typed expressions.
+    fn string_context(&self) -> Option<(&'a Expr, Vec<&'a Expr>)> {
+        let byte = self.cursor.checked_sub(1)?;
+        let expressions = self
+            .document
+            .enclosing_expressions(self.document.position_for_byte(byte));
+        let string = expressions
+            .iter()
+            .rev()
+            .copied()
+            .find(|expression| StringDelimiter::of_expression(expression).is_some())?;
+        Some((string, expressions))
+    }
+
+    /// Whether a containing application passes the string as its first argument.
+    fn string_argument(
+        &self,
+        string: &Expr,
+        expressions: &[&Expr],
+        trigger: impl Fn(&str) -> bool,
+    ) -> bool {
+        expressions.iter().any(|expression| {
+            let Expr::Op(m2_syn::nodes::ExprOp::Bin(m2_syn::nodes::ExprOpBin::Adj(call))) =
+                expression
+            else {
+                return false;
+            };
+            call.left_operand.symbol_name().is_some_and(&trigger)
+                && call
+                    .right_operand
+                    .arguments()
+                    .first()
+                    .copied()
+                    .flatten()
+                    .is_some_and(|argument| std::ptr::eq(argument, string))
         })
     }
 }
@@ -353,10 +383,11 @@ impl CompletionPrefix {
     fn symbol(
         source: &(impl SourceNavigation + ?Sized),
         cursor: usize,
-        symbol: SyntaxNode<'_>,
+        symbol: &Symbol,
     ) -> Option<Self> {
-        let start = symbol.start_byte();
-        (start < cursor && cursor <= symbol.end_byte()).then(|| Self {
+        let bytes = source.syntax_bytes(symbol)?;
+        let start = bytes.start;
+        (start < cursor && cursor <= bytes.end).then(|| Self {
             text: source.text()[start..cursor].to_string(),
             replace: source.range_for_bytes(start..cursor),
         })
@@ -365,10 +396,22 @@ impl CompletionPrefix {
 
 impl CompletionPattern for PackageImportPattern {
     fn query(&self, context: &CompletionContext<'_>) -> Option<CompletionQuery> {
-        let string = context
-            .node
-            .enclosing_node(|node| node.is_string_literal())?;
-        is_package_import_string(string).then_some(())?;
+        let (string, expressions) = context.string_context()?;
+        let option = expressions.iter().any(|expression| {
+            let Expr::Op(m2_syn::nodes::ExprOp::Bin(m2_syn::nodes::ExprOpBin::Adj(call))) =
+                expression
+            else {
+                return false;
+            };
+            PackageLoadingOption::ALL.into_iter().any(|option| {
+                option
+                    .typed_package_names(call, context.document)
+                    .into_iter()
+                    .any(|package| std::ptr::eq(package, string))
+            })
+        });
+        (option || context.string_argument(string, &expressions, is_package_import_trigger))
+            .then_some(())?;
         Some(CompletionQuery::new(
             context.string_prefix(string)?,
             PackageNames,
@@ -382,14 +425,14 @@ impl CompletionPattern for PackageImportPattern {
 
 impl CompletionPattern for LoadedFilePattern {
     fn query(&self, context: &CompletionContext<'_>) -> Option<CompletionQuery> {
-        let string = context
-            .node
-            .enclosing_node(|node| node.is_string_literal())?;
-        FileLoad::names_file(string).then_some(())?;
+        let (string, expressions) = context.string_context()?;
+        context
+            .string_argument(string, &expressions, FileLoad::is_load_function)
+            .then_some(())?;
         Some(CompletionQuery::new(
             context.string_prefix(string)?,
             LoadableFiles {
-                delimiter: StringDelimiter::of(string)?,
+                delimiter: StringDelimiter::of_expression(string)?,
             },
         ))
     }
@@ -403,9 +446,20 @@ impl CompletionPattern for NewTypePattern {
     fn query(&self, context: &CompletionContext<'_>) -> Option<CompletionQuery> {
         let prefix = context.symbol_prefix.clone()?;
         let symbol = context.symbol_node()?;
-        let new_statement = symbol.enclosing_node(|node| node.is::<NewStatement>())?;
-        let class = new_statement.new_class()?;
-        class.contains(symbol).then(|| {
+        let symbol_bytes = context.document.syntax_bytes(symbol)?;
+        let new_statement = context
+            .document
+            .enclosing_expressions(context.document.position_for_byte(symbol_bytes.start))
+            .into_iter()
+            .rev()
+            .find_map(|expression| match expression {
+                Expr::New(new) => Some(new),
+                _ => None,
+            })?;
+        let class = context
+            .document
+            .syntax_bytes(new_statement.class.as_ref())?;
+        (class.start <= symbol_bytes.start && symbol_bytes.end <= class.end).then(|| {
             CompletionQuery::new(prefix, KnownSymbols::of_type(TypeRole::Type.object_name()))
         })
     }
@@ -415,21 +469,23 @@ impl CompletionPattern for OptionValuePattern {
     fn query(&self, context: &CompletionContext<'_>) -> Option<CompletionQuery> {
         let prefix = context.symbol_prefix.clone()?;
         let symbol = context.symbol_node()?;
-        let option = symbol.enclosing_node(|node| node.is::<OptionExpression>())?;
-        option
-            .binary_parts()
-            .map(|parts| parts.right)?
-            .contains(symbol)
-            .then_some(())?;
-        let key = option.binary_parts().map(|parts| parts.left)?;
-        key.is::<Symbol>().then_some(())?;
-        let (callable, _) = super::signature_help::enclosing_application(option, context.cursor)?;
-        callable.is::<Symbol>().then(|| {
+        let symbol_bytes = context.document.syntax_bytes(symbol)?;
+        let option = OptionAtCursor::find(context.document, context.cursor, symbol_bytes.clone())?;
+        let value = context.document.syntax_bytes(option.value.as_ref())?;
+        (value.start <= symbol_bytes.start && symbol_bytes.end <= value.end).then_some(())?;
+        let key = option.key.symbol_name()?;
+        let option_bytes = context.document.syntax_bytes(option)?;
+        let call = super::signature_help::CallAtCursor::find(
+            context.document,
+            context.cursor,
+            option_bytes,
+        )?;
+        call.left_operand.symbol_name().map(|callable| {
             CompletionQuery::new(
                 prefix,
                 OptionValues {
-                    callable: ObjectName::new(callable.text()),
-                    option: ObjectName::new(key.text()),
+                    callable: ObjectName::new(callable),
+                    option: ObjectName::new(key),
                 },
             )
         })
@@ -445,22 +501,84 @@ impl CompletionPattern for OptionKeyPattern {
         let prefix = context.symbol_prefix.clone()?;
         prefix.text.chars().next()?.is_uppercase().then_some(())?;
         let symbol = context.symbol_node()?;
-        if symbol
-            .enclosing_node(|node| node.is::<OptionExpression>())
-            .and_then(|option| option.binary_parts().map(|parts| parts.right))
-            .is_some_and(|value| value.contains(symbol))
+        let symbol_bytes = context.document.syntax_bytes(symbol)?;
+        if OptionAtCursor::find(context.document, context.cursor, symbol_bytes.clone())
+            .and_then(|option| context.document.syntax_bytes(option.value.as_ref()))
+            .is_some_and(|value| value.start <= symbol_bytes.start && symbol_bytes.end <= value.end)
         {
             return None;
         }
-        let (callable, _) = super::signature_help::enclosing_application(symbol, context.cursor)?;
-        callable.is::<Symbol>().then(|| {
+        let call = super::signature_help::CallAtCursor::find(
+            context.document,
+            context.cursor,
+            symbol_bytes,
+        )?;
+        call.left_operand.symbol_name().map(|callable| {
             CompletionQuery::new(
                 prefix,
                 CallableOptions {
-                    callable: ObjectName::new(callable.text()),
+                    callable: ObjectName::new(callable),
                 },
             )
         })
+    }
+}
+
+/// Finds the innermost typed option containing a completion symbol.
+struct OptionAtCursor<'ast, 'source> {
+    /// Document supplying revision-specific coordinates.
+    document: &'source DocumentSnapshot,
+    /// Cursor position in source bytes.
+    cursor: usize,
+    /// Complete source extent of the symbol being completed.
+    symbol: std::ops::Range<usize>,
+    /// Innermost containing option found so far.
+    option: Option<&'ast OptionExpression>,
+}
+
+impl<'ast> OptionAtCursor<'ast, '_> {
+    /// Selects an option in the cell containing the cursor.
+    fn find(
+        document: &'ast DocumentSnapshot,
+        cursor: usize,
+        symbol: std::ops::Range<usize>,
+    ) -> Option<&'ast OptionExpression> {
+        let mut query = OptionAtCursor {
+            document,
+            cursor,
+            symbol,
+            option: None,
+        };
+        for cell in document.syntax().cells_intersecting(cursor..cursor) {
+            if let Some(cell) = cell.syntax() {
+                query.visit_cell(cell);
+            }
+        }
+        query.option
+    }
+}
+
+impl<'ast> Visit<'ast> for OptionAtCursor<'ast, '_> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if self
+            .document
+            .syntax_bytes(expression)
+            .is_none_or(|range| self.cursor < range.start || self.cursor > range.end)
+        {
+            return;
+        }
+        visit::visit_expr(self, expression);
+    }
+
+    fn visit_expr_option(&mut self, option: &'ast OptionExpression) {
+        if self
+            .document
+            .syntax_bytes(option)
+            .is_some_and(|range| range.start <= self.symbol.start && self.symbol.end <= range.end)
+        {
+            self.option = Some(option);
+        }
+        visit::visit_expr_option(self, option);
     }
 }
 
@@ -908,5 +1026,25 @@ mod tests {
                     if edit.range == TextRange::new(pos!(0, 0), pos!(0, 3))
             )
         }));
+    }
+
+    #[test]
+    fn typed_option_context_tracks_key_and_nested_value() {
+        let text = "outer(Strategy => inner(Choice))\n";
+        let document = DocumentSnapshot::from_text(text.to_string(), &ObjectRegistry::default())
+            .expect("snapshot");
+        for name in ["Strategy", "Choice"] {
+            let start = text.find(name).expect("symbol");
+            let option = OptionAtCursor::find(&document, start + 2, start..start + name.len())
+                .expect("option");
+            assert_eq!(option.key.symbol_name(), Some("Strategy"));
+            let value = document
+                .syntax_bytes(option.value.as_ref())
+                .expect("value span");
+            assert_eq!(
+                value.start <= start && start + name.len() <= value.end,
+                name == "Choice"
+            );
+        }
     }
 }

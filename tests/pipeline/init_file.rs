@@ -118,6 +118,21 @@ async fn every_document_starts_with_the_configured_init_file() {
 }
 
 #[tokio::test]
+async fn preloaded_package_assignments_load_packages_for_documents() {
+    let workspace = TestWorkspace::new("");
+    let home = TestWorkspace::new("");
+    let init_uri = home.write_file("init.m2", "Core#\"preloaded packages\" |= {\"JSON\"}\n");
+    let mut server = start(&workspace, json!(home.path("init.m2"))).await;
+    diagnostics_for(&mut server, &init_uri).await;
+
+    let source = "z = toJSON 1\n";
+    let uri = workspace.write_file("uses.m2", source);
+    open(&mut server, &uri, source).await;
+    assert!(inlay_labels(&mut server, &uri).await.contains("String"));
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_directive_starts_its_document_without_an_init_file_or_with_another() {
     let workspace = TestWorkspace::new("");
     let home = TestWorkspace::new("");

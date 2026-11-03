@@ -31,6 +31,7 @@
 
 use std::ops::Range;
 
+use m2_syn::nodes::ExprOpBinAdj;
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 use tower_lsp::lsp_types::Range as TextRange;
 
@@ -45,12 +46,11 @@ const TEX_MATH_DELIMITERS: [(&str, &str); 4] =
     [("$$", "$$"), ("\\[", "\\]"), ("\\(", "\\)"), ("$", "$")];
 
 use super::{
-    hypertext::HypertextMarkdown, DocumentationCollector, DocumentationFaultKind, DocumentationKey,
-    DocumentationMarkup, DocumentationMarkupKind, DocumentationNode, DocumentedSubject,
-    EvaluatedExpression, NodeMarkdown, TextStyle,
+    Code, DocumentationCollector, DocumentationFaultKind, DocumentationKey, DocumentationMarkup,
+    DocumentationMarkupKind, DocumentationNode, DocumentedSubject, EvaluatedExpression,
+    NodeMarkdown, TextStyle,
 };
 use crate::macaulay2::Macaulay2Conventions;
-use crate::node_metadata::SyntaxNode;
 use crate::source::{ByteRange, SourceNavigation};
 use crate::source_package::CodeFragment;
 
@@ -295,7 +295,7 @@ struct PageReading {
 
 impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// Read the SimpleDoc string at `body` passed to `call`.
-    pub(super) fn read_simple_doc(&mut self, call: SyntaxNode<'_>, body: ByteRange) {
+    pub(super) fn read_simple_doc(&mut self, call: &ExprOpBinAdj, body: ByteRange) {
         let lines = SimpleDocLine::read_all(self.source.text(), body.clone());
         let sections = self.sections(&lines, SectionContext::Page);
         let nodes = sections
@@ -304,11 +304,10 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             .copied()
             .collect::<Vec<_>>();
         if nodes.is_empty() {
-            let callee = call.binary_parts().map(|parts| parts.left).map_or_else(
-                || self.source.range_for_node(call),
-                |callee| self.source.range_for_node(callee),
-            );
-            self.read_page(&sections, self.source.range_for_node(call), callee);
+            let code = Code::in_document(self.source);
+            let callee = self.source.range_for_bytes(code.bytes(&*call.left_operand));
+            let call_range = self.source.range_for_bytes(code.bytes(call));
+            self.read_page(&sections, call_range, callee);
             return;
         }
         if nodes.len() < sections.len() {
@@ -541,7 +540,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                     if let Some(rendered) = self.evaluate_simple_doc_expression(
                         line.text.clone(),
                         EvaluatedExpression::Key,
-                        HypertextMarkdown::link_text,
+                        |code, key| code.link_text(key),
                     ) {
                         page.markdown.see_also.push(rendered);
                     }
@@ -556,7 +555,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                     self.evaluate_simple_doc_expression(
                         line.text.clone(),
                         EvaluatedExpression::Value,
-                        |_| (),
+                        |_, _| (),
                     );
                 }
             }
@@ -565,7 +564,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                     self.evaluate_simple_doc_expression(
                         line.text.clone(),
                         EvaluatedExpression::Value,
-                        |_| (),
+                        |_, _| (),
                     );
                 }
             }
@@ -642,7 +641,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 if let Some(rendered) = self.evaluate_simple_doc_expression(
                     first.text.start..last.text.end,
                     EvaluatedExpression::Value,
-                    HypertextMarkdown::render,
+                    |code, expression| code.render(expression),
                 ) {
                     page.markdown.description.push(rendered);
                 }
@@ -726,7 +725,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 self.evaluate_simple_doc_expression(
                     name_bytes,
                     EvaluatedExpression::Value,
-                    HypertextMarkdown::link_text,
+                    |code, key| code.link_text(key),
                 )
             } else {
                 self.documentation.markup.push(DocumentationMarkup {
@@ -741,7 +740,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 self.evaluate_simple_doc_expression(
                     type_bytes,
                     EvaluatedExpression::Value,
-                    HypertextMarkdown::link_text,
+                    |code, key| code.link_text(key),
                 )
             };
             let description = self
@@ -845,7 +844,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                         .evaluate_simple_doc_expression(
                             start..end,
                             EvaluatedExpression::Value,
-                            HypertextMarkdown::render,
+                            |code, expression| code.render(expression),
                         )
                         .unwrap_or_else(|| format!("`{}`", &self.source.text()[start..end]));
                     markdown.push_str(&rendered);
@@ -1064,11 +1063,9 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         if text.starts_with('@') {
             self.render_text(bytes)
         } else {
-            self.evaluate_simple_doc_expression(
-                bytes,
-                EvaluatedExpression::Key,
-                HypertextMarkdown::link_text,
-            )
+            self.evaluate_simple_doc_expression(bytes, EvaluatedExpression::Key, |code, key| {
+                code.link_text(key)
+            })
             .unwrap_or_default()
         }
     }

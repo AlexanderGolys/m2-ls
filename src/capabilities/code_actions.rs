@@ -1,308 +1,285 @@
 //! Diagnostic quick fixes and syntax-preserving refactors offered by the LSP.
+//!
+//! Quick fixes come from the findings themselves: a check that knows the edit
+//! fixing its finding records it as a [`FindingFix`]. Rewrites come from the
+//! [`RewriteSites`] of the cells around the cursor, offered as the quick fix of
+//! the hint reporting them or, where the hint is absent or suppressed, as a
+//! plain refactor.
 
 use std::collections::HashMap;
 
-use m2_syn::nodes::{ExprIf as IfStatement, ExprTry as TryStatement, StringLiteral, Symbol};
-use m2_syn::Token;
+use m2_syn::nodes::{Expr, ExprLiteral};
+use m2_syn::visit::{self, Visit};
 use tower_lsp::lsp_types::Range as TextRange;
 use tower_lsp::lsp_types::*;
 
-use crate::analysis::{CallOptionIssue, MethodCodomainEdit, TypeChecker};
-use crate::diagnostics::rewrites::{
-    ambiguous_float_member_access_rewrite, coalescence_rewrite, else_if_chain_rewrite,
-    if_condition_rewrite, if_null_branch_rewrite, redundant_control_parentheses_inner,
-    simplification_of, try_statement_rewrite, Coalescence,
-};
+use crate::diagnostics::rewrites::{RewriteKind, RewriteSite, RewriteSites};
 use crate::diagnostics::suppression::{DiagnosticSuppressions, SuppressionScope};
-use crate::diagnostics::{catalog, DiagnosticCode, DiagnosticRule};
+use crate::diagnostics::{catalog, DiagnosticCode, DiagnosticRule, FindingFix};
 use crate::document::{DocumentSnapshot, FileProperties};
-use crate::node_metadata::{token_spelling, SyntaxNode};
+use crate::node_metadata::ParsedCell;
 use crate::settings::FormattingSettings;
-use crate::source::SourceNavigation;
+use crate::source::{SourceNavigation, SyntaxSource};
+use crate::string_literal::LiteralSource;
+use crate::syntax::CursorSyntax;
 use crate::util::TextRangeExt;
 
 use super::formatting::{format_action_edit, FormatOptions};
 
+/// The fewest escapes that make a string literal worth writing raw.
+const RAW_STRING_MIN_ESCAPES: usize = 3;
+
+/// The delimiter of a raw string literal, on both sides.
+const RAW_STRING_DELIMITER: &str = "///";
+
 /// Document and request data shared by code-action producers.
-struct CodeActionContext<'tree, 'request> {
+struct CodeActionContext<'a, 'request> {
     /// Immutable document snapshot being queried.
-    document: &'tree DocumentSnapshot,
+    document: &'a DocumentSnapshot,
     /// Document location associated with the request.
     uri: &'request Url,
     /// LSP UTF-16 position at which the request is evaluated.
     position: Position,
-    /// Smallest syntax node covering the requested code-action position.
-    cursor: SyntaxNode<'tree>,
-    /// Findings associated with this request or collected by this pass.
+    /// Expressions enclosing the cursor, outermost first.
+    enclosing: Vec<&'a Expr>,
+    /// Rewrite sites of the cells at the cursor.
+    sites: Vec<RewriteSite<'a>>,
+    /// Diagnostics the client reports for the document.
     diagnostics: &'request [Diagnostic],
 }
 
-/// Builds one code action for the request, or `None` when it does not apply
-/// at the cursor.
-type CodeActionProducer = fn(&CodeActionContext<'_, '_>) -> Option<CodeAction>;
+/// A rewrite offered for the hint reporting it, with its action title.
+fn rewrite_title(site: &RewriteSite<'_>) -> &'static str {
+    match site.kind {
+        RewriteKind::AmbiguousFloatMemberAccess => "Rewrite as member access",
+        RewriteKind::RedundantControlParentheses => "Remove redundant parentheses",
+        RewriteKind::CoalescingAssignment => "Use `??=` coalescing assignment",
+        RewriteKind::Coalescence => "Use `??` coalescence",
+        RewriteKind::NullBranch => "Simplify unnecessary null branch",
+        RewriteKind::TrySimplification => "Simplify try",
+        RewriteKind::IfCondition => "Simplify if condition",
+        RewriteKind::ElseIfChain => "Flatten nested if into else-if chain",
+    }
+}
 
-/// Every code action m2-ls offers, in the order clients list them: quick fixes
-/// for a diagnostic, ordered by diagnostic code, then refactors that apply
-/// without one.
-const CODE_ACTION_PRODUCERS: &[CodeActionProducer] = &[
-    ambiguous_float_member_access_action,
-    colon_equal_part_assignment_action,
-    option_key_convention_action,
-    coalescence_action,
-    install_needs_colon_equals_action,
-    unknown_option_action,
-    method_codomain_action,
-    convert_to_raw_string_action,
-    redundant_control_parentheses_action,
-    conditional_null_action,
-    simplify_try_action,
-    simplify_if_condition_action,
-    flatten_else_if_action,
-];
+/// The hint reporting rewrites of `kind`.
+fn rewrite_rule(kind: RewriteKind) -> &'static DiagnosticRule {
+    match kind {
+        RewriteKind::AmbiguousFloatMemberAccess => &catalog::AMBIGUOUS_FLOAT_MEMBER_ACCESS,
+        RewriteKind::RedundantControlParentheses => &catalog::REDUNDANT_CONTROL_PARENTHESES,
+        RewriteKind::CoalescingAssignment | RewriteKind::Coalescence => {
+            &catalog::PREFER_COALESCENCE
+        }
+        RewriteKind::NullBranch
+        | RewriteKind::TrySimplification
+        | RewriteKind::IfCondition
+        | RewriteKind::ElseIfChain => &catalog::SIMPLIFIABLE_EXPRESSION,
+    }
+}
 
-/// Finding for the requested rule whose source range overlaps this code-action request.
-fn diagnostic_at(context: &CodeActionContext<'_, '_>, rule: &DiagnosticRule) -> Option<Diagnostic> {
-    context
-        .diagnostics
-        .iter()
-        .find(|diagnostic| {
-            DiagnosticCode::from_lsp(diagnostic) == Some(rule.code)
-                && diagnostic.range.contains_position(context.position)
+/// Whether a rewrite of `kind` is offered only as the fix of its reported
+/// hint, never as a refactor of its own.
+fn requires_diagnostic(kind: RewriteKind) -> bool {
+    matches!(
+        kind,
+        RewriteKind::AmbiguousFloatMemberAccess
+            | RewriteKind::CoalescingAssignment
+            | RewriteKind::Coalescence
+    )
+}
+
+impl<'a> CodeActionContext<'a, '_> {
+    /// Builds the request context: the expressions and rewrite sites of the
+    /// cells containing `position`.
+    fn new<'request>(
+        document: &'a DocumentSnapshot,
+        uri: &'request Url,
+        position: Position,
+        diagnostics: &'request [Diagnostic],
+    ) -> Option<CodeActionContext<'a, 'request>> {
+        let byte = document.byte_for_position(position)?;
+        let cells = document
+            .syntax()
+            .cells_intersecting(byte..byte)
+            .iter()
+            .filter_map(ParsedCell::syntax);
+        Some(CodeActionContext {
+            document,
+            uri,
+            position,
+            enclosing: CursorSyntax::at(cells.clone(), byte, document).expressions,
+            sites: RewriteSites::collect(cells, document),
+            diagnostics,
         })
-        .cloned()
-}
-
-/// Code action for method codomain, absent when the request does not match.
-fn method_codomain_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, &catalog::INSTALL_CODOMAIN_MISSING)?;
-    let mut current = Some(context.cursor);
-    while let Some(node) = current {
-        if node.is_assignment() {
-            let knowledge = context
-                .document
-                .object_registry()
-                .at(context.document.position_for_node(node));
-            if let Some(deduction) = context.document.analysis().method_codomain_deduction(
-                node,
-                context.document,
-                &knowledge,
-            ) {
-                if deduction.diagnostic_range == diagnostic.range {
-                    let MethodCodomainEdit::Add(edit_range) = deduction.edit else {
-                        return None;
-                    };
-                    return Some(
-                        CodeActionSpec {
-                            title: "Add codomain annotation".into(),
-                            kind: CodeActionKind::QUICKFIX,
-                            is_preferred: Some(true),
-                            diagnostics: Some(vec![diagnostic]),
-                        }
-                        .build(
-                            context.uri,
-                            edit_range,
-                            format!("{} => ", deduction.codomain),
-                        ),
-                    );
-                }
-            }
-        }
-        current = node.parent();
     }
-    None
-}
 
-/// Code action for colon equal part assignment, absent when the request does not match.
-fn colon_equal_part_assignment_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    assignment_operator_action(
-        context,
-        &catalog::COLON_EQUAL_PART_ASSIGNMENT,
-        token_spelling::<Token![:=]>(),
-        token_spelling::<Token![=]>(),
-        "Use `=` for part assignment",
-    )
-}
-
-/// Code action for install needs colon equals, absent when the request does not match.
-fn install_needs_colon_equals_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    assignment_operator_action(
-        context,
-        &catalog::INSTALL_NEEDS_COLON_EQUALS,
-        token_spelling::<Token![=]>(),
-        token_spelling::<Token![:=]>(),
-        "Use `:=` for method installation",
-    )
-}
-
-/// Code action for assignment operator, absent when the request does not match.
-fn assignment_operator_action(
-    context: &CodeActionContext<'_, '_>,
-    rule: &DiagnosticRule,
-    current_operator: &str,
-    replacement: &str,
-    title: &'static str,
-) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, rule)?;
-    let mut current = Some(context.cursor);
-    while let Some(node) = current {
-        if node.binary_operator() == Some(current_operator) {
-            let operator = node.operator_node()?;
-            return Some(
-                CodeActionSpec {
-                    title: title.into(),
-                    kind: CodeActionKind::QUICKFIX,
-                    is_preferred: Some(true),
-                    diagnostics: Some(vec![diagnostic]),
-                }
-                .build(
-                    context.uri,
-                    context.document.range_for_node(operator),
-                    replacement.to_string(),
-                ),
-            );
-        }
-        current = node.parent();
+    /// The client's diagnostic of `rule` at the cursor.
+    fn diagnostic_at(&self, rule: &DiagnosticRule) -> Option<Diagnostic> {
+        self.diagnostics
+            .iter()
+            .find(|diagnostic| {
+                DiagnosticCode::from_lsp(diagnostic) == Some(rule.code)
+                    && diagnostic.range.contains_position(self.position)
+            })
+            .cloned()
     }
-    None
-}
 
-/// Code action for option key convention, absent when the request does not match.
-fn option_key_convention_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, &catalog::OPTION_KEY_CONVENTION)?;
-    let key = enclosing_node_with_range(context, diagnostic.range, |node| node.is::<Symbol>())?;
-    let mut replacement = key.text().to_string();
-    replacement.get_mut(..1)?.make_ascii_uppercase();
-    Some(
-        CodeActionSpec {
-            title: "Capitalize option key".into(),
-            kind: CodeActionKind::QUICKFIX,
-            is_preferred: Some(true),
-            diagnostics: Some(vec![diagnostic]),
+    /// The client's diagnostic of `rule` exactly covering `range`.
+    fn diagnostic_covering(&self, rule: &DiagnosticRule, range: TextRange) -> Option<&Diagnostic> {
+        self.diagnostics.iter().find(|diagnostic| {
+            DiagnosticCode::from_lsp(diagnostic) == Some(rule.code) && diagnostic.range == range
+        })
+    }
+
+    /// The quick fixes the findings at the cursor record, in diagnostic order.
+    fn finding_fixes(&self) -> Vec<CodeAction> {
+        self.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.range.contains_position(self.position))
+            .filter_map(|diagnostic| {
+                let fix = recorded_fix(self.document, diagnostic)?;
+                Some(
+                    CodeActionSpec {
+                        title: fix.title.clone(),
+                        kind: CodeActionKind::QUICKFIX,
+                        is_preferred: Some(true),
+                        diagnostics: Some(vec![diagnostic.clone()]),
+                    }
+                    .build(self.uri, fix.range, fix.replacement.clone()),
+                )
+            })
+            .collect()
+    }
+
+    /// The rewrite of `site`: the preferred quick fix of the hint reported on
+    /// exactly its expression, or a plain refactor where the hint is absent
+    /// or suppressed.
+    fn rewrite(&self, site: &RewriteSite<'_>) -> Option<CodeAction> {
+        let range = self.document.range_for_syntax(site.expression)?;
+        let diagnostic = self.diagnostic_covering(rewrite_rule(site.kind), range);
+        if diagnostic.is_none() && requires_diagnostic(site.kind) {
+            return None;
         }
-        .build(
-            context.uri,
-            context.document.range_for_node(key),
-            replacement,
-        ),
-    )
-}
-
-/// Quick fix for redundant-control-parentheses, and a refactor where it is
-/// not reported: drop the parentheses around a condition, `try` value, or loop
-/// range that its keyword already delimits (`if (n > 0) then` → `if n > 0
-/// then`), offered inside the parentheses or on the control expression
-/// holding them.
-fn redundant_control_parentheses_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let is_redundant = |node: &SyntaxNode<'_>| redundant_control_parentheses_inner(*node).is_some();
-    let parentheses = std::iter::once(context.cursor)
-        .chain(context.cursor.ancestors())
-        .find_map(|node| {
-            if is_redundant(&node) {
-                Some(node)
-            } else {
-                node.named_children().find(is_redundant)
+        Some(
+            CodeActionSpec {
+                title: rewrite_title(site).into(),
+                kind: if diagnostic.is_some() {
+                    CodeActionKind::QUICKFIX
+                } else {
+                    CodeActionKind::REFACTOR_REWRITE
+                },
+                is_preferred: diagnostic.map(|_| true),
+                diagnostics: diagnostic.map(|diagnostic| vec![diagnostic.clone()]),
             }
-        })?;
-    let inner = redundant_control_parentheses_inner(parentheses)?;
-    let range = context.document.range_for_node(parentheses);
-    Some(
-        CodeActionSpec::rewrite(
-            context,
-            &catalog::REDUNDANT_CONTROL_PARENTHESES,
-            range,
-            "Remove redundant parentheses",
+            .build(self.uri, range, site.replacement.clone()),
         )
-        .build(context.uri, range, inner.text().to_string()),
-    )
+    }
+
+    /// The site of `kind` rewriting `expression`.
+    fn site_of(&self, expression: &Expr, kind: RewriteKind) -> Option<&RewriteSite<'a>> {
+        self.sites
+            .iter()
+            .find(|site| site.kind == kind && std::ptr::eq(site.expression, expression))
+    }
+
+    /// The rewrites offered at the cursor, each kind once:
+    /// - a member access, coalescence, `try` simplification, or condition
+    ///   simplification of the innermost expression offering one;
+    /// - the redundant parentheses of the innermost control expression
+    ///   around the cursor;
+    /// - the else-if chain of the outermost conditional around the cursor.
+    fn rewrites(&self) -> Vec<CodeAction> {
+        let byte = self.document.byte_for_position(self.position);
+        let innermost = |kind: RewriteKind, accepts: fn(&Expr) -> bool| {
+            let expression = self
+                .enclosing
+                .iter()
+                .rev()
+                .find(|expression| accepts(expression))?;
+            self.site_of(expression, kind)
+        };
+        let parentheses = self
+            .sites
+            .iter()
+            .filter(|site| site.kind == RewriteKind::RedundantControlParentheses)
+            .filter_map(|site| {
+                let owner = site.owner.clone()?;
+                byte.is_some_and(|byte| owner.start <= byte && byte <= owner.end)
+                    .then_some((owner.len(), site))
+            })
+            .min_by_key(|(length, _)| *length)
+            .map(|(_, site)| site);
+        let member_access = self.enclosing.iter().rev().find_map(|expression| {
+            self.site_of(expression, RewriteKind::AmbiguousFloatMemberAccess)
+        });
+        let coalescence = self.enclosing.iter().rev().find_map(|expression| {
+            self.site_of(expression, RewriteKind::Coalescence)
+                .or_else(|| self.site_of(expression, RewriteKind::CoalescingAssignment))
+        });
+        let else_if_chain = self
+            .enclosing
+            .iter()
+            .find_map(|expression| self.site_of(expression, RewriteKind::ElseIfChain));
+        let is_if = |expression: &Expr| matches!(expression, Expr::If(_));
+        let is_try = |expression: &Expr| matches!(expression, Expr::Try(_));
+        [
+            member_access,
+            coalescence,
+            parentheses,
+            innermost(RewriteKind::NullBranch, is_if),
+            innermost(RewriteKind::TrySimplification, is_try),
+            innermost(RewriteKind::IfCondition, is_if),
+            else_if_chain,
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|site| self.rewrite(site))
+        .collect()
+    }
+
+    /// Refactor: rewrite a heavily-escaped string literal as a raw
+    /// `///…///` string when the value survives verbatim.
+    fn raw_string(&self) -> Option<CodeAction> {
+        let literal = self
+            .enclosing
+            .last()
+            .filter(|expression| matches!(expression, Expr::Literal(ExprLiteral::String(_))))?;
+        raw_string_edit(self.document, self.uri, literal)
+    }
 }
 
-/// Quick fix for unknown-option: replace a misspelled option name with the
-/// accepted name it most likely means.
-fn unknown_option_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, &catalog::UNKNOWN_OPTION)?;
-    let call = context
-        .cursor
-        .ancestors()
-        .find(|node| node.is_space_application())?;
-    let knowledge = context
-        .document
-        .object_registry()
-        .at(context.document.position_for_node(call));
-    let suggestion = TypeChecker::new(context.document.analysis(), &knowledge)
-        .call_option_issues(call, context.document, &knowledge)
-        .into_iter()
-        .find_map(|issue| match issue {
-            CallOptionIssue::UnknownName {
-                key,
-                suggestion: Some(suggestion),
-                ..
-            } if context.document.range_for_node(key) == diagnostic.range => Some(suggestion),
-            _ => None,
-        })?;
-    let range = diagnostic.range;
+/// The fix the document's finding behind the client's `diagnostic` records.
+fn recorded_fix<'a>(
+    document: &'a DocumentSnapshot,
+    diagnostic: &Diagnostic,
+) -> Option<&'a FindingFix> {
+    let code = DiagnosticCode::from_lsp(diagnostic)?;
+    document
+        .diagnostics()
+        .iter()
+        .find(|reported| reported.rule.code == code && reported.finding.range == diagnostic.range)?
+        .finding
+        .fix
+        .as_ref()
+}
+
+/// The raw-string refactor of the string literal `literal`.
+fn raw_string_edit(document: &DocumentSnapshot, uri: &Url, literal: &Expr) -> Option<CodeAction> {
+    let replacement = raw_string_replacement(literal.literal_source(document)?)?;
     Some(
         CodeActionSpec {
-            title: format!("Replace with `{}`", suggestion.name()),
-            kind: CodeActionKind::QUICKFIX,
-            is_preferred: Some(true),
-            diagnostics: Some(vec![diagnostic]),
+            title: "Convert to raw string".into(),
+            kind: CodeActionKind::REFACTOR_REWRITE,
+            is_preferred: None,
+            diagnostics: None,
         }
-        .build(context.uri, range, suggestion.name().to_string()),
+        .build(uri, document.range_for_syntax(literal)?, replacement),
     )
 }
 
-/// Code action for coalescence, absent when the request does not match.
-fn coalescence_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, &catalog::PREFER_COALESCENCE)?;
-    let mut current = Some(context.cursor);
-    while let Some(node) = current {
-        if context.document.range_for_node(node) == diagnostic.range {
-            let (title, replacement) = match coalescence_rewrite(node)? {
-                Coalescence::Assignment(replacement) => {
-                    ("Use `??=` coalescing assignment", replacement)
-                }
-                Coalescence::Expression(replacement) => ("Use `??` coalescence", replacement),
-            };
-            let range = diagnostic.range;
-            return Some(
-                CodeActionSpec {
-                    title: title.into(),
-                    kind: CodeActionKind::QUICKFIX,
-                    is_preferred: Some(true),
-                    diagnostics: Some(vec![diagnostic]),
-                }
-                .build(context.uri, range, replacement),
-            );
-        }
-        current = node.parent();
-    }
-    None
-}
-
-/// Finds node with range in the enclosing source constructs.
-fn enclosing_node_with_range<'tree>(
-    context: &CodeActionContext<'tree, '_>,
-    range: TextRange,
-    matches: impl Fn(SyntaxNode<'tree>) -> bool,
-) -> Option<SyntaxNode<'tree>> {
-    if let Some(symbol) = context.document.reference_node_at_position(range.start) {
-        if matches(symbol) && context.document.range_for_node(symbol) == range {
-            return Some(symbol);
-        }
-    }
-    let mut current = Some(context.cursor);
-    while let Some(node) = current {
-        if matches(node) && context.document.range_for_node(node) == range {
-            return Some(node);
-        }
-        current = node.parent();
-    }
-    None
-}
-
-/// The code actions offered at `position`: every producer in
-/// [`CODE_ACTION_PRODUCERS`] that applies there. The deepest CST node covering
-/// `position` is resolved once here and shared by all producers.
+/// The code actions offered at `position`: the quick fixes the findings
+/// there record, the rewrites around the cursor, then the directives and the
+/// file-wide fix.
 pub fn available_code_actions(
     document: &DocumentSnapshot,
     uri: &Url,
@@ -310,18 +287,13 @@ pub fn available_code_actions(
     diagnostics: &[Diagnostic],
     formatting: &FormattingSettings,
 ) -> Option<CodeActionResponse> {
-    let cursor = document.node_at_position_minimal(position)?;
-    let context = CodeActionContext {
-        document,
-        uri,
-        position,
-        cursor,
-        diagnostics,
-    };
+    let context = CodeActionContext::new(document, uri, position, diagnostics)?;
     let options = FormatOptions::from(formatting);
-    let mut actions: CodeActionResponse = CODE_ACTION_PRODUCERS
-        .iter()
-        .filter_map(|produce| produce(&context))
+    let mut actions: CodeActionResponse = context
+        .finding_fixes()
+        .into_iter()
+        .chain(context.raw_string())
+        .chain(context.rewrites())
         .chain(primary_code_action(&context))
         .chain(suppression_actions(&context))
         .map(|mut action| {
@@ -340,34 +312,81 @@ pub fn available_code_actions(
     (!actions.is_empty()).then_some(actions)
 }
 
-/// Collect the existing fixes and rewrites throughout the document. Prefer
-/// smaller edits when proposals overlap so no edit overwrites another fix.
+/// The string literals of visited syntax.
+#[derive(Default)]
+struct StringLiterals<'ast>(Vec<&'ast Expr>);
+
+impl<'ast> Visit<'ast> for StringLiterals<'ast> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if let Expr::Literal(ExprLiteral::String(_)) = expression {
+            self.0.push(expression);
+        }
+        visit::visit_expr(self, expression);
+    }
+}
+
+/// Collect the fixes and rewrites throughout the document. Prefer smaller
+/// edits when proposals overlap so no edit overwrites another fix.
 fn fix_all_action(
     document: &DocumentSnapshot,
     uri: &Url,
     diagnostics: &[Diagnostic],
     options: &FormatOptions,
 ) -> Option<CodeAction> {
-    let mut edits = Vec::new();
-    for cursor in document.root_node().descendants() {
-        let context = CodeActionContext {
-            document,
-            uri,
-            position: document.position_for_node(cursor),
-            cursor,
-            diagnostics,
-        };
-        for mut action in CODE_ACTION_PRODUCERS
-            .iter()
-            .filter_map(|produce| produce(&context))
-        {
-            if let Some(changes) = action.edit.as_mut().and_then(|edit| edit.changes.as_mut()) {
-                if let Some(proposed) = changes.remove(uri) {
-                    edits.extend(proposed);
-                }
-            }
-        }
+    let cells = document
+        .syntax()
+        .cells()
+        .iter()
+        .filter_map(ParsedCell::syntax);
+    let mut literals = StringLiterals::default();
+    for cell in cells.clone() {
+        literals.visit_cell(cell);
     }
+    let sites = RewriteSites::collect(cells, document);
+    let context = CodeActionContext {
+        document,
+        uri,
+        position: Position::default(),
+        enclosing: Vec::new(),
+        sites: Vec::new(),
+        diagnostics,
+    };
+    // Only the outermost conditional of a nest flattens into one chain.
+    let chain_bytes = sites
+        .iter()
+        .filter(|site| site.kind == RewriteKind::ElseIfChain)
+        .filter_map(|site| document.syntax_bytes(site.expression))
+        .collect::<Vec<_>>();
+    let nested_chain = |site: &RewriteSite<'_>| {
+        site.kind == RewriteKind::ElseIfChain
+            && document.syntax_bytes(site.expression).is_some_and(|bytes| {
+                chain_bytes.iter().any(|outer| {
+                    *outer != bytes && outer.start <= bytes.start && bytes.end <= outer.end
+                })
+            })
+    };
+    let mut edits = diagnostics
+        .iter()
+        .filter_map(|diagnostic| recorded_fix(document, diagnostic))
+        .map(|fix| TextEdit {
+            range: fix.range,
+            new_text: fix.replacement.clone(),
+        })
+        .chain(
+            literals
+                .0
+                .into_iter()
+                .filter_map(|literal| raw_string_edit(document, uri, literal))
+                .chain(
+                    sites
+                        .iter()
+                        .filter(|site| !nested_chain(site))
+                        .filter_map(|site| context.rewrite(site)),
+                )
+                .filter_map(|action| action.edit?.changes?.remove(uri))
+                .flatten(),
+        )
+        .collect::<Vec<_>>();
     edits.sort_by_key(|edit| {
         let bytes = document.bytes_for_range(edit.range).unwrap();
         (bytes.len(), bytes.start, edit.new_text.clone())
@@ -403,7 +422,7 @@ fn fix_all_action(
 /// library itself: declare the file primary code. Like the suppressions, it
 /// writes a directive, so fix-all leaves it out.
 fn primary_code_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, &catalog::PROTECTED_ASSIGNMENT)?;
+    let diagnostic = context.diagnostic_at(&catalog::PROTECTED_ASSIGNMENT)?;
     let position =
         DiagnosticSuppressions::directive_position(SuppressionScope::File, diagnostic.range.start);
     Some(
@@ -486,30 +505,6 @@ struct CodeActionSpec {
 }
 
 impl CodeActionSpec {
-    /// A rewrite of `range`: the preferred quick fix of the `rule` hint
-    /// reported on exactly that range, or a plain refactor where the hint is
-    /// absent or suppressed.
-    fn rewrite(
-        context: &CodeActionContext<'_, '_>,
-        rule: &DiagnosticRule,
-        range: TextRange,
-        title: &str,
-    ) -> Self {
-        let diagnostic = context.diagnostics.iter().find(|diagnostic| {
-            DiagnosticCode::from_lsp(diagnostic) == Some(rule.code) && diagnostic.range == range
-        });
-        CodeActionSpec {
-            title: title.into(),
-            kind: if diagnostic.is_some() {
-                CodeActionKind::QUICKFIX
-            } else {
-                CodeActionKind::REFACTOR_REWRITE
-            },
-            is_preferred: diagnostic.map(|_| true),
-            diagnostics: diagnostic.map(|diagnostic| vec![diagnostic.clone()]),
-        }
-    }
-
     /// Builds a protocol code action replacing the specified range in one document.
     fn build(self, uri: &Url, range: TextRange, new_text: String) -> CodeAction {
         CodeAction {
@@ -532,153 +527,20 @@ impl CodeActionSpec {
     }
 }
 
-/// Refactor: rewrite a heavily-escaped string literal as a raw `///…///` string
-/// when the value survives verbatim (no unsupported escapes, no `///` inside).
-fn convert_to_raw_string_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let string_node = context
-        .cursor
-        .enclosing_node(|node| node.is::<StringLiteral>())?;
-    let replacement = raw_string_replacement(string_node)?;
-
-    Some(
-        CodeActionSpec {
-            title: "Convert to raw string".into(),
-            kind: CodeActionKind::REFACTOR_REWRITE,
-            is_preferred: None,
-            diagnostics: None,
-        }
-        .build(
-            context.uri,
-            context.document.range_for_node(string_node),
-            replacement,
-        ),
-    )
-}
-
-/// Quickfix for the ambiguous-float diagnostic (`x.3` parses as `x SPACE .3`):
-/// rewrite to the member access the user almost certainly meant (`x#3`).
-fn ambiguous_float_member_access_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let diagnostic = diagnostic_at(context, &catalog::AMBIGUOUS_FLOAT_MEMBER_ACCESS)?;
-    let expression = context
-        .cursor
-        .enclosing_node(|node| node.is_adjacent_expr() || node.is_binary_expr())?;
-    let replacement = ambiguous_float_member_access_rewrite(expression)?;
-
-    Some(
-        CodeActionSpec {
-            title: "Rewrite as member access".into(),
-            kind: CodeActionKind::QUICKFIX,
-            is_preferred: Some(true),
-            diagnostics: Some(vec![diagnostic]),
-        }
-        .build(
-            context.uri,
-            context.document.range_for_node(expression),
-            replacement,
-        ),
-    )
-}
-
-/// Refactor: drop a redundant `else null` (or `then null`, negating the
-/// condition) from an `if` statement.
-fn conditional_null_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let if_node = context
-        .cursor
-        .enclosing_node(|node| node.is::<IfStatement>())?;
-    let replacement = simplification_of(if_node, if_null_branch_rewrite(if_node))?;
-
-    let range = context.document.range_for_node(if_node);
-    Some(
-        CodeActionSpec::rewrite(
-            context,
-            &catalog::SIMPLIFIABLE_EXPRESSION,
-            range,
-            "Simplify unnecessary null branch",
-        )
-        .build(context.uri, range, replacement),
-    )
-}
-
-/// Refactor: simplify a `try` statement — drop a redundant `then` echo or a
-/// redundant `else null`.
-fn simplify_try_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let try_node = context
-        .cursor
-        .enclosing_node(|node| node.is::<TryStatement>())?;
-    let replacement = simplification_of(try_node, try_statement_rewrite(try_node))?;
-
-    let range = context.document.range_for_node(try_node);
-    Some(
-        CodeActionSpec::rewrite(
-            context,
-            &catalog::SIMPLIFIABLE_EXPRESSION,
-            range,
-            "Simplify try",
-        )
-        .build(context.uri, range, replacement),
-    )
-}
-
-/// Refactor: push a leading `not` through a parenthesized comparison
-/// (`if not (a == b) then x` → `if a != b then x`).
-fn simplify_if_condition_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let if_node = context
-        .cursor
-        .enclosing_node(|node| node.is::<IfStatement>())?;
-    let replacement = simplification_of(if_node, if_condition_rewrite(if_node))?;
-
-    let range = context.document.range_for_node(if_node);
-    Some(
-        CodeActionSpec::rewrite(
-            context,
-            &catalog::SIMPLIFIABLE_EXPRESSION,
-            range,
-            "Simplify if condition",
-        )
-        .build(context.uri, range, replacement),
-    )
-}
-
-/// Refactor: flatten the outermost nested `if` around the cursor into an
-/// `else if` chain.
-fn flatten_else_if_action(context: &CodeActionContext<'_, '_>) -> Option<CodeAction> {
-    let mut current = Some(context.cursor);
-    let mut candidate = None;
-    while let Some(node) = current {
-        if node.is::<IfStatement>() {
-            if let Some(replacement) = simplification_of(node, else_if_chain_rewrite(node)) {
-                candidate = Some((node, replacement));
-            }
-        }
-        current = node.parent();
-    }
-    let (node, replacement) = candidate?;
-    let range = context.document.range_for_node(node);
-    Some(
-        CodeActionSpec::rewrite(
-            context,
-            &catalog::SIMPLIFIABLE_EXPRESSION,
-            range,
-            "Flatten nested if into else-if chain",
-        )
-        .build(context.uri, range, replacement),
-    )
-}
-
-/// String replacement retaining the source literal representation.
-fn raw_string_replacement(string_node: SyntaxNode<'_>) -> Option<String> {
-    let content = string_node.string_literal_inner_text()?;
-    let escape_count = count_string_escapes(content);
-    if escape_count <= 2 {
+/// The raw `///…///` form of a string literal's `content`, when it has
+/// enough escapes to be worth it and its value survives verbatim: no escape
+/// the conversion cannot decode, and no `///` inside.
+fn raw_string_replacement(content: &str) -> Option<String> {
+    if count_string_escapes(content) < RAW_STRING_MIN_ESCAPES {
         return None;
     }
-
     let unescaped = unescape_string_literal_content(content)?;
-    if unescaped.contains("///") {
+    if unescaped.contains(RAW_STRING_DELIMITER) {
         return None;
     }
-
-    Some(format!("///{unescaped}///"))
+    Some(format!(
+        "{RAW_STRING_DELIMITER}{unescaped}{RAW_STRING_DELIMITER}"
+    ))
 }
 
 /// Counts string escapes in the supplied source text.
@@ -726,16 +588,15 @@ mod tests {
     use super::*;
     use crate::capabilities::formatting::{format_document_with_options, ControlFlowLayout};
     use crate::diagnostics::visible_diagnostics;
-    use crate::node_metadata::SyntaxParser;
+    use crate::node_metadata::SyntaxSnapshot;
     use crate::object_registry::ObjectRegistry;
     use crate::package_index::SourceResolver;
     use crate::settings::DiagnosticSettings;
 
     fn formatted(text: &str, settings: &FormattingSettings) -> String {
-        let mut parser = SyntaxParser::new().unwrap();
-        let root = parser.parse(text).unwrap();
-        assert!(!root.has_error(), "{text}");
-        format_document_with_options(root, &FormatOptions::from(settings))
+        let syntax = SyntaxSnapshot::parse(text, None);
+        assert!(!syntax.has_error(), "{text}");
+        format_document_with_options(&syntax, &FormatOptions::from(settings))
     }
 
     #[test]

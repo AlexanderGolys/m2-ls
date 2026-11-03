@@ -129,8 +129,20 @@ pub struct RelatedNote {
     pub message: String,
 }
 
-/// What a check reports: the span it flags, the explanation, and the related
-/// locations behind it. The check's diagnostic supplies everything else.
+/// A source edit resolving a finding, offered as its quick fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingFix {
+    /// What the edit does, shown as the quick fix's title.
+    pub title: String,
+    /// The span the edit replaces.
+    pub range: TextRange,
+    /// The text replacing the span.
+    pub replacement: String,
+}
+
+/// What a check reports: the span it flags, the explanation, the related
+/// locations behind it, and the edit fixing it when the check knows one. The
+/// check's diagnostic supplies everything else.
 ///
 /// ```ignore
 /// let finding = Finding::new(range, "`protect x` evaluates the current value of `x`")
@@ -144,6 +156,8 @@ pub struct Finding {
     pub message: String,
     /// Locations that explain the finding.
     pub notes: Vec<RelatedNote>,
+    /// The edit fixing the finding, when the check knows one.
+    pub fix: Option<FindingFix>,
 }
 
 impl Finding {
@@ -153,7 +167,23 @@ impl Finding {
             range,
             message: message.into(),
             notes: Vec::new(),
+            fix: None,
         }
+    }
+
+    /// The finding, fixed by replacing `range` with `replacement`.
+    pub fn with_fix(
+        mut self,
+        title: impl Into<String>,
+        range: TextRange,
+        replacement: impl Into<String>,
+    ) -> Self {
+        self.fix = Some(FindingFix {
+            title: title.into(),
+            range,
+            replacement: replacement.into(),
+        });
+        self
     }
 
     /// The finding, additionally pointing at `range` for the reason `message`.

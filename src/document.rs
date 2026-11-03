@@ -9,19 +9,65 @@ use crate::documentation::{
 };
 use crate::file_load::FileLoad;
 use crate::init_file::InitFileDirective;
-use crate::node_metadata::TypedSource;
-use crate::node_metadata::{SyntaxNode, SyntaxParser, SyntaxTree};
+use crate::node_metadata::SyntaxSnapshot;
 use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::package_documentation::PackageDocumentation;
 use crate::package_index::{collect_imported_packages_in_tree, PackageImport, SourceResolver};
-use crate::source::SourcePoint as Point;
-use crate::source::{ByteRange, DocumentSource, SourceNavigation, SymbolMention};
+use crate::source::{ByteRange, DocumentSource, SourceNavigation, SymbolMention, SyntaxSource};
 use crate::source_package::{PackageSessionCode, SourcePackages};
-use m2_syn::nodes::ExprLambda as LambdaExpression;
+use crate::string_literal::LiteralSource;
+use crate::syntax::{
+    AssignmentOperator, AssignmentSyntax, AssignmentTarget, CursorSyntax, ExpressionSyntax,
+};
+use m2_syn::nodes::{Expr, ExprAssign, ExprOp, ExprOpBin, Symbol};
+use m2_syn::visit::{self, Visit};
 use std::ops::BitOr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use tower_lsp::lsp_types::{Position, Range as TextRange, TextDocumentContentChangeEvent, Url};
+
+/// Collects the contents of package-name literals identified by analysis.
+struct PackageMentionCollector<'a> {
+    /// Coordinates of the current syntax revision.
+    source: &'a DocumentSource,
+    /// Full literal ranges classified as package names.
+    namespace_strings: &'a std::collections::HashSet<ByteRange>,
+    /// Package-name contents in source order.
+    mentions: Vec<SymbolMention>,
+}
+
+impl<'ast> Visit<'ast> for PackageMentionCollector<'_> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if self
+            .source
+            .syntax_bytes(expression)
+            .is_some_and(|bytes| self.namespace_strings.contains(&bytes))
+        {
+            if let Some(bytes) = expression.literal_content_bytes(self.source) {
+                self.mentions
+                    .push(SymbolMention::new(self.source.span_for_bytes(bytes)));
+            }
+        }
+        visit::visit_expr(self, expression);
+    }
+}
+
+/// Collects function literals and their enclosing parentheses.
+struct LambdaRanges<'a> {
+    /// Revision-specific source coordinates.
+    source: &'a DocumentSnapshot,
+    /// Ranges of function values.
+    ranges: Vec<TextRange>,
+}
+
+impl<'ast> Visit<'ast> for LambdaRanges<'_> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if matches!(expression.unparenthesized(), Some(Expr::Lambda(_))) {
+            self.ranges.extend(self.source.range_for_syntax(expression));
+        }
+        visit::visit_expr(self, expression);
+    }
+}
 
 /// One immutable source, syntax, and semantic-analysis snapshot served to LSP
 /// requests.
@@ -34,7 +80,7 @@ pub struct DocumentSnapshot {
     /// The text, with the positions of the parse tree it is analyzed from.
     source: DocumentSource,
     /// The parse tree of the text, kept for incremental reparsing.
-    tree: SyntaxTree,
+    tree: SyntaxSnapshot,
     /// Bindings, scopes, inferred types and method installations of the text.
     analysis: Analysis,
     /// The findings of the analysis and of the package sessions, before
@@ -88,15 +134,17 @@ impl FileProperties {
     /// The directive command declaring a file primary code.
     const PRIMARY_CODE_COMMAND: &str = "primaryCode";
 
-    /// The properties declared by the directive comments under `root`.
-    fn collect(root: SyntaxNode<'_>) -> Self {
+    /// The properties declared by the retained directive comments.
+    fn collect(syntax: &SyntaxSnapshot) -> Self {
         Self {
-            primary_code: root
-                .descendants()
-                .filter(SyntaxNode::is_line_comment)
-                .any(|comment| {
-                    comment
-                        .text()
+            primary_code: syntax
+                .cells()
+                .iter()
+                .flat_map(|cell| cell.trivia())
+                .filter(|comment| comment.kind() == m2_syn::TriviaKind::LineComment)
+                .flat_map(|comment| comment.text().lines())
+                .any(|line| {
+                    line.trim_start_matches([' ', '\t'])
                         .strip_prefix(LINE_COMMENT)
                         .and_then(|body| body.trim_start().strip_prefix(DIRECTIVE_MARKER))
                         .is_some_and(|body| body.trim() == Self::PRIMARY_CODE_COMMAND)
@@ -156,6 +204,12 @@ impl SourceNavigation for DocumentSnapshot {
     }
 }
 
+impl SyntaxSource for DocumentSnapshot {
+    fn syntax(&self) -> &SyntaxSnapshot {
+        &self.tree
+    }
+}
+
 /// The common first step of every reference / highlight / rename request: the
 /// source occurrence under the cursor together with its scope-aware binding.
 /// The occurrence may be a CST symbol or a [`SymbolMention`].
@@ -186,11 +240,14 @@ impl DocumentSnapshot {
         implied_properties: FileProperties,
     ) -> Option<Self> {
         let source = DocumentSource::new(text);
-        let parsing = crate::telemetry::Timing::start(
+        let mut parsing = crate::telemetry::Timing::start(
             "document.parse",
             serde_json::json!({"source_bytes": source.text().len(), "incremental": false}),
         );
-        let tree = SyntaxParser::new()?.parse_tree(source.text(), None)?;
+        let tree = SyntaxSnapshot::parse(source.text(), None);
+        let reparsed = tree.changed_ranges().len();
+        parsing.record("reparsed_cells", reparsed);
+        parsing.record("reused_cells", tree.cells().len().saturating_sub(reparsed));
         drop(parsing);
         Some(Self::analyze(
             source,
@@ -209,11 +266,14 @@ impl DocumentSnapshot {
         knowledge: &ObjectRegistry,
     ) -> Option<Self> {
         let source = DocumentSource::new(text);
-        let parsing = crate::telemetry::Timing::start(
+        let mut parsing = crate::telemetry::Timing::start(
             "document.parse",
             serde_json::json!({"source_bytes": source.text().len(), "incremental": false}),
         );
-        let tree = SyntaxParser::new()?.parse_tree(source.text(), None)?;
+        let tree = SyntaxSnapshot::parse(source.text(), None);
+        let reparsed = tree.changed_ranges().len();
+        parsing.record("reparsed_cells", reparsed);
+        parsing.record("reused_cells", tree.cells().len().saturating_sub(reparsed));
         drop(parsing);
         Some(Self::analyze(
             source,
@@ -233,19 +293,18 @@ impl DocumentSnapshot {
     /// and those its directive comments declare.
     fn analyze(
         source: DocumentSource,
-        tree: SyntaxTree,
+        tree: SyntaxSnapshot,
         knowledge_provider: &ObjectRegistry,
         previous_sessions: Vec<PackageSession>,
         full: bool,
         implied_properties: FileProperties,
     ) -> Self {
         let mut source = source;
-        source.register_syntax(tree.snapshot());
-        let typed_ast = Some(tree.syntax());
-        let root = tree.root(source.text());
-        let properties = implied_properties | FileProperties::collect(root);
-        let imported_packages = collect_imported_packages_in_tree(root, typed_ast, &source);
-        let file_loads = FileLoad::collect(root, typed_ast, &source);
+        source.register_syntax(&tree);
+        let typed_ast = &tree;
+        let properties = implied_properties | FileProperties::collect(typed_ast);
+        let imported_packages = collect_imported_packages_in_tree(typed_ast, &source);
+        let file_loads = FileLoad::collect(typed_ast, &source);
         let baseline = if properties.primary_code {
             knowledge_provider.without_prelude()
         } else {
@@ -256,16 +315,16 @@ impl DocumentSnapshot {
             "document.analysis",
             serde_json::json!({"source_bytes": source.text().len(), "full": full}),
         );
-        let analysis = Analysis::new_with_knowledge(root, typed_ast, &source, &knowledge);
+        let analysis = Analysis::new_with_knowledge(typed_ast, &source, &knowledge);
         drop(analysis_timing);
         let documentation_timing = crate::telemetry::Timing::start(
             "document.documentation",
             serde_json::json!({"source_bytes": source.text().len()}),
         );
-        let packages = SourcePackages::collect(root, &source);
-        let package_documentation = PackageDocumentation::collect(root, &source, &packages);
-        let diagnostic_suppressions = DiagnosticSuppressions::collect(root, &source);
-        let init_file_directive = InitFileDirective::collect(root, &source);
+        let packages = SourcePackages::collect(typed_ast, &source);
+        let package_documentation = PackageDocumentation::collect(typed_ast, &source, &packages);
+        let diagnostic_suppressions = DiagnosticSuppressions::collect(typed_ast, &source);
+        let init_file_directive = InitFileDirective::collect(typed_ast, &source);
         drop(documentation_timing);
         let diagnostics_timing = crate::telemetry::Timing::start(
             "document.diagnostics",
@@ -275,7 +334,6 @@ impl DocumentSnapshot {
             diagnostics::DiagnosticInputs {
                 primary_code: properties.primary_code,
                 analysis: &analysis,
-                root,
                 syntax: typed_ast,
                 source: &source,
                 knowledge: &knowledge,
@@ -289,7 +347,7 @@ impl DocumentSnapshot {
             "document.attached_documentation",
             serde_json::json!({"source_bytes": source.text().len()}),
         );
-        let mut documentation = collect_documentation(&source, root, &analysis);
+        let mut documentation = collect_documentation(&source, typed_ast, &analysis);
         documentation.extend_blocks(package_documentation.documentation_blocks(&analysis));
         let mut symbol_mentions = documentation
             .references()
@@ -316,15 +374,13 @@ impl DocumentSnapshot {
             })
             .map(|token| token.span.bytes())
             .collect::<std::collections::HashSet<_>>();
-        let package_mentions = root
-            .descendants()
-            .filter(|node| {
-                node.is_string_literal()
-                    && namespace_strings.contains(&(node.start_byte()..node.end_byte()))
-            })
-            .filter_map(|node| node.string_literal_inner_bytes())
-            .map(|bytes| SymbolMention::new(source.span_for_bytes(bytes)))
-            .collect();
+        let mut package_collector = PackageMentionCollector {
+            source: &source,
+            namespace_strings: &namespace_strings,
+            mentions: Vec::new(),
+        };
+        typed_ast.visit(&mut package_collector);
+        let package_mentions = package_collector.mentions;
         drop(documentation_timing);
         let mut snapshot = Self {
             implied_properties,
@@ -456,15 +512,17 @@ impl DocumentSnapshot {
         if source.text() == self.text() {
             return Some(());
         }
-        let parsing = crate::telemetry::Timing::start(
+        let mut parsing = crate::telemetry::Timing::start(
             "document.parse",
             serde_json::json!({"source_bytes": source.text().len(), "incremental": true}),
         );
-        let tree = SyntaxParser::new()?.parse_tree(source.text(), Some(&self.tree))?;
+        let tree = SyntaxSnapshot::parse(source.text(), Some(&self.tree));
+        let reparsed = tree.changed_ranges().len();
+        parsing.record("reparsed_cells", reparsed);
+        parsing.record("reused_cells", tree.cells().len().saturating_sub(reparsed));
         drop(parsing);
         let implied_properties = self.implied_properties;
-        if implied_properties | FileProperties::collect(tree.root(source.text())) != self.properties
-        {
+        if implied_properties | FileProperties::collect(&tree) != self.properties {
             *self = Self::analyze(
                 source,
                 tree,
@@ -532,11 +590,6 @@ impl DocumentSnapshot {
     /// The semantic analysis of the text.
     pub fn analysis(&self) -> &Analysis {
         &self.analysis
-    }
-
-    /// The typed syntax tree of the text.
-    pub fn syntax(&self) -> Option<&TypedSource> {
-        Some(self.tree.syntax())
     }
 
     /// Every finding of the analysis and the package sessions, before settings
@@ -628,8 +681,8 @@ impl DocumentSnapshot {
         if let Some(mention) = self.symbol_mention_at(position) {
             return self.mention_symbol(&mention);
         }
-        let node = self.reference_node_at_position(position)?;
-        self.source_binding_at(node.text(), position)
+        let symbol = self.reference_symbol_at(position)?.symbol;
+        self.source_binding_at(symbol.text(), position)
     }
 
     /// The binding `name` resolves to at `position`, if the session sees it
@@ -667,8 +720,8 @@ impl DocumentSnapshot {
         let (name, range) = if let Some(mention) = mention.as_ref() {
             (mention.name(self.text()), mention.range())
         } else {
-            let node = self.reference_node_at_position(position)?;
-            (node.text(), self.range_for_node(node))
+            let symbol = self.reference_symbol_at(position)?.symbol;
+            (symbol.text(), self.range_for_syntax(symbol)?)
         };
         let symbol = if let Some(mention) = mention {
             self.mention_symbol(&mention)?
@@ -732,13 +785,14 @@ impl DocumentSnapshot {
     /// The code of the statement at `position`: its cell without the
     /// comments around it, which document it rather than being its code.
     fn statement_code_at(&self, position: Position) -> Option<&str> {
-        let cell = self
-            .node_at_position_minimal(position)?
-            .enclosing_node(|node| node.is_source_cell())?;
-        let mut code = cell.named_children().filter(|child| !child.is_comment());
-        let first = code.next()?;
-        let end = code.last().unwrap_or(first).end_byte();
-        Some(&self.text()[first.start_byte()..end])
+        let byte = self.byte_for_position(position)?;
+        self.syntax().cells_at(byte).find_map(|cell| {
+            let bytes = self.syntax_bytes(&cell.content)?;
+            bytes
+                .contains(&byte)
+                .then(|| self.text().get(bytes))
+                .flatten()
+        })
     }
 
     /// The documentation comment attached to `binding`.
@@ -785,8 +839,8 @@ impl DocumentSnapshot {
         if let Some(mention) = self.symbol_mention_at(position) {
             return Some((mention.name(self.text()), mention.range()));
         }
-        let node = self.reference_node_at_position(position)?;
-        Some((node.text(), self.range_for_node(node)))
+        let symbol = self.reference_symbol_at(position)?.symbol;
+        Some((symbol.text(), self.range_for_syntax(symbol)?))
     }
 
     /// The function the name at `position` is bound to.
@@ -798,68 +852,76 @@ impl DocumentSnapshot {
     /// The ranges of the values that are functions, `x -> …`, possibly
     /// parenthesized.
     pub fn lambda_value_ranges(&self) -> Vec<TextRange> {
-        self.root_node()
-            .descendants()
-            .filter(|node| {
-                let mut value = *node;
-                while value.is_holder() {
-                    let Some(inner) = value.final_value_child() else {
-                        return false;
-                    };
-                    value = inner;
-                }
-                value.is::<LambdaExpression>()
+        let mut visitor = LambdaRanges {
+            source: self,
+            ranges: Vec::new(),
+        };
+        self.syntax().visit(&mut visitor);
+        visitor.ranges
+    }
+
+    /// The syntax enclosing `position`: the expressions around it and the
+    /// symbol written there.
+    pub fn cursor_syntax(&self, position: Position) -> CursorSyntax<'_> {
+        let Some(byte) = self.byte_for_position(position) else {
+            return CursorSyntax::default();
+        };
+        CursorSyntax::at(self.syntax().cells_at(byte), byte, self)
+    }
+
+    /// The expressions enclosing `position`, outermost first.
+    pub fn enclosing_expressions(&self, position: Position) -> Vec<&Expr> {
+        self.cursor_syntax(position).expressions
+    }
+
+    /// The symbol under the cursor that reads or binds a name; `None` on a
+    /// member key, which names itself.
+    pub fn reference_symbol_at(&self, position: Position) -> Option<SymbolAt<'_>> {
+        let cursor = self.cursor_syntax(position);
+        let symbol = cursor.symbol?;
+        let expression = cursor
+            .innermost()
+            .filter(|expression| matches!(expression, Expr::Symbol(written) if std::ptr::eq(written, symbol)));
+        let outer =
+            &cursor.expressions[..cursor.expressions.len() - usize::from(expression.is_some())];
+        let parent = outer.last().copied();
+        (!cursor.member_key).then_some(SymbolAt {
+            symbol,
+            expression,
+            parent,
+        })
+    }
+
+    /// The `:=` installation whose method function the cursor rests on: the
+    /// assignment `f ZZ := …` for a cursor on its `f`.
+    pub fn installing_assignment_at(&self, position: Position) -> Option<&ExprAssign> {
+        let byte = self.byte_for_position(position)?;
+        self.enclosing_expressions(position)
+            .into_iter()
+            .rev()
+            .find_map(|expression| {
+                let Expr::Assign(assignment) = expression else {
+                    return None;
+                };
+                let parts = assignment.parts();
+                let method = match parts.target {
+                    AssignmentTarget::Method { method, .. } => method,
+                    AssignmentTarget::Operator(ExprOp::Bin(ExprOpBin::Adj(call)))
+                        if parts.operator == AssignmentOperator::Local =>
+                    {
+                        call.left_operand.as_ref()
+                    }
+                    _ => return None,
+                };
+                self.syntax_bytes(method)
+                    .is_some_and(|bytes| bytes.contains(&byte))
+                    .then_some(assignment)
             })
-            .map(|node| self.range_for_node(node))
-            .collect()
-    }
-
-    /// The parse tree of the text.
-    pub(crate) fn syntax_tree(&self) -> &SyntaxTree {
-        &self.tree
-    }
-
-    /// The root of the parse tree.
-    pub fn root_node(&self) -> SyntaxNode<'_> {
-        self.tree.root(self.text())
-    }
-
-    /// The smallest syntax node at `position`.
-    pub fn node_at_position_minimal(&self, position: Position) -> Option<SyntaxNode<'_>> {
-        let point = self.point_for_position(position)?;
-        self.root_node().descendant_for_point_range(point, point)
-    }
-
-    /// The symbol under the cursor that refers to a binding by name; `None`
-    /// on a member key, which names the symbol itself.
-    pub fn reference_node_at_position(&self, position: Position) -> Option<SyntaxNode<'_>> {
-        let point = self.point_for_position(position)?;
-        let root = self.root_node();
-        // When the cursor sits on the boundary between the anonymous SPACE
-        // application operator (which the grammar emits zero-width) and an
-        // adjacent symbol — e.g. the trailing `M` in an application `(f x) M`,
-        // where SPACE sits exactly at `M`'s start column — a zero-width lookup
-        // lands on the operator. Widening the lookup to the character under the
-        // cursor lands on the symbol; the exact-point lookup is tried first so
-        // ordinary mid-token positions are unaffected.
-        let next = Point::new(point.row, point.column + 1);
-        let starts = [
-            root.descendant_for_point_range(point, point),
-            root.descendant_for_point_range(point, next),
-        ];
-        for start in starts.into_iter().flatten() {
-            let mut node = start;
-            loop {
-                if node.is_symbol_like() {
-                    return (!node.is_member_key()).then_some(node);
-                }
-                match node.parent() {
-                    Some(parent) => node = parent,
-                    None => break,
-                }
-            }
-        }
-        None
+            .filter(|assignment| {
+                self.analysis()
+                    .installation_for(*assignment, self)
+                    .is_some()
+            })
     }
 }
 
@@ -1094,7 +1156,7 @@ mod snapshot_scheduling_tests {
         let knowledge = ObjectRegistry::default();
         let mut document =
             DocumentSnapshot::from_text("x = 1\ny = 2\n".into(), &knowledge).unwrap();
-        let before = document.tree.snapshot().clone();
+        let before = document.tree.clone();
         document
             .apply_changes(
                 &[
@@ -1113,28 +1175,15 @@ mod snapshot_scheduling_tests {
             )
             .unwrap();
         assert_eq!(document.text(), "x = 1234\ny = 2\n");
-        assert_eq!(
-            document.tree.snapshot().cells()[1].id(),
-            before.cells()[1].id()
-        );
-        let ids = document
+        assert!(document.tree.cells()[1].shares_parse_with(&before.cells()[1]));
+        let saved = document.save_job(knowledge)();
+        assert_eq!(saved.tree.cells().len(), document.tree.cells().len());
+        assert!(saved
             .tree
-            .snapshot()
             .cells()
             .iter()
-            .map(|cell| cell.id())
-            .collect::<Vec<_>>();
-        let saved = document.save_job(knowledge)();
-        assert_eq!(
-            saved
-                .tree
-                .snapshot()
-                .cells()
-                .iter()
-                .map(|cell| cell.id())
-                .collect::<Vec<_>>(),
-            ids
-        );
+            .zip(document.tree.cells())
+            .all(|(saved, original)| saved.shares_parse_with(original)));
     }
 
     #[test]
@@ -1218,4 +1267,17 @@ mod snapshot_scheduling_tests {
             .any(|d| d.rule.code == diagnostics::catalog::SYNTAX_ERROR.code
                 && d.finding.range.start.line == 0));
     }
+}
+
+/// A symbol under the cursor, with the expressions around it.
+#[derive(Debug, Clone, Copy)]
+pub struct SymbolAt<'a> {
+    /// The symbol.
+    pub symbol: &'a Symbol,
+    /// The symbol as an expression, when it is written in expression
+    /// position rather than as a parameter or assignment target.
+    pub expression: Option<&'a Expr>,
+    /// The innermost expression containing the symbol, other than the
+    /// symbol itself.
+    pub parent: Option<&'a Expr>,
 }

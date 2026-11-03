@@ -4,13 +4,11 @@
 //! delegate to their alternatives; operands remain borrowed typed expressions.
 //! The context supplies positioned semantic knowledge and memoized recursion.
 
-use m2_syn::{nodes::*, Spanned};
+use m2_syn::{nodes::*, Spanned, Token};
 
-use super::syntax_roles::OperatorSyntax;
 use crate::object_registry::OperatorForm;
 use crate::typesystem::{InferredType, TypeRole};
 
-pub mod navigation;
 pub mod session;
 pub mod syntax;
 
@@ -259,10 +257,9 @@ impl InferType for ExprOpBinAdj {
 
 impl InferType for ExprOpBinRegular {
     fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        let spelling = self.operator.operator_spelling();
         context.binary(
             self,
-            spelling.as_deref().unwrap_or_default(),
+            self.operator.spelling(),
             &self.left_operand,
             &self.right_operand,
         )
@@ -271,29 +268,22 @@ impl InferType for ExprOpBinRegular {
 
 impl InferType for ExprOpBinIndex {
     fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        use m2_syn::Token;
-        context.binary(
-            self,
-            <m2_syn::Token![#]>::SPELLING,
-            &self.receiver,
-            &self.index,
-        )
+        context.binary(self, <Token![#]>::SPELLING, &self.receiver, &self.index)
     }
 }
 
 impl InferType for ExprOpBinMember {
     fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        use m2_syn::Token;
         match self {
             Self::Dot(access) => context.binary(
                 self,
-                <m2_syn::Token![.]>::SPELLING,
+                <Token![.]>::SPELLING,
                 &access.receiver,
                 &access.member,
             ),
             Self::Optional(access) => context.binary(
                 self,
-                <m2_syn::Token![.?]>::SPELLING,
+                <Token![.?]>::SPELLING,
                 &access.receiver,
                 &access.member,
             ),
@@ -303,10 +293,9 @@ impl InferType for ExprOpBinMember {
 
 impl InferType for ExprOpPrefix {
     fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        let spelling = self.operator.operator_spelling();
         context.unary(
             self,
-            spelling.as_deref().unwrap_or_default(),
+            self.operator.spelling(),
             &self.operand,
             OperatorForm::Prefix,
         )
@@ -315,10 +304,9 @@ impl InferType for ExprOpPrefix {
 
 impl InferType for ExprOpPostfix {
     fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        let spelling = self.operator.operator_spelling();
         context.unary(
             self,
-            spelling.as_deref().unwrap_or_default(),
+            self.operator.spelling(),
             &self.operand,
             OperatorForm::Postfix,
         )

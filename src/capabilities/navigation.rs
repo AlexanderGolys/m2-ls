@@ -3,20 +3,22 @@
 
 use std::collections::HashMap;
 
-use m2_syn::nodes::Symbol;
+use m2_syn::nodes::{Expr, ExprOp, ExprOpBin, ExprOpBinAdj};
+use m2_syn::visit::{self, Visit};
 use tower_lsp::lsp_types::request::{
     GotoDeclarationResponse, GotoImplementationResponse, GotoTypeDefinitionResponse,
 };
 use tower_lsp::lsp_types::Range as TextRange;
 use tower_lsp::lsp_types::*;
 
-use crate::document::{DocumentSnapshot, TargetSymbol};
+use crate::document::{DocumentSnapshot, SymbolAt, TargetSymbol};
 use crate::library_index::LibrarySources;
-use crate::node_metadata::SyntaxNode;
 use crate::object_registry::ObjectName;
-use crate::package_index::{package_source_string, SourceResolver};
+use crate::package_index::{is_package_import_trigger, PackageLoadingOption, SourceResolver};
 use crate::record_lsp::LspKnowledge;
-use crate::source::SourceNavigation;
+use crate::source::{SourceNavigation, SyntaxSource};
+use crate::string_literal::LiteralSource;
+use crate::syntax::{BindingReferences, ExpressionSyntax};
 use crate::workspace_index::{
     ImplementationKind, WorkspaceDefinitionKnowledge, WorkspaceImplementationKnowledge,
     WorkspaceSymbolKnowledge,
@@ -140,7 +142,7 @@ fn goto_symbol_response(
     library: &LibrarySources,
     target: NavigationTarget,
 ) -> Option<GotoDefinitionResponse> {
-    let node = document.node_at_position_minimal(position)?;
+    let cursor = document.cursor_syntax(position);
     let mention = document.symbol_mention_at(position);
 
     if let NavigationTarget::Definition = target {
@@ -153,8 +155,16 @@ fn goto_symbol_response(
                     GotoDefinitionResponse::Scalar(Location::new(file, TextRange::default()))
                 });
         }
-        if let Some(string_node) = node.enclosing_node(SyntaxNode::is_string_literal) {
-            if let Some(package_name) = crate::package_index::package_source_string(string_node) {
+        for expression in cursor.expressions.iter().rev() {
+            if let Some(content) = expression.literal_content_bytes(document) {
+                let is_package = document
+                    .package_mentions()
+                    .iter()
+                    .any(|mention| mention.byte_span() == (content.start, content.end));
+                if !is_package {
+                    continue;
+                }
+                let package_name = document.text().get(content)?;
                 if let Some(path) = library.source_resolver().resolve_package_file(package_name) {
                     if let Ok(uri) = Url::from_file_path(path) {
                         return Some(GotoDefinitionResponse::Scalar(Location {
@@ -170,10 +180,7 @@ fn goto_symbol_response(
     let node_text = if let Some(mention) = mention.as_ref() {
         mention.name(document.text())
     } else {
-        if !node.is::<Symbol>() {
-            return None;
-        }
-        node.text()
+        cursor.symbol?.text()
     };
 
     let local_binding = match target {
@@ -261,16 +268,18 @@ pub fn goto_type_definition_response(
     workspace_index: &(impl WorkspaceDefinitionKnowledge + ?Sized),
     library: &LibrarySources,
 ) -> Option<GotoTypeDefinitionResponse> {
-    let node = document.reference_node_at_position(position)?;
+    let symbol = document.reference_symbol_at(position)?;
     let inferred_type = document
         .binding_at_position(position)
         .and_then(|binding| binding.state.inferred_type.as_ref())
         .and_then(crate::typesystem::InferredType::single)
         .cloned()
         .or_else(|| {
-            document
-                .analysis()
-                .infer_expression_static_type(node, document, knowledge)
+            document.analysis().infer_expression_static_type(
+                symbol.expression?,
+                document,
+                knowledge,
+            )
         })?;
     if inferred_type.name() == "Thing" {
         return None;
@@ -315,21 +324,23 @@ pub fn goto_implementation_response(
         .or_else(|| document.future_assignment_binding_at(name, position));
     let function = binding.and_then(|binding| analysis.function_for_binding(binding));
     let call_installations = function.and_then(|function| {
-        let callable = document.reference_node_at_position(position)?;
-        if analysis.is_method_installation_callable(callable, document) {
+        let SymbolAt {
+            expression: Some(callable),
+            parent: Some(Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call)))),
+            ..
+        } = document.reference_symbol_at(position)?
+        else {
+            return None;
+        };
+        if !std::ptr::eq(call.left_operand.as_ref(), callable)
+            || document.installing_assignment_at(position).is_some()
+        {
             return None;
         }
-        let application = callable.parent()?;
-        if !application.is_space_application() {
-            return None;
-        }
-        let head = application.binary_parts().map(|parts| parts.left)?;
-        (head.id() == callable.id()).then_some(())?;
-        let argument = application.binary_parts().map(|parts| parts.right)?;
         Some(analysis.local_call_installations(
             function,
-            argument,
-            document.position_for_node(callable),
+            call,
+            document.position_for_syntax(callable)?,
             document,
             knowledge,
         ))
@@ -483,20 +494,11 @@ pub fn document_links_response(
         })
         .collect::<Vec<_>>();
 
-    links.extend(
-        document
-            .root_node()
-            .descendants()
-            .filter(SyntaxNode::is_string_literal)
-            .filter_map(|node| {
-                let package = package_source_string(node)?;
-                Some(document_link(
-                    document.range_for_node(node),
-                    uri,
-                    format!("Open package `{package}`"),
-                ))
-            }),
-    );
+    document.syntax().visit(&mut PackageLinks {
+        document,
+        uri,
+        links: &mut links,
+    });
     links.extend(document.file_loads().iter().filter_map(|load| {
         let file = load.resolve(uri, sources.path()).file()?.clone();
         Some(DocumentLink {
@@ -512,6 +514,52 @@ pub fn document_links_response(
     links.sort_by_key(|link| (link.range.start, link.range.end));
     links.dedup_by_key(|link| link.range);
     links
+}
+
+/// Collects links for package-name literals in typed import and constructor calls.
+struct PackageLinks<'a> {
+    /// Document providing literal text and source coordinates.
+    document: &'a DocumentSnapshot,
+    /// URI used to resolve a link through the usual navigation request.
+    uri: &'a Url,
+    /// Links accumulated in source order.
+    links: &'a mut Vec<DocumentLink>,
+}
+
+impl PackageLinks<'_> {
+    /// Adds a link for a literal package name with known source coordinates.
+    fn add(&mut self, literal: &Expr) {
+        if let (Some(name), Some(range)) = (
+            literal.literal_source(self.document),
+            self.document.range_for_syntax(literal),
+        ) {
+            self.links.push(document_link(
+                range,
+                self.uri,
+                format!("Open package `{name}`"),
+            ));
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for PackageLinks<'_> {
+    fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
+        if call
+            .left_operand
+            .symbol_name()
+            .is_some_and(is_package_import_trigger)
+        {
+            if let Some(literal) = call.right_operand.arguments().into_iter().next().flatten() {
+                self.add(literal);
+            }
+        }
+        for option in PackageLoadingOption::ALL {
+            for literal in option.typed_package_names(call, self.document) {
+                self.add(literal);
+            }
+        }
+        visit::visit_expr_op_bin_adj(self, call);
+    }
 }
 
 /// Builds a protocol document-link request for the supplied document URI.
@@ -597,14 +645,10 @@ pub fn reference_ranges_resolved(
     let target_range = target.symbol.range;
 
     let mut references = Vec::new();
-    for node in document.root_node().binding_references() {
-        let node_text = node.text();
-        if node_text == target_name {
-            let range = document.range_for_node(node);
-            if let Some(symbol) = document.source_symbol_at(node_text, range.start) {
-                if symbol.range == target_range && (include_declaration || range != target_range) {
-                    references.push(range);
-                }
+    for range in binding_reference_ranges(document, target_name) {
+        if let Some(symbol) = document.source_symbol_at(target_name, range.start) {
+            if symbol.range == target_range && (include_declaration || range != target_range) {
+                references.push(range);
             }
         }
     }
@@ -701,16 +745,14 @@ pub fn reference_target(
 pub fn global_reference_ranges(document: &DocumentSnapshot, name: &str) -> Vec<TextRange> {
     let analysis = document.analysis();
     let mut references = Vec::new();
-    for node in document.root_node().binding_references() {
-        if node.text() == name {
-            let position = document.position_for_node(node);
-            // A use is global unless a local binding shadows the name here.
-            let shadowed = analysis
-                .get_binding_at(name, position)
-                .is_some_and(|binding| binding.scope_idx != 0);
-            if !shadowed {
-                references.push(document.range_for_node(node));
-            }
+    for range in binding_reference_ranges(document, name) {
+        let position = range.start;
+        // A use is global unless a local binding shadows the name here.
+        let shadowed = analysis
+            .get_binding_at(name, position)
+            .is_some_and(|binding| binding.scope_idx != 0);
+        if !shadowed {
+            references.push(range);
         }
     }
     for mention in document.symbol_mentions() {
@@ -746,17 +788,9 @@ pub fn global_reference_ranges(document: &DocumentSnapshot, name: &str) -> Vec<T
 /// light up with the library object they replace.
 pub fn unbound_reference_ranges(document: &DocumentSnapshot, name: &str) -> Vec<TextRange> {
     let analysis = document.analysis();
-    let mut references = document
-        .root_node()
-        .binding_references()
-        .filter(|node| node.text() == name)
-        .filter_map(|node| {
-            let range = document.range_for_node(node);
-            analysis
-                .get_binding_at(name, range.start)
-                .is_none()
-                .then_some(range)
-        })
+    let mut references = binding_reference_ranges(document, name)
+        .into_iter()
+        .filter(|range| analysis.get_binding_at(name, range.start).is_none())
         .collect::<Vec<_>>();
 
     references.extend(
@@ -772,6 +806,18 @@ pub fn unbound_reference_ranges(document: &DocumentSnapshot, name: &str) -> Vec<
     references.sort_by_key(|range| (range.start, range.end));
     references.dedup();
     references
+}
+
+/// Typed symbol occurrences that can refer to a binding, excluding member keys.
+fn binding_reference_ranges(document: &DocumentSnapshot, name: &str) -> Vec<TextRange> {
+    let mut references = BindingReferences::default();
+    document.syntax().visit(&mut references);
+    references
+        .0
+        .into_iter()
+        .filter(|symbol| symbol.text() == name)
+        .filter_map(|symbol| document.range_for_syntax(symbol))
+        .collect()
 }
 
 /// Whether `name` is a valid M2 identifier (a letter followed by letters and

@@ -14,9 +14,11 @@ use crate::semantic_token::{
     SourceSemanticToken, SourceSemanticTokenContext,
 };
 use crate::settings::{DefaultLibraryMode, DefaultLibrarySetting, SemanticTokenSettings};
-use crate::source::{ByteRange, DocumentSpan, SourceNavigation, SymbolMention};
+use crate::source::{ByteRange, DocumentSpan, SourceNavigation, SymbolMention, SyntaxSource};
 use crate::source_package::{CodeFragment, ExportAccess};
 use crate::workspace_index::{WorkspaceDefinitionKnowledge, WorkspaceIndex, WorkspaceView};
+use m2_syn::nodes::ExprDebug;
+use m2_syn::visit::{self, Visit};
 use tower_lsp::lsp_types::Range as TextRange;
 use tower_lsp::lsp_types::*;
 
@@ -161,23 +163,10 @@ impl<'a> SemanticTokenEmitter<'a> {
                 .cloned()
                 .map(|bytes| (bytes, M2SemanticTokenModifier::Example)),
         );
-        contexts.extend(
-            document
-                .root_node()
-                .descendants()
-                .filter(|node| {
-                    node.is_debug_expr()
-                        && node
-                            .children()
-                            .any(|child| child.is::<m2_syn::Token![TEST]>())
-                })
-                .map(|node| {
-                    (
-                        node.start_byte()..node.end_byte(),
-                        M2SemanticTokenModifier::Test,
-                    )
-                }),
-        );
+        document.syntax().visit(&mut TestContexts {
+            document,
+            contexts: &mut contexts,
+        });
         Self {
             document,
             settings,
@@ -362,6 +351,25 @@ impl<'a> SemanticTokenEmitter<'a> {
     /// Consumes the emitter and returns its accumulated protocol tokens.
     fn finish(self) -> Vec<SemanticToken> {
         self.tokens
+    }
+}
+
+/// Adds TEST expression spans to the semantic modifier contexts.
+struct TestContexts<'a> {
+    /// Source coordinates for the retained syntax.
+    document: &'a DocumentSnapshot,
+    /// Modifier ranges accumulated for this request.
+    contexts: &'a mut Vec<(ByteRange, M2SemanticTokenModifier)>,
+}
+
+impl<'ast> Visit<'ast> for TestContexts<'_> {
+    fn visit_expr_debug(&mut self, expression: &'ast ExprDebug) {
+        if matches!(expression, ExprDebug::Test(_)) {
+            if let Some(bytes) = self.document.syntax_bytes(expression) {
+                self.contexts.push((bytes, M2SemanticTokenModifier::Test));
+            }
+        }
+        visit::visit_expr_debug(self, expression);
     }
 }
 

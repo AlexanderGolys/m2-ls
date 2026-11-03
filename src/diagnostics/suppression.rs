@@ -17,7 +17,7 @@ use strum::{Display, EnumString, IntoStaticStr};
 use tower_lsp::lsp_types::Position;
 
 use super::{DiagnosticCode, M2Diagnostic};
-use crate::node_metadata::SyntaxNode;
+use crate::node_metadata::SyntaxSnapshot;
 use crate::source::SourceNavigation;
 
 /// What starts a directive inside a line comment.
@@ -79,27 +79,42 @@ impl SilencedRules {
 }
 
 impl DiagnosticSuppressions {
-    /// The directives of the comments under `root`.
-    pub fn collect(root: SyntaxNode<'_>, source: &(impl SourceNavigation + ?Sized)) -> Self {
+    /// The directives in the retained comments of `syntax`, including failed cells.
+    pub fn collect(syntax: &SyntaxSnapshot, source: &(impl SourceNavigation + ?Sized)) -> Self {
         let mut suppressions = Self::default();
-        for comment in root.descendants().filter(SyntaxNode::is_comment) {
-            let Some((scope, rules)) = Self::directive(comment.text()) else {
+        for comment in syntax.cells().iter().flat_map(|cell| cell.trivia()) {
+            if comment.kind() != m2_syn::TriviaKind::LineComment {
+                continue;
+            }
+            let Some(text) = source.text_for_syntax(comment) else {
                 continue;
             };
-            match scope {
-                SuppressionScope::File => {
-                    suppressions.file = Some(match suppressions.file.take() {
-                        Some(silenced) => silenced.join(rules),
-                        None => rules,
-                    });
-                }
-                SuppressionScope::NextLine => {
-                    let line = source.position_for_node(comment).line + 1;
-                    let silenced = match suppressions.lines.remove(&line) {
-                        Some(silenced) => silenced.join(rules),
-                        None => rules,
-                    };
-                    suppressions.lines.insert(line, silenced);
+            let Some(bytes) = source.syntax_bytes(comment) else {
+                continue;
+            };
+            let mut offset = bytes.start;
+            for line in text.split_inclusive('\n') {
+                let line_start = offset;
+                offset += line.len();
+                let Some((scope, rules)) = Self::directive(line.trim_start_matches([' ', '\t']))
+                else {
+                    continue;
+                };
+                match scope {
+                    SuppressionScope::File => {
+                        suppressions.file = Some(match suppressions.file.take() {
+                            Some(silenced) => silenced.join(rules),
+                            None => rules,
+                        });
+                    }
+                    SuppressionScope::NextLine => {
+                        let line = source.position_for_byte(line_start).line + 1;
+                        let silenced = match suppressions.lines.remove(&line) {
+                            Some(silenced) => silenced.join(rules),
+                            None => rules,
+                        };
+                        suppressions.lines.insert(line, silenced);
+                    }
                 }
             }
         }
@@ -166,12 +181,13 @@ mod tests {
     use crate::diagnostics::catalog::{RING_VARIABLE_NAMING, UNUSED_BINDING};
     use crate::document::DocumentSnapshot;
     use crate::object_registry::ObjectRegistry;
+    use crate::source::SyntaxSource;
 
     fn reported(text: &str) -> Vec<(u32, DiagnosticCode)> {
         let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document =
             DocumentSnapshot::from_text(text.to_string(), &builtins).expect("fixture should parse");
-        let suppressions = DiagnosticSuppressions::collect(document.root_node(), &document);
+        let suppressions = DiagnosticSuppressions::collect(document.syntax(), &document);
         document
             .diagnostics()
             .iter()
@@ -230,5 +246,34 @@ mod tests {
                 SilencedRules::Only(vec![UNUSED_BINDING.code])
             ))
         );
+    }
+
+    #[test]
+    fn directives_follow_relocated_cells_and_survive_invalid_syntax() {
+        use tower_lsp::lsp_types::{Range, TextDocumentContentChangeEvent};
+
+        let registry = ObjectRegistry::default();
+        let mut document = DocumentSnapshot::from_text(
+            "x = 1\n-- m2-ls: disable-next-line S02\ny = (\n".to_string(),
+            &registry,
+        )
+        .expect("the document retains invalid cells");
+        let collect = |document: &DocumentSnapshot| {
+            DiagnosticSuppressions::collect(document.syntax(), document)
+        };
+        assert!(collect(&document).lines.contains_key(&2));
+        document
+            .apply_changes(
+                &[TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(0, 0), Position::new(0, 0))),
+                    range_length: None,
+                    text: "before = 0\n".to_string(),
+                }],
+                &registry,
+            )
+            .expect("the edit is valid");
+        let suppressions = collect(&document);
+        assert!(suppressions.lines.contains_key(&3));
+        assert!(!suppressions.lines.contains_key(&2));
     }
 }

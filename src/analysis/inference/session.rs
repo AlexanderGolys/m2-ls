@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::ptr;
 
+use m2_syn::visit::{self, Visit};
 use m2_syn::{nodes::*, Spanned};
 use tower_lsp::lsp_types::Position;
 
@@ -16,10 +17,11 @@ use crate::typesystem::{
     InferredType, LiteralOption, PositionedTypeKnowledge, TypeKnowledge, TypeRole,
 };
 
-use super::syntax::{ExpressionSyntax, InfixSyntax, MethodConstructor};
+use super::syntax::{InfixSyntax, MethodConstructor};
 use super::{InferType, InferenceContext};
 use crate::analysis::ring::values::RingValues;
 use crate::analysis::SourceRangeKey;
+use crate::syntax::ExpressionSyntax;
 
 /// Borrowed identity of one generated expression, independent of source-span equality.
 #[derive(Debug, Clone, Copy)]
@@ -453,6 +455,55 @@ where
     }
 }
 
+/// The inferred types of every expression of visited syntax, each after the
+/// operands it depends on.
+pub struct ExpressionTypes<'ast, 'request, 'query, S: ?Sized, K: ?Sized> {
+    /// The shared typed cache and positioned semantic context.
+    session: &'query InferenceSession<'ast, 'request, S, K>,
+    /// Expressions with their inferred types, in postorder.
+    found: Vec<(&'ast Expr, InferredType)>,
+}
+
+impl<'ast, 'request, 'query, S, K> ExpressionTypes<'ast, 'request, 'query, S, K>
+where
+    S: SourceNavigation + ?Sized,
+    K: PositionedTypeKnowledge + ?Sized,
+{
+    /// The types of the expressions of every cell of `snapshot`, in postorder.
+    pub fn collect(
+        session: &'query InferenceSession<'ast, 'request, S, K>,
+        snapshot: &'ast SyntaxSnapshot,
+    ) -> Vec<(&'ast Expr, InferredType)> {
+        let mut visitor = Self {
+            session,
+            found: Vec::new(),
+        };
+        snapshot.visit(&mut visitor);
+        visitor.found
+    }
+}
+
+impl<'ast, S, K> Visit<'ast> for ExpressionTypes<'ast, '_, '_, S, K>
+where
+    S: SourceNavigation + ?Sized,
+    K: PositionedTypeKnowledge + ?Sized,
+{
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        visit::visit_expr(self, expression);
+        match expression {
+            // Their values never reach the expression around them.
+            Expr::Catch(_) | Expr::Throw(_) | Expr::Trap(_) => return,
+            // A computed class has no static instance type.
+            Expr::New(new) if new.class.symbol_name().is_none() => return,
+            _ => {}
+        }
+        let inferred = self
+            .session
+            .infer(expression, self.session.scope_at(expression));
+        self.found.push((expression, inferred));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Cache correctness when one borrowed expression is queried in distinct scopes.
@@ -460,6 +511,7 @@ mod tests {
     use super::*;
     use crate::document::DocumentSnapshot;
     use crate::object_registry::ObjectRegistry;
+    use crate::source::SyntaxSource;
     use m2_syn::visit::Visit;
 
     /// Finds a variadic lambda's typed body without using navigation casts.
@@ -484,12 +536,12 @@ mod tests {
             &registry,
         )
         .unwrap();
-        let root = document.root_node();
+        let syntax = document.syntax();
         let mut body = LambdaBody::default();
-        root.typed_source().visit(&mut body);
+        syntax.visit(&mut body);
         let expression = body.expression.unwrap();
         let checker = TypeChecker::new(document.analysis(), &registry);
-        let session = InferenceSession::new(&checker, &document, root.snapshot());
+        let session = InferenceSession::new(&checker, &document, syntax);
         let scope = checker
             .find_scope_at(document.range_for_syntax(expression).unwrap().start)
             .unwrap();

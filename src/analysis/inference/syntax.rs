@@ -1,8 +1,9 @@
 //! Typed structural queries shared by expression inference and call handling.
 
 use crate::analysis::{MethodDeclarationOption, MethodOptions};
+use crate::syntax::ExpressionSyntax;
 use crate::typesystem::TypeRole;
-use m2_syn::nodes::*;
+use m2_syn::{nodes::*, Span, Spanned, Token};
 
 /// The value produced by each generated assignment alternative.
 pub trait AssignmentValue {
@@ -23,65 +24,6 @@ impl AssignmentValue for ExprAssign {
             Self::Install(ExprAssignInstall::Op(node)) => &node.function,
             Self::Install(ExprAssignInstall::New(node)) => &node.function,
             Self::Op(node) => &node.value_expr,
-        }
-    }
-}
-
-/// Expression structure relevant to argument passing and nominal class inference.
-pub trait ExpressionSyntax {
-    /// Peels holders that contribute a value; an empty holder has no value.
-    fn unparenthesized(&self) -> Option<&Expr>;
-    /// Symbol spelling when this exact expression is a symbol, without peeling holders.
-    fn symbol_name(&self) -> Option<&str>;
-    /// Positional arguments, retaining empty components as `None`.
-    fn arguments(&self) -> Vec<Option<&Expr>>;
-}
-
-impl ExpressionSyntax for Expr {
-    fn unparenthesized(&self) -> Option<&Expr> {
-        let mut expression = self;
-        while let Self::Holder(holder) = expression {
-            expression = holder.value.as_deref()?;
-        }
-        Some(expression)
-    }
-
-    fn symbol_name(&self) -> Option<&str> {
-        match self {
-            Self::Symbol(symbol) => Some(symbol.text()),
-            _ => None,
-        }
-    }
-
-    fn arguments(&self) -> Vec<Option<&Expr>> {
-        let expression = self.unparenthesized().unwrap_or(self);
-        match expression {
-            Self::Collection(ExprCollection::Sequence(sequence)) => sequence
-                .elements
-                .as_ref()
-                .map_or_else(Vec::new, PackedArguments::arguments),
-            _ => vec![Some(expression)],
-        }
-    }
-}
-
-/// Value slots in a generated packed argument list.
-pub trait PackedArguments {
-    /// Returns expressions and explicit empty slots, excluding muted statements.
-    fn arguments(&self) -> Vec<Option<&Expr>>;
-}
-impl PackedArguments for PackedContent {
-    fn arguments(&self) -> Vec<Option<&Expr>> {
-        match self {
-            Self::Expr(expression) => vec![Some(expression)],
-            Self::Pack(pack) => pack
-                .pack
-                .iter()
-                .map(|component| match component {
-                    Component::Expr(expression) => Some(expression.as_ref()),
-                    Component::Empty(_) => None,
-                })
-                .collect(),
         }
     }
 }
@@ -147,8 +89,10 @@ pub struct InfixOperands<'ast> {
     pub left: &'ast Expr,
     /// Operand evaluated after the application result.
     pub right: &'ast Expr,
-    /// Canonical operator spelling with attached trivia excluded.
-    pub operator: String,
+    /// Canonical operator spelling.
+    pub operator: &'static str,
+    /// Where the operator is written.
+    pub operator_span: Option<Span>,
 }
 
 /// Recognizes explicit infix structure without classifying navigation nodes.
@@ -168,35 +112,38 @@ impl InfixSyntax for Expr {
 
 impl InfixSyntax for ExprOpBin {
     fn infix_operands(&self) -> Option<InfixOperands<'_>> {
-        use crate::analysis::syntax_roles::OperatorSyntax;
-        use m2_syn::Token;
-        let (left, right, operator) = match self {
+        let (left, right, operator, operator_span) = match self {
             Self::Adj(_) => return None,
             Self::Regular(binary) => (
                 &binary.left_operand,
                 &binary.right_operand,
-                binary.operator.operator_spelling()?,
+                binary.operator.spelling(),
+                binary.operator.try_span(),
             ),
             Self::Index(index) => (
                 &index.receiver,
                 &index.index,
-                <m2_syn::Token![#]>::SPELLING.to_owned(),
+                <Token![#]>::SPELLING,
+                index.operator.try_span(),
             ),
             Self::Member(ExprOpBinMember::Dot(member)) => (
                 &member.receiver,
                 &member.member,
-                <m2_syn::Token![.]>::SPELLING.to_owned(),
+                <Token![.]>::SPELLING,
+                member.operator.try_span(),
             ),
             Self::Member(ExprOpBinMember::Optional(member)) => (
                 &member.receiver,
                 &member.member,
-                <m2_syn::Token![.?]>::SPELLING.to_owned(),
+                <Token![.?]>::SPELLING,
+                member.operator.try_span(),
             ),
         };
         Some(InfixOperands {
             left,
             right,
             operator,
+            operator_span,
         })
     }
 }

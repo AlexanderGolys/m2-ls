@@ -21,7 +21,7 @@ use crate::catalog::CatalogSource;
 use crate::diagnostics::visible_diagnostics;
 use crate::document::{DocumentSnapshot, FileProperties};
 use crate::init_file::InitFiles;
-use crate::node_metadata::SyntaxParser;
+use crate::node_metadata::SyntaxSnapshot;
 use crate::object_registry::ObjectRegistry;
 use crate::package_index::{Macaulay2Environment, SourceResolver};
 use crate::settings::{ServerSettings, SettingProblem};
@@ -213,16 +213,12 @@ impl Tool {
     /// Format `text`, writing, printing or only checking the result as
     /// `options` say. Returns the exit status.
     fn format(options: &Options, settings: &ServerSettings, text: String) -> Result<u8, String> {
-        let mut parser = SyntaxParser::new().ok_or("could not initialize parser")?;
-        let tree = parser
-            .parse_tree(&text, None)
-            .ok_or("could not parse source")?;
-        let root = tree.root(&text);
-        if root.has_error() {
+        let syntax = SyntaxSnapshot::parse(&text, None);
+        if syntax.has_error() {
             return Err("cannot format source with syntax errors".into());
         }
         let formatted =
-            format_document_with_options(root, &FormatOptions::from(&settings.formatting));
+            format_document_with_options(&syntax, &FormatOptions::from(&settings.formatting));
         match &options.input {
             _ if options.check => {
                 if formatted != text {

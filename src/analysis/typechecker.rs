@@ -12,22 +12,16 @@
 //! before combining candidate codomains.
 
 use crate::builtin_index::CallableInfo;
-use crate::node_metadata::TypedSource;
+use crate::node_metadata::SyntaxSnapshot;
 use std::ops::Deref;
 
-use m2_syn::nodes::{
-    ExprAssign as Assignment, ExprLambda as LambdaExpression, ExprNew as NewStatement,
-    ExprOpBinAdj as AdjacentExpr, Sequence,
-};
-use m2_syn::visit::{self, Visit};
-use m2_syn::Token;
+use m2_syn::nodes::{Expr, ExprCollection, ExprOpBinAdj};
 
-use super::inference::{
-    navigation::InferenceNavigation, session::InferenceSession, syntax::AssignmentValue,
-};
-use super::ring::RingSemantics;
+use super::inference::session::{ExpressionTypes, InferenceSession};
+use super::inference::InferType;
 use super::*;
 use crate::object_registry::TypeStore;
+use crate::source::{SyntaxNavigation, SyntaxSource};
 
 /// Partial-order view combining source and external type edges without copying.
 struct SourceTypeOrder<'analysis, Knowledge: ?Sized> {
@@ -113,20 +107,18 @@ impl<Knowledge: ?Sized> Deref for TypeChecker<'_, '_, Knowledge> {
 }
 
 impl Analysis {
-    /// Visits inferable expressions with their result ranges, evaluating child expressions before their parents.
-    pub fn for_each_expression_type<'tree>(
+    /// The inferred type of every expression of `syntax`, each after the
+    /// operands it depends on.
+    pub fn expression_types<'ast>(
         &self,
-        root: SyntaxNode<'tree>,
-        _syntax: Option<&TypedSource>,
+        syntax: &'ast SyntaxSnapshot,
         source: &(impl SourceNavigation + ?Sized),
         knowledge_provider: &(impl PositionedTypeKnowledge + ?Sized),
-        mut visit: impl FnMut(SyntaxNode<'tree>, InferredType),
-    ) {
+    ) -> Vec<(&'ast Expr, InferredType)> {
         let checker = TypeChecker::new(self, knowledge_provider);
-        let navigation = InferenceNavigation::new(root);
-        let source = crate::source::SyntaxNavigation::new(source.source(), root.snapshot());
-        let session = InferenceSession::new(&checker, &source, root.snapshot());
-        navigation.visit_types(&session, &mut visit);
+        let source = SyntaxNavigation::new(source.source(), syntax);
+        let session = InferenceSession::new(&checker, &source, syntax);
+        ExpressionTypes::collect(&session, syntax)
     }
 
     /// Whether the class has a known proper subtype at this source position.
@@ -146,200 +138,6 @@ impl Analysis {
                 }
                 .has_strict_subtype_id(&type_id)
             })
-    }
-
-    /// Enriches lambda node using the bindings and type knowledge already collected.
-    fn enrich_lambda_node(&mut self, node: SyntaxNode, source: &(impl SourceNavigation + ?Sized)) {
-        if let Some(parameters) = node.lambda_parameters() {
-            let parameter_types = self.argument_lambda_domain(node, source).cloned();
-            self.enrich_parameters(parameters, source, parameter_types.as_deref());
-        }
-    }
-
-    /// Enriches assignment node using the bindings and type knowledge already collected.
-    fn enrich_assignment_node(
-        &mut self,
-        node: SyntaxNode,
-        syntax: Option<&Assignment>,
-        source: &(impl SourceNavigation + ?Sized),
-        scope_idx: usize,
-        knowledge_provider: &(impl PositionedTypeKnowledge + ?Sized),
-    ) {
-        let Some((left, operator, value)) = assignment_parts(node) else {
-            return;
-        };
-        let right = Some(value);
-        let knowledge = knowledge_provider.at_position(source.position_for_node(node));
-        let installation_id = self.record_method_installation(node, source, &knowledge);
-        let inferred_type = right.map(|right| {
-            if let Some(declaration) = MethodDeclaration::of(right) {
-                InferredType::exact_from_id(declaration.runtime_class().object_name())
-            } else {
-                TypeChecker::new(self, knowledge_provider).type_of(right, source, scope_idx)
-            }
-        });
-        let type_name = inferred_type.as_ref().and_then(InferredType::single);
-        let parent_type = right.and_then(|right| {
-            self.declared_type_parent(
-                right,
-                type_name,
-                source.position_for_node(right),
-                &knowledge,
-            )
-        });
-        let presentation_kind = if right.is_some_and(|right| {
-            right.is::<LambdaExpression>() || MethodDeclaration::of(right).is_some()
-        }) || type_name
-            .is_some_and(|type_name| knowledge.has_type_role(type_name, TypeRole::Function))
-        {
-            SymbolKind::FUNCTION
-        } else if type_name.is_some_and(|type_name| {
-            TypeChecker::new(self, &knowledge).is_subtype(
-                type_name,
-                &TypeRole::Type.object_name(),
-                source.position_for_node(left),
-                &knowledge,
-            )
-        }) {
-            SymbolKind::CLASS
-        } else {
-            SymbolKind::VARIABLE
-        };
-        let object_id = right
-            .zip(single_symbol_assignment_target(left))
-            .and_then(|(right, _)| {
-                self.callable_object_for_value(right, source, scope_idx, &knowledge)
-            });
-
-        if !left.is::<NewStatement>()
-            && (matches_token::<Token![:=]>(operator.text())
-                || matches_token::<Token![=]>(operator.text()))
-        {
-            self.enrich_definitions(
-                left,
-                source,
-                BindingEnrichment {
-                    presentation_kind,
-                    inferred_type: inferred_type.clone(),
-                    object_id,
-                    indexed_element_type: None,
-                    parent_type,
-                },
-            );
-        }
-
-        if let (Some(right), Some(inferred_type), Some(ring_name)) = (
-            right,
-            inferred_type.as_ref(),
-            single_symbol_assignment_target(left),
-        ) {
-            if RingSemantics::may_be_ring(inferred_type, &knowledge) {
-                self.collect_ring_generator_bindings(
-                    ring_name,
-                    (right, syntax.map(AssignmentValue::assigned_value)),
-                    left,
-                    scope_idx,
-                    source,
-                    &knowledge,
-                );
-            }
-        }
-
-        if matches_token::<Token![=]>(operator.text()) {
-            let value_type = type_name
-                .cloned()
-                .unwrap_or_else(|| TypeRole::Thing.object_name());
-            self.register_indexed_assignment(left, value_type, source);
-        }
-
-        self.record_assignment_fact(node, left, right, scope_idx, installation_id, source);
-    }
-
-    /// Traverses generated syntax to enrich callable and binding type facts.
-    pub(super) fn enrich_types_typed(
-        &mut self,
-        syntax: &TypedSource,
-        root: SyntaxNode,
-        source: &(impl SourceNavigation + ?Sized),
-        knowledge_provider: &(impl PositionedTypeKnowledge + ?Sized),
-    ) {
-        syntax.visit(&mut TypedTypeEnricher {
-            analysis: self,
-            root,
-            source,
-            knowledge_provider,
-        });
-    }
-}
-
-/// AST visitor recording types and installations after binding collection.
-struct TypedTypeEnricher<'analysis, 'tree, 'source, 'knowledge, Source: ?Sized, Knowledge: ?Sized> {
-    /// Semantic facts for the current document snapshot.
-    analysis: &'analysis mut Analysis,
-    /// Document syntax root used for navigation within this revision.
-    root: SyntaxNode<'tree>,
-    /// Source-declared runtime classes supplementing the external type graph.
-    source: &'source Source,
-    /// Object and type knowledge queried at each source position.
-    knowledge_provider: &'knowledge Knowledge,
-}
-
-impl<Source, Knowledge> TypedTypeEnricher<'_, '_, '_, '_, Source, Knowledge>
-where
-    Source: SourceNavigation + ?Sized,
-    Knowledge: PositionedTypeKnowledge + ?Sized,
-{
-    /// Records install method call for later semantic or editor queries.
-    fn record_install_method_call(&mut self, node: SyntaxNode) {
-        let knowledge = self
-            .knowledge_provider
-            .at_position(self.source.position_for_node(node));
-        let _ = self
-            .analysis
-            .record_install_method_call(node, self.source, &knowledge);
-    }
-}
-
-impl<'ast, Source, Knowledge> Visit<'ast> for TypedTypeEnricher<'_, '_, '_, '_, Source, Knowledge>
-where
-    Source: SourceNavigation + ?Sized,
-    Knowledge: PositionedTypeKnowledge + ?Sized,
-{
-    fn visit_expr_assign(&mut self, node: &'ast Assignment) {
-        if let Some(assignment) = self.root.related(node) {
-            let scope_idx = self
-                .analysis
-                .find_scope_at(self.source.position_for_node(assignment))
-                .unwrap_or(0);
-            self.analysis.enrich_assignment_node(
-                assignment,
-                Some(node),
-                self.source,
-                scope_idx,
-                self.knowledge_provider,
-            );
-        }
-        visit::visit_expr_assign(self, node);
-    }
-
-    fn visit_expr_lambda(&mut self, node: &'ast LambdaExpression) {
-        if let Some(lambda) = self.root.related(node) {
-            self.analysis.enrich_lambda_node(lambda, self.source);
-        }
-        visit::visit_expr_lambda(self, node);
-    }
-
-    fn visit_expr_op_bin_adj(&mut self, node: &'ast AdjacentExpr) {
-        if let Some(call) = self.root.related(node) {
-            self.record_install_method_call(call);
-            self.analysis.enrich_package_declaration(call, self.source);
-            let knowledge = self
-                .knowledge_provider
-                .at_position(self.source.position_for_node(call));
-            self.analysis
-                .bind_anonymous_ring_generators(call, self.source, &knowledge);
-        }
-        visit::visit_expr_op_bin_adj(self, node);
     }
 }
 
@@ -519,26 +317,15 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         })
     }
 
-    /// Infers a legacy navigation input through a typed session scoped to its AST revision.
-    pub fn type_of(
+    /// Infers typed syntax in one lexical scope of the revision `source` maps.
+    pub fn infer_type<'ast, T: InferType + ?Sized>(
         &self,
-        node: SyntaxNode<'_>,
-        source: &(impl SourceNavigation + ?Sized),
+        syntax: &'ast T,
+        source: &'ast (impl SyntaxSource + ?Sized),
         scope_idx: usize,
     ) -> InferredType {
-        let navigation = InferenceNavigation::new(node.root());
-        if let Some(expression) = node
-            .get::<Expr>()
-            .filter(|expression| source.syntax_bytes(*expression).is_some())
-        {
-            let session = InferenceSession::new(self, source, node.snapshot());
-            return session.infer(expression, scope_idx);
-        }
-        // Standalone callers can supply unregistered text; establish this
-        // revision's offsets once without nesting source-wrapper types.
-        let source = crate::source::SyntaxNavigation::new(source.source(), node.snapshot());
-        let session = InferenceSession::new(self, &source, node.snapshot());
-        navigation.infer_node(node, &session.context(scope_idx))
+        let session = InferenceSession::new(self, source, source.syntax());
+        syntax.infer(&session.context(scope_idx))
     }
 
     /// Forms the union of result possibilities contributed by the input expressions.
@@ -723,68 +510,48 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
             })
     }
 
-    /// Infers call facts from expression syntax and positioned type evidence.
-    pub fn infer_call_facts(
+    /// Argument types and literal options of a call.
+    pub fn call_facts<'ast>(
         &self,
-        node: SyntaxNode,
-        source: &(impl SourceNavigation + ?Sized),
+        call: &'ast ExprOpBinAdj,
+        source: &'ast (impl SyntaxSource + ?Sized),
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> CallStaticFacts {
-        let callable = node
-            .parent()
-            .filter(|parent| parent.is_space_application())
-            .and_then(|parent| parent.binary_parts())
-            .filter(|parts| parts.right.id() == node.id())
-            .and_then(|parts| symbol_node_text(parts.left));
-        self.infer_call_facts_for_callable(node, source, scope_idx, callable, knowledge)
+        self.argument_facts(
+            &call.right_operand,
+            source,
+            scope_idx,
+            call.left_operand.symbol_name(),
+            knowledge,
+        )
     }
 
-    /// Infers call facts for callable from expression syntax and positioned type evidence.
-    fn infer_call_facts_for_callable(
+    /// Argument types and literal options of `arguments`, passed to `callable`.
+    fn argument_facts<'ast>(
         &self,
-        node: SyntaxNode,
-        source: &(impl SourceNavigation + ?Sized),
+        arguments: &'ast Expr,
+        source: &'ast (impl SyntaxSource + ?Sized),
         scope_idx: usize,
         callable: Option<&str>,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> CallStaticFacts {
-        let Some(expression) = node.get::<Expr>() else {
-            return CallStaticFacts::default();
-        };
-        if source.syntax_bytes(expression).is_some() {
-            let session = InferenceSession::new(self, source, node.snapshot());
-            return session
-                .context(scope_idx)
-                .call_facts(expression, callable, knowledge);
-        }
-        let source = crate::source::SyntaxNavigation::new(source.source(), node.snapshot());
-        let session = InferenceSession::new(self, &source, node.snapshot());
+        let session = InferenceSession::new(self, source, source.syntax());
         session
             .context(scope_idx)
-            .call_facts(expression, callable, knowledge)
+            .call_facts(arguments, callable, knowledge)
     }
 
     /// Reports only calls whose known domains are disjoint from every possible
     /// argument type. Missing type or signature facts leave the call unchecked.
     pub fn disjoint_call_argument_types(
         &self,
-        node: SyntaxNode,
-        source: &(impl SourceNavigation + ?Sized),
+        call: &ExprOpBinAdj,
+        source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<Vec<InferredType>> {
-        if !node.is_space_application() {
-            return None;
-        }
-        let parts = node.binary_parts()?;
-        let name = symbol_node_text(parts.left)?;
-        if self
-            .analysis
-            .is_method_installation_callable(parts.left, source)
-        {
-            return None;
-        }
-        let position = source.position_for_node(node);
+        let name = call.left_operand.symbol_name()?;
+        let position = source.position_for_syntax(call)?;
         let scope = self.find_scope_at(position).unwrap_or(0);
         let function = self.local_function_at(name, scope, position, knowledge);
         let indexed_name = ObjectName::new(name);
@@ -812,8 +579,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         {
             return None;
         }
-        let facts =
-            self.infer_call_facts_for_callable(parts.right, source, scope, Some(name), knowledge);
+        let facts = self.call_facts(call, source, scope, knowledge);
         let binary = function
             .is_some_and(|function| function.runtime_class == Some(TypeRole::MethodFunctionBinary))
             || record.is_some_and(|record| {
@@ -868,61 +634,61 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
     /// are checked: one declaring a literal option list in source, or a
     /// catalog function recording its option table, directly or for the one
     /// installation the call reaches.
-    pub fn call_option_issues<'tree>(
+    pub fn call_option_issues<'ast>(
         &self,
-        node: SyntaxNode<'tree>,
-        source: &(impl SourceNavigation + ?Sized),
+        call: &'ast ExprOpBinAdj,
+        source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> Vec<CallOptionIssue<'tree>> {
-        let Some(parts) = node
-            .is_space_application()
-            .then(|| node.binary_parts())
-            .flatten()
-        else {
+    ) -> Vec<CallOptionIssue<'ast>> {
+        let Some(name) = call.left_operand.symbol_name() else {
             return Vec::new();
         };
-        let Some(name) = symbol_node_text(parts.left) else {
-            return Vec::new();
-        };
-        let arguments = parenthesized_value(parts.right).unwrap_or(parts.right);
-        let passed = if arguments.is::<Sequence>() {
-            arguments.collection_elements().collect::<Vec<_>>()
-        } else {
-            vec![arguments]
+        let arguments = call
+            .right_operand
+            .unparenthesized()
+            .unwrap_or(&call.right_operand);
+        let passed = match arguments {
+            Expr::Collection(ExprCollection::Sequence(_)) => {
+                arguments.collection_elements().unwrap_or_default()
+            }
+            _ => vec![Some(arguments)],
         };
         let passed = passed
             .into_iter()
-            .filter(|argument| argument.is_option_assignment())
-            .filter_map(|argument| argument.binary_parts())
-            .filter(|option| option.left.is::<Symbol>())
+            .flatten()
+            .filter_map(|argument| match argument {
+                Expr::Option(option) if matches!(option.key.as_ref(), Expr::Symbol(_)) => {
+                    Some(option)
+                }
+                _ => None,
+            })
             .collect::<Vec<_>>();
-        if passed.is_empty()
-            || self
-                .analysis
-                .is_method_installation_callable(parts.left, source)
-        {
+        let Some(position) = source
+            .position_for_syntax(call)
+            .filter(|_| !passed.is_empty())
+        else {
             return Vec::new();
-        }
-        let position = source.position_for_node(node);
+        };
         let scope = self.find_scope_at(position).unwrap_or(0);
         let Some(accepted) =
-            self.accepted_call_options(name, parts.right, scope, position, source, knowledge)
+            self.accepted_call_options(name, call, scope, position, source, knowledge)
         else {
             return Vec::new();
         };
         let mut issues = Vec::new();
         for option in passed {
-            let key = option.left;
-            let Some(spec) = accepted.iter().find(|spec| spec.name.name() == key.text()) else {
+            let key = option.key.as_ref();
+            let key_name = key.symbol_name().unwrap_or_default();
+            let Some(spec) = accepted.iter().find(|spec| spec.name.name() == key_name) else {
                 issues.push(CallOptionIssue::UnknownName {
                     key,
-                    suggestion: Self::closest_option_name(key.text(), &accepted),
+                    suggestion: Self::closest_option_name(key_name, &accepted),
                     accepted: accepted.iter().map(|spec| spec.name.clone()).collect(),
                 });
                 continue;
             };
             if let Some(issue) =
-                self.option_value_issue(spec, option.right, scope, source, knowledge)
+                self.option_value_issue(spec, &option.value, scope, source, knowledge)
             {
                 issues.push(issue);
             }
@@ -935,10 +701,10 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
     fn accepted_call_options(
         &self,
         name: &str,
-        arguments: SyntaxNode,
+        call: &ExprOpBinAdj,
         scope: usize,
         position: Position,
-        source: &(impl SourceNavigation + ?Sized),
+        source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<Vec<CallableOption>> {
         let callable =
@@ -960,13 +726,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         match info.option_passing? {
             OptionPassing::Table => Some(info.options.clone()),
             OptionPassing::Forwarded => {
-                let facts = self.infer_call_facts_for_callable(
-                    arguments,
-                    source,
-                    scope,
-                    Some(name),
-                    knowledge,
-                );
+                let facts = self.call_facts(call, source, scope, knowledge);
                 self.external_call_signature_facts(&callable, &facts, position, knowledge)?
                     .pinned?
                     .options
@@ -977,16 +737,19 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
 
     /// A value `spec` does not accept: one whose type is disproven for every
     /// accepted type, or an unbound symbol outside its possible values.
-    fn option_value_issue<'tree>(
+    fn option_value_issue<'ast>(
         &self,
         spec: &CallableOption,
-        value: SyntaxNode<'tree>,
+        value: &'ast Expr,
         scope: usize,
-        source: &(impl SourceNavigation + ?Sized),
+        source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
-    ) -> Option<CallOptionIssue<'tree>> {
-        let position = source.position_for_node(value);
-        if let Some(symbol) = symbol_node_text(value).filter(|_| !spec.possible_values.is_empty()) {
+    ) -> Option<CallOptionIssue<'ast>> {
+        let position = source.position_for_syntax(value)?;
+        if let Some(symbol) = value
+            .symbol_name()
+            .filter(|_| !spec.possible_values.is_empty())
+        {
             let evaluates_to_itself = self
                 .visible_source_binding_from_scope(symbol, scope, position, knowledge)
                 .is_none()
@@ -1008,7 +771,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         if spec.accepted_types.is_empty() {
             return None;
         }
-        let actual = self.type_of(value, source, scope);
+        let actual = self.infer_type(value, source, scope);
         let disproven = spec.accepted_types.iter().all(|accepted| {
             actual.possibility_by(accepted, |candidate, bound| {
                 self.subtype_evidence(candidate, bound, position, knowledge)

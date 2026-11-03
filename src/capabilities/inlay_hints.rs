@@ -7,11 +7,15 @@
 //! assignment, the cell it ends and the line it ends, only one is shown.
 
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::iter;
 
-use m2_syn::nodes::{ExprLambda as LambdaExpression, ExprNew as NewStatement, Symbol};
-use m2_syn::Token;
+use m2_syn::nodes::{
+    AssignmentArgument, AssignmentList, Cell, Expr, ExprControl, ExprLambda, ExprOp, ExprOpBin,
+    ExprOpBinAdj, PackedContent, Symbol,
+};
+use m2_syn::visit::{self, Visit};
+use m2_syn::{Lex, Spanned, TokenStream, TokenTree};
 use tower_lsp::lsp_types::{
     InlayHint, InlayHintKind, InlayHintLabel, InlayHintServerCapabilities, InlayHintTooltip, OneOf,
     Position, Range as TextRange,
@@ -19,10 +23,13 @@ use tower_lsp::lsp_types::{
 
 use crate::document::DocumentSnapshot;
 use crate::meta::BindingRole;
-use crate::node_metadata::{SyntaxNode, SyntaxNodeId};
 use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::settings::InlayHintSettings;
-use crate::source::SourceNavigation;
+use crate::source::{ByteRange, SourceNavigation, SyntaxSource};
+use crate::syntax::{
+    AssignmentListSyntax, AssignmentOperator, AssignmentSyntax, AssignmentTarget, BoundSymbols,
+    ExpressionSyntax, LambdaSyntax,
+};
 use crate::typesystem::InferredType;
 use crate::util::TextRangeExt;
 
@@ -164,20 +171,27 @@ pub fn inlay_hints_response(
     hints
 }
 
+/// The literal symbols whose spelling states their type.
+const LITERAL_SYMBOLS: [&str; 3] = ["true", "false", "null"];
+
 /// What the hints of one request are computed from: the document, the types
 /// analysis inferred for its expressions, and the settings choosing which
 /// are shown.
-struct HintContext<'request, 'tree> {
+struct HintContext<'request, 'a> {
     /// Immutable document snapshot being queried.
-    document: &'tree DocumentSnapshot,
+    document: &'a DocumentSnapshot,
     /// Positioned object and type facts available to this request.
     knowledge: &'request ObjectRegistry,
     /// Options accepted by the callable, or settings governing this request.
     options: &'request InlayHintSettings,
     /// The part of the document the client asks hints for.
     range: TextRange,
-    /// Expression identities paired with their syntax and inferred types.
-    inferred_types: HashMap<SyntaxNodeId, (SyntaxNode<'tree>, InferredType)>,
+    /// Every typed expression with its inferred type, in postorder.
+    typed: Vec<(&'a Expr, InferredType)>,
+    /// Where each typed expression is in `typed`, by identity.
+    typed_index: HashMap<*const Expr, usize>,
+    /// The syntax facts the hints are placed by.
+    syntax: HintSyntax<'a>,
     /// The parts of the document's assignments, whose types binding hints
     /// show.
     assignment_parts: AssignmentParts,
@@ -191,47 +205,138 @@ fn hint_order(label: &InlayHintLabel) -> bool {
     label_text(label).starts_with(CALL_RESULT_PREFIX)
 }
 
-/// Expression types derived from the available type evidence.
-fn inferred_expression_types<'tree>(
-    document: &'tree DocumentSnapshot,
-    knowledge: &ObjectRegistry,
-) -> HashMap<SyntaxNodeId, (SyntaxNode<'tree>, InferredType)> {
-    let mut inferred = HashMap::new();
-    document.analysis().for_each_expression_type(
-        document.root_node(),
-        document.syntax(),
-        document,
-        knowledge,
-        |node, inferred_type| {
-            inferred.insert(node.id(), (node, inferred_type));
-        },
-    );
-    inferred
+/// The syntax facts of a document that decide where hints go, collected in
+/// one visit.
+#[derive(Default)]
+struct HintSyntax<'a> {
+    /// Every function literal, to find the parameters a call passes to.
+    lambdas: Vec<&'a ExprLambda>,
+    /// Every assignment expression.
+    assignments: Vec<&'a Expr>,
+    /// The argument expressions of applications, by identity.
+    call_arguments: HashSet<*const Expr>,
+    /// Bytes of the expressions a `;` discards the value of.
+    discarded: Vec<ByteRange>,
+    /// The value each cell ends with, as Macaulay2's `oN : T` line reads it.
+    cell_values: Vec<&'a Expr>,
+    /// The `return`s, by identity, whose value some function receives.
+    received_returns: HashSet<*const ExprControl>,
 }
 
-impl<'request, 'tree> HintContext<'request, 'tree> {
+/// Visitor collecting [`HintSyntax`].
+struct HintSyntaxVisitor<'a, 'document> {
+    /// Source coordinates of the visited revision.
+    document: &'document DocumentSnapshot,
+    /// Facts collected so far.
+    syntax: HintSyntax<'a>,
+}
+
+impl<'a> HintSyntaxVisitor<'a, '_> {
+    /// Records the final value of discarded `content` as discarded.
+    fn discard(&mut self, content: &PackedContent) {
+        let value = match content {
+            PackedContent::Expr(expression) => Some(expression.as_ref()),
+            PackedContent::Pack(pack) => {
+                pack.pack
+                    .iter()
+                    .last()
+                    .and_then(|component| match component {
+                        m2_syn::nodes::Component::Expr(expression) => Some(expression.as_ref()),
+                        m2_syn::nodes::Component::Empty(_) => None,
+                    })
+            }
+        };
+        if let Some(bytes) = value.and_then(|value| self.document.syntax_bytes(value)) {
+            self.syntax.discarded.push(bytes);
+        }
+    }
+}
+
+impl<'a> Visit<'a> for HintSyntaxVisitor<'a, '_> {
+    fn visit_cell(&mut self, cell: &'a Cell) {
+        if let PackedContent::Expr(value) = &cell.content {
+            self.syntax.cell_values.push(value);
+        }
+        if cell.semicolon.is_some() {
+            self.discard(&cell.content);
+        }
+        visit::visit_cell(self, cell);
+    }
+
+    fn visit_statement(&mut self, statement: &'a m2_syn::nodes::Statement) {
+        self.discard(&statement.content);
+        visit::visit_statement(self, statement);
+    }
+
+    fn visit_expr(&mut self, expression: &'a Expr) {
+        match expression {
+            Expr::Lambda(lambda) => self.syntax.lambdas.push(lambda),
+            Expr::Assign(_) => self.syntax.assignments.push(expression),
+            Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => {
+                self.syntax
+                    .call_arguments
+                    .insert(std::ptr::from_ref(call.right_operand.as_ref()));
+            }
+            _ => {}
+        }
+        visit::visit_expr(self, expression);
+    }
+}
+
+impl<'request, 'a> HintContext<'request, 'a> {
     /// Constructs this value from the supplied dependencies and initial state.
     fn new(
-        document: &'tree DocumentSnapshot,
+        document: &'a DocumentSnapshot,
         knowledge: &'request ObjectRegistry,
         options: &'request InlayHintSettings,
         range: TextRange,
     ) -> Self {
+        let typed = document
+            .analysis()
+            .expression_types(document.syntax(), document, knowledge);
+        let typed_index = typed
+            .iter()
+            .enumerate()
+            .map(|(index, (expression, _))| (std::ptr::from_ref(*expression), index))
+            .collect();
+        let mut visitor = HintSyntaxVisitor {
+            document,
+            syntax: HintSyntax::default(),
+        };
+        document.syntax().visit(&mut visitor);
+        let mut syntax = visitor.syntax;
+        syntax.received_returns = document
+            .analysis()
+            .control_transfers(
+                document
+                    .syntax()
+                    .cells()
+                    .iter()
+                    .filter_map(crate::node_metadata::ParsedCell::syntax),
+                document,
+                knowledge,
+            )
+            .into_iter()
+            .filter(|transfer| transfer.target.is_some())
+            .map(|transfer| std::ptr::from_ref(transfer.transfer))
+            .collect();
         let mut context = Self {
             document,
             knowledge,
             options,
             range,
-            inferred_types: inferred_expression_types(document, knowledge),
+            typed,
+            typed_index,
+            syntax,
             assignment_parts: AssignmentParts::default(),
             opaque_self_describing_values: Vec::new(),
         };
         context.assignment_parts = context.assignment_parts();
         context.opaque_self_describing_values = context
-            .self_describing_assignment_value_nodes()
+            .self_describing_assignment_values()
             .into_iter()
-            .filter(|node| !parenthesized_value(*node).is::<LambdaExpression>())
-            .map(|node| document.range_for_node(node))
+            .filter(|value| !matches!(value.unparenthesized(), Some(Expr::Lambda(_))))
+            .filter_map(|value| document.range_for_syntax(value))
             .collect();
         context
     }
@@ -248,27 +353,33 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
         }
         if options.after_cell {
             hints.extend(self.value_hints(
-                self.cell_values(),
+                self.syntax.cell_values.iter().copied(),
                 HintSource::Cell,
                 HintPlacement::AfterValue,
             ));
         }
         if options.after_call {
-            hints.extend(self.value_hints(
-                self.typed_nodes().filter(|node| node.is_bracketed_call()),
-                HintSource::Call,
-                HintPlacement::AfterValue,
-            ));
-        }
-        if options.after_brackets {
             hints.extend(
                 self.value_hints(
-                    self.typed_nodes()
-                        .filter(|node| node.is_holder() && applied_call(*node).is_none()),
-                    HintSource::Parenthesized,
+                    self.typed_expressions()
+                        .filter(|value| is_bracketed_call(value)),
+                    HintSource::Call,
                     HintPlacement::AfterValue,
                 ),
             );
+        }
+        if options.after_brackets {
+            hints.extend(self.value_hints(
+                self.typed_expressions().filter(|value| {
+                    matches!(value, Expr::Holder(_))
+                        && !self
+                            .syntax
+                            .call_arguments
+                            .contains(&std::ptr::from_ref(*value))
+                }),
+                HintSource::Parenthesized,
+                HintPlacement::AfterValue,
+            ));
         }
         if options.after_line_end {
             hints.extend(self.line_end_hints());
@@ -282,24 +393,31 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
         }
         if options.everywhere {
             hints.extend(self.value_hints(
-                self.typed_nodes(),
+                self.typed_expressions(),
                 HintSource::Everywhere,
                 HintPlacement::AfterValue,
             ));
+            hints.extend(self.parameter_binding_hints());
         }
         hints
     }
 
     /// The expressions analysis inferred a type for.
-    fn typed_nodes(&self) -> impl Iterator<Item = SyntaxNode<'tree>> + '_ {
-        self.inferred_types.values().map(|(node, _)| *node)
+    fn typed_expressions(&self) -> impl Iterator<Item = &'a Expr> + '_ {
+        self.typed.iter().map(|(expression, _)| *expression)
+    }
+
+    /// The inferred type of `expression`.
+    fn inferred_type(&self, expression: &Expr) -> Option<&InferredType> {
+        let index = *self.typed_index.get(&std::ptr::from_ref(expression))?;
+        Some(&self.typed[index].1)
     }
 
     /// The hints of each of `values` placed at `placement` that the filters
     /// keep.
     fn value_hints(
         &self,
-        values: impl IntoIterator<Item = SyntaxNode<'tree>>,
+        values: impl IntoIterator<Item = &'a Expr>,
         source: HintSource,
         placement: HintPlacement,
     ) -> Vec<PlacedHint> {
@@ -313,15 +431,15 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
     /// leave it out.
     fn value_hint(
         &self,
-        value: SyntaxNode<'tree>,
+        value: &'a Expr,
         source: HintSource,
         placement: HintPlacement,
     ) -> Option<PlacedHint> {
-        let (_, inferred_type) = self.inferred_types.get(&value.id())?;
-        let value_range = self.document.range_for_node(value);
+        let inferred_type = self.inferred_type(value)?;
+        let value_range = self.document.range_for_syntax(value)?;
         let repeated = || {
             self.assignment_parts
-                .suppresses(value_range, value.is_space_application())
+                .suppresses(value_range, is_application(value))
         };
         let stated_by_literal = || {
             is_self_describing_value(value)
@@ -331,8 +449,7 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
                     .any(|opaque| range_contains(*opaque, value_range))
         };
         if !range_contains(self.range, value_range)
-            || value.is_muted_statement()
-            || (self.options.hide_after_semicolon && is_discarded_by_semicolon(value))
+            || (self.options.hide_after_semicolon && self.is_discarded(value))
             || self.is_excluded_call(value)
             || self.type_is_stated_by_installation(value)
             || (!self.options.show_repeated && repeated())
@@ -347,9 +464,20 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
             HintPlacement::LineEnd(line_end) => line_end,
         };
         Some(PlacedHint {
-            value: Some(self.document.range_for_node(described_value(value))),
+            value: self.document.range_for_syntax(described_value(value)),
             source,
             hint: self.type_hint(position, expression_label(value, type_name)),
+        })
+    }
+
+    /// Whether nothing but a `;` follows `value` in the statement it ends,
+    /// so its value is discarded.
+    fn is_discarded(&self, value: &Expr) -> bool {
+        self.document.syntax_bytes(value).is_some_and(|value| {
+            self.syntax
+                .discarded
+                .iter()
+                .any(|statement| statement.start <= value.start && statement.end == value.end)
         })
     }
 
@@ -357,22 +485,20 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
     /// arguments, as `f(x: Number 2)`; none for a call whose parameters do
     /// not match its arguments one to one.
     fn parameter_hints(&self) -> Vec<InlayHint> {
-        let lambdas = self
-            .document
-            .root_node()
-            .descendants()
-            .filter(|node| node.is::<LambdaExpression>())
-            .collect::<Vec<_>>();
-        self.typed_nodes()
-            .filter(|call| call.is_space_application() && !self.is_excluded_call(*call))
+        self.typed_expressions()
+            .filter(|value| !self.is_excluded_call(value))
+            .filter_map(|value| match value {
+                Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => Some(call),
+                _ => None,
+            })
             .flat_map(|call| {
-                let arguments = call_arguments(call);
-                let parameters = self.called_parameters(call, &lambdas);
+                let arguments = call.right_operand.arguments();
+                let parameters = self.called_parameters(call);
                 if arguments.len() != parameters.len() {
                     return Vec::new();
                 }
                 iter::zip(arguments, parameters)
-                    .filter_map(|(argument, parameter)| self.parameter_hint(argument, parameter))
+                    .filter_map(|(argument, parameter)| self.parameter_hint(argument?, parameter))
                     .collect()
             })
             .collect()
@@ -381,35 +507,30 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
     /// The parameters `call` passes its arguments to, as far as they are
     /// known: of the one local method installation or library signature the
     /// argument types select, or of the lambda a local function is.
-    fn called_parameters(
-        &self,
-        call: SyntaxNode<'tree>,
-        lambdas: &[SyntaxNode<'tree>],
-    ) -> Vec<CalledParameter> {
-        let Some(parts) = call.binary_parts() else {
+    fn called_parameters(&self, call: &ExprOpBinAdj) -> Vec<CalledParameter> {
+        let Expr::Symbol(head) = call.left_operand.as_ref() else {
             return Vec::new();
         };
-        let (head, argument) = (parts.left, parts.right);
-        if !head.is::<Symbol>() {
-            return Vec::new();
-        }
+        let name = head.text();
         let analysis = self.document.analysis();
-        let position = self.document.position_for_node(head);
+        let Some(position) = self.document.position_for_syntax(head) else {
+            return Vec::new();
+        };
         let view = self.knowledge.at(position);
-        let names = |lambda: Option<&SyntaxNode<'tree>>| {
+        let names = |lambda: Option<&&ExprLambda>| {
             lambda.map(|lambda| {
                 lambda
-                    .lambda_parameter_symbols()
+                    .bound_symbols()
                     .iter()
                     .map(|symbol| symbol.text().to_string())
                     .collect::<Vec<_>>()
             })
         };
-        let Some(function) = analysis.function_at(head.text(), position) else {
-            let facts = analysis.infer_call_static_facts(argument, self.document, &view);
+        let Some(function) = analysis.function_at(name, position) else {
+            let facts = analysis.infer_call_static_facts(call, self.document, &view);
             let Some(signature) = analysis
                 .infer_external_call_signature_facts(
-                    &ObjectName::new(head.text()),
+                    &ObjectName::new(name),
                     &facts,
                     position,
                     &view,
@@ -432,11 +553,11 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
         };
         if !function.is_method_function() {
             let value_range = analysis
-                .get_binding_at(head.text(), position)
+                .get_binding_at(name, position)
                 .and_then(|binding| binding.state.value_range);
-            let lambda = lambdas
-                .iter()
-                .find(|lambda| value_range == Some(self.document.range_for_node(**lambda)));
+            let lambda = self.syntax.lambdas.iter().find(|lambda| {
+                value_range.is_some() && value_range == self.document.range_for_syntax(**lambda)
+            });
             return names(lambda)
                 .unwrap_or_default()
                 .into_iter()
@@ -447,13 +568,13 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
                 .collect();
         }
         let installations =
-            analysis.local_call_installations(function, argument, position, self.document, &view);
+            analysis.local_call_installations(function, call, position, self.document, &view);
         let [installation] = installations.as_slice() else {
             return Vec::new();
         };
-        let lambda = lambdas.iter().find(|lambda| {
+        let lambda = self.syntax.lambdas.iter().find(|lambda| {
             analysis
-                .installation_receiving_arguments(**lambda, self.document)
+                .installation_receiving_arguments(lambda, self.document)
                 .is_some_and(|receiving| receiving.id == installation.id)
         });
         let names = names(lambda).filter(|names| names.len() == installation.method.domain.len());
@@ -472,18 +593,14 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
     /// The hint before `argument` of the `parameter` it is passed to, of
     /// what the settings show of it: `x: T`, `x:` or `T`. A name the
     /// argument already spells is left out.
-    fn parameter_hint(
-        &self,
-        argument: SyntaxNode<'_>,
-        parameter: CalledParameter,
-    ) -> Option<InlayHint> {
-        let position = self.document.position_for_node(argument);
+    fn parameter_hint(&self, argument: &Expr, parameter: CalledParameter) -> Option<InlayHint> {
+        let position = self.document.position_for_syntax(argument)?;
         if !self.range.contains_position(position) {
             return None;
         }
-        let name = parameter
-            .name
-            .filter(|name| self.options.arg_names && name != argument.text());
+        let name = parameter.name.filter(|name| {
+            self.options.arg_names && Some(name.as_str()) != self.document.text_for_syntax(argument)
+        });
         let type_name = parameter
             .domain
             .filter(|_| self.options.arg_types)
@@ -514,37 +631,38 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
     /// opening bracket starts.
     fn line_end_hints(&self) -> Vec<PlacedHint> {
         let line_of = |byte| self.document.position_for_byte(byte).line;
-        let mut last_complete = HashMap::<u32, SyntaxNode<'tree>>::new();
+        let mut last_complete = HashMap::<u32, (&'a Expr, ByteRange)>::new();
         let mut last_continued_start = HashMap::<u32, usize>::new();
-        for node in self.typed_nodes().filter(|node| !node.is_muted_statement()) {
-            let (start_line, end_line) = (line_of(node.start_byte()), line_of(node.end_byte()));
+        for value in self.typed_expressions() {
+            let Some(bytes) = self.document.syntax_bytes(value) else {
+                continue;
+            };
+            let (start_line, end_line) = (line_of(bytes.start), line_of(bytes.end));
             if start_line < end_line {
                 let start = last_continued_start.entry(start_line).or_default();
-                *start = (*start).max(node.start_byte());
+                *start = (*start).max(bytes.start);
             }
-            let ends_later = |other: SyntaxNode<'_>| {
-                (node.end_byte(), node.end_byte() - node.start_byte())
-                    > (other.end_byte(), other.end_byte() - other.start_byte())
-            };
+            let ends_later =
+                |other: &ByteRange| (bytes.end, bytes.len()) > (other.end, other.len());
             last_complete
                 .entry(end_line)
                 .and_modify(|last| {
-                    if ends_later(*last) {
-                        *last = node;
+                    if ends_later(&last.1) {
+                        *last = (value, bytes.clone());
                     }
                 })
-                .or_insert(node);
+                .or_insert((value, bytes.clone()));
         }
         let content_ends = self.line_content_ends();
         last_complete
             .into_iter()
-            .filter(|(line, value)| {
+            .filter(|(line, (_, bytes))| {
                 last_continued_start
                     .get(line)
-                    .is_none_or(|start| *start < value.end_byte())
+                    .is_none_or(|start| *start < bytes.end)
             })
-            .filter_map(|(line, value)| {
-                let line_end = content_ends.get(&line).copied().unwrap_or(value.end_byte());
+            .filter_map(|(line, (value, bytes))| {
+                let line_end = content_ends.get(&line).copied().unwrap_or(bytes.end);
                 self.value_hint(
                     value,
                     HintSource::LineEnd,
@@ -557,34 +675,61 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
     /// Where the code of each line ends, before any comment closing it: the
     /// end of the last token on it.
     fn line_content_ends(&self) -> HashMap<u32, usize> {
+        /// Records where `syntax` ends as the end of its line's code, when it
+        /// ends after what the line held so far.
+        fn record_end(
+            syntax: &dyn Spanned,
+            document: &DocumentSnapshot,
+            ends: &mut HashMap<u32, usize>,
+        ) {
+            if let Some(bytes) = document.syntax_bytes(syntax) {
+                let end = ends
+                    .entry(document.position_for_byte(bytes.end).line)
+                    .or_default();
+                *end = (*end).max(bytes.end);
+            }
+        }
+        /// Records the end of each token of `stream` on its line.
+        fn record(
+            stream: TokenStream,
+            document: &DocumentSnapshot,
+            ends: &mut HashMap<u32, usize>,
+        ) {
+            for token in stream {
+                match token {
+                    TokenTree::Group(group) => {
+                        record_end(&group.delimiter().opening_span(), document, ends);
+                        if let Some(closing) = group.delimiter().closing_span() {
+                            record_end(&closing, document, ends);
+                        }
+                        record(group.stream().clone(), document, ends);
+                    }
+                    token => record_end(&token, document, ends),
+                }
+            }
+        }
         let mut ends = HashMap::<u32, usize>::new();
-        for token in self
+        for cell in self
             .document
-            .root_node()
-            .descendants()
-            .filter(|node| node.children().next().is_none() && !node.is_comment())
+            .syntax()
+            .cells()
+            .iter()
+            .filter_map(crate::node_metadata::ParsedCell::syntax)
         {
-            let end = ends
-                .entry(self.document.position_for_byte(token.end_byte()).line)
-                .or_default();
-            *end = (*end).max(token.end_byte());
+            record(cell.to_token_stream(), self.document, &mut ends);
         }
         ends
     }
 
-    /// The values of the top-level expressions, each as Macaulay2's
-    /// `oN : T` line would read.
-    fn cell_values(&self) -> impl Iterator<Item = SyntaxNode<'tree>> + '_ {
-        self.document
-            .root_node()
-            .children()
-            .filter_map(|cell| cell.final_value_child())
-    }
-
-    /// Whether `node` calls a function the settings exclude.
-    fn is_excluded_call(&self, node: SyntaxNode<'_>) -> bool {
-        node.applied_symbol_name()
-            .is_some_and(|name| self.options.excluded_calls.contains(name))
+    /// Whether `value` calls a function the settings exclude.
+    fn is_excluded_call(&self, value: &Expr) -> bool {
+        match value {
+            Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => call
+                .left_operand
+                .symbol_name()
+                .is_some_and(|name| self.options.excluded_calls.contains(name)),
+            _ => false,
+        }
     }
 
     /// A type hint reading `label` at `position`, cut to `maxLabelLength`
@@ -621,31 +766,28 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
     /// The types functions return, after the value they end with: their
     /// final expression, or what `return` returns.
     fn lambda_return_type_hints(&self) -> Vec<PlacedHint> {
-        let analysis = self.document.analysis();
-        self.inferred_types
-            .values()
-            .filter_map(|(node, _)| {
-                let node = *node;
-                if node.is_return_expr() {
-                    let value = node.control_transfer_value()?;
-                    let view = self.knowledge.at(self.document.position_for_node(value));
-                    analysis.control_transfer_target(node, self.document, &view)?;
-                    Some(value)
-                } else if node.is::<LambdaExpression>() {
-                    lambda_final_value(node)
-                } else {
-                    None
+        self.typed_expressions()
+            .filter_map(|value| match value {
+                Expr::Control(transfer @ ExprControl::Return(node))
+                    if self
+                        .syntax
+                        .received_returns
+                        .contains(&std::ptr::from_ref(transfer)) =>
+                {
+                    node.value.as_deref()
                 }
+                Expr::Lambda(lambda) => lambda_final_value(lambda),
+                _ => None,
             })
-            .filter(|value| self.options.show_literal || !is_self_describing_value(*value))
+            .filter(|value| self.options.show_literal || !is_self_describing_value(value))
             .filter_map(|value| {
-                let value_range = self.document.range_for_node(value);
+                let value_range = self.document.range_for_syntax(value)?;
                 if !self.range.contains_position(value_range.end) {
                     return None;
                 }
                 let type_name = self.inferred_type_label(value)?;
                 Some(PlacedHint {
-                    value: Some(self.document.range_for_node(described_value(value))),
+                    value: self.document.range_for_syntax(described_value(value)),
                     source: HintSource::Return,
                     hint: self.type_hint(value_range.end, expression_label(value, type_name)),
                 })
@@ -653,11 +795,11 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
             .collect()
     }
 
-    /// The label of the inferred type of `node`, when it is shown.
-    fn inferred_type_label(&self, node: SyntaxNode<'_>) -> Option<String> {
+    /// The label of the inferred type of `value`, when it is shown.
+    fn inferred_type_label(&self, value: &Expr) -> Option<String> {
         self.displayed_type(
-            self.document.position_for_node(node),
-            &self.inferred_types.get(&node.id())?.1,
+            self.document.position_for_syntax(value)?,
+            self.inferred_type(value)?,
             TypedSubject::Value,
         )
     }
@@ -708,9 +850,9 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
     fn binding_type_hints(&self) -> Vec<PlacedHint> {
         let assigned_values = self.assigned_values();
         let self_describing_values = self
-            .self_describing_assignment_value_nodes()
+            .self_describing_assignment_values()
             .into_iter()
-            .map(|node| self.document.range_for_node(node))
+            .filter_map(|value| self.document.range_for_syntax(value))
             .collect::<Vec<_>>();
         let mut hints = Vec::new();
 
@@ -765,78 +907,109 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
         hints
     }
 
-    /// Whether `node` names a parameter whose type its method installation
-    /// states.
-    fn type_is_stated_by_installation(&self, node: SyntaxNode<'_>) -> bool {
-        node.is::<Symbol>()
-            && self
-                .document
-                .analysis()
-                .get_binding_at(node.text(), self.document.position_for_node(node))
-                .is_some_and(|binding| {
-                    binding.role == BindingRole::Parameter && binding.state.inferred_type.is_some()
+    /// Types of lambda parameter bindings when hints are requested everywhere.
+    fn parameter_binding_hints(&self) -> Vec<PlacedHint> {
+        self.document
+            .analysis()
+            .bindings()
+            .filter(|binding| binding.role == BindingRole::Parameter)
+            .filter_map(|binding| {
+                let state = binding.states.first()?;
+                if state.inferred_type.is_some() || !self.range.contains_position(state.span.end) {
+                    return None;
+                }
+                let inferred = InferredType::unknown();
+                let label =
+                    self.displayed_type(state.span.start, &inferred, TypedSubject::Value)?;
+                Some(PlacedHint {
+                    value: Some(state.span),
+                    source: HintSource::Everywhere,
+                    hint: self.type_hint(state.span.end, label),
                 })
+            })
+            .collect()
+    }
+
+    /// Whether `value` names a parameter whose type its method installation
+    /// states.
+    fn type_is_stated_by_installation(&self, value: &Expr) -> bool {
+        let Expr::Symbol(symbol) = value else {
+            return false;
+        };
+        self.document
+            .position_for_syntax(symbol)
+            .and_then(|position| {
+                self.document
+                    .analysis()
+                    .get_binding_at(symbol.text(), position)
+            })
+            .is_some_and(|binding| {
+                binding.role == BindingRole::Parameter && binding.state.inferred_type.is_some()
+            })
     }
 
     /// Target and value operands extracted from supported assignment syntax.
     fn assignment_parts(&self) -> AssignmentParts {
-        let mut parts = AssignmentParts {
-            assignments: Vec::new(),
-            targets: Vec::new(),
-            values: Vec::new(),
-        };
-        for assignment in self
-            .inferred_types
-            .values()
-            .map(|(node, _)| *node)
-            .filter(SyntaxNode::is_assignment)
-        {
+        let mut parts = AssignmentParts::default();
+        for &expression in &self.syntax.assignments {
+            let Expr::Assign(assignment) = expression else {
+                continue;
+            };
+            let assigned = assignment.parts();
             parts
                 .assignments
-                .push(self.document.range_for_node(assignment));
-            if let Some(target) = assignment.binary_parts().map(|parts| parts.left) {
-                parts.targets.push(self.document.range_for_node(target));
+                .extend(self.document.range_for_syntax(expression));
+            if let Some(target) = assigned.target.bytes(self.document) {
+                parts.targets.push(self.document.range_for_bytes(target));
             }
-            if let Some(value) = assignment.binary_parts().map(|parts| parts.right) {
-                parts.values.push(self.document.range_for_node(value));
-            }
+            parts
+                .values
+                .extend(self.document.range_for_syntax(assigned.value));
         }
         parts
+    }
+
+    /// The parts of the `=` and `:=` assignments.
+    fn plain_assignments(&self) -> impl Iterator<Item = crate::syntax::AssignmentParts<'a>> + '_ {
+        self.syntax.assignments.iter().filter_map(|expression| {
+            let Expr::Assign(assignment) = expression else {
+                return None;
+            };
+            let parts = assignment.parts();
+            matches!(
+                parts.operator,
+                AssignmentOperator::Global | AssignmentOperator::Local
+            )
+            .then_some(parts)
+        })
     }
 
     /// Target/value pairs eligible for assignment type hints.
     fn assigned_values(&self) -> Vec<AssignedValue> {
         let mut values = Vec::new();
-        for assignment in self
-            .inferred_types
-            .values()
-            .map(|(node, _)| *node)
-            .filter(|node| {
-                node.has_binary_operator::<Token![=]>() || node.has_binary_operator::<Token![:=]>()
-            })
-        {
-            let (Some(left), Some(right)) = (
-                assignment.binary_parts().map(|parts| parts.left),
-                assignment.binary_parts().map(|parts| parts.right),
-            ) else {
-                continue;
-            };
-            let destructured = left.is_collection_expression();
-            let pairs = if destructured {
-                paired_assignment_values(left, right)
-            } else if left.is::<Symbol>() {
-                vec![(left, right)]
-            } else {
-                Vec::new()
+        for parts in self.plain_assignments() {
+            let (pairs, destructured) = match parts.target {
+                AssignmentTarget::Symbol(symbol) => (vec![(symbol, parts.value)], false),
+                AssignmentTarget::List(targets) => {
+                    (paired_assignment_values(targets, parts.value), true)
+                }
+                _ => continue,
             };
             for (target, value) in pairs {
                 let Some(type_name) = self.inferred_type_label(value) else {
                     continue;
                 };
+                let (Some(target_range), Some(value_range), Some(described_range)) = (
+                    self.document.range_for_syntax(target),
+                    self.document.range_for_syntax(value),
+                    self.document.range_for_syntax(described_value(value)),
+                ) else {
+                    continue;
+                };
                 values.push(AssignedValue {
-                    target_range: self.document.range_for_node(target),
-                    value_range: self.document.range_for_node(value),
-                    described_range: self.document.range_for_node(described_value(value)),
+                    target_range,
+                    value_range,
+                    described_range,
                     type_name,
                     destructured,
                 });
@@ -845,28 +1018,44 @@ impl<'request, 'tree> HintContext<'request, 'tree> {
         values
     }
 
-    /// Assignment value nodes whose literal syntax already communicates the displayed type.
-    fn self_describing_assignment_value_nodes(&self) -> Vec<SyntaxNode<'tree>> {
-        self.inferred_types
-            .values()
-            .map(|(node, _)| *node)
-            .filter(|node| node.is_assignment())
-            .filter_map(|assignment| {
-                let left = assignment.binary_parts().map(|parts| parts.left)?;
-                let right = assignment.binary_parts().map(|parts| parts.right)?;
-                (left.is::<Symbol>() && is_self_describing_value(right)).then_some(right)
+    /// Values assigned to a name whose literal syntax already communicates
+    /// the displayed type.
+    fn self_describing_assignment_values(&self) -> Vec<&'a Expr> {
+        self.syntax
+            .assignments
+            .iter()
+            .filter_map(|expression| {
+                let Expr::Assign(assignment) = expression else {
+                    return None;
+                };
+                let parts = assignment.parts();
+                (matches!(parts.target, AssignmentTarget::Symbol(_))
+                    && is_self_describing_value(parts.value))
+                .then_some(parts.value)
             })
             .collect()
     }
 }
 
 /// Final expression contributing the lambda's return value.
-fn lambda_final_value(lambda: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
-    let mut value = lambda.lambda_body()?;
-    while value.is_holder() {
-        value = value.final_value_child()?;
-    }
-    (!value.is_return_expr()).then_some(value)
+fn lambda_final_value(lambda: &ExprLambda) -> Option<&Expr> {
+    let value = lambda.body().unparenthesized()?;
+    (!matches!(value, Expr::Control(ExprControl::Return(_)))).then_some(value)
+}
+
+/// Whether `value` applies a function.
+fn is_application(value: &Expr) -> bool {
+    matches!(value, Expr::Op(ExprOp::Bin(ExprOpBin::Adj(_))))
+}
+
+/// A call whose arguments are bracketed, as `f(x)`, `f()` or `QQ[x]`, not
+/// one by juxtaposition, as `f x`.
+fn is_bracketed_call(value: &Expr) -> bool {
+    matches!(
+        value,
+        Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call)))
+            if matches!(call.right_operand.as_ref(), Expr::Collection(_) | Expr::Holder(_))
+    )
 }
 
 /// Plain text of either protocol inlay-label representation.
@@ -890,68 +1079,36 @@ fn inlay_type_label(type_name: String) -> String {
 
 /// The hint label of `type_name`, the type of `expression`: a call result
 /// reads `-> T`.
-fn expression_label(expression: SyntaxNode<'_>, type_name: String) -> String {
-    if expression.is_space_application() {
+fn expression_label(expression: &Expr, type_name: String) -> String {
+    if is_application(expression) {
         format!("{CALL_RESULT_PREFIX}{type_name}")
     } else {
         type_name
     }
 }
 
-/// Whether nothing but a `;` follows `value` in the statement it ends, so
-/// its value is discarded.
-fn is_discarded_by_semicolon(value: SyntaxNode<'_>) -> bool {
-    value
-        .ancestors()
-        .find(|ancestor| ancestor.is_muted_statement() || ancestor.end_byte() != value.end_byte())
-        .is_some_and(|ancestor| ancestor.is_muted_statement())
-}
-
-/// The expression whose value `node` evaluates to as written: through an
+/// The expression whose value `value` evaluates to as written: through an
 /// assignment `x = v` or `x := v` the value `v` it assigns, and through
 /// parentheses `(v)` the value `v` they hold. Hints of the same described
 /// value give the same type.
-fn described_value(mut node: SyntaxNode<'_>) -> SyntaxNode<'_> {
+fn described_value(mut value: &Expr) -> &Expr {
     loop {
-        let inner = if node.has_binary_operator::<Token![=]>()
-            || node.has_binary_operator::<Token![:=]>()
-        {
-            node.binary_parts().map(|parts| parts.right)
-        } else if node.is_holder() {
-            node.final_value_child()
-        } else {
-            None
+        let inner = match value {
+            Expr::Assign(assignment) => {
+                let parts = assignment.parts();
+                matches!(
+                    parts.operator,
+                    AssignmentOperator::Global | AssignmentOperator::Local
+                )
+                .then_some(parts.value)
+            }
+            Expr::Holder(holder) => holder.value.as_deref(),
+            _ => None,
         };
         match inner {
-            Some(inner) => node = inner,
-            None => return node,
+            Some(inner) => value = inner,
+            None => return value,
         }
-    }
-}
-
-/// The call `arguments` are the bracketed arguments of.
-fn applied_call(arguments: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
-    arguments.parent().filter(|call| {
-        call.is_space_application()
-            && call
-                .binary_parts()
-                .is_some_and(|parts| parts.right.id() == arguments.id())
-    })
-}
-
-/// The arguments `call` applies its function to: the elements of a
-/// sequence, else the one value.
-fn call_arguments(call: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
-    let Some(argument) = call
-        .binary_parts()
-        .map(|parts| parenthesized_value(parts.right))
-    else {
-        return Vec::new();
-    };
-    if argument.is_sequence() {
-        argument.collection_elements().collect()
-    } else {
-        vec![argument]
     }
 }
 
@@ -992,57 +1149,54 @@ impl AssignmentParts {
     }
 }
 
-/// Assignment values paired according to the assignment component positions.
-fn paired_assignment_values<'tree>(
-    target: SyntaxNode<'tree>,
-    value: SyntaxNode<'tree>,
-) -> Vec<(SyntaxNode<'tree>, SyntaxNode<'tree>)> {
-    if target.is::<Symbol>() {
-        return vec![(target, value)];
-    }
-    if !target.is_collection_expression() {
+/// The symbols of a parallel assignment's `targets` paired with the values
+/// `value` assigns them, by position.
+fn paired_assignment_values<'a>(
+    targets: &'a AssignmentList,
+    value: &'a Expr,
+) -> Vec<(&'a Symbol, &'a Expr)> {
+    let targets = targets.targets();
+    let Some(value) = value.unparenthesized() else {
         return Vec::new();
-    }
-    let targets = target.collection_elements().collect::<Vec<_>>();
-    let value = parenthesized_value(value);
-    if value.is_collection_expression() {
-        let values = value.collection_elements().collect::<Vec<_>>();
+    };
+    let pair = |target: &'a AssignmentArgument, value: &'a Expr| match target {
+        AssignmentArgument::Symbol(symbol) => vec![(symbol, value)],
+        AssignmentArgument::List(nested) => paired_assignment_values(nested, value),
+        _ => Vec::new(),
+    };
+    if let Some(values) = value.collection_elements() {
         if targets.len() != values.len() {
             return Vec::new();
         }
         return targets
             .into_iter()
             .zip(values)
-            .flat_map(|(target, value)| paired_assignment_values(target, value))
+            .filter_map(|(target, value)| Some(pair(target, value?)))
+            .flatten()
             .collect();
     }
     match targets.as_slice() {
-        [target] => paired_assignment_values(*target, value),
+        [target] => pair(target, value),
         _ => Vec::new(),
     }
 }
 
-/// Whether this node is a self describing value.
-fn is_self_describing_value(node: SyntaxNode<'_>) -> bool {
-    let node = parenthesized_value(node);
-    node.is_literal()
-        || node.is_nothing_value()
-        || (node.is::<Symbol>() && matches!(node.text(), "true" | "false" | "null"))
-        || node.is::<LambdaExpression>()
-        || node.is::<NewStatement>()
-        || ((node.is_collection_expression() || node.is_sequence())
-            && node.collection_elements().all(is_self_describing_value))
-}
-
-/// Unwraps parentheses to obtain the expression supplying a value.
-fn parenthesized_value(mut node: SyntaxNode<'_>) -> SyntaxNode<'_> {
-    while node.is_holder() {
-        let Some(value) = node.final_value_child() else {
-            break;
-        };
-        node = value;
+/// Whether the syntax of `value` already states its type: a literal, a
+/// function, a `new` instance, or a collection of such values.
+fn is_self_describing_value(value: &Expr) -> bool {
+    let Some(value) = value.unparenthesized() else {
+        return false;
+    };
+    match value {
+        Expr::Literal(_) | Expr::Lambda(_) | Expr::New(_) => true,
+        Expr::Symbol(symbol) => LITERAL_SYMBOLS.contains(&symbol.text()),
+        Expr::Collection(_) => value.collection_elements().is_some_and(|elements| {
+            elements
+                .into_iter()
+                .all(|element| element.is_none_or(is_self_describing_value))
+        }),
+        _ => false,
     }
-    node
 }
 
 /// Tests whether the outer source range covers the complete inner range.

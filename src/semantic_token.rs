@@ -47,12 +47,11 @@
 
 use crate::builtin_index::Record;
 use crate::meta::{BindingRole, Metadata};
-use crate::node_metadata::SyntaxNode;
 use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry, ObjectRegistryView};
 use crate::settings::SemanticTokenSettings;
 use crate::source::DocumentSpan;
 use crate::typesystem::TypeKnowledge;
-use m2_syn::nodes::{FloatLiteral, IntegerLiteral};
+use m2_syn::{LiteralKind, Token, TokenTree};
 use strum::{EnumIter, IntoEnumIterator};
 use these_macros_should_be_illegal::enum_fn;
 use tower_lsp::lsp_types::{
@@ -541,25 +540,49 @@ pub fn local_symbol_semantic_token(
     })
 }
 
-/// Token category determined solely by the node's syntax.
-pub fn syntax_semantic_token_type(node: SyntaxNode<'_>) -> Option<M2SemanticTokenType> {
-    if node.is_operator() {
-        return Some(M2SemanticTokenType::Operator);
-    }
+/// Separators, which are punctuation but no operator.
+const SEPARATORS: [&str; 2] = [<Token![,]>::SPELLING, <Token![;]>::SPELLING];
 
-    if node.is::<IntegerLiteral>() || node.is::<FloatLiteral>() {
-        Some(M2SemanticTokenType::Number)
-    } else if node.is_string_literal() {
-        Some(M2SemanticTokenType::String)
-    } else if node.is_comment() {
-        Some(M2SemanticTokenType::Comment)
-    } else if node.is_modifier_token() {
-        Some(M2SemanticTokenType::QuoteModifier)
-    } else if node.is_keyword_token() {
-        Some(M2SemanticTokenType::Keyword)
-    } else {
-        None
-    }
+/// Keywords selecting how a quote binds its symbol.
+const QUOTE_MODIFIERS: [&str; 5] = [
+    <Token![global]>::SPELLING,
+    <Token![local]>::SPELLING,
+    <Token![symbol]>::SPELLING,
+    <Token![threadLocal]>::SPELLING,
+    <Token![threadVariable]>::SPELLING,
+];
+
+/// Operators spelled as words.
+const WORD_OPERATORS: [&str; 4] = [
+    <Token![and]>::SPELLING,
+    <Token![or]>::SPELLING,
+    <Token![not]>::SPELLING,
+    <Token![xor]>::SPELLING,
+];
+
+/// Token category determined solely by the token, absent for delimited groups
+/// and separators. A word is a keyword here; whether it is a symbol instead
+/// is for the syntax around it to decide.
+pub fn lexical_semantic_token_type(token: &TokenTree) -> Option<M2SemanticTokenType> {
+    Some(match token {
+        TokenTree::Group(_) => return None,
+        TokenTree::Literal(literal) => match literal.kind {
+            LiteralKind::Integer | LiteralKind::Float => M2SemanticTokenType::Number,
+            LiteralKind::String | LiteralKind::RawString => M2SemanticTokenType::String,
+        },
+        TokenTree::Punct(punct) if SEPARATORS.contains(&punct.text()) => return None,
+        TokenTree::Punct(_) => M2SemanticTokenType::Operator,
+        TokenTree::Ident(ident) => {
+            let word = ident.text();
+            if QUOTE_MODIFIERS.contains(&word) {
+                M2SemanticTokenType::QuoteModifier
+            } else if WORD_OPERATORS.contains(&word) {
+                M2SemanticTokenType::Operator
+            } else {
+                M2SemanticTokenType::Keyword
+            }
+        }
+    })
 }
 
 /// Token category and modifiers implied by a recorded semantic source role.

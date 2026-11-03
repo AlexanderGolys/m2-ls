@@ -1,44 +1,29 @@
 //! The occasions on which diagnostics are spawned from a completed analysis:
-//! each syntax node, each method installation, and the whole document; and,
-//! once the document is published, its location on disk.
+//! each typed expression, each method installation, and the whole document;
+//! and, once the document is published, its location on disk.
 //!
 //! Each occasion has a module whose `spawn` runs that occasion's checks. A
 //! check inspects what its occasion provides and spawns the diagnostics it
 //! finds into the [`DiagnosticSink`], under whichever rules apply.
 
-use crate::node_metadata::TypedSource;
 mod document;
 mod documentation;
+mod expressions;
 mod installation;
 mod location;
-mod node;
+mod parse;
 
-use tower_lsp::lsp_types::{Range as TextRange, Url};
+use tower_lsp::lsp_types::Url;
 
 use super::{DiagnosticRule, Finding, M2Diagnostic};
 use crate::analysis::{Analysis, MethodInstallation};
 use crate::document::DocumentSnapshot;
-use crate::node_metadata::{visit_source_nodes, SyntaxNode};
+use crate::node_metadata::SyntaxSnapshot;
 use crate::object_registry::{ObjectRegistry, ObjectRegistryView};
 use crate::package_documentation::PackageDocumentation;
 use crate::package_index::SourceResolver;
-use crate::source::{DocumentSource, SourceNavigation};
+use crate::source::{DocumentSource, SourceNavigation, SyntaxNavigation};
 use crate::source_package::SourcePackages;
-
-/// What the node occasion provides: the node, the analysis of its document,
-/// and the source and the type knowledge positioned at the node.
-struct NodeContext<'context, 'tree> {
-    /// Whether this document is analyzed as library implementation code.
-    primary_code: bool,
-    /// Semantic facts for the current document snapshot.
-    analysis: &'context Analysis,
-    /// Syntax supplying this item's source and structure.
-    node: SyntaxNode<'tree>,
-    /// Source data supplying text and coordinate conversions.
-    source: &'context DocumentSource,
-    /// Positioned object and type facts available to this request.
-    knowledge: &'context ObjectRegistryView<'context>,
-}
 
 /// What the installation occasion provides: the installation, the analysis
 /// that characterized it, and the type knowledge positioned at it.
@@ -51,13 +36,13 @@ struct InstallationContext<'context> {
     knowledge: &'context ObjectRegistryView<'context>,
 }
 
-/// What the document occasion provides: the analysis, the syntax root, and the
+/// What the document occasion provides: the analysis, the syntax, and the
 /// source of the document.
-struct DocumentContext<'context, 'tree> {
+struct DocumentContext<'context> {
     /// Semantic facts for the current document snapshot.
     analysis: &'context Analysis,
-    /// Document syntax root used for navigation within this revision.
-    root: SyntaxNode<'tree>,
+    /// The syntax revision the analysis describes.
+    syntax: &'context SyntaxSnapshot,
     /// Source data supplying text and coordinate conversions.
     source: &'context DocumentSource,
 }
@@ -65,15 +50,13 @@ struct DocumentContext<'context, 'tree> {
 /// What the documentation occasion provides: the package documentation the
 /// document writes, the packages it declares, the syntax and source it is
 /// written in, and the knowledge of the packages the document loads.
-struct DocumentationContext<'context, 'tree> {
+struct DocumentationContext<'context> {
     /// Documentation extracted from the current document or selected object.
     documentation: &'context PackageDocumentation,
     /// Package declarations and imports visible to this operation.
     packages: &'context SourcePackages,
-    /// Document syntax root used for navigation within this revision.
-    root: SyntaxNode<'tree>,
     /// Parsed syntax backing this item, when available.
-    syntax: Option<&'context TypedSource>,
+    syntax: &'context SyntaxSnapshot,
     /// Source data supplying text and coordinate conversions.
     source: &'context DocumentSource,
     /// Positioned object and type facts available to this request.
@@ -105,19 +88,14 @@ impl DiagnosticSink {
     }
 }
 
-/// Every diagnostic spawned for one analyzed document: on each syntax node in
-/// source order, then on each method installation, then on the whole
-/// document, then on the package documentation it writes.
 /// Shared semantic inputs, all derived from the same retained syntax snapshot.
 pub struct DiagnosticInputs<'a> {
     /// Whether this document is analyzed as library implementation code.
     pub primary_code: bool,
     /// Semantic facts for the current document snapshot.
     pub analysis: &'a Analysis,
-    /// Document syntax root used for navigation within this revision.
-    pub root: SyntaxNode<'a>,
     /// Parsed syntax backing this item, when available.
-    pub syntax: Option<&'a TypedSource>,
+    pub syntax: &'a SyntaxSnapshot,
     /// Source data supplying text and coordinate conversions.
     pub source: &'a DocumentSource,
     /// Positioned object and type facts available to this request.
@@ -128,12 +106,13 @@ pub struct DiagnosticInputs<'a> {
     pub documentation: &'a PackageDocumentation,
 }
 
-/// Runs the selected syntax, installation, document, and documentation checks in deterministic source order.
+/// Every diagnostic spawned for one analyzed document: on each cell's
+/// expressions in source order, then on each method installation, then on the
+/// whole document, then on the package documentation it writes.
 pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
     let DiagnosticInputs {
         primary_code,
         analysis,
-        root,
         syntax,
         source,
         knowledge,
@@ -143,24 +122,25 @@ pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
     // A live update re-checks everything from its first changed cell on:
     // what follows an edit may depend on it, while the findings before it
     // are kept by the document.
-    let first_change = root.changed_ranges().first().map(|cell| cell.start);
+    let first_change = syntax.changed_ranges().first().map(|cell| cell.start);
     let selected =
         |range: std::ops::Range<usize>| !live || first_change.is_none_or(|start| start < range.end);
     let mut sink = DiagnosticSink::default();
-    visit_source_nodes(root, syntax, |node| {
-        if !selected(node.start_byte()..node.end_byte()) {
-            return;
+    let navigation = SyntaxNavigation::new(source, syntax);
+    let context = expressions::ExpressionContext {
+        primary_code,
+        analysis,
+        source: &navigation,
+        knowledge,
+        first_change: first_change.filter(|_| live),
+    };
+    for cell in syntax.cells() {
+        if !selected(cell.document_range()) {
+            continue;
         }
-        let knowledge = knowledge.at(source.position_for_node(node));
-        let context = NodeContext {
-            primary_code,
-            analysis,
-            node,
-            source,
-            knowledge: &knowledge,
-        };
-        node::spawn(&context, &mut sink);
-    });
+        parse::spawn(cell, source, &mut sink);
+        expressions::spawn(cell, &context, &mut sink);
+    }
     for installation in analysis.installations() {
         if !source
             .bytes_for_range(installation.span)
@@ -181,14 +161,13 @@ pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
     }
     let context = DocumentContext {
         analysis,
-        root,
+        syntax,
         source,
     };
     document::spawn(&context, &mut sink);
     let context = DocumentationContext {
         documentation,
         packages,
-        root,
         syntax,
         source,
         knowledge,
@@ -214,13 +193,6 @@ pub fn collect_located(
         &mut sink,
     );
     sink.diagnostics
-}
-
-impl NodeContext<'_, '_> {
-    /// The span of the node under inspection.
-    fn node_range(&self) -> TextRange {
-        self.source.range_for_node(self.node)
-    }
 }
 
 #[cfg(test)]

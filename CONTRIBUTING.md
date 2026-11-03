@@ -14,7 +14,8 @@ src/
   source.rs               indexed source text and the single position-conversion API
   analysis.rs, analysis/  staged analysis: scopes, bindings, installations, typechecking
   typesystem.rs           static type inference over the object facts
-  node_metadata/          per-node facts produced by analysis and consumed by features
+  node_metadata/          retained parsed cells, the syntax snapshot, Markdown parsing
+  syntax.rs               shared structural operations on generated expressions
   object_registry.rs      canonical object identities and registry lookup
   builtin_index.rs        in-memory form of the builtin corpus
   catalog.rs              external catalog download, verification, and caching
@@ -30,26 +31,33 @@ src/
 
 Macaulay2 parsing goes through the released `m2-syn` API using its native
 parser. Each retained cell owns its generated `Cell` directly; unchanged cells
-share their allocation across document revisions. Typed spans map to the current
-revision through `SourceNavigation`, including comments and failed cells.
+share their allocation across document revisions. `SyntaxSnapshot` owns the
+revision's cells and is the entry point for generated visitors. Typed spans map
+to the current revision through `SourceNavigation`, including comments and
+failed cells. There is no second syntax representation: features walk generated
+nodes with `Visit` and read generated fields. `tests/architecture.rs` fails if
+an untyped layer returns or a capability parses on its own.
 
 Analysis runs first and records semantic facts; the modules in `capabilities/`
-read those facts rather than re-deriving them. New typed operations should read
-generated fields and use focused extension traits. Option, property, and quoted
-symbol roles follow this pattern; other existing operations still use the
-navigation adapter during migration.
+read those facts rather than re-deriving them. Shared structural operations
+(delimiters, arguments, assigned functions) live in `syntax.rs` as extension
+traits on generated nodes; option, property, and quoted symbol roles follow the
+same pattern.
 
 Expression inference lives in `analysis/inference/`. Generated constructs
 implement their own `InferType` rules and follow typed operand fields. A session
 borrows one syntax revision and caches results by expression allocation and
 lexical scope; source-span equality does not identify an expression. Operator
-spellings come from lexical tokens, excluding attached trivia. Existing editor
-callers enter through the isolated navigation adapter; new expression rules
-must not recover types through runtime casts. Ring values and specialized
+spellings come from lexical tokens, excluding attached trivia. New expression
+rules must not recover types through runtime casts. Ring values and specialized
 operators live in `analysis/ring/values.rs`, using generated operands and the
 same session cache. Generator syntax is shared through `analysis/ring/syntax.rs`.
 Binding value ranges locate retained typed expressions; they do not replace
 allocation identity in the inference cache.
+
+Formatting runs on one `SyntaxSnapshot`: whitespace edits are collected by typed
+visitors and applied through `LayoutSource`, which maps original syntax spans to
+the edited text without reparsing between passes.
 
 Treat every `target/` directory as build output.
 

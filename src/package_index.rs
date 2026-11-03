@@ -1,7 +1,7 @@
 //! Imported-package discovery and configured source-file resolution.
 
 use crate::macaulay2::Macaulay2Conventions;
-use crate::node_metadata::TypedSource;
+use crate::node_metadata::SyntaxSnapshot;
 use crate::telemetry::Timing;
 use std::ffi::OsString;
 use std::fs;
@@ -10,15 +10,15 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, iter, str, thread};
 
-use m2_syn::nodes::Sequence;
+use m2_syn::nodes::{Expr, ExprOpBinAdj};
+use m2_syn::visit::{self, Visit};
 use tower_lsp::lsp_types::{Location, Position, Range as TextRange, Url};
 
-#[cfg(test)]
-use crate::node_metadata::SyntaxParser;
-use crate::node_metadata::{visit_source_nodes, SyntaxNode};
 use crate::object_registry::ObjectName;
 use crate::settings::SourceSettings;
 use crate::source::SourceNavigation;
+use crate::string_literal::LiteralSource;
+use crate::syntax::ExpressionSyntax;
 
 // Wrapper discovery must finish even when the runtime cannot start.
 /// How long an `M2` hidden behind a wrapper may take to print its prefix before
@@ -571,50 +571,8 @@ impl SourceResolver {
 }
 
 /// The function names whose string argument names a package to import.
-fn is_package_import_trigger(name: &str) -> bool {
+pub fn is_package_import_trigger(name: &str) -> bool {
     Macaulay2Conventions::PACKAGE_IMPORT_FUNCTIONS.contains(&name)
-}
-
-/// The package name a string literal gives an import, `"Graphs"` in
-/// `needsPackage "Graphs"`, without its delimiters.
-pub fn package_source_string(node: SyntaxNode<'_>) -> Option<&str> {
-    is_package_import_string(node).then(|| node.string_literal_inner_text())?
-}
-
-/// Whether `node` is the string naming the package of an import call or of a
-/// `PackageImports`/`PackageExports` list.
-pub fn is_package_import_string(node: SyntaxNode<'_>) -> bool {
-    PackageLoadingOption::lists_package(node)
-        || node.ancestors().any(|application| {
-            package_import_argument(application).is_some_and(|argument| argument.id() == node.id())
-        })
-}
-
-/// The string argument of the import call `application` with the package name
-/// it holds.
-fn package_import<'tree>(
-    application: SyntaxNode<'tree>,
-) -> Option<(SyntaxNode<'tree>, &'tree str)> {
-    let argument = package_import_argument(application)?;
-    Some((argument, argument.string_literal_inner_text()?))
-}
-
-/// The first argument of `application` when it calls an import function.
-fn package_import_argument(application: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
-    first_call_argument(application, is_package_import_trigger)
-}
-
-/// The name string of `newPackage "P"` / `newPackage("P", …)`, which binds the
-/// global symbol `P` to the new package wherever the call runs.
-pub fn declared_package_name(application: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
-    first_call_argument(application, |name| {
-        name == Macaulay2Conventions::PACKAGE_CONSTRUCTOR
-    })
-    .filter(|argument| {
-        argument
-            .string_literal_inner_text()
-            .is_some_and(|name| !name.is_empty())
-    })
 }
 
 /// A `newPackage` option listing packages the new package loads: right after
@@ -641,63 +599,39 @@ impl PackageLoadingOption {
         }
     }
 
-    /// The package-name strings `call` lists under the option, when `call` is
-    /// a `newPackage` call. Macaulay2 accepts only a list as its value.
-    pub fn package_names(self, call: SyntaxNode<'_>) -> Vec<SyntaxNode<'_>> {
-        if first_call_argument(call, |name| {
-            name == Macaulay2Conventions::PACKAGE_CONSTRUCTOR
-        })
-        .is_none()
+    /// Literal package names listed by this option on a typed constructor call.
+    pub fn typed_package_names<'ast>(
+        self,
+        call: &'ast ExprOpBinAdj,
+        source: &(impl SourceNavigation + ?Sized),
+    ) -> Vec<&'ast Expr> {
+        if call.left_operand.symbol_name() != Some(Macaulay2Conventions::PACKAGE_CONSTRUCTOR) {
+            return Vec::new();
+        }
+        let arguments = call.right_operand.arguments();
+        if arguments
+            .first()
+            .copied()
+            .flatten()
+            .and_then(|argument| argument.literal_source(source))
+            .is_none_or(|name| name.is_empty())
         {
             return Vec::new();
         }
-        let Some(arguments) = call.binary_parts().map(|parts| parts.right) else {
-            return Vec::new();
-        };
         arguments
-            .collection_elements()
-            .filter(|option| option.is_option_assignment())
-            .filter(|option| {
-                option
-                    .binary_parts()
-                    .map(|parts| parts.left)
-                    .is_some_and(|key| key.text() == self.key())
+            .into_iter()
+            .flatten()
+            .filter_map(|argument| match argument {
+                Expr::Option(option) if option.key.symbol_name() == Some(self.key()) => {
+                    option.value.collection_elements()
+                }
+                _ => None,
             })
-            .filter_map(|option| option.binary_parts().map(|parts| parts.right))
-            .filter(|packages| packages.is_collection_expression())
-            .flat_map(|packages| packages.collection_elements().collect::<Vec<_>>())
-            .filter(|package| package.string_literal_inner_text().is_some())
+            .flatten()
+            .flatten()
+            .filter(|package| package.literal_source(source).is_some())
             .collect()
     }
-
-    /// Whether the string `node` names a package some option of an enclosing
-    /// `newPackage` call lists.
-    pub fn lists_package(node: SyntaxNode<'_>) -> bool {
-        node.ancestors().any(|call| {
-            Self::ALL.into_iter().any(|option| {
-                option
-                    .package_names(call)
-                    .iter()
-                    .any(|package| package.id() == node.id())
-            })
-        })
-    }
-}
-
-/// The first argument of `callee ARG` / `callee(ARG, …)` when `callee` is
-/// accepted by `is_trigger`.
-pub fn first_call_argument(
-    application: SyntaxNode<'_>,
-    is_trigger: impl Fn(&str) -> bool,
-) -> Option<SyntaxNode<'_>> {
-    binary_expression_left_symbol(application).filter(|name| is_trigger(name))?;
-    let argument = application.binary_parts().map(|parts| parts.right)?;
-    let argument = if argument.is::<Sequence>() || argument.is_holder() {
-        argument.collection_elements().next()?
-    } else {
-        argument
-    };
-    Some(argument)
 }
 
 /// The packages `text` imports, each from the position its import takes effect.
@@ -705,64 +639,82 @@ pub fn first_call_argument(
 pub fn collect_imported_packages(text: &str) -> Vec<PackageImport> {
     use crate::source::DocumentSource;
 
-    let Some(mut parser) = SyntaxParser::new() else {
-        return Vec::new();
-    };
-    let source = DocumentSource::new(text.to_string());
-    let Some(tree) = parser.parse_tree(text, None) else {
-        return Vec::new();
-    };
-    let syntax = Some(tree.syntax());
-    collect_imported_packages_in_tree(tree.root(text), syntax, &source)
+    let syntax = SyntaxSnapshot::parse(text, None);
+    let mut source = DocumentSource::new(text.to_string());
+    source.register_syntax(&syntax);
+    collect_imported_packages_in_tree(&syntax, &source)
 }
 
 /// Walk an already-parsed tree for package-import calls, reusing the caller's
 /// parse rather than spinning up a fresh parser. The snapshot keeps its tree
 /// around, so per-version import collection costs one walk, not a re-parse.
 pub fn collect_imported_packages_in_tree(
-    root: SyntaxNode<'_>,
-    syntax: Option<&TypedSource>,
+    syntax: &SyntaxSnapshot,
     source: &(impl SourceNavigation + ?Sized),
 ) -> Vec<PackageImport> {
-    let mut packages = Vec::new();
-    visit_source_nodes(root, syntax, |application| {
-        let effective_from = source.range_for_node(application).end;
-        if let Some((_, package_name)) = package_import(application) {
-            packages.push(PackageImport {
-                package: ObjectName::new(package_name),
-                effective_from,
-            });
-        }
-        if application.applied_symbol_name() == Some(Macaulay2Conventions::BEGIN_DOCUMENTATION) {
-            packages.extend(
-                Macaulay2Conventions::DOCUMENTATION_PACKAGES
-                    .into_iter()
-                    .map(|package| PackageImport {
-                        package: ObjectName::new(package),
-                        effective_from,
-                    }),
-            );
-        }
-        packages.extend(
-            PackageLoadingOption::ALL
-                .into_iter()
-                .flat_map(|option| option.package_names(application))
-                .filter_map(|package| package.string_literal_inner_text())
-                .map(|package| PackageImport {
-                    package: ObjectName::new(package),
-                    effective_from,
-                }),
-        );
-    });
-
-    packages
+    let mut collector = PackageImportCollector {
+        source,
+        packages: Vec::new(),
+    };
+    syntax.visit(&mut collector);
+    collector.packages
 }
 
-/// The left symbol of an application `callee ARG` (`needsPackage "Pkg"`): the
-/// callee name, when `node` is a `SPACE` application whose left operand is a
-/// bare symbol.
-fn binary_expression_left_symbol(node: SyntaxNode<'_>) -> Option<&str> {
-    node.applied_symbol_name()
+/// Collects source-ordered package inclusions directly from generated calls.
+struct PackageImportCollector<'source, S: ?Sized> {
+    /// Coordinate mapping and original literal text.
+    source: &'source S,
+    /// Imports collected in traversal order.
+    packages: Vec<PackageImport>,
+}
+
+impl<S: SourceNavigation + ?Sized> PackageImportCollector<'_, S> {
+    /// Records a package at the position where the containing call takes effect.
+    fn record(&mut self, package: &str, effective_from: Position) {
+        self.packages.push(PackageImport {
+            package: ObjectName::new(package),
+            effective_from,
+        });
+    }
+}
+
+impl<'ast, S: SourceNavigation + ?Sized> Visit<'ast> for PackageImportCollector<'_, S> {
+    fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
+        if let (Some(head), Some(range)) = (
+            call.left_operand.symbol_name(),
+            self.source.range_for_syntax(call),
+        ) {
+            let effective_from = range.end;
+            if is_package_import_trigger(head) {
+                if let Some(name) = call
+                    .right_operand
+                    .arguments()
+                    .first()
+                    .copied()
+                    .flatten()
+                    .and_then(|arg| arg.literal_source(self.source))
+                {
+                    self.record(name, effective_from);
+                }
+            }
+            if head == Macaulay2Conventions::BEGIN_DOCUMENTATION {
+                for name in Macaulay2Conventions::DOCUMENTATION_PACKAGES {
+                    self.record(name, effective_from);
+                }
+            }
+            if head == Macaulay2Conventions::PACKAGE_CONSTRUCTOR {
+                // Macaulay2 loads imports before exports, independent of option order.
+                for option in PackageLoadingOption::ALL {
+                    for package in option.typed_package_names(call, self.source) {
+                        if let Some(name) = package.literal_source(self.source) {
+                            self.record(name, effective_from);
+                        }
+                    }
+                }
+            }
+        }
+        visit::visit_expr_op_bin_adj(self, call);
+    }
 }
 
 #[cfg(test)]
@@ -772,8 +724,8 @@ mod import_trigger_tests {
     use std::{env, fs};
 
     use super::{
-        collect_imported_packages, package_source_string, Macaulay2Conventions,
-        Macaulay2Environment, ObjectName, SourceResolver, SyntaxParser,
+        collect_imported_packages, Macaulay2Conventions, Macaulay2Environment, ObjectName,
+        SourceResolver,
     };
 
     /// An isolated fixture tree with canonical paths and automatic cleanup.
@@ -864,18 +816,11 @@ mod import_trigger_tests {
     }
 
     #[test]
-    fn package_source_string_detects_import_like_calls() {
-        let text =
-            "needsPackage \"Graphs\"\nloadPackage(\"Normaliz\", Reload => true)\ndebug \"Core\"";
-        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
-        let root = parser.parse(text).expect("fixture should parse");
-        let packages = root
-            .descendants()
-            .filter(|node| node.is_string_literal())
-            .filter_map(package_source_string)
-            .collect::<Vec<_>>();
-
-        assert_eq!(packages, vec!["Graphs", "Normaliz", "Core"]);
+    fn import_calls_collect_package_string_arguments() {
+        assert_eq!(
+            imported_names("needsPackage \"Graphs\"\nloadPackage(\"Normaliz\", Reload => true)\ndebug \"Core\""),
+            ["Graphs", "Normaliz", "Core"]
+        );
     }
 
     #[test]
@@ -889,6 +834,32 @@ mod import_trigger_tests {
                 "Normaliz".to_string(),
                 "Graphs".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn typed_imports_keep_positions_and_option_load_order_across_cells() {
+        let text = concat!(
+            "-- 😀\r\n",
+            "newPackage(\"Pkg\", PackageExports => {\"Exported\"}, PackageImports => {\"Imported\"})\r\n",
+            "loadPackage ///Next///\r\n",
+        );
+        let imports = collect_imported_packages(text);
+        assert_eq!(
+            imports
+                .iter()
+                .map(|import| import.package.name())
+                .collect::<Vec<_>>(),
+            ["Imported", "Exported", "Next"]
+        );
+        assert_eq!(
+            imports[0].effective_from,
+            tower_lsp::lsp_types::Position::new(1, 81)
+        );
+        assert_eq!(imports[1].effective_from, imports[0].effective_from);
+        assert_eq!(
+            imports[2].effective_from,
+            tower_lsp::lsp_types::Position::new(2, 22)
         );
     }
 

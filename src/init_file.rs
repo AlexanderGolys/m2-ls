@@ -17,18 +17,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
-use m2_syn::nodes::Symbol;
-use m2_syn::Token;
+use m2_syn::nodes::{Expr, ExprAssign, ExprOp, ExprOpBin, ExprOpBinIndex};
+use m2_syn::visit::{self, Visit};
+use m2_syn::{Lex, Token};
 use serde::Deserialize;
 use tower_lsp::lsp_types::{Range as TextRange, Url};
 
 use crate::diagnostics::suppression::{DIRECTIVE_MARKER, LINE_COMMENT};
 use crate::document::DocumentSnapshot;
 use crate::macaulay2::Macaulay2Conventions;
-use crate::node_metadata::{matches_token, visit_source_nodes, SyntaxNode, TypedSource};
+use crate::node_metadata::SyntaxSnapshot;
 use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::package_index::Macaulay2Environment;
-use crate::source::SourceNavigation;
+use crate::source::{SourceNavigation, SyntaxSource};
+use crate::string_literal::LiteralSource;
+use crate::syntax::ExpressionSyntax;
 
 /// The directive command selecting the init file of a document.
 const DIRECTIVE_COMMAND: &str = "initFile";
@@ -89,21 +92,38 @@ pub struct InitFileDirective {
 }
 
 impl InitFileDirective {
-    /// The first `initFile` directive comment under `root`: later ones are
+    /// The first `initFile` directive comment in `syntax`: later ones are
     /// ignored.
     pub fn collect(
-        root: SyntaxNode<'_>,
+        syntax: &SyntaxSnapshot,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<Self> {
-        root.descendants()
-            .filter(SyntaxNode::is_line_comment)
-            .find_map(|comment| {
-                let choice = Self::choice_in(comment.text())?;
-                Some(Self {
-                    choice,
-                    range: source.range_for_node(comment),
-                })
+        syntax
+            .cells()
+            .iter()
+            .flat_map(|cell| cell.trivia())
+            .filter(|comment| comment.kind() == m2_syn::TriviaKind::LineComment)
+            .filter_map(|comment| {
+                let bytes = source.syntax_bytes(comment)?;
+                let text = source.text().get(bytes.clone())?;
+                let mut offset = bytes.start;
+                let mut directives = Vec::new();
+                for line in text.split_inclusive('\n') {
+                    let trimmed = line
+                        .trim_start_matches([' ', '\t'])
+                        .trim_end_matches(['\r', '\n']);
+                    let start = offset + line.len() - line.trim_start_matches([' ', '\t']).len();
+                    if let Some(choice) = Self::choice_in(trimmed) {
+                        directives.push(Self {
+                            choice,
+                            range: source.range_for_bytes(start..start + trimmed.len()),
+                        });
+                    }
+                    offset += line.len();
+                }
+                directives.into_iter().next()
             })
+            .min_by_key(|directive| directive.range.start)
     }
 
     /// The choice a comment written as `comment` makes, if it is an
@@ -201,10 +221,7 @@ impl InitFile {
             .iter()
             .map(|import| import.package.clone())
             .collect::<Vec<_>>();
-        packages.extend(preloaded_package_additions(
-            snapshot.root_node(),
-            snapshot.syntax(),
-        ));
+        packages.extend(preloaded_package_additions(snapshot.syntax(), &snapshot));
         Ok(Self {
             path: path.to_path_buf(),
             uri,
@@ -521,42 +538,89 @@ fn is_same_file(left: &Path, right: &Path) -> bool {
 /// are unknown here, so the defaults stay: a name kept visible is never
 /// wrongly reported unknown.
 fn preloaded_package_additions(
-    root: SyntaxNode<'_>,
-    syntax: Option<&TypedSource>,
+    syntax: &SyntaxSnapshot,
+    source: &(impl SourceNavigation + ?Sized),
 ) -> Vec<ObjectName> {
-    let mut packages = Vec::new();
-    visit_source_nodes(root, syntax, |node| {
-        if let Some(listed) = preloaded_packages_assignment(node) {
-            packages.extend(
-                listed
-                    .descendants()
-                    .filter(|literal| literal.is_string_literal())
-                    .filter_map(|literal| literal.string_literal_inner_text())
-                    .map(ObjectName::new),
-            );
-        }
-    });
-    packages
+    let mut collector = PreloadedPackages {
+        source,
+        packages: Vec::new(),
+    };
+    syntax.visit(&mut collector);
+    collector.packages
 }
 
-/// The right side of `Core#"preloaded packages" = …` or `|= …`.
-fn preloaded_packages_assignment(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
-    let operator = node.binary_operator()?;
-    if !(matches_token::<Token![=]>(operator) || matches_token::<Token![|=]>(operator)) {
-        return None;
+/// Collects literal names from assignments to Core's preloaded-package list.
+struct PreloadedPackages<'source, S: ?Sized> {
+    /// Source coordinates for literal contents.
+    source: &'source S,
+    /// Names in source traversal order.
+    packages: Vec<ObjectName>,
+}
+
+impl<S: SourceNavigation + ?Sized> PreloadedPackages<'_, S> {
+    /// Whether the indexed target names the preloaded-package list.
+    fn is_preloaded_target(&self, target: &ExprOpBinIndex) -> bool {
+        target.receiver.symbol_name() == Some(Macaulay2Conventions::CORE)
+            && target.index.literal_source(self.source)
+                == Some(Macaulay2Conventions::PRELOADED_PACKAGES_KEY)
     }
-    let target = node.binary_parts().map(|parts| parts.left)?;
-    let (Some(table), Some(key)) = (
-        target.binary_parts().map(|parts| parts.left),
-        target.binary_parts().map(|parts| parts.right),
-    ) else {
-        return None;
-    };
-    let names_preloaded_packages = target.has_binary_operator::<Token![#]>()
-        && table.is::<Symbol>()
-        && table.text() == Macaulay2Conventions::CORE
-        && key.string_literal_inner_text() == Some(Macaulay2Conventions::PRELOADED_PACKAGES_KEY);
-    names_preloaded_packages.then(|| node.binary_parts().map(|parts| parts.right))?
+}
+
+impl<'ast, S: SourceNavigation + ?Sized> Visit<'ast> for PreloadedPackages<'_, S> {
+    fn visit_expr_assign(&mut self, assignment: &'ast ExprAssign) {
+        let parts = match assignment {
+            ExprAssign::Op(node) => match &node.argument_expr {
+                ExprOp::Bin(ExprOpBin::Index(target)) => Some((target, node.value_expr.as_ref())),
+                _ => None,
+            },
+            ExprAssign::Augmented(node)
+                if node
+                    .operator
+                    .to_token_stream()
+                    .into_iter()
+                    .next()
+                    .and_then(|token| token.spelling().map(str::to_owned))
+                    .as_deref()
+                    == Some(<m2_syn::Token![|=]>::SPELLING) =>
+            {
+                match node.target.as_ref() {
+                    Expr::Op(ExprOp::Bin(ExprOpBin::Index(target))) => {
+                        Some((target, node.value.as_ref()))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(value) = parts
+            .filter(|(target, _)| self.is_preloaded_target(target))
+            .map(|(_, value)| value)
+        {
+            let mut literals = PreloadedLiteralNames {
+                source: self.source,
+                packages: &mut self.packages,
+            };
+            literals.visit_expr(value);
+        }
+        visit::visit_expr_assign(self, assignment);
+    }
+}
+
+/// Collects literal strings within one preloaded-package assignment value.
+struct PreloadedLiteralNames<'source, 'output, S: ?Sized> {
+    /// Source coordinates for literal contents.
+    source: &'source S,
+    /// Names found in this assignment.
+    packages: &'output mut Vec<ObjectName>,
+}
+
+impl<'ast, S: SourceNavigation + ?Sized> Visit<'ast> for PreloadedLiteralNames<'_, '_, S> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if let Some(name) = expression.literal_source(self.source) {
+            self.packages.push(ObjectName::new(name));
+        }
+        visit::visit_expr(self, expression);
+    }
 }
 
 #[cfg(test)]
@@ -596,7 +660,7 @@ mod tests {
     fn additions(text: &str) -> Vec<String> {
         let snapshot =
             DocumentSnapshot::from_text(text.to_string(), &registry()).expect("snapshot");
-        preloaded_package_additions(snapshot.root_node(), snapshot.syntax())
+        preloaded_package_additions(snapshot.syntax(), &snapshot)
             .into_iter()
             .map(|package| package.name().to_string())
             .collect()
@@ -619,6 +683,8 @@ mod tests {
                 "-- Core#\"preloaded packages\" |= {\"StateTables\"}\n",
                 "favorites = {\"NotAPackage\"}\n",
                 "Core#\"other key\" = {\"NotAPackage\"}\n",
+                "Other#\"preloaded packages\" |= {\"NotAPackage\"}\n",
+                "Core#\"preloaded packages\" += {\"NotAPackage\"}\n",
             )),
             Vec::<String>::new()
         );
@@ -640,6 +706,24 @@ mod tests {
             None
         );
         assert_eq!(InitFileDirective::choice_in("-- initFile a.m2"), None);
+    }
+
+    #[test]
+    fn first_directive_is_selected_in_invalid_source() {
+        let snapshot = DocumentSnapshot::from_text(
+            "x = (\n  -- m2-ls: initFile first.m2\n  -- m2-ls: initFile none\n".to_string(),
+            &registry(),
+        )
+        .expect("invalid syntax remains available");
+        let directive = snapshot.init_file_directive().expect("directive retained");
+        assert_eq!(
+            directive.choice,
+            InitFileChoice::Path(PathBuf::from("first.m2"))
+        );
+        assert_eq!(
+            directive.range.start,
+            tower_lsp::lsp_types::Position::new(1, 2)
+        );
     }
 
     #[test]

@@ -240,9 +240,7 @@ fn build_scope_symbols(scope_idx: usize, by_scope: &mut [Vec<Declaration>]) -> V
 mod tests {
     use super::*;
     use crate::document::DocumentSnapshot;
-    use crate::node_metadata::{SyntaxNode, SyntaxParser};
     use crate::object_registry::ObjectRegistry;
-    use m2_syn::nodes::{ExprLambda as LambdaExpression, Symbol};
     use tower_lsp::lsp_types::Range as TextRange;
 
     fn document(text: &str, builtins: &ObjectRegistry) -> DocumentSnapshot {
@@ -416,35 +414,8 @@ mod tests {
 
     #[test]
     fn document_symbols_cover_static_top_level_extractor_bindings() {
-        fn has_function_ancestor(node: SyntaxNode) -> bool {
-            node.ancestors()
-                .any(|parent| parent.is::<LambdaExpression>())
-        }
-
-        fn collect_static_top_level_bindings(node: SyntaxNode, names: &mut Vec<String>) {
-            if node.is_assignment() && !has_function_ancestor(node) {
-                if let Some(left) = node.binary_parts().map(|parts| parts.left) {
-                    if left.is::<Symbol>() {
-                        let name = left.text().to_string();
-                        if !names.contains(&name) {
-                            names.push(name);
-                        }
-                    }
-                }
-            }
-
-            for child in node.children() {
-                collect_static_top_level_bindings(child, names);
-            }
-        }
-
         let text = include_str!("../../tests/fixtures/formatting_example.m2");
         let builtins = ObjectRegistry::default();
-        let mut parser = SyntaxParser::new().expect("Macaulay2 parser should load");
-        let root = parser.parse(text).expect("fixture should parse");
-        let mut expected = Vec::new();
-        collect_static_top_level_bindings(root, &mut expected);
-
         let document = document(text, &builtins);
         let symbols = collect_document_symbols(&document);
         let actual = symbols
@@ -452,12 +423,14 @@ mod tests {
             .map(|symbol| symbol.name.as_str())
             .collect::<Vec<_>>();
 
-        for name in expected {
+        for name in ["randomPlanePoints", "K"] {
             assert!(
-                actual.contains(&name.as_str()),
+                actual.contains(&name),
                 "missing static top-level document symbol `{name}`"
             );
         }
+        assert!(!actual.contains(&"k"));
+        assert!(!actual.contains(&"eps"));
     }
 
     #[test]

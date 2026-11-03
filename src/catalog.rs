@@ -11,7 +11,8 @@
 use std::env;
 use std::fmt::{self, Display};
 use std::fs;
-use std::io::{self, Write};
+use std::io::Error as IOError;
+use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -89,7 +90,7 @@ impl CatalogSource {
                 let requirement = match env::var(CATALOG_VERSION_ENV) {
                     Ok(requirement) => requirement,
                     Err(env::VarError::NotPresent) => "*".to_owned(),
-                    Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+                    Err(error) => return Err(IOError::new(ErrorKind::InvalidInput, error)),
                 };
                 let requirement = if requirement == "latest" {
                     "*"
@@ -97,8 +98,8 @@ impl CatalogSource {
                     &requirement
                 };
                 let requirement = VersionReq::parse(requirement).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
+                    IOError::new(
+                        ErrorKind::InvalidInput,
                         format!("{CATALOG_VERSION_ENV}: {error}"),
                     )
                 })?;
@@ -153,12 +154,12 @@ impl CatalogSource {
             Self::Override(path) => fs::read_to_string(Self::resolve_override(path)?),
             Self::Cache(cache) => match cache.verified()? {
                 Some(cached) => String::from_utf8(cached.bytes)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+                    .map_err(|error| IOError::new(ErrorKind::InvalidData, error)),
                 None => fs::read_to_string(cache.update()?),
             },
         }?;
         BuiltinIndex::validate(&corpus)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            .map_err(|error| IOError::new(ErrorKind::InvalidData, error))?;
         Ok(corpus)
     }
 
@@ -180,8 +181,8 @@ impl CatalogSource {
     /// Validates an explicitly configured catalog path before opening it.
     fn resolve_override(path: &Path) -> io::Result<PathBuf> {
         fs::canonicalize(path).map_err(|error| {
-            io::Error::new(
-                io::Error::kind(&error),
+            IOError::new(
+                IOError::kind(&error),
                 format!("{}: {error}", path.display()),
             )
         })
@@ -323,7 +324,7 @@ impl M2BookReleases {
             .agent
             .head(format!("{RELEASES_URL}/latest"))
             .call()
-            .map_err(io::Error::other)?;
+            .map_err(IOError::other)?;
         let tag = Self::tag_of_release_page(response.get_uri().path())?;
         self.release(tag)
     }
@@ -345,14 +346,14 @@ impl M2BookReleases {
                     concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")),
                 )
                 .call()
-                .map_err(io::Error::other)?
+                .map_err(IOError::other)?
                 .body_mut()
                 .with_config()
                 .limit(MAX_RELEASE_METADATA_BYTES)
                 .read_to_vec()
-                .map_err(io::Error::other)?;
+                .map_err(IOError::other)?;
             let releases: Vec<PublishedRelease> =
-                serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                serde_json::from_slice(&bytes).map_err(IOError::other)?;
             let last_page = releases.len() < RELEASES_PER_PAGE;
             if let Some(candidate) = PublishedRelease::select(releases, requirement) {
                 if selected
@@ -367,8 +368,8 @@ impl M2BookReleases {
             }
         }
         let (_, tag) = selected.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
+            IOError::new(
+                ErrorKind::NotFound,
                 format!("no published M2Book release matches {requirement}"),
             )
         })?;
@@ -380,8 +381,8 @@ impl M2BookReleases {
         let checksum = self.asset(&tag, CHECKSUM_ASSET, MAX_CHECKSUM_BYTES)?;
         let digest =
             CatalogDigest::parse(&String::from_utf8_lossy(&checksum)).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
+                IOError::new(
+                    ErrorKind::InvalidData,
                     format!("{CHECKSUM_ASSET} of M2Book {tag} does not contain a SHA-256 digest"),
                 )
             })?;
@@ -394,8 +395,8 @@ impl M2BookReleases {
             .map(|(_, tag)| tag.to_owned())
             .filter(|tag| !tag.is_empty() && !tag.contains('/'))
             .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
+                IOError::new(
+                    ErrorKind::NotFound,
                     format!("M2Book has no published release at {RELEASES_URL}"),
                 )
             })
@@ -411,12 +412,12 @@ impl M2BookReleases {
         self.agent
             .get(format!("{RELEASES_URL}/download/{tag}/{asset}"))
             .call()
-            .map_err(io::Error::other)?
+            .map_err(IOError::other)?
             .body_mut()
             .with_config()
             .limit(limit)
             .read_to_vec()
-            .map_err(io::Error::other)
+            .map_err(IOError::other)
     }
 }
 
@@ -502,8 +503,8 @@ impl CatalogCache {
     /// An unsuccessful download does not install an unverified cache entry.
     pub fn update(&self) -> io::Result<PathBuf> {
         self.fetch_latest(&M2BookReleases::new()).map_err(|error| {
-            io::Error::new(
-                io::Error::kind(&error),
+            IOError::new(
+                IOError::kind(&error),
                 format!("could not download the builtin catalog from M2Book: {error}; for offline use, set {CATALOG_ENV} to a local catalog file"),
             )
         })
@@ -557,7 +558,7 @@ impl CatalogCache {
     fn cached_file(&self) -> io::Result<Option<(PathBuf, CatalogDigest)>> {
         let entries = match fs::read_dir(&self.directory) {
             Ok(entries) => entries,
-            Err(error) if io::Error::kind(&error) == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if IOError::kind(&error) == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
         let mut catalogs = Vec::new();
@@ -583,8 +584,8 @@ impl CatalogCache {
     /// its digest and wire format. Nothing is cached when either check fails.
     fn store(&self, release: &CatalogRelease, catalog: &[u8]) -> io::Result<PathBuf> {
         if !release.digest.matches(catalog) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(IOError::new(
+                ErrorKind::InvalidData,
                 format!(
                     "builtin catalog does not match the checksum published by M2Book {}",
                     release.tag
@@ -592,10 +593,10 @@ impl CatalogCache {
             ));
         }
         let text = std::str::from_utf8(catalog)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            .map_err(|error| IOError::new(ErrorKind::InvalidData, error))?;
         BuiltinIndex::validate(text).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
+            IOError::new(
+                ErrorKind::InvalidData,
                 format!(
                     "M2Book {} published a catalog in an unsupported format: {error}",
                     release.tag
@@ -617,7 +618,7 @@ impl CatalogCache {
     /// Removes a cache file while treating an already absent path as success.
     fn remove(path: &Path) -> io::Result<()> {
         match fs::remove_file(path) {
-            Err(error) if io::Error::kind(&error) != io::ErrorKind::NotFound => Err(error),
+            Err(error) if IOError::kind(&error) != ErrorKind::NotFound => Err(error),
             _ => Ok(()),
         }
     }
@@ -634,8 +635,8 @@ impl CatalogCache {
             .filter(|path| path.is_absolute())
             .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
         directory.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
+            IOError::new(
+                ErrorKind::NotFound,
                 format!("no user cache directory; set {CATALOG_ENV} to a local catalog file"),
             )
         })

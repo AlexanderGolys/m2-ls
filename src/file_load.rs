@@ -14,13 +14,15 @@ use std::io::{self, ErrorKind};
 use std::iter;
 use std::path::{Component, Path, PathBuf};
 
+use m2_syn::nodes::ExprOpBinAdj;
+use m2_syn::visit::{self, Visit};
 use tower_lsp::lsp_types::{Position, Range as TextRange, Url};
 
 use crate::macaulay2::Macaulay2Conventions;
-use crate::node_metadata::{visit_source_nodes, SyntaxNode, SyntaxParser, TypedSource};
-use crate::package_index::first_call_argument;
+use crate::node_metadata::SyntaxSnapshot;
 use crate::source::{DocumentSource, SourceNavigation};
-use crate::string_literal::StringDelimiter;
+use crate::string_literal::{LiteralSource, StringDelimiter};
+use crate::syntax::ExpressionSyntax;
 
 /// How Macaulay2 looks for the file a [`FileLoad`] names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,57 +99,32 @@ pub struct FileLoad {
 }
 
 impl FileLoad {
-    /// Every load under `root` naming its file with a literal, in source
+    /// Every load in `syntax` naming its file with a literal, in source
     /// order. A literal with an escape Macaulay2 does not read names no
     /// file and is left out.
     pub fn collect(
-        root: SyntaxNode<'_>,
-        syntax: Option<&TypedSource>,
+        syntax: &SyntaxSnapshot,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Vec<Self> {
-        let mut loads = Vec::new();
-        visit_source_nodes(root, syntax, |call| {
-            let Some(literal) = first_call_argument(call, Self::is_load_function) else {
-                return;
-            };
-            let (Some(name), Some(delimiter)) =
-                (literal.string_literal_value(), StringDelimiter::of(literal))
-            else {
-                return;
-            };
-            loads.push(Self {
-                call: source.position_for_node(call),
-                name,
-                delimiter,
-                literal: source.range_for_node(literal),
-            });
-        });
-        loads
+        let mut collector = FileLoadCollector {
+            source,
+            loads: Vec::new(),
+        };
+        syntax.visit(&mut collector);
+        collector.loads
     }
 
     /// The loads of `text`, parsed without analysis: for files read only for
     /// the files they load.
     pub fn collect_from_text(text: &str) -> Vec<Self> {
-        let Some(mut parser) = SyntaxParser::new() else {
-            return Vec::new();
-        };
-        let Some(tree) = parser.parse_tree(text, None) else {
-            return Vec::new();
-        };
-        let source = DocumentSource::new(text.to_string());
-        Self::collect(tree.root(text), Some(tree.syntax()), &source)
-    }
-
-    /// Whether `node` is the string naming the file of a load.
-    pub fn names_file(node: SyntaxNode<'_>) -> bool {
-        node.ancestors().any(|call| {
-            first_call_argument(call, Self::is_load_function)
-                .is_some_and(|literal| literal.id() == node.id())
-        })
+        let syntax = SyntaxSnapshot::parse(text, None);
+        let mut source = DocumentSource::new(text.to_string());
+        source.register_syntax(&syntax);
+        Self::collect(&syntax, &source)
     }
 
     /// Whether the symbol names load, needs, or input.
-    fn is_load_function(name: &str) -> bool {
+    pub fn is_load_function(name: &str) -> bool {
         Macaulay2Conventions::FILE_LOAD_FUNCTIONS.contains(&name)
     }
 
@@ -318,6 +295,38 @@ impl FileLoad {
     }
 }
 
+/// Collects file-loading calls directly from the generated syntax.
+struct FileLoadCollector<'source, S: ?Sized> {
+    /// Source coordinates and original literal contents.
+    source: &'source S,
+    /// Loads in traversal order.
+    loads: Vec<FileLoad>,
+}
+
+impl<'ast, S: SourceNavigation + ?Sized> Visit<'ast> for FileLoadCollector<'_, S> {
+    fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
+        if call
+            .left_operand
+            .symbol_name()
+            .is_some_and(FileLoad::is_load_function)
+        {
+            let load = (|| {
+                let literal = call.right_operand.arguments().into_iter().next()??;
+                let delimiter = StringDelimiter::of_expression(literal)?;
+                let name = delimiter.decode(literal.literal_source(self.source)?)?;
+                Some(FileLoad {
+                    call: self.source.range_for_syntax(call)?.start,
+                    name,
+                    delimiter,
+                    literal: self.source.range_for_syntax(literal)?,
+                })
+            })();
+            self.loads.extend(load);
+        }
+        visit::visit_expr_op_bin_adj(self, call);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +349,33 @@ mod tests {
         assert!(
             FileLoad::collect_from_text("load \"\\q.m2\"\n").is_empty(),
             "an unreadable escape names no file"
+        );
+    }
+
+    #[test]
+    fn text_collection_retains_valid_loads_around_a_failed_cell() {
+        let loads = FileLoad::collect_from_text(
+            "-- 😀\nload \"first.m2\"\nf = x -> (x + )\nload \"second.m2\"\n",
+        );
+        assert_eq!(
+            loads
+                .iter()
+                .map(|load| load.name.as_str())
+                .collect::<Vec<_>>(),
+            ["first.m2", "second.m2"]
+        );
+        assert_eq!(loads[1].call.line, 3);
+    }
+
+    #[test]
+    fn text_collection_recovers_after_an_unexpected_closer() {
+        let loads = FileLoad::collect_from_text("load \"first.m2\"\nx = )\nload \"second.m2\"\n");
+        assert_eq!(
+            loads
+                .iter()
+                .map(|load| load.name.as_str())
+                .collect::<Vec<_>>(),
+            ["first.m2", "second.m2"]
         );
     }
 

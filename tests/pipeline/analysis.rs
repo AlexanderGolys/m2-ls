@@ -2296,6 +2296,38 @@ async fn document_links_resolve_and_completion_surfaces_contextual_choices() {
 }
 
 #[tokio::test]
+async fn package_document_links_cover_imports_and_constructor_options() {
+    let source = concat!(
+        "needsPackage \"JSON\"\n",
+        "newPackage(\"Pkg\", PackageImports => {\"Graphs\"}, PackageExports => {\"Chordal\"})\n",
+        "ordinary = \"NotAPackage\"\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let links = session
+        .request(
+            "textDocument/documentLink",
+            json!({
+                "textDocument": {"uri": session.uri()}
+            }),
+        )
+        .await;
+    let tooltips = response_array(&links)
+        .iter()
+        .filter_map(|link| link["tooltip"].as_str())
+        .collect::<Vec<_>>();
+    for name in ["JSON", "Graphs", "Chordal"] {
+        assert!(
+            tooltips.contains(&format!("Open package `{name}`").as_str()),
+            "{tooltips:?}"
+        );
+    }
+    assert!(!tooltips
+        .iter()
+        .any(|tooltip| tooltip.contains("NotAPackage")));
+    session.shutdown().await;
+}
+
+#[tokio::test]
 async fn attached_markdown_is_visible_in_hover() {
     let source = "-- Computes **the answer** with [[ideal]].\nanswer := 42\nanswer\n";
     let mut session = DocumentSession::open(source).await;
@@ -3191,6 +3223,23 @@ const PACKAGE_WITH_OPTIONS: &str = concat!(
 );
 
 #[tokio::test]
+async fn package_constructors_bind_names_from_typed_string_arguments() {
+    for (declaration, name) in [
+        ("newPackage \"AlphaPkg\"", "AlphaPkg"),
+        ("newPackage(\"BetaPkg\", PackageImports => {})", "BetaPkg"),
+        ("newPackage ///GammaPkg///", "GammaPkg"),
+    ] {
+        let mut session = DocumentSession::open(&format!("{declaration}\n{name}\n")).await;
+        let definition = session.request_at("textDocument/definition", name, 1).await;
+        assert_eq!(
+            definition["range"]["start"]["line"], 0,
+            "{declaration}: {definition}"
+        );
+        session.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn exported_name_strings_refer_to_the_globals_they_name() {
     let mut session = DocumentSession::open(PACKAGE_WITH_OPTIONS).await;
     let definition_line = 2;
@@ -3833,6 +3882,45 @@ async fn ring_subscripts_evaluate_to_inline_values_and_bound_errors() {
         messages[0].starts_with("index 9 out of bounds 0 .. 8"),
         "unexpected message: {messages:?}"
     );
+}
+
+/// Range filtering follows relocated syntax cells after an edit.
+#[tokio::test]
+async fn inline_values_respect_requested_ranges_after_cell_relocation() {
+    let source = "S = QQ[x,y]\nS_0\nS_1\n";
+    let mut session = DocumentSession::open(source).await;
+    session.replace(&format!("-- 😀\n{source}")).await;
+    let values = session
+        .request(
+            "textDocument/inlineValue",
+            json!({
+                "textDocument": {"uri": session.uri()},
+                "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 3}},
+                "context": {"frameId": 0, "stoppedLocation": {
+                    "start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 3}
+                }}
+            }),
+        )
+        .await;
+    let values = response_array(&values);
+    assert_eq!(values.len(), 1, "{values:?}");
+    assert_eq!(values[0]["text"], "S_1 = y");
+    assert_eq!(values[0]["range"]["start"]["line"], 3);
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn parse_diagnostics_follow_malformed_cells_across_edits() {
+    let source = "a = 1\nf = x -> (x + )\nb = 2\n";
+    let mut session = DocumentSession::open(source).await;
+    assert_eq!(diagnostic_lines(&session, "X01"), vec![1]);
+    session.replace(&format!("-- α\n{source}")).await;
+    assert_eq!(diagnostic_lines(&session, "X01"), vec![2]);
+    session
+        .replace("-- α\na = 1\nf = x -> (x + 1)\nb = 2\n")
+        .await;
+    assert!(diagnostic_lines(&session, "X01").is_empty());
+    session.shutdown().await;
 }
 
 /// Typed operands retain scope and output-history semantics when shared cells move

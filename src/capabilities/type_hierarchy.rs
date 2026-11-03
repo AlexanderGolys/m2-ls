@@ -51,9 +51,9 @@ impl<'a, K: PartitionedTypeKnowledge + ?Sized> TypeHierarchyContext<'a, K> {
         uri: &Url,
         position: Position,
     ) -> Option<Vec<TypeHierarchyItem>> {
-        let node = document.reference_node_at_position(position)?;
-        let name = node.text();
-        let range = document.range_for_node(node);
+        let symbol = document.reference_symbol_at(position)?.symbol;
+        let name = symbol.text();
+        let range = document.range_for_syntax(symbol)?;
 
         let (package, record) = scoped.get_record_with_package(&ObjectName::new(name))?;
         record.type_info()?;
