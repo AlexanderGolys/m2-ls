@@ -284,7 +284,7 @@ fn installation_domain(signature: &Expr) -> Option<Vec<&Expr>> {
 
 impl Operator {
     /// The operator an operation applies, with its form.
-    pub(super) fn of_operation(operation: &ExprOp) -> Option<Self> {
+    pub fn of_operation(operation: &ExprOp) -> Option<Self> {
         let (token, form) = match operation {
             ExprOp::Bin(ExprOpBin::Adj(_)) => (
                 Macaulay2Conventions::APPLICATION_OPERATOR,

@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.5.0 - 2026-11-05
+
+- Add grouped TOML and JSON configuration for hint placement, argument names,
+  hide filters, diagnostic severities, catalog selection, source discovery,
+  and multiple initialization files. Keep earlier settings as compatibility
+  aliases. Use tabs by default when formatting.
+- Refine inlay hints with separate sequence and holder settings, explicit
+  holder requests, per-parameter name limits, operator argument labels, and
+  filtering of consecutive labels.
+- Add E19 `manual-type-dispatch` for repeated class tests of a parameter,
+  E20 `list-record-shape` for fixed-size list validation, and S07
+  `shared-method-codomain` for methods with at least five installations and
+  more than 75% sharing an explicit result annotation.
+- Keep regex delimiters and ordinary text as strings, highlight only regex
+  punctuation as `regexp`, and classify escapes as `escapeSequence`.
+  `semanticTokens.standardOnly` falls back to strings for escape sequences.
+- Add a user guide covering editor setup, configuration, diagnostics, runtime
+  commands, and navigation. Install through Cargo on all supported platforms.
+- Record lint results and indexing summaries in local JSONL usage history,
+  separate from operational logs, with path overrides and opt-out settings.
+  Tests disable both file writers.
+
 ## 2.4.0 - 2026-11-05
 
 - Share one workspace hierarchy between type navigation and the new

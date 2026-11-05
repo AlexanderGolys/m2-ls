@@ -1,5 +1,8 @@
 //! LSP encoding of semantic-token candidates registered in document analysis.
 
+mod regex;
+
+use self::regex::RegexTokens;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -11,7 +14,7 @@ use crate::package_documentation::{DocumentationMarkupKind, TextStyle};
 use crate::semantic_token::{
     classify_source_semantic_token, local_symbol_semantic_token, CompiledCallableKind,
     M2SemanticToken, M2SemanticTokenModifier, M2SemanticTokenType, SemanticTokenKnowledge,
-    SourceSemanticToken, SourceSemanticTokenContext,
+    SourceSemanticRole, SourceSemanticToken, SourceSemanticTokenContext,
 };
 use crate::settings::{DefaultLibraryMode, DefaultLibrarySetting, SemanticTokenSettings};
 use crate::source::{ByteRange, DocumentSpan, SourceNavigation, SymbolMention, SyntaxSource};
@@ -116,7 +119,25 @@ impl SessionTokenClassifier<'_> {
             .analysis()
             .source_semantic_tokens()
             .iter()
-            .filter_map(|token| self.classifier.semantic_span(token, false))
+            .flat_map(|token| {
+                if token.source_role == Some(SourceSemanticRole::RegularExpression) {
+                    let bytes = token.span.bytes();
+                    let text = &self.session.snapshot.text()[bytes.clone()];
+                    RegexTokens::new(text, bytes)
+                        .runs()
+                        .into_iter()
+                        .map(|(bytes, kind)| SemanticSpan {
+                            source: self.session.snapshot.span_for_bytes(bytes),
+                            token: M2SemanticToken::new(kind),
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    self.classifier
+                        .semantic_span(token, false)
+                        .into_iter()
+                        .collect()
+                }
+            })
             .filter_map(|span| {
                 let bytes = document.bytes_for_range(span.range())?;
                 (container.start <= bytes.start && bytes.end <= container.end).then(|| {
@@ -199,6 +220,17 @@ impl<'a> SemanticTokenEmitter<'a> {
             return false;
         };
         let source_bytes = source_token.span.bytes();
+        if source_token.source_role == Some(SourceSemanticRole::RegularExpression) {
+            let text = &self.document.text()[source_bytes.clone()];
+            for (bytes, kind) in RegexTokens::new(text, source_bytes).runs() {
+                self.push(SemanticSpan {
+                    source: self.document.span_for_bytes(bytes),
+                    token: M2SemanticToken::new(kind),
+                });
+            }
+            return true;
+        }
+
         let inside =
             |bytes: ByteRange| source_bytes.start <= bytes.start && bytes.end <= source_bytes.end;
 
@@ -446,8 +478,23 @@ where
                 DefaultLibraryMode::AllPackages => package.is_some(),
                 DefaultLibraryMode::None => false,
             },
-            DefaultLibrarySetting::Packages(packages) => {
-                package.is_some_and(|package| packages.iter().any(|selected| selected == package))
+            DefaultLibrarySetting::Selectors(packages) => {
+                packages.iter().any(|selected| match selected.as_str() {
+                    "CompiledFunction" => {
+                        token.compiled_callable == Some(CompiledCallableKind::Function)
+                    }
+                    "Compiled" => token.compiled_callable.is_some(),
+                    "Core" => package == Some("Core"),
+                    "Prelude" => package.is_some_and(|package| {
+                        self.builtins
+                            .default_loaded()
+                            .iter()
+                            .any(|preloaded| preloaded == package)
+                    }),
+                    "AllPackages" => package.is_some(),
+                    "None" => false,
+                    _ => package == Some(selected.as_str()),
+                })
             }
         };
         token.with_modifier_state(M2SemanticTokenModifier::DefaultLibrary, selected)
@@ -2361,7 +2408,11 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         for token_type in M2SemanticTokenType::iter() {
             assert_eq!(
                 M2SemanticToken::new(token_type).encode(&standard_only).0,
-                token_type as u32
+                if token_type == M2SemanticTokenType::EscapeSequence {
+                    M2SemanticTokenType::String as u32
+                } else {
+                    token_type as u32
+                }
             );
         }
     }

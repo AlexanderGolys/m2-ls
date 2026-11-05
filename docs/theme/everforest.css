@@ -1,0 +1,349 @@
+/* Everforest (dark, medium contrast) as an extra mdBook theme. mdBook sets the
+   active theme as a class on <html>; `index.hbs` adds it to the theme picker.
+   Palette: https://github.com/sainnhe/everforest */
+
+.everforest {
+    --bg: #2d353b;
+    --fg: #d3c6aa;
+
+    --sidebar-bg: #232a2e;
+    --sidebar-fg: #d3c6aa;
+    --sidebar-non-existant: #7a8478;
+    --sidebar-active: #a7c080;
+    --sidebar-spacer: #3d484d;
+
+    --scrollbar: var(--sidebar-fg);
+
+    --icons: #7a8478;
+    --icons-hover: #d3c6aa;
+
+    --links: #7fbbb3;
+
+    --inline-code-color: #83c092;
+
+    --theme-popup-bg: #343f44;
+    --theme-popup-border: #4f585e;
+    --theme-hover: #3d484d;
+
+    --quote-bg: #343f44;
+    --quote-border: #475258;
+
+    --warning-border: #e69875;
+
+    --table-border-color: #3d484d;
+    --table-header-bg: #475258;
+    --table-alternate-bg: #343f44;
+
+    --searchbar-border-color: #4f585e;
+    --searchbar-bg: #343f44;
+    --searchbar-fg: #d3c6aa;
+    --searchbar-shadow-color: #232a2e;
+    --searchresults-header-fg: #859289;
+    --searchresults-border-color: #4f585e;
+    --searchresults-li-bg: #343f44;
+    --search-mark-bg: #4d4c43;
+
+    --color-scheme: dark;
+
+    /* Same as `--icons` */
+    --copy-button-filter: invert(52%) sepia(14%) saturate(239%) hue-rotate(65deg) brightness(95%) contrast(91%);
+    /* Same as `--sidebar-active` */
+    --copy-button-filter-hover: invert(91%) sepia(8%) saturate(1483%) hue-rotate(33deg) brightness(82%) contrast(88%);
+
+    --footnote-highlight: #7fbbb3;
+
+    --overlay-bg: rgba(35, 42, 46, 0.4);
+
+    --blockquote-note-color: #7fbbb3;
+    --blockquote-tip-color: #a7c080;
+    --blockquote-important-color: #d699b6;
+    --blockquote-warning-color: #dbbc7f;
+    --blockquote-caution-color: #e67e80;
+
+    --sidebar-header-border-color: #a7c080;
+
+    /* ANCHOR: highlighting */
+    /* Tree-sitter hues: Everforest's palette. */
+    --ts-red:    #e67e80;
+    --ts-orange: #e69875;
+    --ts-yellow: #dbbc7f;
+    --ts-green:  #a7c080;
+    --ts-cyan:   #83c092;
+    --ts-blue:   #7fbbb3;
+    --ts-purple: #d699b6;
+    --ts-gray:   #859289;
+
+    /* Every colour role, as Everforest colours that kind of syntax. The
+       highlight.js rules below use them; tree-sitter captures are styled
+       individually at the end of this file. */
+    --ts-comment:     var(--ts-gray);
+    --ts-keyword:     var(--ts-red);
+    --ts-string:      var(--ts-cyan);
+    --ts-escape:      var(--ts-green);
+    --ts-number:      var(--ts-purple);
+    --ts-function:    var(--ts-green);
+    --ts-declaration: var(--ts-green);
+    --ts-type:        var(--ts-yellow);
+    --ts-special:     var(--ts-orange);
+    --ts-namespace:   var(--ts-yellow);
+    --ts-attribute:   var(--ts-purple);
+    --ts-heading:     var(--ts-orange);
+    --ts-link:        var(--ts-blue);
+    /* ANCHOR_END: highlighting */
+}
+
+/* Code blocks, and highlight.js blocks in the same roles, so blocks left to
+   mdBook match the tree-sitter ones. mdBook keeps its light highlight.js
+   stylesheet active for themes it does not know; these rules cover its
+   selectors. */
+.everforest .hljs {
+    background: #232a2e;
+    color: var(--fg);
+}
+
+.everforest .hljs-comment,
+.everforest .hljs-quote {
+    color: var(--ts-comment);
+    font-style: italic;
+}
+
+.everforest .hljs-variable,
+.everforest .hljs-template-variable,
+.everforest .hljs-attribute,
+.everforest .hljs-attr,
+.everforest .hljs-tag,
+.everforest .hljs-name,
+.everforest .hljs-regexp,
+.everforest .hljs-link,
+.everforest .hljs-selector-id,
+.everforest .hljs-selector-class {
+    color: var(--ts-special);
+}
+
+.everforest .hljs-number,
+.everforest .hljs-meta,
+.everforest .hljs-built_in,
+.everforest .hljs-builtin-name,
+.everforest .hljs-literal,
+.everforest .hljs-type,
+.everforest .hljs-params {
+    color: var(--ts-number);
+}
+
+.everforest .hljs-string,
+.everforest .hljs-symbol,
+.everforest .hljs-bullet {
+    color: var(--ts-string);
+}
+
+.everforest .hljs-title,
+.everforest .hljs-section {
+    color: var(--ts-function);
+}
+
+.everforest .hljs-keyword,
+.everforest .hljs-selector-tag {
+    color: var(--ts-keyword);
+}
+
+.everforest .hljs-addition {
+    color: var(--ts-green);
+    background-color: #425047;
+}
+
+.everforest .hljs-deletion {
+    color: var(--ts-red);
+    background-color: #514045;
+}
+
+/* Tree-sitter captures styled as Everforest's Neovim highlight groups
+   (sainnhe/everforest 85a86eb, dark background, default options): each
+   `@capture` group's colour, italic, bold, underline, and strikethrough.
+   Groups for one language apply to blocks fenced with that language's name.
+   The bundled stylesheet's dimmed punctuation and link underlines have no
+   counterpart in Neovim, so they are reset first, at the lowest specificity,
+   on capture spans only: mdBook dims hidden lines through their wrapper. */
+.everforest :where(pre.treesitter [class^="ts-"]) {
+    opacity: 1;
+    text-decoration: none;
+}
+
+.everforest .ts-annotation { color: #d699b6; }
+.everforest .ts-attribute { color: #d699b6; }
+.everforest .ts-boolean { color: #d699b6; }
+.everforest .ts-character { color: #83c092; }
+.everforest .ts-comment { color: #859289; font-style: italic; }
+.everforest .ts-conceal { color: #859289; }
+.everforest .ts-conditional { color: #e67e80; }
+.everforest .ts-constant { color: #d3c6aa; }
+.everforest .ts-constructor { color: #a7c080; }
+.everforest .ts-debug { color: #e69875; }
+.everforest .ts-define { color: #d699b6; }
+.everforest .ts-error { color: #e67e80; }
+.everforest .ts-exception { color: #e67e80; }
+.everforest .ts-field { color: #7fbbb3; }
+.everforest .ts-float { color: #d699b6; }
+.everforest .ts-function { color: #a7c080; }
+.everforest .ts-include { color: #e67e80; }
+.everforest .ts-keyword { color: #e67e80; }
+.everforest .ts-label { color: #e69875; }
+.everforest .ts-markup { color: #dbbc7f; }
+.everforest .ts-math { color: #7fbbb3; }
+.everforest .ts-method { color: #a7c080; }
+.everforest .ts-module { color: #dbbc7f; }
+.everforest .ts-namespace { color: #dbbc7f; }
+.everforest .ts-none { color: #d3c6aa; }
+.everforest .ts-number { color: #d699b6; }
+.everforest .ts-operator { color: #e69875; }
+.everforest .ts-parameter { color: #d3c6aa; }
+.everforest .ts-preproc { color: #d699b6; }
+.everforest .ts-property { color: #7fbbb3; }
+.everforest .ts-punctuation { color: #d3c6aa; }
+.everforest .ts-repeat { color: #e67e80; }
+.everforest .ts-storageclass { color: #e69875; }
+.everforest .ts-strike { color: #859289; }
+.everforest .ts-string { color: #83c092; }
+.everforest .ts-symbol { color: #d3c6aa; }
+.everforest .ts-tag { color: #e69875; }
+.everforest .ts-text { color: #a7c080; }
+.everforest .ts-todo { color: #2d353b; font-weight: bold; }
+.everforest .ts-type { color: #dbbc7f; }
+.everforest .ts-uri { color: #7fbbb3; text-decoration: underline; }
+.everforest .ts-variable { color: #d3c6aa; }
+.everforest .ts-attribute-builtin { color: #dbbc7f; }
+.everforest .ts-character-special { color: #dbbc7f; }
+.everforest .ts-comment-documentation { color: #859289; font-style: italic; }
+.everforest .ts-comment-error { color: #2d353b; font-style: normal; font-weight: bold; }
+.everforest .ts-comment-note { color: #2d353b; font-style: normal; font-weight: bold; }
+.everforest .ts-comment-todo { color: #2d353b; font-style: normal; font-weight: bold; }
+.everforest .ts-comment-warning { color: #2d353b; font-style: normal; font-weight: bold; }
+.everforest .ts-constant-builtin { color: #d699b6; }
+.everforest .ts-constant-macro { color: #d699b6; }
+.everforest .ts-diff-delta { color: #7fbbb3; }
+.everforest .ts-diff-minus { color: #e67e80; }
+.everforest .ts-diff-plus { color: #a7c080; }
+.everforest .ts-function-builtin { color: #a7c080; }
+.everforest .ts-function-call { color: #a7c080; }
+.everforest .ts-function-macro { color: #a7c080; }
+.everforest .ts-function-method { color: #a7c080; }
+.everforest .ts-keyword-conditional { color: #e67e80; }
+.everforest .ts-keyword-coroutine { color: #e67e80; }
+.everforest .ts-keyword-debug { color: #e69875; }
+.everforest .ts-keyword-directive { color: #d699b6; }
+.everforest .ts-keyword-exception { color: #e67e80; }
+.everforest .ts-keyword-function { color: #e67e80; }
+.everforest .ts-keyword-import { color: #e67e80; }
+.everforest .ts-keyword-modifier { color: #e67e80; }
+.everforest .ts-keyword-operator { color: #e69875; }
+.everforest .ts-keyword-repeat { color: #e67e80; }
+.everforest .ts-keyword-return { color: #e67e80; }
+.everforest .ts-keyword-storage { color: #e69875; }
+.everforest .ts-keyword-type { color: #e67e80; }
+.everforest .ts-markup-emphasis { font-style: italic; }
+.everforest .ts-markup-environment { color: #83c092; }
+.everforest .ts-markup-heading { color: #e69875; font-weight: bold; }
+.everforest .ts-markup-italic { font-style: italic; }
+.everforest .ts-markup-link { color: #83c092; }
+.everforest .ts-markup-list { color: #7fbbb3; }
+.everforest .ts-markup-math { color: #7fbbb3; }
+.everforest .ts-markup-note { color: #2d353b; font-weight: bold; }
+.everforest .ts-markup-quote { color: #859289; }
+.everforest .ts-markup-raw { color: #a7c080; }
+.everforest .ts-markup-strike { color: #859289; }
+.everforest .ts-markup-strikethrough { text-decoration: line-through; }
+.everforest .ts-markup-strong { font-weight: bold; }
+.everforest .ts-markup-underline { text-decoration: underline; }
+.everforest .ts-method-call { color: #a7c080; }
+.everforest .ts-module-builtin { color: #dbbc7f; }
+.everforest .ts-number-float { color: #d699b6; }
+.everforest .ts-parameter-reference { color: #d3c6aa; }
+.everforest .ts-punctuation-bracket { color: #d3c6aa; }
+.everforest .ts-punctuation-delimiter { color: #859289; }
+.everforest .ts-punctuation-special { color: #7fbbb3; }
+.everforest .ts-storageclass-lifetime { color: #e69875; }
+.everforest .ts-string-escape { color: #a7c080; }
+.everforest .ts-string-regexp { color: #a7c080; }
+.everforest .ts-string-special { color: #dbbc7f; }
+.everforest .ts-tag-attribute { color: #a7c080; }
+.everforest .ts-tag-builtin { color: #dbbc7f; }
+.everforest .ts-tag-delimiter { color: #a7c080; }
+.everforest .ts-text-danger { color: #2d353b; font-weight: bold; }
+.everforest .ts-text-emphasis { font-style: italic; }
+.everforest .ts-text-environment { color: #83c092; }
+.everforest .ts-text-literal { color: #a7c080; }
+.everforest .ts-text-math { color: #7fbbb3; }
+.everforest .ts-text-note { color: #2d353b; font-weight: bold; }
+.everforest .ts-text-reference { color: #83c092; }
+.everforest .ts-text-strike { color: #859289; }
+.everforest .ts-text-strong { font-weight: bold; }
+.everforest .ts-text-title { color: #e69875; font-weight: bold; }
+.everforest .ts-text-todo { color: #2d353b; font-weight: bold; }
+.everforest .ts-text-underline { text-decoration: underline; }
+.everforest .ts-text-uri { color: #7fbbb3; text-decoration: underline; }
+.everforest .ts-text-warning { color: #2d353b; font-weight: bold; }
+.everforest .ts-type-builtin { color: #dbbc7f; }
+.everforest .ts-type-definition { color: #dbbc7f; }
+.everforest .ts-type-parameter { color: #dbbc7f; }
+.everforest .ts-type-qualifier { color: #e69875; }
+.everforest .ts-variable-builtin { color: #d699b6; }
+.everforest .ts-variable-member { color: #7fbbb3; }
+.everforest .ts-variable-parameter { color: #d3c6aa; }
+.everforest .ts-function-method-call { color: #a7c080; }
+.everforest .ts-keyword-conditional-ternary { color: #e67e80; }
+.everforest .ts-keyword-directive-define { color: #d699b6; }
+.everforest .ts-markup-environment-name { color: #dbbc7f; }
+.everforest .ts-markup-link-label { color: #dbbc7f; }
+.everforest .ts-markup-link-url { color: #7fbbb3; text-decoration: underline; }
+.everforest .ts-markup-list-checked { color: #a7c080; }
+.everforest .ts-markup-list-unchecked { color: #859289; }
+.everforest .ts-markup-raw-block { color: #a7c080; }
+.everforest .ts-string-special-path { color: #dbbc7f; }
+.everforest .ts-string-special-symbol { color: #d3c6aa; }
+.everforest .ts-string-special-uri { color: #7fbbb3; text-decoration: underline; }
+.everforest .ts-string-special-url { text-decoration: underline; }
+.everforest .ts-text-diff-add { color: #a7c080; }
+.everforest .ts-text-diff-delete { color: #e67e80; }
+.everforest .ts-text-environment-name { color: #dbbc7f; }
+.everforest .ts-text-todo-checked { color: #a7c080; font-weight: normal; }
+.everforest .ts-text-todo-unchecked { color: #859289; font-weight: normal; }
+.everforest .ts-variable-parameter-builtin { color: #dbbc7f; }
+.everforest code[data-language="yaml"] .ts-boolean { color: #e69875; }
+.everforest code[data-language="lua"] .ts-constructor { color: #d3c6aa; }
+.everforest code[data-language="tsx"] .ts-constructor { color: #dbbc7f; }
+.everforest code[data-language="yaml"] .ts-field { color: #a7c080; }
+.everforest code[data-language="go"] .ts-include { color: #d699b6; }
+.everforest code[data-language="javascript"] .ts-include { color: #d699b6; }
+.everforest code[data-language="typescript"] .ts-include { color: #d699b6; }
+.everforest code[data-language="json"] .ts-label { color: #a7c080; }
+.everforest code[data-language="go"] .ts-module { color: #d3c6aa; }
+.everforest code[data-language="go"] .ts-namespace { color: #d3c6aa; }
+.everforest code[data-language="toml"] .ts-property { color: #a7c080; }
+.everforest code[data-language="json"] .ts-string { color: #d3c6aa; }
+.everforest code[data-language="regex"] .ts-string { color: #a7c080; }
+.everforest code[data-language="toml"] .ts-string { color: #d3c6aa; }
+.everforest code[data-language="yaml"] .ts-string { color: #d3c6aa; }
+.everforest code[data-language="gitcommit"] .ts-text { color: #d3c6aa; }
+.everforest code[data-language="html"] .ts-text { color: #d3c6aa; }
+.everforest code[data-language="go"] .ts-constant-builtin { color: #83c092; }
+.everforest code[data-language="yaml"] .ts-constant-builtin { color: #e69875; }
+.everforest code[data-language="javascript"] .ts-keyword-import { color: #d699b6; }
+.everforest code[data-language="tsx"] .ts-keyword-import { color: #d699b6; }
+.everforest code[data-language="typescript"] .ts-keyword-import { color: #d699b6; }
+.everforest code[data-language="tsx"] .ts-punctuation-special { color: #e69875; }
+.everforest code[data-language="typescript"] .ts-punctuation-special { color: #e69875; }
+.everforest code[data-language="json"] .ts-string-escape { color: #dbbc7f; }
+.everforest code[data-language="yaml"] .ts-string-escape { color: #dbbc7f; }
+.everforest code[data-language="markdown"] .ts-markup-heading-1 { color: #e67e80; font-weight: bold; }
+.everforest code[data-language="markdown"] .ts-markup-heading-2 { color: #e69875; font-weight: bold; }
+.everforest code[data-language="markdown"] .ts-markup-heading-3 { color: #dbbc7f; font-weight: bold; }
+.everforest code[data-language="markdown"] .ts-markup-heading-4 { color: #a7c080; font-weight: bold; }
+.everforest code[data-language="markdown"] .ts-markup-heading-5 { color: #7fbbb3; font-weight: bold; }
+.everforest code[data-language="markdown"] .ts-markup-heading-6 { color: #d699b6; font-weight: bold; }
+.everforest code[data-language="vimdoc"] .ts-markup-heading-1-delimiter { color: #2d353b; font-weight: normal; }
+.everforest code[data-language="markdown"] .ts-markup-heading-1-marker { color: #859289; font-weight: normal; }
+.everforest code[data-language="vimdoc"] .ts-markup-heading-2-delimiter { color: #2d353b; font-weight: normal; text-decoration: underline; }
+.everforest code[data-language="markdown"] .ts-markup-heading-2-marker { color: #859289; font-weight: normal; }
+.everforest code[data-language="markdown"] .ts-markup-heading-3-marker { color: #859289; font-weight: normal; }
+.everforest code[data-language="markdown"] .ts-markup-heading-4-marker { color: #859289; font-weight: normal; }
+.everforest code[data-language="markdown"] .ts-markup-heading-5-marker { color: #859289; font-weight: normal; }
+.everforest code[data-language="markdown"] .ts-markup-heading-6-marker { color: #859289; font-weight: normal; }

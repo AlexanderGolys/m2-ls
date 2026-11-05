@@ -1,5 +1,5 @@
 //! The init file end to end: the file every document starts with, as
-//! `sources.initFile` selects it, the `-- m2-ls: initFile …` directive
+//! `initialization.files` selects it, the `-- m2-ls: initFile …` directive
 //! selecting another or none, and what the server reports when one cannot be
 //! read or parsed.
 
@@ -20,13 +20,18 @@ const INIT_FILE: &str = "needsPackage \"JSON\"\ninitHelper = x -> x + 1\n";
 const USES_INIT_FILE: &str = "y = initHelper 3\nz = toJSON 1\n";
 
 /// Start a server for the workspace `root` with `initFile` as
-/// `sources.initFile`, completing the initialization.
+/// `initialization.files`, completing the initialization.
 async fn start(root: &TestWorkspace, init_file: Value) -> LspProcess {
     let mut server = LspProcess::spawn().await;
+    let files = match init_file {
+        Value::Bool(false) => json!([]),
+        Value::Bool(true) => json!(["${applicationDirectory}/init.m2"]),
+        path => json!([path]),
+    };
     server
         .initialize_with_options(
             &root.root_uri(),
-            json!({ "sources": { "initFile": init_file } }),
+            json!({ "initialization": { "files": files } }),
         )
         .await;
     server.notify("initialized", json!({})).await;
@@ -277,7 +282,7 @@ async fn a_configured_init_file_that_cannot_be_read_is_reported_once() {
     let message = server.wait_for_notification("window/showMessage").await;
     let text = message["params"]["message"].as_str().expect("a message");
     assert!(text.contains("there is no init file"), "{text}");
-    assert!(text.contains("sources.initFile"), "{text}");
+    assert!(text.contains("initialization.files"), "{text}");
 
     server.shutdown().await;
 }
@@ -309,5 +314,47 @@ async fn an_init_file_changed_on_disk_restarts_the_sessions_starting_with_it() {
         .await
         .contains(&init_uri));
 
+    server.shutdown().await;
+}
+
+/// The initialization list supplies every file's globals and watches each file.
+#[tokio::test]
+async fn initialization_files_share_globals_and_reload_each_selected_file() {
+    let workspace = TestWorkspace::new("");
+    let first = workspace.write_file("first.m2", "firstHelper = x -> x\n");
+    let second = workspace.write_file("second.m2", "secondHelper = x -> x\n");
+    let mut server = LspProcess::spawn().await;
+    server
+        .initialize_with_options(
+            &workspace.root_uri(),
+            json!({
+                "initialization": {"files": ["first.m2", "second.m2"]},
+                "macaulay2": {"runtimeDiscovery": false},
+                "sources": {"enabled": false}
+            }),
+        )
+        .await;
+    server.notify("initialized", json!({})).await;
+    diagnostics_for(&mut server, &second).await;
+    let source = "a = firstHelper 1\nb = secondHelper 2\n";
+    let uri = workspace.write_file("uses.m2", source);
+    open(&mut server, &uri, source).await;
+    assert!(definition(&mut server, &uri, source, "firstHelper")
+        .await
+        .contains(&first));
+    assert!(definition(&mut server, &uri, source, "secondHelper")
+        .await
+        .contains(&second));
+    workspace.write_file("first.m2", "replacementHelper = x -> x\n");
+    server
+        .notify(
+            "workspace/didChangeWatchedFiles",
+            json!({"changes": [{"uri": first, "type": 2}]}),
+        )
+        .await;
+    diagnostics_for(&mut server, &uri).await;
+    assert!(!definition(&mut server, &uri, source, "firstHelper")
+        .await
+        .contains(&first));
     server.shutdown().await;
 }

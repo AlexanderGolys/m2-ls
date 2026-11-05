@@ -453,6 +453,49 @@ UNAVAILABLE_INIT_FILE {
         severity: WARNING,
     }
 
+    /// Repeated positive class tests on a function parameter in an else-if chain.
+    /// At least two distinct classes must have branches beyond a bare error call.
+    /// Prefer method specializations so additional classes can add behavior.
+    ///
+    /// ```m2
+    /// renderLabel = x -> if instance(x, String) then x else if instance(x, ZZ) then toString x else "other"
+    /// ```
+MANUAL_TYPE_DISPATCH {
+        code: "E19",
+        name: "manual-type-dispatch",
+        severity: WARNING,
+    }
+
+    /// A list-family inheritance test combined with a fixed length above one.
+    /// Named hash-table fields better describe a record's structure.
+    ///
+    /// ```m2
+    /// validateTask = task -> if not instance(task, VisibleList) or #task != 2 then error "task needs two fields"
+    /// ```
+LIST_RECORD_SHAPE {
+        code: "E20",
+        name: "list-record-shape",
+        severity: WARNING,
+    }
+
+    /// More than three quarters of a local method's installations explicitly
+    /// annotate one result type, with at least five effective installations.
+    /// Prefer one `TypicalValue` in the constructor and retain differing overrides.
+    ///
+    /// ```m2
+    /// renderLabel = method()
+    /// renderLabel String := String => x -> x
+    /// renderLabel ZZ := String => x -> toString x
+    /// renderLabel List := String => x -> toString x
+    /// renderLabel Boolean := String => x -> toString x
+    /// renderLabel Nothing := String => x -> ""
+    /// ```
+SHARED_METHOD_CODOMAIN {
+        code: "S07",
+        name: "shared-method-codomain",
+        severity: HINT,
+    }
+
     /// A method call whose argument types cannot match any known domain.
     ///
     /// ```m2

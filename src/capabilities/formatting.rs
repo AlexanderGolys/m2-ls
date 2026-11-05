@@ -3654,6 +3654,7 @@ mod tests {
     fn leading_keywords_keep_bodies_after_their_keyword() {
         let options = settings_options(FormattingSettings {
             control_flow_layout: ControlFlowLayout::LeadingKeywords,
+            use_tabs: Some(false),
             ..FormattingSettings::default()
         });
         assert_eq!(
@@ -3673,6 +3674,7 @@ mod tests {
                 text,
                 &settings_options(FormattingSettings {
                     space_in_braces,
+                    use_tabs: Some(false),
                     ..FormattingSettings::default()
                 }),
             )
@@ -3699,6 +3701,7 @@ mod tests {
         );
         let options = settings_options(FormattingSettings {
             keep_line_breaks: true,
+            use_tabs: Some(false),
             control_flow_layout: ControlFlowLayout::Multiline,
             break_after_semicolon: true,
             hard_line_width: Some(10),

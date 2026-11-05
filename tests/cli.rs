@@ -23,6 +23,8 @@ impl Workspace {
 
     fn run(&self, binary: &str, args: &[&str], stdin: &str) -> Output {
         let mut child = Command::new(binary)
+            .env("M2_LS_USAGE_LOG", "off")
+            .env("M2_LS_LOG", "off")
             .args(args)
             .current_dir(&self.0)
             .env("HOME", &self.0)
@@ -100,6 +102,8 @@ fn formatter_and_linter_remain_usable_without_a_catalog() {
     fs::write(&source, "x=1+2\n").unwrap();
     let missing = workspace.0.join("missing-catalog.jsonl");
     let formatted = Command::new(FMT)
+        .env("M2_LS_USAGE_LOG", "off")
+        .env("M2_LS_LOG", "off")
         .args(["--stdout", source.to_str().unwrap()])
         .env("M2_LS_CATALOG", &missing)
         .output()
@@ -107,6 +111,8 @@ fn formatter_and_linter_remain_usable_without_a_catalog() {
     assert!(formatted.status.success(), "{formatted:?}");
     assert!(!formatted.stdout.is_empty());
     let linted = Command::new(LINT)
+        .env("M2_LS_USAGE_LOG", "off")
+        .env("M2_LS_LOG", "off")
         .arg(&source)
         .env("M2_LS_CATALOG", &missing)
         .output()
@@ -264,7 +270,7 @@ fn lint_warning_policy_and_formatter_configuration() {
     );
     fs::write(
         workspace.0.join("settings.json"),
-        r#"{"diagnostics":{"disabled":["X03"]},"formatting":{"indent":2}}"#,
+        r#"{"diagnostics":{"disabled":["X03"]},"formatting":{"indent":2,"useTabs":false}}"#,
     )
     .unwrap();
     assert!(workspace
@@ -296,5 +302,52 @@ fn formatter_leaves_invalid_source_untouched() {
     assert_eq!(
         fs::read_to_string(workspace.0.join("a.m2")).unwrap(),
         invalid
+    );
+}
+
+/// The grouped TOML configuration is accepted by both standalone tools.
+#[test]
+fn grouped_toml_configuration_controls_formatting_and_diagnostic_emission() {
+    let workspace = Workspace::new();
+    fs::write(
+        workspace.0.join("settings.toml"),
+        include_str!("fixtures/configuration.toml"),
+    )
+    .unwrap();
+    let formatted = workspace.run(
+        FMT,
+        &["--config", "settings.toml", "-"],
+        "f = x -> (\nx+1\n)\n",
+    );
+    assert!(formatted.status.success(), "{formatted:?}");
+    assert!(
+        String::from_utf8_lossy(&formatted.stdout).contains("\tx + 1"),
+        "{formatted:?}"
+    );
+    fs::write(
+        workspace.0.join("settings.toml"),
+        "[diagnostics.emitAs]\nerror = [\"unused-binding\"]\n[initialization]\nfiles = []\n",
+    )
+    .unwrap();
+    let linted = workspace.run(
+        LINT,
+        &["--config", "settings.toml", "-"],
+        "f = () -> (unused := 1; 2)\n",
+    );
+    assert_eq!(linted.status.code(), Some(1), "{linted:?}");
+    assert!(
+        String::from_utf8_lossy(&linted.stdout).contains("error["),
+        "{linted:?}"
+    );
+    fs::write(workspace.0.join("settings.toml"), "[diagnostics.emitAs]\nfixActionOnly = [\"unused-binding\"]\n[initialization]\nfiles = []\n").unwrap();
+    let hidden = workspace.run(
+        LINT,
+        &["--config", "settings.toml", "-"],
+        "f = () -> (unused := 1; 2)\n",
+    );
+    assert!(hidden.status.success(), "{hidden:?}");
+    assert!(
+        !String::from_utf8_lossy(&hidden.stdout).contains("unused-binding"),
+        "{hidden:?}"
     );
 }

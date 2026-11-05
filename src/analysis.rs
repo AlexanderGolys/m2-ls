@@ -1561,6 +1561,24 @@ impl Analysis {
             .collect()
     }
 
+    /// Source operator installations applicable to the inferred operand tuple.
+    pub fn operator_call_installations<'a>(
+        &'a self,
+        operator: &Operator,
+        arguments: &[InferredType],
+        position: Position,
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Vec<&'a MethodInstallation> {
+        let Some(function) = self.registry.operator_functions.get(operator) else {
+            return Vec::new();
+        };
+        TypeChecker::new(self, knowledge)
+            .local_call_candidate_installation_ids(function, arguments, position, knowledge)
+            .into_iter()
+            .filter_map(|id| self.method_installation(id))
+            .collect()
+    }
+
     /// Infers an expression's single result class, when one is known.
     pub fn infer_expression_static_type(
         &self,

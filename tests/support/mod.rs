@@ -38,6 +38,8 @@ impl LspProcess {
         // Keep discovery independent of the machine running the tests.
         let mut command = Command::new(env!("CARGO_BIN_EXE_m2-ls"));
         command.env_clear();
+        command.env("M2_LS_USAGE_LOG", "off");
+        command.env("M2_LS_LOG", "off");
         if let Some(catalog) = catalog {
             command.env("M2_LS_CATALOG", catalog);
         }
@@ -70,7 +72,7 @@ impl LspProcess {
     pub(crate) async fn initialize(&mut self, root_uri: &str) -> Value {
         self.initialize_with_options(
             root_uri,
-            json!({ "inlayHints": base_inlay_hint_settings() }),
+            json!({ "inlayHints": base_inlay_hint_settings(), "formatting": {"indent": null, "useTabs": null} }),
         )
         .await
     }
@@ -330,7 +332,13 @@ fn base_inlay_hint_settings() -> Value {
     json!({
         "everywhere": true,
         "showThing": true,
-        "maxLabelLength": null
+        "maxLabelLength": null,
+        "afterCall": false,
+        "afterReturn": true,
+        "afterBrackets": false,
+        "argNames": false,
+        "showRepeated": false,
+        "hide": {"trivial": false, "sequential": false, "operatorCalls": false, "calls": []}
     })
 }
 

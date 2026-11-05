@@ -1,0 +1,83 @@
+[catalog]
+enabled = true
+version = "0.1.*"
+
+[diagnostics]
+enabled = true
+disabled = []
+
+[diagnostics.emitAs]
+error = []
+warning = []
+info = []
+hint = []
+fixActionOnly = []
+
+
+[formatting]
+indent = 4
+useTabs = true
+softWrapWidth = 78
+hardLineWidth = 90
+controlFlowLayout = "multilineCompactElse"
+compactFactorOperators = true
+breakAfterSemicolon = false
+keepLineBreaks = false
+
+
+[inlayHints]
+argTypes = false
+everywhere = false
+
+[inlayHints.argNames]
+enabled = true
+requireBracket = true
+ignoreVariadic = true
+maxLength = 15
+
+[inlayHints.types]
+enabled = true
+after = {
+    call = true,
+    endOfLine = true,
+    endOfCell = true,
+    assignment = true,
+    brackets = ["parentheses"], # "array" | "list" | "angle bar" | "holder"
+    return = false
+}
+
+[inlayHints.hide]
+types = ["Thing", "Nothing"]
+calls = ["toString", "net", "toList"]
+literal = true
+trivial = true
+sequential = true
+operatorCalls = true
+
+[semanticTokens]
+standardOnly = false
+defaultLibrary = ["CompiledFunction"]
+
+
+# These paths are discovered automatically. Uncomment an override only when
+# discovery misses an installation or a source checkout.
+[macaulay2]
+runtimeDiscovery = true
+ # executable = "/path/to/M2"
+# prefix = "/path/to/installation"
+# applicationDirectory = "~/.Macaulay2"
+
+# Discovery may query M2; the server also works without a usable executable.
+
+[sources]
+enabled = true
+
+# Additional package directories, in search order. These can be used without M2.
+packagePaths = []
+
+# Core sources are discovered automatically and have special analysis rules.
+corePath = "auto"
+primaryCodePaths = []
+
+[initialization]
+files = ["${applicationDirectory}/init.m2"]

@@ -110,15 +110,32 @@ impl LibraryIndex {
             serde_json::json!({"packages": packages.iter().map(ObjectName::name).collect::<Vec<_>>()}),
         );
         let _indexing = self.indexing.lock().await;
+        let started = std::time::Instant::now();
+        let mut advanced = false;
         drop(queue_timing);
         for name in packages {
             let Some(package) = self.package(&name, true) else {
                 continue;
             };
+            advanced |= package.has_pending_files();
             let registry = self.registry.clone();
             task::spawn_blocking(move || package.index_next_file(&registry))
                 .await
                 .expect("library indexing task panicked");
+        }
+        if advanced {
+            let packages = self.packages.lock().expect("library cache lock");
+            let indexed_files = packages
+                .values()
+                .map(|package| package.sources.indexed_file_uris().len())
+                .sum::<usize>();
+            crate::usage_log::record(
+                "indexing",
+                serde_json::json!({
+                    "scope": "library", "packages": packages.len(), "indexed_files": indexed_files,
+                    "duration_ms": started.elapsed().as_secs_f64() * 1000.0,
+                }),
+            );
         }
     }
 

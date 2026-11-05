@@ -1,7 +1,7 @@
 //! Bounded structured diagnostics and timings, independent of the LSP stream.
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,7 +36,7 @@ struct Logger {
 /// Mutable file, byte count, and accumulated operation statistics behind the logger lock.
 struct LogState {
     /// Open log file, absent when logging could not be initialized.
-    file: Option<File>,
+    file: Option<Box<dyn Write + Send>>,
     /// Bytes already written to the current log file, used to decide when to rotate.
     bytes: u64,
     /// Accumulated timings grouped by operation name.
@@ -56,8 +56,12 @@ struct Statistics {
     maximum_ms: f64,
 }
 
-/// Initializes the process logger once from the logging environment setting.
-fn logger() -> &'static Logger {
+/// Enable operational logging only at an executable entry point.
+/// Tests and subprocesses using `M2_LS_LOG=off` never install a file writer.
+pub fn enable() {
+    if cfg!(test) || std::env::var_os("M2_LS_LOG").is_some_and(|value| value == "off") {
+        return;
+    }
     LOGGER.get_or_init(|| {
         let setting = std::env::var_os("M2_LS_LOG");
         let path = setting
@@ -65,7 +69,12 @@ fn logger() -> &'static Logger {
             .filter(|value| *value != "1" && *value != "true" && !value.is_empty())
             .map_or_else(|| PathBuf::from("/tmp/m2-ls.log"), PathBuf::from);
         Logger::new(path, setting.is_some())
-    })
+    });
+}
+
+/// The writer, if a real executable enabled operational logging.
+fn logger() -> Option<&'static Logger> {
+    LOGGER.get()
 }
 
 impl Logger {
@@ -84,6 +93,11 @@ impl Logger {
         }
     }
 
+    /// Whether the next row would exceed the current file size limit.
+    fn needs_rotation(bytes: u64, incoming: usize) -> bool {
+        bytes.saturating_add(incoming as u64) > MAX_LOG_BYTES
+    }
+
     /// Writes a structured log event, rotating the file at the configured size bound.
     fn write(&self, state: &mut LogState, event: Value) {
         let row = json!({
@@ -96,7 +110,7 @@ impl Logger {
             return;
         };
         row.push(b'\n');
-        if state.bytes.saturating_add(row.len() as u64) > MAX_LOG_BYTES {
+        if Self::needs_rotation(state.bytes, row.len()) {
             state.file.take();
             let backup = self.path.with_extension("log.1");
             if fs::rename(&self.path, backup).is_err() && self.path.exists() {
@@ -109,7 +123,8 @@ impl Logger {
                 .create(true)
                 .append(true)
                 .open(&self.path)
-                .ok();
+                .ok()
+                .map(|file| Box::new(file) as Box<dyn Write + Send>);
         }
         if let Some(file) = &mut state.file {
             if file.write_all(&row).is_ok() {
@@ -198,8 +213,8 @@ impl Timing {
     pub fn start(operation: &'static str, mut fields: Value) -> Self {
         let id = NEXT_SPAN.fetch_add(1, Ordering::Relaxed);
         fields["span_id"] = json!(id);
-        if logger().verbose {
-            logger().event(json!({"operation": operation, "phase": "start", "fields": fields}));
+        if let Some(logger) = logger().filter(|logger| logger.verbose) {
+            logger.event(json!({"operation": operation, "phase": "start", "fields": fields}));
         }
         Self {
             operation,
@@ -223,7 +238,8 @@ impl Timing {
 
 impl Drop for Timing {
     fn drop(&mut self) {
-        logger().complete(
+        let Some(logger) = logger() else { return };
+        logger.complete(
             self.operation,
             std::mem::take(&mut self.fields),
             self.started.elapsed(),
@@ -234,12 +250,14 @@ impl Drop for Timing {
 
 /// Records a structured event without writing to the protocol stream.
 pub fn event(event: Value) {
-    logger().event(event);
+    if let Some(logger) = logger() {
+        logger.event(event);
+    }
 }
 
 /// Writes accumulated operation counts and duration statistics.
 pub fn summary() {
-    let logger = logger();
+    let Some(logger) = logger() else { return };
     let mut state = logger
         .state
         .lock()
@@ -250,12 +268,27 @@ pub fn summary() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    /// Test output retained only in memory, never appended to usage or operational files.
+    struct MemoryOutput(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for MemoryOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn errors_keep_request_context_and_statistics_without_verbose_logging() {
-        let path =
-            std::env::temp_dir().join(format!("m2-ls-telemetry-{}.jsonl", std::process::id()));
-        let logger = Logger::new(path.clone(), false);
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = Logger::new(PathBuf::new(), false);
+        logger.state.lock().unwrap().file = Some(Box::new(MemoryOutput(output.clone())));
         logger.complete(
             "rpc",
             json!({"method": "textDocument/definition", "request_id": 7,
@@ -267,8 +300,8 @@ mod tests {
             let mut state = logger.state.lock().unwrap();
             logger.summary(&mut state);
         }
-        let rows = fs::read_to_string(&path)
-            .unwrap()
+        let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let rows = text
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
@@ -279,32 +312,17 @@ mod tests {
             "rpc:textDocument/definition"
         );
         assert_eq!(rows[1]["event"]["statistics"][0]["count"], 1);
-        drop(logger);
-        fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn log_rotation_keeps_only_the_current_file_and_one_backup() {
-        let path =
-            std::env::temp_dir().join(format!("m2-ls-log-rotation-{}.jsonl", std::process::id()));
-        let logger = Logger::new(path.clone(), false);
-        for sequence in 0..3 {
-            let mut state = logger.state.lock().unwrap();
-            state.bytes = MAX_LOG_BYTES;
-            logger.write(&mut state, json!({"sequence": sequence}));
-        }
-        let current: Value =
-            serde_json::from_str(fs::read_to_string(&path).unwrap().trim()).unwrap();
-        let backup: Value = serde_json::from_str(
-            fs::read_to_string(path.with_extension("log.1"))
-                .unwrap()
-                .trim(),
-        )
-        .unwrap();
-        assert_eq!(current["event"]["sequence"], 2);
-        assert_eq!(backup["event"]["sequence"], 1);
-        drop(logger);
-        fs::remove_file(&path).unwrap();
-        fs::remove_file(path.with_extension("log.1")).unwrap();
+    fn rotation_starts_only_when_the_next_row_exceeds_the_limit() {
+        assert!(!Logger::needs_rotation(MAX_LOG_BYTES - 1, 1));
+        assert!(Logger::needs_rotation(MAX_LOG_BYTES, 1));
+    }
+
+    #[test]
+    fn tests_cannot_enable_operational_logging() {
+        enable();
+        assert!(logger().is_none());
     }
 }

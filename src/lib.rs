@@ -17,11 +17,10 @@
 use std::backtrace::Backtrace;
 use std::collections::HashMap;
 use std::env;
-use std::ffi::OsStr;
 use std::fs;
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use dashmap::{DashMap, DashSet};
@@ -71,6 +70,7 @@ mod telemetry;
 #[cfg(test)]
 mod test_support;
 mod typesystem;
+mod usage_log;
 mod workspace_index;
 
 use capabilities::code_actions::available_code_actions;
@@ -115,7 +115,7 @@ use crate::diagnostics::DiagnosticCode;
 use crate::object_hierarchy::{HierarchySnapshot, WorkspaceHierarchy};
 use crate::object_registry::ObjectRegistry;
 use crate::semantic_token::M2SemanticToken;
-use crate::settings::{ServerSettings, SettingProblem, SettingsStore, SourceSettings};
+use crate::settings::{ServerSettings, SettingProblem, SettingsStore};
 use crate::workspace_index::{
     WorkspaceDefinitionKnowledge, WorkspaceIndex, WorkspaceSymbolKnowledge, WorkspaceView,
 };
@@ -129,7 +129,7 @@ struct Backend {
     client: Client,
     /// The builtin catalog with the default packages loaded, which every
     /// session starts from; init files are added per document.
-    registry: ObjectRegistry,
+    registry: OnceLock<ObjectRegistry>,
     /// Where the Macaulay2 installation, the user's application directory and
     /// the server's source override are.
     environment: Macaulay2Environment,
@@ -163,12 +163,11 @@ struct Backend {
 }
 
 impl Backend {
-    /// The state of a session with `client`, its catalog read from `corpus`,
-    /// before the client sends its settings.
-    fn new(client: Client, corpus: &str) -> Self {
+    /// Session state before initialization selects the optional catalog.
+    fn new(client: Client) -> Self {
         let environment = Macaulay2Environment::current();
-        let registry = ObjectRegistry::load(corpus);
-        let library = configured_library(&environment, &registry, &SourceSettings::default());
+        let registry = ObjectRegistry::load("");
+        let library = configured_library(&environment, &registry, &ServerSettings::default());
         let workspace_index = Arc::new(WorkspaceIndex::default());
         if !registry.has_catalog() {
             workspace_index.configure_fallback_sources(Some(library.source_resolver().clone()));
@@ -176,7 +175,7 @@ impl Backend {
         Backend {
             client,
             library: SettingsStore::new(library),
-            registry,
+            registry: OnceLock::new(),
             environment,
             documents: DashMap::new(),
             document_versions: DashMap::new(),
@@ -189,6 +188,11 @@ impl Backend {
             init_files: InitFiles::default(),
             workspace_folders: DashSet::new(),
         }
+    }
+
+    /// Registry selected during initialization, before document analysis begins.
+    fn registry(&self) -> &ObjectRegistry {
+        self.registry.get_or_init(|| ObjectRegistry::load(""))
     }
 
     /// The open workspace folders on disk.
@@ -210,7 +214,7 @@ impl Backend {
             };
             let loaded =
                 self.workspace_index
-                    .index_snapshot(&loader, document.value(), &self.registry);
+                    .index_snapshot(&loader, document.value(), self.registry());
             drop(document);
             self.index_loaded_in_background(loaded).await;
             if let Some(document) = self.documents.get(&loader) {
@@ -241,7 +245,7 @@ impl Backend {
                 self.workspace_index.index_snapshot(
                     document.key(),
                     document.value(),
-                    &self.registry,
+                    self.registry(),
                 )
             })
             .collect();
@@ -460,16 +464,15 @@ impl Backend {
                 .and_then(|indexed| indexed.package_context.clone());
             snapshots.insert(document.key().clone(), snapshot);
         }
-        WorkspaceHierarchy::new(snapshots, &self.registry)
+        WorkspaceHierarchy::new(snapshots, self.registry())
     }
 
     /// Point library navigation at the sources `sources` configures.
-    fn configure_library(&self, sources: &SourceSettings) {
-        let library = configured_library(&self.environment, &self.registry, sources);
-        if !self.registry.has_catalog() {
-            self.workspace_index
-                .configure_fallback_sources(Some(library.source_resolver().clone()));
-        }
+    fn configure_library(&self, settings: &ServerSettings) {
+        let library = configured_library(&self.environment, self.registry(), settings);
+        self.workspace_index.configure_fallback_sources(
+            (!self.registry().has_catalog()).then(|| library.source_resolver().clone()),
+        );
         self.library.replace(library);
     }
 
@@ -500,12 +503,12 @@ impl Backend {
         properties: FileProperties,
     ) -> ObjectRegistry {
         if properties.primary_code {
-            return self.registry.clone();
+            return self.registry().clone();
         }
         let start = self
             .init_files
-            .start_for(uri, directive, &self.environment, &self.registry);
-        self.registry.with_init_file(start)
+            .start_for(uri, directive, &self.environment, self.registry());
+        self.registry().with_init_file(start)
     }
 
     /// The registry the session of `document`, at `uri`, starts with as the
@@ -517,7 +520,7 @@ impl Backend {
     /// The registry the files the documents load are analyzed with: they
     /// run in sessions starting with the configured init file.
     fn workspace_registry(&self) -> ObjectRegistry {
-        self.registry.with_init_file(self.init_files.configured())
+        self.registry().with_init_file(self.init_files.configured())
     }
 
     /// Start the session of each open document again where it should start
@@ -530,7 +533,7 @@ impl Backend {
             let registry = self.document_session_registry(&uri, document.value());
             if document.restart_session(&registry) {
                 self.workspace_index
-                    .index_snapshot(&uri, document.value(), &self.registry);
+                    .index_snapshot(&uri, document.value(), self.registry());
                 restarted.push(uri);
             }
         }
@@ -546,17 +549,16 @@ impl Backend {
     /// Select the init file the documents without a directive start with,
     /// as `sources` configures it, and start their sessions again with it.
     /// Returns whether it changed.
-    async fn configure_init_file(&self, sources: &SourceSettings) -> bool {
+    async fn configure_init_file(&self, settings: &ServerSettings) -> bool {
         let previous_files = self.init_files.files();
         let previous = self.init_files.configured();
         let workspace_folder = self.workspace_folder_paths().into_iter().next();
-        let replaced = match InitFiles::locate(
-            &sources.init_file,
-            sources.enabled,
+        let replaced = match InitFiles::locate_settings(
+            settings,
             workspace_folder.as_deref(),
             &self.environment,
         ) {
-            Ok(location) => self.init_files.configure(location, &self.registry),
+            Ok(location) => self.init_files.configure(location, self.registry()),
             Err(problem) => self.init_files.configure_unavailable(problem),
         };
         if replaced.is_none() {
@@ -578,7 +580,7 @@ impl Backend {
                     MessageType::WARNING,
                     format!(
                         "m2-ls analyzes every document without an init file: {problem}. \
-                         Set `sources.initFile` to a readable file, or to `false`."
+                         Set `initialization.files` to readable files, or to `[]`."
                     ),
                 )
                 .await;
@@ -590,7 +592,7 @@ impl Backend {
     async fn reload_init_file(&self, path: &Path) {
         let previous_files = self.init_files.files();
         let previous = self.init_files.configured();
-        if !self.init_files.reload(path, &self.registry) {
+        if !self.init_files.reload(path, self.registry()) {
             return;
         }
         self.report_configured_init_file(&previous).await;
@@ -628,7 +630,7 @@ impl Backend {
     /// Index the init file `start` reads and publish its diagnostics, if no
     /// session started with it before.
     async fn adopt_started_init_file(&self, start: &InitFileStart) {
-        if let Some(init_file) = start.file() {
+        for init_file in start.files() {
             if !self.workspace_index.is_init_file(init_file.uri()) {
                 self.adopt_init_file(init_file).await;
             }
@@ -646,7 +648,7 @@ impl Backend {
         let loaded = self.workspace_index.index_snapshot(
             init_file.uri(),
             init_file.snapshot(),
-            &self.registry,
+            self.registry(),
         );
         self.index_loaded_in_background(loaded).await;
         self.publish_init_file_diagnostics(init_file).await;
@@ -678,7 +680,8 @@ impl Backend {
                 || DiagnosticCode::from_lsp(diagnostic)
                     .is_some_and(DiagnosticCode::is_parse_failure)
         })
-        .collect();
+        .collect::<Vec<_>>();
+        usage_log::diagnostics(init_file.uri(), init_file.snapshot().text(), &diagnostics);
         self.client
             .publish_diagnostics(init_file.uri().clone(), diagnostics, None)
             .await;
@@ -706,21 +709,22 @@ impl Backend {
         let Some(location) = self.init_files.configured_location() else {
             return;
         };
-        let path = location.path();
-        let (Some(base), Some(name)) = (
-            path.parent()
-                .and_then(|directory| Url::from_directory_path(directory).ok()),
-            path.file_name().and_then(OsStr::to_str),
-        ) else {
-            return;
-        };
+        let watchers = location
+            .paths()
+            .into_iter()
+            .filter_map(|path| {
+                let base = Url::from_directory_path(path.parent()?).ok()?;
+                let name = path.file_name()?.to_str()?;
+                Some(serde_json::json!({"globPattern": {"baseUri": base, "pattern": name}}))
+            })
+            .collect::<Vec<_>>();
         let _ = self
             .client
             .register_capability(vec![Registration {
                 id: ID.to_string(),
                 method: METHOD.to_string(),
                 register_options: Some(serde_json::json!({
-                    "watchers": [{ "globPattern": { "baseUri": base, "pattern": name } }]
+                    "watchers": watchers
                 })),
             }])
             .await;
@@ -774,11 +778,19 @@ impl Backend {
               + ?Sized),
     ) -> Result<()> {
         let previous = self.settings.replace(settings.clone());
+        if previous.catalog != settings.catalog {
+            self.client
+                .log_message(MessageType::WARNING, "Changing catalog settings requires a server restart; set it in initializationOptions.")
+                .await;
+        }
         let mut reanalyzed = false;
-        if previous.sources != settings.sources {
-            self.configure_library(&settings.sources);
+        if previous.sources != settings.sources
+            || previous.macaulay2 != settings.macaulay2
+            || previous.initialization != settings.initialization
+        {
+            self.configure_library(&settings);
             reanalyzed = self.imply_document_properties();
-            if self.configure_init_file(&settings.sources).await {
+            if self.configure_init_file(&settings).await {
                 reanalyzed = true;
                 self.watch_init_file().await;
             }
@@ -803,6 +815,9 @@ impl Backend {
                 })
                 .collect::<Vec<_>>();
             for (uri, diagnostics) in diagnostics {
+                if let Some(document) = self.documents.get(&uri) {
+                    usage_log::diagnostics(&uri, document.text(), &diagnostics);
+                }
                 self.client
                     .publish_diagnostics(uri, diagnostics, None)
                     .await;
@@ -846,7 +861,7 @@ impl Backend {
         let started = document.object_registry().init_file().clone();
         let loaded = self
             .workspace_index
-            .index_snapshot(&uri, &document, &self.registry);
+            .index_snapshot(&uri, &document, self.registry());
         self.document_versions.insert(uri.clone(), params.version);
         self.documents.insert(uri.clone(), document);
         self.index_loaded_in_background(loaded).await;
@@ -888,9 +903,9 @@ impl Backend {
                     .package_of_source_file(&path)
                     .is_some()
             });
-            if !library_file || !self.registry.has_catalog() {
+            if !library_file || !self.registry().has_catalog() {
                 self.workspace_index
-                    .index_snapshot(&uri, document.value(), &self.registry);
+                    .index_snapshot(&uri, document.value(), self.registry());
             }
             document.object_registry().init_file().clone()
         };
@@ -962,7 +977,7 @@ impl Backend {
             }
             let loaded = self
                 .workspace_index
-                .index_snapshot(&uri, &saved, &self.registry);
+                .index_snapshot(&uri, &saved, self.registry());
             document.insert(saved);
             loaded
         };
@@ -1073,12 +1088,41 @@ impl LanguageServer for Backend {
         self.inlay_hint_refresh.negotiate(&params.capabilities);
         self.semantic_tokens_refresh.negotiate(&params.capabilities);
 
-        if let Some(options) = params.initialization_options.as_ref() {
-            let parsed = ServerSettings::from_value(options);
-            self.configure_library(&parsed.settings.sources);
-            self.settings.replace(parsed.settings);
-            self.report_setting_problems(&parsed.problems).await;
-        }
+        let parsed = ServerSettings::from_value(
+            params
+                .initialization_options
+                .as_ref()
+                .unwrap_or(&serde_json::Value::Null),
+        );
+        let corpus = if parsed.settings.catalog.enabled {
+            let corpus = CatalogSource::load_configured(&parsed.settings.catalog);
+            if !corpus.is_empty() {
+                if let Ok(source @ CatalogSource::Cache(_)) =
+                    CatalogSource::configured(&parsed.settings.catalog)
+                {
+                    thread::spawn(move || {
+                        if let Err(error) = source.update() {
+                            eprintln!("m2-ls: builtin catalog not updated: {error}");
+                        }
+                    });
+                }
+            }
+            corpus
+        } else {
+            String::new()
+        };
+        let _ = self.registry.set(ObjectRegistry::load(&corpus));
+        usage_log::record(
+            "catalog",
+            serde_json::json!({
+                "packages": self.registry().package_names_with_prefix("", usize::MAX).len(),
+                "loaded_objects": self.registry().len(),
+                "available": self.registry().has_catalog(),
+            }),
+        );
+        self.configure_library(&parsed.settings);
+        self.settings.replace(parsed.settings);
+        self.report_setting_problems(&parsed.problems).await;
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -1162,8 +1206,7 @@ impl LanguageServer for Backend {
     async fn initialized(&self, _: InitializedParams) {
         // Notifications such as the init file's diagnostics may only follow
         // the initialization.
-        self.configure_init_file(&self.settings.snapshot().sources)
-            .await;
+        self.configure_init_file(&self.settings.snapshot()).await;
         if self.type_hierarchy_dynamic_registration.is_supported()
             && self
                 .client
@@ -1203,7 +1246,7 @@ impl LanguageServer for Backend {
                 MessageType::INFO,
                 format!(
                     "Macaulay2 LSP initialized with {} builtin symbols",
-                    self.registry.len()
+                    self.registry().len()
                 ),
             )
             .await;
@@ -1309,12 +1352,9 @@ impl LanguageServer for Backend {
         for folder in params.event.added {
             self.workspace_folders.insert(folder.uri);
         }
-        // A relative `sources.initFile` names a file of the first folder,
+        // Relative initialization files belong to the first workspace folder,
         // and which init files are the user's project changed.
-        if self
-            .configure_init_file(&self.settings.snapshot().sources)
-            .await
-        {
+        if self.configure_init_file(&self.settings.snapshot()).await {
             self.watch_init_file().await;
         }
         self.publish_init_files_diagnostics().await;
@@ -1383,7 +1423,7 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
         Ok(self
             .with_source_at(uri, position, |document, knowledge, workspace| {
-                let source_symbols = if self.registry.has_catalog() {
+                let source_symbols = if self.registry().has_catalog() {
                     Vec::new()
                 } else {
                     self.workspace_index
@@ -1452,10 +1492,12 @@ impl LanguageServer for Backend {
         let position = params.range.start;
         Ok(self
             .with_source_at(uri, position, |document, _, _| {
+                let mut action_settings = settings.diagnostics.clone();
+                action_settings.emit_as.fix_action_only.clear();
                 let mut diagnostics = visible_diagnostics(
                     document,
                     uri,
-                    &settings.diagnostics,
+                    &action_settings,
                     self.library.snapshot().source_resolver(),
                 );
                 for diagnostic in params
@@ -1890,9 +1932,9 @@ impl LanguageServer for Backend {
 fn configured_library(
     environment: &Macaulay2Environment,
     registry: &ObjectRegistry,
-    sources: &SourceSettings,
+    settings: &ServerSettings,
 ) -> Arc<LibraryIndex> {
-    let source_resolver = SourceResolver::configured(environment, sources);
+    let source_resolver = SourceResolver::for_settings(environment, settings);
     Arc::new(LibraryIndex::new(source_resolver, registry.clone()))
 }
 
@@ -1925,17 +1967,8 @@ pub const RUNTIME_THREAD_STACK_BYTES: usize = 1 << 30;
 /// m2_ls::run_server();
 /// ```
 pub fn run_server() {
-    let corpus = CatalogSource::load_available();
-    // A newer matching catalog is fetched in the background for the next start.
-    if !corpus.is_empty() {
-        if let Ok(source @ CatalogSource::Cache(_)) = CatalogSource::current() {
-            thread::spawn(move || {
-                if let Err(error) = source.update() {
-                    eprintln!("m2-ls: builtin catalog not updated: {error}");
-                }
-            });
-        }
-    }
+    telemetry::enable();
+    usage_log::enable("m2-ls");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(RUNTIME_THREAD_STACK_BYTES)
         .enable_all()
@@ -1943,18 +1976,18 @@ pub fn run_server() {
         .expect("tokio runtime builds");
     // The session runs on a runtime thread, never on the default-sized main thread.
     runtime
-        .block_on(runtime.spawn(serve(corpus)))
+        .block_on(runtime.spawn(serve()))
         .expect("language server session task panicked");
 }
 
-/// Serve one client over stdio, its catalog read from `corpus`, until it exits
-/// or disconnects.
-async fn serve(corpus: String) {
+/// Serve one client over stdio until it exits or disconnects.
+/// Initialization settings select whether its builtin catalog is loaded.
+async fn serve() {
     install_panic_logging();
     let session_end = SessionEnd::default();
     let stdin = ClientInput::new(io::stdin(), session_end.clone());
     let stdout = io::stdout();
-    let (service, socket) = LspService::new(|client| Backend::new(client, &corpus));
+    let (service, socket) = LspService::new(Backend::new);
     let service = ExitNotificationService::new(
         TypeHierarchyCapabilityService::new(service),
         session_end.clone(),

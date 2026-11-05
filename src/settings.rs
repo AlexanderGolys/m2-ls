@@ -5,7 +5,7 @@
 //! client sends them under the `m2-ls` section (`macaulay2` is accepted too):
 //!
 //! ```json
-//! { "m2-ls": { "formatting": { "indent": 4 }, "sources": { "paths": ["~/M2"] } } }
+//! { "m2-ls": { "formatting": { "indent": 4 }, "sources": { "packagePaths": ["~/packages"] } } }
 //! ```
 //!
 //! Settings are read leniently: a value that does not deserialize, an unknown
@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 use std::{fmt, mem};
 
+use semver::VersionReq;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use serde_path_to_error::{Path, Segment};
@@ -71,6 +72,8 @@ impl<T: Clone> SettingsStore<T> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ServerSettings {
+    /// Whether builtin metadata and documentation are loaded. Default `true`.
+    pub catalog: CatalogSettings,
     /// `diagnostics.*`: which diagnostics are published, and how prominently.
     pub diagnostics: DiagnosticSettings,
     /// `formatting.*`: how the formatter lays out a document.
@@ -81,6 +84,36 @@ pub struct ServerSettings {
     pub semantic_tokens: SemanticTokenSettings,
     /// `sources.*`: where the library sources and the init file are.
     pub sources: SourceSettings,
+    /// Installation overrides, independent of source navigation.
+    pub macaulay2: Macaulay2Settings,
+    /// Files analyzed before each ordinary document, in order.
+    pub initialization: InitializationSettings,
+}
+
+/// Controls optional builtin metadata and documentation.
+/// The server reads this group during initialization; changes require a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogSettings {
+    /// Read and automatically download the catalog. Default `true`.
+    /// Disabling skips catalog reads, downloads, and background updates.
+    pub enabled: bool,
+    /// Cargo-style M2Book release bound. Default `0.1.*` excludes breaking releases.
+    pub version: VersionReq,
+}
+
+impl CatalogSettings {
+    /// Catalog release line understood by this server version.
+    pub const DEFAULT_VERSION: &str = "0.1.*";
+}
+
+impl Default for CatalogSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            version: VersionReq::parse(Self::DEFAULT_VERSION).expect("valid catalog release bound"),
+        }
+    }
 }
 
 /// `diagnostics.*`: which diagnostics are published, and how prominently.
@@ -96,6 +129,8 @@ pub struct DiagnosticSettings {
     pub warnings_as_hint: HashSet<DiagnosticCode>,
     /// Rules whose warnings are shown as information.
     pub warnings_as_info: HashSet<DiagnosticCode>,
+    /// Explicit publication categories for selected rules.
+    pub emit_as: DiagnosticEmissionSettings,
 }
 
 /// `formatting.*`: how the formatter lays out a document.
@@ -108,6 +143,7 @@ pub struct FormattingSettings {
     pub use_tabs: Option<bool>,
     /// The width lines are preferably wrapped at; `0` or `null` disables it.
     /// It never exceeds `hardLineWidth`.
+    #[serde(rename = "softWrapWidth", alias = "softLineWidth")]
     pub soft_line_width: Option<u32>,
     /// The width lines are always wrapped at; `0` or `null` disables it.
     pub hard_line_width: Option<u32>,
@@ -127,15 +163,14 @@ pub struct FormattingSettings {
 
 /// `inlayHints.*`: which inferred types are shown inline, and where.
 ///
-/// Each `after…`, `during…` and `of…` setting places hints at one kind of
-/// place, and each `show…` and `hide…` setting keeps or drops a kind of hint
-/// wherever it is placed; all of them are independent. Two places giving the
-/// same hint at the same position show it once.
+/// Runtime controls lowered from [`HintConfiguration`]. The grouped configuration
+/// separates argument names, type placement, and filters; these normalized fields
+/// let every hint source share the same presentation rules.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(from = "HintConfiguration")]
 pub struct InlayHintSettings {
     /// After each call whose arguments are bracketed, as `f(x)`, `f()` or
-    /// `f(x, y)`, but not `f x`: the type it returns. Default `false`.
+    /// `f(x, y)`, but not `f x`: the type it returns. Default `true`.
     pub after_call: bool,
     /// At the end of each line: the type of the last expression complete on
     /// it, as `2` after `2+` and `2+2` after the `2` below it. Default `true`.
@@ -147,17 +182,17 @@ pub struct InlayHintSettings {
     /// changes. Default `true`.
     pub during_assignment: bool,
     /// Before each argument of a call, the name of the parameter it is
-    /// passed to, as `f(x: 2)`. Default `false`.
+    /// passed to, as `f(x: 2)`. Default `true`.
     pub arg_names: bool,
     /// Before each argument of a call, the type the parameter it is passed
-    /// to is declared for, as `f(Number 2)`, or with `argNames` `f(x: Number
+    /// to is declared for, as `f(Number 2)`, or with argument names `f(Number x:
     /// 2)`. Default `false`.
     pub arg_types: bool,
     /// After each parenthesized value, as `(2)` or `(a + b)`: the type of
     /// the value it evaluates to. Not after collections such as `(2,)`,
     /// `()`, `[2]` or `{2}`, nor after a call's arguments. Default `false`.
     pub after_brackets: bool,
-    /// After the value a function returns. Default `true`.
+    /// After the value a function returns. Default `false`.
     pub after_return: bool,
     /// After every expression. Default `false`.
     pub everywhere: bool,
@@ -181,25 +216,38 @@ pub struct InlayHintSettings {
     /// Default `false`.
     pub hide_after_semicolon: bool,
     /// The longest label shown in full; a longer one is cut, its whole type
-    /// in the tooltip. `0` or `null` never cuts. Default `40`.
+    /// in the tooltip. `0` or `null` never cuts. Unlimited by default.
     pub max_label_length: Option<u32>,
     /// Functions whose calls and arguments get no hints, e.g. `["print"]`.
     pub excluded_calls: HashSet<ObjectName>,
+    /// Controls argument-name labels independently of argument type labels.
+    pub argument_names: ArgumentNameSettings,
+    /// Enables all type hints without changing argument-name hints.
+    pub types_enabled: bool,
+    /// Collection delimiters receiving type hints.
+    pub bracket_kinds: HashSet<HintBracket>,
+    /// Hides values whose type is apparent from their producer.
+    pub hide_trivial: bool,
+    /// Keeps only the final type label at a position with adjacent type hints.
+    pub hide_sequential: bool,
+    /// Hides parameter-name and domain labels on operator operands.
+    pub hide_operator_calls: bool,
 }
 
 /// `semanticTokens.*`: the vocabulary semantic highlighting is sent in.
 ///
-/// The legend offers standard token types and both standard and custom
-/// modifiers. Changes take effect through a semantic-token refresh.
+/// The legend offers standard token types, custom escape sequences, and both
+/// standard and custom modifiers. Changes take effect through a semantic-token
+/// refresh.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct SemanticTokenSettings {
-    /// Only LSP-standard modifiers: the Macaulay2-specific ones, such as
-    /// `option` or `algebraic`, are dropped. Token types are always
-    /// standard. Default `false`.
+    /// Only LSP-standard classifications: custom escape sequences fall back
+    /// to strings and Macaulay2-specific modifiers such as `option` and
+    /// `algebraic` are dropped. Other token types remain standard. Default `false`.
     pub standard_only: bool,
     /// Which values receive `defaultLibrary`: a named policy or a list of
-    /// defining packages. Default `"CompiledFunction"`.
+    /// policies and defining packages. Default `["CompiledFunction"]`.
     pub default_library: DefaultLibrarySetting,
 }
 
@@ -210,13 +258,13 @@ pub struct SemanticTokenSettings {
 pub enum DefaultLibrarySetting {
     /// A named policy, written as a string.
     Mode(DefaultLibraryMode),
-    /// The packages whose globals receive the modifier, written as an array.
-    Packages(Vec<String>),
+    /// Policy and package selectors combined by union, written as an array.
+    Selectors(Vec<String>),
 }
 
 impl Default for DefaultLibrarySetting {
     fn default() -> Self {
-        Self::Mode(DefaultLibraryMode::CompiledFunction)
+        Self::Selectors(vec!["CompiledFunction".to_string()])
     }
 }
 
@@ -251,6 +299,7 @@ pub struct SourceSettings {
     /// or an installation prefix (a build tree's `usr-dist` included),
     /// standing for that installation, or else a directory added to
     /// Macaulay2's `path`. A leading `~` is the home directory.
+    #[serde(rename = "packagePaths", alias = "paths")]
     pub paths: Vec<PathBuf>,
     /// Directories whose files implement the library itself, analyzed as if
     /// each declared `-- m2-ls: primaryCode`, in addition to the discovered
@@ -263,6 +312,8 @@ pub struct SourceSettings {
     /// workspace folder, a leading `~` the home directory. Independent of
     /// `enabled` when a path. Default `true`.
     pub init_file: InitFileChoice,
+    /// Core source discovery: `auto`, `false`, or an explicit directory.
+    pub core_path: CorePathSetting,
 }
 
 impl Default for DiagnosticSettings {
@@ -272,6 +323,7 @@ impl Default for DiagnosticSettings {
             disabled: HashSet::new(),
             warnings_as_hint: HashSet::new(),
             warnings_as_info: HashSet::new(),
+            emit_as: DiagnosticEmissionSettings::default(),
         }
     }
 }
@@ -279,8 +331,8 @@ impl Default for DiagnosticSettings {
 impl Default for FormattingSettings {
     fn default() -> Self {
         Self {
-            indent: None,
-            use_tabs: None,
+            indent: Some(4),
+            use_tabs: Some(true),
             soft_line_width: Some(78),
             hard_line_width: Some(90),
             control_flow_layout: ControlFlowLayout::default(),
@@ -294,26 +346,7 @@ impl Default for FormattingSettings {
 
 impl Default for InlayHintSettings {
     fn default() -> Self {
-        Self {
-            after_call: false,
-            after_line_end: true,
-            after_cell: true,
-            during_assignment: true,
-            arg_names: false,
-            arg_types: false,
-            after_brackets: false,
-            after_return: true,
-            everywhere: false,
-            show_literal: false,
-            show_upper_closure: true,
-            show_thing: false,
-            show_nothing: false,
-            show_repeated: false,
-            hide_types: HashSet::new(),
-            hide_after_semicolon: false,
-            max_label_length: Some(40),
-            excluded_calls: HashSet::new(),
-        }
+        HintConfiguration::default().into()
     }
 }
 
@@ -324,7 +357,298 @@ impl Default for SourceSettings {
             paths: Vec::new(),
             primary_code_paths: Vec::new(),
             init_file: InitFileChoice::Discovered,
+            core_path: CorePathSetting::default(),
         }
+    }
+}
+
+/// Grouped hint configuration accepted from editor settings and configuration files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct HintConfiguration {
+    /// Parameter-name hint controls.
+    pub arg_names: ArgumentNameSettings,
+    /// Include parameter domain types before arguments.
+    pub arg_types: bool,
+    /// Annotate every expression, subject to the hide filters.
+    pub everywhere: bool,
+    /// Enables type annotations and chooses their positions.
+    pub types: TypeHintSettings,
+    /// Filters applied to displayed hints.
+    pub hide: HiddenHintSettings,
+    /// Compatibility switch for repeated hints from the previous configuration.
+    pub show_repeated: Option<bool>,
+    /// Compatibility limit for labels; omitted labels are unlimited.
+    pub max_label_length: Option<u32>,
+}
+
+/// Type annotations, independently enabled from parameter-name annotations.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct TypeHintSettings {
+    /// Enable type annotations. Default `true`.
+    pub enabled: bool,
+    /// Expression positions after which annotations are displayed.
+    pub after: TypeHintPositions,
+}
+
+impl Default for TypeHintSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            after: TypeHintPositions::default(),
+        }
+    }
+}
+
+/// Independent positions at which the type of an expression is displayed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct TypeHintPositions {
+    /// After the result of a function call.
+    pub call: bool,
+    /// After the last expression completed on a line.
+    pub end_of_line: bool,
+    /// After a top-level cell's final value.
+    pub end_of_cell: bool,
+    /// After the name bound by an assignment.
+    pub assignment: bool,
+    /// After values enclosed by the selected delimiters.
+    pub brackets: HashSet<HintBracket>,
+    /// After the value returned by a function.
+    #[serde(rename = "return")]
+    pub return_value: bool,
+}
+
+impl Default for TypeHintPositions {
+    fn default() -> Self {
+        Self {
+            call: true,
+            end_of_line: true,
+            end_of_cell: true,
+            assignment: true,
+            brackets: HashSet::from([HintBracket::Parentheses]),
+            return_value: false,
+        }
+    }
+}
+
+/// Filters shared by type hint positions.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct HiddenHintSettings {
+    /// Type names whose hints are omitted.
+    pub types: HashSet<ObjectName>,
+    /// Function names whose calls and arguments are not annotated.
+    pub calls: HashSet<ObjectName>,
+    /// Hide the non-exact type marker without hiding the type.
+    pub non_exact_mark: bool,
+    /// Hide types explicitly stated by literal syntax.
+    pub literal: bool,
+    /// Hide hints whose type is evident from the surrounding source.
+    pub trivial: bool,
+    /// Hide preceding type labels when several appear consecutively at one position.
+    pub sequential: bool,
+    /// Hide result hints before a value-discarding semicolon.
+    pub before_semicolon: bool,
+    /// Hide operator operand parameter labels, preserving expression type hints.
+    pub operator_calls: bool,
+}
+
+impl Default for HiddenHintSettings {
+    fn default() -> Self {
+        Self {
+            types: HashSet::from([ObjectName::new("Thing"), ObjectName::new("Nothing")]),
+            calls: ["toString", "net", "toList"]
+                .into_iter()
+                .map(ObjectName::new)
+                .collect(),
+            non_exact_mark: false,
+            literal: true,
+            trivial: true,
+            sequential: true,
+            before_semicolon: false,
+            operator_calls: true,
+        }
+    }
+}
+
+impl From<HintConfiguration> for InlayHintSettings {
+    fn from(configuration: HintConfiguration) -> Self {
+        let after = configuration.types.after;
+        let mut hidden_types = configuration.hide.types;
+        let show_thing = !hidden_types.remove(&ObjectName::new("Thing"));
+        let show_nothing = !hidden_types.remove(&ObjectName::new("Nothing"));
+        Self {
+            after_call: after.call,
+            after_line_end: after.end_of_line,
+            after_cell: after.end_of_cell,
+            during_assignment: after.assignment,
+            arg_names: configuration.arg_names.enabled,
+            arg_types: configuration.arg_types,
+            after_brackets: false,
+            after_return: after.return_value,
+            everywhere: configuration.everywhere,
+            show_literal: !configuration.hide.literal,
+            show_upper_closure: !configuration.hide.non_exact_mark,
+            show_thing,
+            show_nothing,
+            show_repeated: configuration.show_repeated.unwrap_or(false),
+            hide_types: hidden_types,
+            hide_after_semicolon: configuration.hide.before_semicolon,
+            max_label_length: configuration.max_label_length,
+            excluded_calls: configuration.hide.calls,
+            argument_names: configuration.arg_names,
+            types_enabled: configuration.types.enabled,
+            bracket_kinds: after.brackets,
+            hide_trivial: configuration.hide.trivial,
+            hide_sequential: configuration.hide.sequential,
+            hide_operator_calls: configuration.hide.operator_calls,
+        }
+    }
+}
+
+/// Rules explicitly assigned to each diagnostic publication category.
+/// If a rule is listed more than once, the first category in field order wins.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiagnosticEmissionSettings {
+    /// Rules emitted as errors, regardless of their original severity.
+    pub error: HashSet<DiagnosticCode>,
+    /// Rules emitted as warnings.
+    pub warning: HashSet<DiagnosticCode>,
+    /// Rules emitted as information.
+    pub info: HashSet<DiagnosticCode>,
+    /// Rules emitted as hints.
+    pub hint: HashSet<DiagnosticCode>,
+    /// Rules available to quick fixes without publishing diagnostics.
+    pub fix_action_only: HashSet<DiagnosticCode>,
+}
+
+/// Controls the presentation of argument names without truncating type labels.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArgumentNameSettings {
+    /// Whether parameter names are shown. Default `true`.
+    pub enabled: bool,
+    /// Show names only for calls with bracketed arguments. Default `true`.
+    pub require_bracket: bool,
+    /// Omit names for variadic parameters. Default `true`.
+    pub ignore_variadic: bool,
+    /// Maximum parameter-name length, or no limit with `0` or `null`.
+    pub max_length: Option<u32>,
+}
+
+impl Default for ArgumentNameSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            require_bracket: true,
+            ignore_variadic: true,
+            max_length: Some(15),
+        }
+    }
+}
+
+impl ArgumentNameSettings {
+    /// Ellipsis used when a parameter name exceeds its display limit.
+    pub const TRUNCATION_MARK: char = '…';
+
+    /// Truncate this individual name by Unicode scalar count, excluding its colon.
+    /// A zero or absent limit preserves the complete name. The ellipsis counts
+    /// toward the limit, so a one-character limit displays only the ellipsis.
+    pub fn display_name(&self, name: &str) -> String {
+        match self
+            .max_length
+            .filter(|limit| *limit > 0)
+            .map(|limit| limit as usize)
+        {
+            Some(limit) if name.chars().count() > limit => name
+                .chars()
+                .take(limit - 1)
+                .chain(std::iter::once(Self::TRUNCATION_MARK))
+                .collect(),
+            _ => name.to_string(),
+        }
+    }
+}
+
+/// Delimiters after which an expression's type may be displayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[non_exhaustive]
+pub enum HintBracket {
+    /// Parenthesized sequences such as `(1, 2)`.
+    #[serde(rename = "parentheses")]
+    Parentheses,
+    /// Array literals written with square brackets.
+    #[serde(rename = "array")]
+    Array,
+    /// List literals written with braces.
+    #[serde(rename = "list")]
+    List,
+    /// Expressions delimited by angle bars.
+    #[serde(rename = "angle bar")]
+    AngleBar,
+    /// A single held value, such as `(1)` or `((1, 2))`.
+    #[serde(rename = "holder")]
+    Holder,
+}
+
+/// Explicit Macaulay2 installation paths; omitted paths are discovered.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct Macaulay2Settings {
+    /// The Macaulay2 executable, overriding discovery through PATH.
+    pub executable: Option<PathBuf>,
+    /// Installation prefix, overriding the prefix inferred from the executable.
+    pub prefix: Option<PathBuf>,
+    /// User application directory containing packages and init.m2.
+    pub application_directory: Option<PathBuf>,
+    /// Whether discovering an installation may invoke its executable.
+    pub runtime_discovery: bool,
+}
+
+impl Default for Macaulay2Settings {
+    fn default() -> Self {
+        Self {
+            executable: None,
+            prefix: None,
+            application_directory: None,
+            runtime_discovery: true,
+        }
+    }
+}
+
+/// Files supplying the initial globals and packages of document sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct InitializationSettings {
+    /// Initialization files in execution order; an empty list disables initialization.
+    pub files: Vec<PathBuf>,
+}
+
+impl Default for InitializationSettings {
+    fn default() -> Self {
+        Self {
+            files: vec![PathBuf::from("${applicationDirectory}/init.m2")],
+        }
+    }
+}
+
+/// Whether Core sources are discovered, disabled, or selected explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum CorePathSetting {
+    /// `auto` selects discovered Core sources; other strings are directory paths.
+    Path(PathBuf),
+    /// `false` disables Core sources; `true` enables automatic discovery.
+    Enabled(bool),
+}
+
+impl Default for CorePathSetting {
+    fn default() -> Self {
+        Self::Path(PathBuf::from("auto"))
     }
 }
 
@@ -383,22 +707,31 @@ impl fmt::Display for SettingProblem {
 }
 
 impl ServerSettings {
-    /// The names the client may send the settings section under.
-    const SECTIONS: [&str; 2] = ["m2-ls", "macaulay2"];
-
     /// Read the settings in `value`, either the section itself or an object
     /// holding it. Each value that fails to deserialize is reported, removed,
     /// and the rest read again, until what remains reads cleanly.
     pub fn from_value(value: &Value) -> ParsedSettings {
-        let mut section = Self::SECTIONS
+        let legacy_section = value.get("macaulay2").filter(|section| {
+            [
+                "diagnostics",
+                "formatting",
+                "inlayHints",
+                "semanticTokens",
+                "sources",
+            ]
             .iter()
-            .find_map(|name| value.get(name))
+            .any(|group| section.get(group).is_some())
+        });
+        let mut section = value
+            .get("m2-ls")
+            .or(legacy_section)
             .unwrap_or(value)
             .clone();
         if section.is_null() {
             section = Value::Object(Default::default());
         }
         let mut problems = InlayHintSettings::upgrade_deprecated_keys(&mut section);
+        Self::upgrade_hint_layout(&mut section);
         loop {
             match serde_path_to_error::deserialize::<_, Self>(&section) {
                 Ok(settings) => return ParsedSettings { settings, problems },
@@ -421,6 +754,88 @@ impl ServerSettings {
                 }
             }
         }
+    }
+
+    /// Translate the previous flat hint keys; explicitly supplied grouped values win.
+    fn upgrade_hint_layout(section: &mut Value) {
+        let Some(hints) = section.get_mut("inlayHints").and_then(Value::as_object_mut) else {
+            return;
+        };
+        if let Some(enabled) = hints
+            .get("argNames")
+            .filter(|value| value.is_boolean())
+            .cloned()
+        {
+            hints.insert("argNames".into(), serde_json::json!({
+                "enabled": enabled, "requireBracket": false, "ignoreVariadic": false, "maxLength": null
+            }));
+        }
+        for (old, group, key, inverted) in [
+            ("afterCall", "after", "call", false),
+            ("afterLineEnd", "after", "endOfLine", false),
+            ("afterCell", "after", "endOfCell", false),
+            ("duringAssignment", "after", "assignment", false),
+            ("afterReturn", "after", "return", false),
+            ("showLiteral", "hide", "literal", true),
+            ("showUpperClosure", "hide", "nonExactMark", true),
+            ("hideAfterSemicolon", "hide", "beforeSemicolon", false),
+            ("excludedCalls", "hide", "calls", false),
+        ] {
+            let Some(mut value) = hints.remove(old) else {
+                continue;
+            };
+            if inverted {
+                if let Some(flag) = value.as_bool() {
+                    value = Value::Bool(!flag);
+                }
+            }
+            let path = if group == "after" {
+                vec!["types", "after", key]
+            } else {
+                vec![group, key]
+            };
+            Self::insert_hint_value(hints, &path, value);
+        }
+        if let Some(value) = hints.remove("afterBrackets") {
+            let value = match value.as_bool() {
+                Some(true) => serde_json::json!(["holder"]),
+                Some(false) => serde_json::json!([]),
+                None => value,
+            };
+            Self::insert_hint_value(hints, &["types", "after", "brackets"], value);
+        }
+        let legacy_types = hints.remove("hideTypes");
+        let thing = hints.remove("showThing");
+        let nothing = hints.remove("showNothing");
+        if legacy_types.is_some() || thing.is_some() || nothing.is_some() {
+            let mut types = legacy_types.unwrap_or_else(|| serde_json::json!([]));
+            if let Some(types) = types.as_array_mut() {
+                for (name, show) in [("Thing", thing), ("Nothing", nothing)] {
+                    if show.as_ref().and_then(Value::as_bool) != Some(true) {
+                        types.push(Value::String(name.into()));
+                    }
+                }
+            }
+            Self::insert_hint_value(hints, &["hide", "types"], types);
+        }
+    }
+
+    /// Insert a compatibility setting only if its grouped replacement is absent.
+    fn insert_hint_value(fields: &mut Map<String, Value>, path: &[&str], value: Value) {
+        let Some((key, parents)) = path.split_last() else {
+            return;
+        };
+        let mut fields = fields;
+        for parent in parents {
+            let group = fields
+                .entry((*parent).to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            let Some(group) = group.as_object_mut() else {
+                return;
+            };
+            fields = group;
+        }
+        fields.entry((*key).to_string()).or_insert(value);
     }
 
     /// Remove the value at `path` from `section`; `false` when the path does
@@ -538,6 +953,11 @@ impl DiagnosticSettings {
         self.enabled && !self.disabled.contains(&code)
     }
 
+    /// Whether the rule is published, rather than available only as a quick fix.
+    pub fn publishes(&self, code: DiagnosticCode) -> bool {
+        self.allows(code) && !self.emit_as.fix_action_only.contains(&code)
+    }
+
     /// The severity a finding filed under `code` is published with: a warning
     /// the user listed in `warningsAsHint` or `warningsAsInfo` is lowered.
     pub fn published_severity(
@@ -545,7 +965,15 @@ impl DiagnosticSettings {
         code: DiagnosticCode,
         severity: DiagnosticSeverity,
     ) -> DiagnosticSeverity {
-        if severity != DiagnosticSeverity::WARNING {
+        if self.emit_as.error.contains(&code) {
+            DiagnosticSeverity::ERROR
+        } else if self.emit_as.warning.contains(&code) {
+            DiagnosticSeverity::WARNING
+        } else if self.emit_as.info.contains(&code) {
+            DiagnosticSeverity::INFORMATION
+        } else if self.emit_as.hint.contains(&code) {
+            DiagnosticSeverity::HINT
+        } else if severity != DiagnosticSeverity::WARNING {
             severity
         } else if self.warnings_as_hint.contains(&code) {
             DiagnosticSeverity::HINT
@@ -598,7 +1026,7 @@ mod tests {
         assert!(!settings.semantic_tokens.standard_only);
         assert_eq!(
             settings.semantic_tokens.default_library,
-            DefaultLibrarySetting::Mode(DefaultLibraryMode::CompiledFunction)
+            DefaultLibrarySetting::default()
         );
         assert_eq!(valid_settings(Value::Null), settings);
     }
@@ -666,6 +1094,12 @@ mod tests {
                 max_label_length: Some(0),
                 hide_types: HashSet::from([ObjectName::new("ZZ")]),
                 excluded_calls: HashSet::from([ObjectName::new("print")]),
+                argument_names: ArgumentNameSettings {
+                    enabled: true,
+                    require_bracket: false,
+                    ignore_variadic: false,
+                    max_length: None
+                },
                 ..InlayHintSettings::default()
             }
         );
@@ -691,6 +1125,7 @@ mod tests {
                 show_literal: true,
                 after_line_end: false,
                 show_thing: true,
+                show_repeated: false,
                 ..InlayHintSettings::default()
             }
         );
@@ -738,7 +1173,9 @@ mod tests {
                 valid_settings(serde_json::json!({"semanticTokens": {"defaultLibrary": packages}}));
             assert_eq!(
                 settings.semantic_tokens.default_library,
-                DefaultLibrarySetting::Packages(packages.into_iter().map(str::to_string).collect())
+                DefaultLibrarySetting::Selectors(
+                    packages.into_iter().map(str::to_string).collect()
+                )
             );
         }
         let parsed = ServerSettings::from_value(&serde_json::json!({
@@ -772,7 +1209,7 @@ mod tests {
         let settings = &parsed.settings;
         assert!(!settings.diagnostics.allows(catalog::UNUSED_BINDING.code));
         assert!(settings.diagnostics.allows(catalog::SYNTAX_ERROR.code));
-        assert_eq!(settings.formatting.indent, None);
+        assert_eq!(settings.formatting.indent, Some(4));
         assert_eq!(settings.formatting.use_tabs, Some(true));
         assert_eq!(settings.inlay_hints, InlayHintSettings::default());
 
@@ -937,5 +1374,39 @@ mod tests {
         assert!(store.replace(vec![1, 2, 3]).is_empty());
 
         assert_eq!(store.snapshot(), vec![1, 2, 3]);
+    }
+    /// The complete documented TOML example is the server's actual default configuration.
+    #[test]
+    fn grouped_example_matches_every_default() {
+        let value = toml::from_str(include_str!("../tests/fixtures/configuration.toml")).unwrap();
+        let parsed = ServerSettings::from_value(&value);
+        assert!(parsed.problems.is_empty(), "{:?}", parsed.problems);
+        assert_eq!(parsed.settings, ServerSettings::default());
+    }
+
+    /// Invalid nested settings retain valid siblings and defaults for rejected values.
+    #[test]
+    fn nested_validation_preserves_valid_siblings() {
+        let parsed = ServerSettings::from_value(&serde_json::json!({
+            "m2-ls": {
+                "inlayHints": {
+                    "argNames": {"enabled": false, "maxLength": "short"},
+                    "types": {"enabled": false, "after": {"endOfLine": false}},
+                    "hide": {"literal": false, "types": ["String", 123]}
+                },
+                "macaulay2": {"runtimeDiscovery": false},
+                "initialization": {"files": []}
+            }
+        }));
+        assert!(!parsed.settings.inlay_hints.arg_names);
+        assert!(!parsed.settings.inlay_hints.types_enabled);
+        assert!(!parsed.settings.inlay_hints.after_line_end);
+        assert!(parsed.settings.inlay_hints.show_literal);
+        assert!(!parsed.settings.macaulay2.runtime_discovery);
+        assert!(parsed.settings.initialization.files.is_empty());
+        assert_eq!(parsed.problems.len(), 2, "{:?}", parsed.problems);
+        let store = SettingsStore::new(parsed.settings);
+        store.replace(ServerSettings::from_value(&serde_json::json!({})).settings);
+        assert_eq!(store.snapshot(), ServerSettings::default());
     }
 }

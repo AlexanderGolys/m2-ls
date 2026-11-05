@@ -89,7 +89,7 @@ struct Options {
     stdout: bool,
     /// `--deny-warnings`: fail on warnings as well as errors.
     deny_warnings: bool,
-    /// `--config`: the JSON settings file, read as the server reads its
+    /// `--config`: the TOML or JSON settings file, read as the server reads its
     /// settings.
     config: Option<PathBuf>,
 }
@@ -106,6 +106,10 @@ impl Tool {
     /// Run on a worker with the same stack reservation as the server, keeping
     /// deeply nested generated expressions off the process's small main stack.
     pub fn run(self) -> ExitCode {
+        crate::telemetry::enable();
+        if self == Self::Linter {
+            crate::usage_log::enable(self.name());
+        }
         let result = std::thread::Builder::new()
             .name(self.name().into())
             .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
@@ -133,7 +137,7 @@ impl Tool {
             Self::Linter => "    --deny-warnings  Exit 1 for warnings as well as errors\n",
         };
         format!(
-            "Usage: {} [OPTIONS] <FILE | ->\n\nReads one .m2 file, or stdin for -.\n\n{specific}    --config FILE    Read JSON settings (same format as m2-ls)\n    -h, --help       Show help\n    -V, --version    Show version\n    --               Treat the next argument as the file\n\nExit codes: 0 success, 1 findings/check failure, 2 usage or I/O error.\n",
+            "Usage: {} [OPTIONS] <FILE | ->\n\nReads one .m2 file, or stdin for -.\n\n{specific}    --config FILE    Read TOML or JSON settings (same groups as m2-ls)\n    -h, --help       Show help\n    -V, --version    Show version\n    --               Treat the next argument as the file\n\nExit codes: 0 success, 1 findings/check failure, 2 usage or I/O error.\n",
             self.name()
         )
     }
@@ -242,26 +246,29 @@ impl Tool {
     /// the init file `settings` and its directive select. Returns the exit
     /// status: `1` for an error, or a warning under `--deny-warnings`.
     fn lint(options: &Options, settings: &ServerSettings, text: String) -> Result<u8, String> {
-        let corpus = CatalogSource::load_available();
+        let corpus = CatalogSource::load_configured(&settings.catalog);
         let environment = Macaulay2Environment::current();
         let registry = ObjectRegistry::load(&corpus);
+        crate::usage_log::record(
+            "catalog",
+            serde_json::json!({
+                "packages": registry.package_names_with_prefix("", usize::MAX).len(),
+                "loaded_objects": registry.len(),
+                "available": registry.has_catalog(),
+            }),
+        );
         let uri = options.input.uri()?;
         let label = options.input.label();
         let init_files = InitFiles::default();
         let current_directory = env::current_dir().ok();
-        match InitFiles::locate(
-            &settings.sources.init_file,
-            settings.sources.enabled,
-            current_directory.as_deref(),
-            &environment,
-        ) {
+        match InitFiles::locate_settings(settings, current_directory.as_deref(), &environment) {
             Ok(location) => init_files.configure(location, &registry),
             Err(problem) => init_files.configure_unavailable(problem),
         };
         if let Some(problem) = init_files.configured().problem() {
             eprintln!("{label}: warning: analyzed without an init file: {problem}");
         }
-        let sources = SourceResolver::configured(&environment, &settings.sources);
+        let sources = SourceResolver::for_settings(&environment, settings);
         let implied_properties = FileProperties::implied_by_location(&uri, &sources);
         let session_registry = |document: Option<&DocumentSnapshot>| {
             let properties = document.map_or(implied_properties, DocumentSnapshot::properties);
@@ -279,8 +286,10 @@ impl Tool {
         .ok_or("could not parse source")?;
         let directed = session_registry(Some(&document));
         document.restart_session(&directed);
+        let diagnostics = visible_diagnostics(&document, &uri, &settings.diagnostics, &sources);
+        crate::usage_log::diagnostics(&uri, document.text(), &diagnostics);
         let mut failed = false;
-        for diagnostic in visible_diagnostics(&document, &uri, &settings.diagnostics, &sources) {
+        for diagnostic in diagnostics {
             let severity = diagnostic.severity.unwrap_or(DiagnosticSeverity::WARNING);
             failed |= severity == DiagnosticSeverity::ERROR
                 || (options.deny_warnings && severity == DiagnosticSeverity::WARNING);
@@ -322,8 +331,15 @@ impl Options {
         };
         let text =
             fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-        let value =
-            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+        let value = if path
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+        {
+            toml::from_str::<serde_json::Value>(&text)
+                .map_err(|error| format!("{}: {error}", path.display()))?
+        } else {
+            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?
+        };
         let parsed = ServerSettings::from_value(&value);
         let listed = parsed
             .problems

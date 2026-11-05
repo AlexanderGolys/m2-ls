@@ -1,6 +1,6 @@
 [package]
 name = "m2-ls"
-version = "2.4.0"
+version = "2.5.0"
 authors = ["Alexander Golys <alexandergolys@gmail.com>"]
 description = "Language server for Macaulay2"
 edition = "2021"
@@ -9,6 +9,7 @@ rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/AlexanderGolys/m2-ls"
 readme = "README.md"
+exclude = ["docs/"]
 keywords = ["macaulay2", "lsp", "language-server", "parser"]
 categories = ["development-tools"]
 
@@ -27,13 +28,14 @@ tree-sitter-md = { version = "0.5.3", features = ["parser"] }
 serde_path_to_error = "0.1"
 strum = { version = "0.28.0", features = ["derive"] }
 these-macros-should-be-illegal = "0.12.2"
-semver = "1"
+semver = { version = "1", features = ["serde"] }
 sha2 = "0.10"
 tempfile = "3"
 ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
 pathdiff = "0.2.3"
 walkdir = "2.5.0"
 same-file = "1.0.6"
+toml = { version = "0.9.12", default-features = false, features = ["parse", "serde"] }
 
 [lints.rust]
 missing_docs = "deny"

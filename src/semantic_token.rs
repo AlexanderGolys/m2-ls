@@ -100,8 +100,9 @@ pub trait SemanticTokenKnowledge: TypeKnowledge {
     fn is_protected_global(&self, name: &str) -> bool;
 }
 
-/// The token types, named in Macaulay2 terms and each sent as a standard
-/// LSP type. Each discriminant is its legend index; finer distinctions are
+/// The token types, named in Macaulay2 terms and sent as standard LSP
+/// types except for the custom `escapeSequence` classification. Each
+/// discriminant is its legend index; finer distinctions are
 /// carried by [modifiers](M2SemanticTokenModifier). The module documentation
 /// says which objects are functions and which are methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
@@ -157,8 +158,11 @@ pub enum M2SemanticTokenType {
     /// `Key` or `Description`, or a link to another
     /// documentation page, `TO`, `TOH` or `TO2`. Sent as `decorator`.
     Annotation = SemanticTokenType::DECORATOR,
-    /// Regular-expression content classified using the protocol regexp category.
+    /// Regular-expression punctuation classified using the protocol regexp category.
     Regexp = SemanticTokenType::REGEXP,
+    /// An escaped character in a pattern, including its source backslashes.
+    /// Falls back to `string` under `standardOnly`.
+    EscapeSequence = SemanticTokenType::new("escapeSequence"),
 }
 
 impl M2SemanticTokenType {
@@ -353,7 +357,7 @@ impl M2SemanticToken {
 
     /// The token as sent against [`legend`](Self::legend): its type index and
     /// modifier bitset, without the M2-specific modifiers under
-    /// `standardOnly`.
+    /// `standardOnly`; custom escape tokens fall back to `string`.
     pub fn encode(self, settings: &SemanticTokenSettings) -> (u32, u32) {
         if !settings.standard_only {
             return (self.token_type as u32, self.modifiers.0);
@@ -364,7 +368,12 @@ impl M2SemanticToken {
                 M2SemanticTokenModifiers::default(),
                 M2SemanticTokenModifiers::with,
             );
-        (self.token_type as u32, modifiers.0)
+        let token_type = if self.token_type == M2SemanticTokenType::EscapeSequence {
+            M2SemanticTokenType::String
+        } else {
+            self.token_type
+        };
+        (token_type as u32, modifiers.0)
     }
 }
 

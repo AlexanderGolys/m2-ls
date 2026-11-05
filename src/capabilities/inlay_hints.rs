@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::iter;
 
 use m2_syn::nodes::{
-    AssignmentArgument, AssignmentList, Cell, Expr, ExprControl, ExprLambda, ExprOp, ExprOpBin,
-    ExprOpBinAdj, PackedContent, Symbol,
+    AssignmentArgument, AssignmentList, Cell, Expr, ExprCollection, ExprControl, ExprLambda,
+    ExprOp, ExprOpBin, ExprOpBinAdj, PackedContent, Symbol,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Lex, Spanned, Token, TokenStream, TokenTree};
@@ -21,10 +21,12 @@ use tower_lsp::lsp_types::{
     Position, Range as TextRange,
 };
 
+use crate::analysis::{CallStaticFacts, InfixSyntax, MethodInstallation, Operator};
+use crate::builtin_index::MethodSignature;
 use crate::document::DocumentSnapshot;
 use crate::meta::BindingRole;
 use crate::object_registry::{ObjectName, ObjectRegistry};
-use crate::settings::InlayHintSettings;
+use crate::settings::{ArgumentNameSettings, HintBracket, InlayHintSettings};
 use crate::source::{ByteRange, SourceNavigation, SyntaxSource};
 use crate::syntax::{
     AssignmentListSyntax, AssignmentOperator, AssignmentSyntax, AssignmentTarget, BoundSymbols,
@@ -37,19 +39,19 @@ use crate::util::TextRangeExt;
 const CALL_RESULT_PREFIX: &str = "-> ";
 /// The type of `null`: Macaulay2 prints nothing for a cell of this value.
 const NOTHING_TYPE: &str = "Nothing";
-/// What ends a label cut short to `maxLabelLength`.
-const TRUNCATION_MARK: char = '…';
 
 /// The kind of place a hint is put at. Of the hints giving the type of the
 /// same value, the one of the earliest kind is kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum HintSource {
+    /// An explicit holder request, kept at the parentheses rather than moved to a binding.
+    RequestedHolder,
     /// After the name an assignment binds.
     Assignment,
     /// After the value a function returns.
     Return,
-    /// After a parenthesized value.
-    Parenthesized,
+    /// After a selected collection delimiter or an explicitly held value.
+    Delimited,
     /// After a call with bracketed arguments.
     Call,
     /// After a top-level expression.
@@ -167,6 +169,16 @@ pub fn inlay_hints_response(
             && left.kind == right.kind
             && label_text(&left.label) == label_text(&right.label)
     });
+
+    if options.hide_sequential {
+        let mut retained_positions = HashSet::new();
+        hints.reverse();
+        hints.retain(|hint| {
+            hint.kind != Some(InlayHintKind::TYPE)
+                || retained_positions.insert((hint.position.line, hint.position.character))
+        });
+        hints.reverse();
+    }
 
     hints
 }
@@ -335,30 +347,46 @@ impl<'request, 'a> HintContext<'request, 'a> {
         context.opaque_self_describing_values = context
             .self_describing_assignment_values()
             .into_iter()
-            .filter(|value| !matches!(value.unparenthesized(), Some(Expr::Lambda(_))))
+            .filter(|value| Self::literal_is_opaque(value))
             .filter_map(|value| document.range_for_syntax(value))
             .collect();
         context
+    }
+
+    /// Whether literal syntax also makes all nested type hints redundant.
+    /// Computed collection elements and lambda bodies retain their own hints.
+    fn literal_is_opaque(value: &Expr) -> bool {
+        match value.unparenthesized() {
+            Some(Expr::Lambda(_)) => false,
+            Some(collection @ Expr::Collection(_)) => {
+                collection.collection_elements().is_some_and(|elements| {
+                    elements
+                        .into_iter()
+                        .all(|element| element.is_none_or(Self::literal_is_opaque))
+                })
+            }
+            _ => is_literal_value(value),
+        }
     }
 
     /// The hints of every kind of place the settings turn on.
     fn placed_hints(&self) -> Vec<PlacedHint> {
         let options = self.options;
         let mut hints = Vec::new();
-        if options.during_assignment {
+        if options.types_enabled && options.during_assignment {
             hints.extend(self.binding_type_hints());
         }
-        if options.after_return {
+        if options.types_enabled && options.after_return {
             hints.extend(self.lambda_return_type_hints());
         }
-        if options.after_cell {
+        if options.types_enabled && options.after_cell {
             hints.extend(self.value_hints(
                 self.syntax.cell_values.iter().copied(),
                 HintSource::Cell,
                 HintPlacement::AfterValue,
             ));
         }
-        if options.after_call {
+        if options.types_enabled && options.after_call {
             hints.extend(
                 self.value_hints(
                     self.typed_expressions()
@@ -368,30 +396,27 @@ impl<'request, 'a> HintContext<'request, 'a> {
                 ),
             );
         }
-        if options.after_brackets {
-            hints.extend(self.value_hints(
-                self.typed_expressions().filter(|value| {
-                    matches!(value, Expr::Holder(_))
-                        && !self
-                            .syntax
-                            .call_arguments
-                            .contains(&std::ptr::from_ref(*value))
-                }),
-                HintSource::Parenthesized,
-                HintPlacement::AfterValue,
-            ));
+        if options.types_enabled && (options.after_brackets || !options.bracket_kinds.is_empty()) {
+            hints.extend(
+                self.value_hints(
+                    self.typed_expressions()
+                        .filter(|value| self.has_hint_brackets(value)),
+                    HintSource::Delimited,
+                    HintPlacement::AfterValue,
+                ),
+            );
         }
-        if options.after_line_end {
+        if options.types_enabled && options.after_line_end {
             hints.extend(self.line_end_hints());
         }
-        if options.arg_names || options.arg_types {
+        if options.arg_names || options.types_enabled && options.arg_types {
             hints.extend(self.parameter_hints().into_iter().map(|hint| PlacedHint {
                 value: None,
                 source: HintSource::Argument,
                 hint,
             }));
         }
-        if options.everywhere {
+        if options.types_enabled && options.everywhere {
             hints.extend(self.value_hints(
                 self.typed_expressions(),
                 HintSource::Everywhere,
@@ -400,6 +425,24 @@ impl<'request, 'a> HintContext<'request, 'a> {
             hints.extend(self.parameter_binding_hints());
         }
         hints
+    }
+
+    /// Whether this exact delimiter form is selected outside call arguments.
+    fn has_hint_brackets(&self, value: &Expr) -> bool {
+        let kind = match value {
+            Expr::Collection(ExprCollection::Sequence(_)) => HintBracket::Parentheses,
+            Expr::Collection(ExprCollection::Array(_)) => HintBracket::Array,
+            Expr::Collection(ExprCollection::List(_)) => HintBracket::List,
+            Expr::Collection(ExprCollection::AngleBar(_)) => HintBracket::AngleBar,
+            Expr::Holder(_) => HintBracket::Holder,
+            _ => return false,
+        };
+        (self.options.bracket_kinds.contains(&kind)
+            || self.options.after_brackets && kind == HintBracket::Holder)
+            && !self
+                .syntax
+                .call_arguments
+                .contains(&std::ptr::from_ref(value))
     }
 
     /// The expressions analysis inferred a type for.
@@ -437,12 +480,13 @@ impl<'request, 'a> HintContext<'request, 'a> {
     ) -> Option<PlacedHint> {
         let inferred_type = self.inferred_type(value)?;
         let value_range = self.document.range_for_syntax(value)?;
+        let requested_holder = source == HintSource::Delimited && matches!(value, Expr::Holder(_));
         let repeated = || {
             self.assignment_parts
                 .suppresses(value_range, is_application(value))
         };
         let stated_by_literal = || {
-            is_self_describing_value(value)
+            is_literal_value(value)
                 || self
                     .opaque_self_describing_values
                     .iter()
@@ -452,8 +496,10 @@ impl<'request, 'a> HintContext<'request, 'a> {
             || (self.options.hide_after_semicolon && self.is_discarded(value))
             || self.is_excluded_call(value)
             || self.type_is_stated_by_installation(value)
-            || (!self.options.show_repeated && repeated())
-            || (!self.options.show_literal && stated_by_literal())
+            || (!requested_holder && !self.options.show_repeated && repeated())
+            || (!requested_holder
+                && (!self.options.show_literal || self.options.hide_trivial)
+                && stated_by_literal())
         {
             return None;
         }
@@ -465,7 +511,11 @@ impl<'request, 'a> HintContext<'request, 'a> {
         };
         Some(PlacedHint {
             value: self.document.range_for_syntax(described_value(value)),
-            source,
+            source: if requested_holder {
+                HintSource::RequestedHolder
+            } else {
+                source
+            },
             hint: self.type_hint(position, expression_label(value, type_name)),
         })
     }
@@ -482,10 +532,11 @@ impl<'request, 'a> HintContext<'request, 'a> {
     }
 
     /// The parameters each call passes its arguments to, before the
-    /// arguments, as `f(x: Number 2)`; none for a call whose parameters do
+    /// arguments, as `f(Number x: 2)`; none for a call whose parameters do
     /// not match its arguments one to one.
     fn parameter_hints(&self) -> Vec<InlayHint> {
-        self.typed_expressions()
+        let mut hints = self
+            .typed_expressions()
             .filter(|value| !self.is_excluded_call(value))
             .filter_map(|value| match value {
                 Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => Some(call),
@@ -497,11 +548,33 @@ impl<'request, 'a> HintContext<'request, 'a> {
                 if arguments.len() != parameters.len() {
                     return Vec::new();
                 }
+                let names_allowed = !self.options.argument_names.require_bracket
+                    || call.right_operand.delimiter().is_some();
                 iter::zip(arguments, parameters)
-                    .filter_map(|(argument, parameter)| self.parameter_hint(argument?, parameter))
+                    .filter_map(|(argument, mut parameter)| {
+                        if !names_allowed {
+                            parameter.name = None;
+                        }
+                        self.parameter_hint(argument?, parameter)
+                    })
                     .collect()
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if !self.options.hide_operator_calls {
+            hints.extend(
+                self.typed_expressions()
+                    .filter_map(|value| match value {
+                        Expr::Op(operation)
+                            if !matches!(operation, ExprOp::Bin(ExprOpBin::Adj(_))) =>
+                        {
+                            Some(operation)
+                        }
+                        _ => None,
+                    })
+                    .flat_map(|operation| self.operator_parameter_hints(operation)),
+            );
+        }
+        hints
     }
 
     /// The parameters `call` passes its arguments to, as far as they are
@@ -517,15 +590,6 @@ impl<'request, 'a> HintContext<'request, 'a> {
             return Vec::new();
         };
         let view = self.knowledge.at(position);
-        let names = |lambda: Option<&&ExprLambda>| {
-            lambda.map(|lambda| {
-                lambda
-                    .bound_symbols()
-                    .iter()
-                    .map(|symbol| symbol.text().to_string())
-                    .collect::<Vec<_>>()
-            })
-        };
         let Some(function) = analysis.function_at(name, position) else {
             let facts = analysis.infer_call_static_facts(call, self.document, &view);
             let Some(signature) = analysis
@@ -539,17 +603,7 @@ impl<'request, 'a> HintContext<'request, 'a> {
             else {
                 return Vec::new();
             };
-            return signature
-                .domain
-                .iter()
-                .map(|object| CalledParameter {
-                    name: None,
-                    domain: self
-                        .knowledge
-                        .object(object)
-                        .map(|record| record.name.clone()),
-                })
-                .collect();
+            return self.external_parameters(&signature);
         };
         if !function.is_method_function() {
             let value_range = analysis
@@ -558,7 +612,8 @@ impl<'request, 'a> HintContext<'request, 'a> {
             let lambda = self.syntax.lambdas.iter().find(|lambda| {
                 value_range.is_some() && value_range == self.document.range_for_syntax(**lambda)
             });
-            return names(lambda)
+            return lambda
+                .and_then(|lambda| self.parameter_names(lambda))
                 .unwrap_or_default()
                 .into_iter()
                 .map(|name| CalledParameter {
@@ -572,12 +627,35 @@ impl<'request, 'a> HintContext<'request, 'a> {
         let [installation] = installations.as_slice() else {
             return Vec::new();
         };
-        let lambda = self.syntax.lambdas.iter().find(|lambda| {
-            analysis
-                .installation_receiving_arguments(lambda, self.document)
-                .is_some_and(|receiving| receiving.id == installation.id)
-        });
-        let names = names(lambda).filter(|names| names.len() == installation.method.domain.len());
+        self.installation_parameters(installation)
+    }
+
+    /// Names supplied by a source lambda, respecting variadic-name filtering.
+    fn parameter_names(&self, lambda: &ExprLambda) -> Option<Vec<String>> {
+        (!self.options.argument_names.ignore_variadic || !matches!(lambda, ExprLambda::Variadic(_)))
+            .then(|| {
+                lambda
+                    .bound_symbols()
+                    .iter()
+                    .map(|symbol| symbol.text().to_string())
+                    .collect()
+            })
+    }
+
+    /// Parameter names and domains supplied by one selected source installation.
+    fn installation_parameters(&self, installation: &MethodInstallation) -> Vec<CalledParameter> {
+        let analysis = self.document.analysis();
+        let names = self
+            .syntax
+            .lambdas
+            .iter()
+            .find(|lambda| {
+                analysis
+                    .installation_receiving_arguments(lambda, self.document)
+                    .is_some_and(|receiving| receiving.id == installation.id)
+            })
+            .and_then(|lambda| self.parameter_names(lambda))
+            .filter(|names| names.len() == installation.method.domain.len());
         installation
             .method
             .domain
@@ -590,8 +668,89 @@ impl<'request, 'a> HintContext<'request, 'a> {
             .collect()
     }
 
+    /// Catalog domain types, without inventing parameter names absent from metadata.
+    fn external_parameters(&self, signature: &MethodSignature) -> Vec<CalledParameter> {
+        signature
+            .domain
+            .iter()
+            .map(|object| CalledParameter {
+                name: None,
+                domain: self
+                    .knowledge
+                    .object(object)
+                    .map(|record| record.name.clone()),
+            })
+            .collect()
+    }
+
+    /// Parameter labels on typed operator operands, independently of expression type hints.
+    fn operator_parameter_hints(&self, operation: &ExprOp) -> Vec<InlayHint> {
+        let Some(range) = self.document.range_for_syntax(operation) else {
+            return Vec::new();
+        };
+        if self
+            .assignment_parts
+            .targets
+            .iter()
+            .any(|target| range_contains(*target, range))
+        {
+            return Vec::new();
+        }
+        let Some(operator) = Operator::of_operation(operation) else {
+            return Vec::new();
+        };
+        let operands = match operation {
+            ExprOp::Bin(binary) => {
+                let Some(operands) = binary.infix_operands() else {
+                    return Vec::new();
+                };
+                vec![operands.left, operands.right]
+            }
+            ExprOp::Prefix(prefix) => vec![prefix.operand.as_ref()],
+            ExprOp::Postfix(postfix) => vec![postfix.operand.as_ref()],
+        };
+        let facts = CallStaticFacts {
+            argument_types: operands
+                .iter()
+                .map(|operand| {
+                    self.inferred_type(operand)
+                        .cloned()
+                        .unwrap_or_else(InferredType::unknown)
+                })
+                .collect(),
+            literal_options: Vec::new(),
+        };
+        let analysis = self.document.analysis();
+        let view = self.knowledge.at(range.start);
+        let installations = analysis.operator_call_installations(
+            &operator,
+            &facts.argument_types,
+            range.start,
+            &view,
+        );
+        let parameters = match installations.as_slice() {
+            [installation] => self.installation_parameters(installation),
+            [] => analysis
+                .infer_external_call_signature_facts(&operator.token, &facts, range.start, &view)
+                .and_then(|facts| facts.pinned)
+                .map_or_else(Vec::new, |signature| self.external_parameters(&signature)),
+            _ => return Vec::new(),
+        };
+        if operands.len() != parameters.len() {
+            return Vec::new();
+        }
+        iter::zip(operands, parameters)
+            .filter_map(|(operand, mut parameter)| {
+                if self.options.argument_names.require_bracket {
+                    parameter.name = None;
+                }
+                self.parameter_hint(operand, parameter)
+            })
+            .collect()
+    }
+
     /// The hint before `argument` of the `parameter` it is passed to, of
-    /// what the settings show of it: `x: T`, `x:` or `T`. A name the
+    /// what the settings show of it: `T x:`, `x:` or `T`. A name the
     /// argument already spells is left out.
     fn parameter_hint(&self, argument: &Expr, parameter: CalledParameter) -> Option<InlayHint> {
         let position = self.document.position_for_syntax(argument)?;
@@ -603,7 +762,7 @@ impl<'request, 'a> HintContext<'request, 'a> {
         });
         let type_name = parameter
             .domain
-            .filter(|_| self.options.arg_types)
+            .filter(|_| self.options.types_enabled && self.options.arg_types)
             .and_then(|domain| {
                 self.displayed_type(
                     position,
@@ -611,8 +770,14 @@ impl<'request, 'a> HintContext<'request, 'a> {
                     TypedSubject::ParameterDomain,
                 )
             });
-        let label = match (name, type_name) {
-            (Some(name), Some(type_name)) => format!("{name}: {type_name}"),
+        let displayed_name = name
+            .as_deref()
+            .map(|name| self.options.argument_names.display_name(name));
+        let tooltip = name
+            .filter(|name| displayed_name.as_ref() != Some(name))
+            .map(InlayHintTooltip::String);
+        let label = match (displayed_name, type_name) {
+            (Some(name), Some(type_name)) => format!("{type_name} {name}:"),
             (Some(name), None) => format!("{name}:"),
             (None, Some(type_name)) => type_name,
             (None, None) => return None,
@@ -621,7 +786,11 @@ impl<'request, 'a> HintContext<'request, 'a> {
             kind: Some(InlayHintKind::PARAMETER),
             padding_left: None,
             padding_right: Some(true),
-            ..self.type_hint(position, label)
+            position,
+            label: label.into(),
+            text_edits: None,
+            tooltip,
+            data: None,
         })
     }
 
@@ -745,7 +914,7 @@ impl<'request, 'a> HintContext<'request, 'a> {
                 label
                     .chars()
                     .take(limit - 1)
-                    .chain(iter::once(TRUNCATION_MARK))
+                    .chain(iter::once(ArgumentNameSettings::TRUNCATION_MARK))
                     .collect::<String>(),
                 Some(InlayHintTooltip::String(label)),
             ),
@@ -792,8 +961,8 @@ impl<'request, 'a> HintContext<'request, 'a> {
             })
             .filter(|(value, constructed)| {
                 constructed.is_some()
-                    || self.options.show_literal
-                    || !is_self_describing_value(value)
+                    || self.options.show_literal && !self.options.hide_trivial
+                    || !is_literal_value(value)
             })
             .filter_map(|(value, constructed)| {
                 let value_range = self.document.range_for_syntax(value)?;
@@ -907,7 +1076,7 @@ impl<'request, 'a> HintContext<'request, 'a> {
                 let value_range = assigned
                     .map(|value| value.value_range)
                     .or(state.value_range);
-                if !self.options.show_literal
+                if (!self.options.show_literal || self.options.hide_trivial)
                     && value_range.is_some_and(|value_range| {
                         self_describing_values.contains(&value_range)
                             && assigned.is_none_or(|value| !value.destructured)
@@ -1052,7 +1221,7 @@ impl<'request, 'a> HintContext<'request, 'a> {
                 };
                 let parts = assignment.parts();
                 (matches!(parts.target, AssignmentTarget::Symbol(_))
-                    && is_self_describing_value(parts.value))
+                    && is_literal_value(parts.value))
                 .then_some(parts.value)
             })
             .collect()
@@ -1203,20 +1372,12 @@ fn paired_assignment_values<'a>(
     }
 }
 
-/// Whether the syntax of `value` already states its type: a literal, a
-/// function, a `new` instance, or a collection of such values.
-fn is_self_describing_value(value: &Expr) -> bool {
-    let Some(value) = value.unparenthesized() else {
-        return false;
-    };
-    match value {
-        Expr::Literal(_) | Expr::Lambda(_) | Expr::New(_) => true,
-        Expr::Symbol(symbol) => LITERAL_SYMBOLS.contains(&symbol.text()),
-        Expr::Collection(_) => value.collection_elements().is_some_and(|elements| {
-            elements
-                .into_iter()
-                .all(|element| element.is_none_or(is_self_describing_value))
-        }),
+/// Whether an expression is a directly written value: a scalar, collection,
+/// lambda, or explicit `new` construction. Holders preserve this classification.
+fn is_literal_value(value: &Expr) -> bool {
+    match described_value(value).unparenthesized() {
+        Some(Expr::Literal(_) | Expr::Lambda(_) | Expr::New(_) | Expr::Collection(_)) => true,
+        Some(Expr::Symbol(symbol)) => LITERAL_SYMBOLS.contains(&symbol.text()),
         _ => false,
     }
 }
@@ -1240,6 +1401,13 @@ mod tests {
             after_cell: false,
             during_assignment: false,
             after_return: false,
+            after_call: false,
+            arg_names: false,
+            bracket_kinds: HashSet::new(),
+            hide_trivial: false,
+            hide_sequential: false,
+            hide_operator_calls: false,
+            excluded_calls: HashSet::new(),
             ..InlayHintSettings::default()
         }
     }
@@ -1500,11 +1668,11 @@ mod tests {
             ..everywhere_it_ends.clone()
         };
 
-        // The assignment's hint stands for its value's cell, line end,
-        // parentheses and call.
+        // An explicit holder takes precedence over the assignment, cell,
+        // line end and call without repeating the value's type.
         assert_eq!(
             library_hints("x = (instance(3, ZZ))\n", &assigning),
-            [placed(pos!(0, 1), "Boolean")]
+            [placed(pos!(0, 21), "Boolean")]
         );
         assert_eq!(
             library_hints("x = instance(3, ZZ)\n", &everywhere_it_ends),
@@ -1541,7 +1709,7 @@ mod tests {
 
         assert_eq!(
             placed_labels(&hints),
-            [placed(pos!(2, 2), "n: ZZ"), placed(pos!(2, 5), "s: String")]
+            [placed(pos!(2, 2), "ZZ n:"), placed(pos!(2, 5), "String s:")]
         );
         assert!(hints.iter().all(|hint| {
             hint.kind == Some(InlayHintKind::PARAMETER) && hint.padding_right == Some(true)
@@ -1573,10 +1741,14 @@ mod tests {
                 &InlayHintSettings {
                     arg_names: true,
                     arg_types: true,
+                    argument_names: crate::settings::ArgumentNameSettings {
+                        ignore_variadic: false,
+                        ..Default::default()
+                    },
                     ..nowhere()
                 }
             ),
-            [placed(pos!(2, 2), "x: Number")]
+            [placed(pos!(2, 2), "Number x:")]
         );
     }
 
@@ -1704,7 +1876,7 @@ mod tests {
             "nothing = null\n",
         );
         let calm = hints(self_describing, false);
-        assert_eq!(labels(&calm), ["Thing"]);
+        assert!(calm.is_empty());
         let verbose = hints(self_describing, true);
         assert_eq!(labels(&verbose), ["Thing", "Thing"]);
     }

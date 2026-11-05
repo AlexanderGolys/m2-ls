@@ -16,6 +16,7 @@ use crate::syntax::BindingReferences;
 /// Spawns every diagnostic that needs the whole document.
 pub(super) fn spawn(context: &DocumentContext, sink: &mut DiagnosticSink) {
     unused_binding(context, sink);
+    super::method_typical_value::MethodTypicalValue::spawn(context, sink);
 }
 
 /// Reports ordinary source bindings that have no value-reading references.

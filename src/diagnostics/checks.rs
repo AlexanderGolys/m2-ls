@@ -11,6 +11,7 @@ mod documentation;
 mod expressions;
 mod installation;
 mod location;
+mod method_typical_value;
 mod parse;
 
 use tower_lsp::lsp_types::Url;

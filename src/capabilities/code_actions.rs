@@ -627,7 +627,7 @@ mod tests {
                 &edit.new_text,
             );
         }
-        assert_eq!(result, "-- λ 😀\nx#3\ny#4\nif ready then\n    value\n");
+        assert_eq!(result, "-- λ 😀\nx#3\ny#4\nif ready then\n\tvalue\n");
         let rewritten = DocumentSnapshot::from_text(result, &registry).unwrap();
         let diagnostics = visible_diagnostics(
             &rewritten,

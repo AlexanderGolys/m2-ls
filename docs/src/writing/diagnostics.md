@@ -1,0 +1,237 @@
+# Diagnostics
+
+Macaulay2 accepts a lot of code that does not do what it says. A misspelled
+name becomes a symbol, a method installed with `=` is rejected only when that
+line runs, a non-`Boolean` condition fails deep inside a computation. `m2-ls`
+reports these while you type, and its messages say what to write instead.
+
+```m2
+R = QQ[x0, x1]
+--     ^^ hint[S06]: Ring variable `x0` is a multi-character symbol, not an
+--        indexed variable; use `x_0` so the generators form one indexed family
+
+g = method()
+g ZZ = n -> n
+-- ^ error[E04]: Installing a method on `g` must use `:=`, not `=`: M2 rejects
+--   this ("no method for storing values of function g"). Use `:=`.
+
+sizeLabel = L -> (
+    n := #L;
+    if n then "nonempty" else "empty"
+    -- ^ warning[T02]: if condition must have type `Boolean`, but this
+    --   expression has type `ZZ`
+    )
+```
+
+Many diagnostics come with a [code action](code-actions.md) that applies the
+fix. The same checks run outside the editor through
+[`m2-lint`](../beyond/command-line.md).
+
+## Codes
+
+Every diagnostic has a stable code and a stable name; settings and suppression
+comments accept either. The letter says what kind of problem it is:
+
+`X` — structure
+: Source that is malformed, or assignments Macaulay2 cannot carry out.
+
+`E` — runtime
+: Runtime concerns and design patterns worth reviewing; some are valid code
+  with a more idiomatic alternative.
+
+`T` — types
+: Type errors found by inference.
+
+`S` — style
+: Hints toward idiomatic Macaulay2.
+
+`D` — documentation
+: Package documentation Macaulay2 rejects or warns about when installing.
+
+Codes are never reused: a retired diagnostic's code stays retired, so a
+setting written for one release never silently means something else in the
+next.
+
+## The catalog { #catalog }
+
+| Code | Name | Severity | Reported for |
+| --- | --- | --- | --- |
+| `X01` | `syntax-error` | error | source the grammar cannot parse: `x = (1 + ]` |
+| `X02` | `missing-node` | error | a token the grammar expected, such as an `if` ending after `then` |
+| `X03` | `ambiguous-float-member-access` | warning | `L.1`, which is `L` applied to the float `.1`; fix: `L#1` |
+| `X04` | `multiple-assignment-targets` | error | a parallel-assignment target that cannot be assigned: `(a, 1) = (2, 3)` |
+| `X05` | `colon-equal-part-assignment` | error | `L#0 := 5`; parts are assigned with `=` |
+| `X06` | `parallel-assignment-arity` | error | `(a, b) = (1, 2, 3)` |
+| `E01` | `install-no-effect` | warning | an installation nothing dispatches to: on a plain function, the binary `??`, or a `<-` method on anything but one non-symbol type |
+| `E02` | `operator-not-flexible` | error | an installation on an operator users cannot extend: `ZZ === ZZ := …` |
+| `E03` | `install-arity` | error | `g(ZZ, ZZ) := (a, b, c) -> a` |
+| `E04` | `install-needs-colon-equals` | error | `g ZZ = n -> n`; installations use `:=` |
+| `E06` | `protect-computed-symbol` | warning | `protect getSymbol "x"`, protecting a value known only at run time |
+| `E08` | `invalid-control-transfer` | error | `return`, `break` or `continue` outside the function or loop it needs |
+| `E09` | `explicit-install-required` | error | `(x <- ZZ) := …`; `<-` is overloaded only through `installMethod` |
+| `E11` | `install-option-form` | error | an installed function whose shape does not match how the method passes options |
+| `E12` | `install-unreachable-options` | warning | `{Limit => 1} >> o -> …` installed on a method without options, so the defaults always apply |
+| `E13` | `protected-assignment` | error | assigning to a protected indexed symbol, such as `ZZ = 7`; local shadows remain assignable, and [library code](../getting-started/inline-directives.md#primary-code) may define them |
+| `E14` | `ring-index-out-of-bounds` | error | a subscript past the variables of a ring the program writes out: `A_2` after `A = QQ[a, b_1]` |
+| `E15` | `ring-variable-not-found` | error | a lookup by name of a variable the ring lacks: `"b"_A`, `b_2_A`; see [Rings](../reading/rings.md#diagnostics) |
+| `E16` | `unknown-option` | error | an option name the called function does not accept, which Macaulay2 rejects: `f(1, Verbos => true)`; fix: the closest accepted name |
+| `E17` | `unloadable-file` | warning | a `load`/`needs`/`input` name `load` cannot run: no file where it looks, a directory, a file it may not read, or an empty name: `load "no-such-file.m2"`; see [Workspace files](../navigating/workspace-files.md#unloadable) |
+| `E18` | `unavailable-init-file` | warning | an [`initFile` directive](../getting-started/inline-directives.md#init-file) naming a file that cannot be read: `-- m2-ls: initFile no-such-init.m2`; the file starts without an init file |
+| `E19` | `manual-type-dispatch` | warning | repeated `instance(x, Class)` tests of the same function parameter against distinct named classes with at least two non-error branches in an `if` / `else if` chain; consider method specializations |
+| `E20` | `list-record-shape` | warning | a list-family `instance` check combined with a fixed length above one; consider a hash-table-based record type |
+| `T01` | `parallel-assignment-type` | error | `(a, b) = 5` |
+| `T02` | `condition-type` | warning | an `if` or `while` condition known not to be `Boolean` |
+| `T03` | `install-codomain-missing` | hint | an installation other than `new` without a codomain that inference can deduce; fix: insert `ZZ =>` |
+| `T04` | `install-codomain-mismatch` | warning | a declared codomain contradicting the inferred result: `g ZZ := String => n -> n + 1` |
+| `T05` | `call-domain-mismatch` | warning | no known method domain can accept the inferred argument types; uncertain matches remain valid |
+| `T06` | `option-value-mismatch` | warning | an option value of none of the documented types, or a symbol outside the values the option accepts |
+| `S01` | `option-key-convention` | hint | a lowercase option name in `method(Options => {…})` or `{…} >> o -> …` |
+| `S02` | `unused-binding` | warning | a local that is never read; names starting with `_` are exempt |
+| `S03` | `redundant-control-parentheses` | hint | parentheses the keyword already delimits: `if (n > 0) then` |
+| `S04` | `prefer-coalescence` | hint | a null test `??` says directly: `if x === null then 0 else x` |
+| `S05` | `simplifiable-expression` | hint | an `if` or `try` with a shorter form, which the message names: `if v === null then null else w` |
+| `S06` | `ring-variable-naming` | hint | a multi-character ring variable such as `x0` instead of `x_0` |
+| `S07` | `shared-method-codomain` | hint | at least five method installations, with more than 75% explicitly annotating the same result type; consider declaring a shared `TypicalValue` |
+| `D01` | `unknown-documentation-section` | error | a SimpleDoc keyword or `document` option that does not exist there |
+| `D02` | `malformed-documentation` | error | documentation SimpleDoc or `document` rejects: a repeated section, a multi-line headline, `Inputs` without `Usage`, … |
+| `D03` | `missing-documentation-key` | error | a documentation page without a `Key` |
+| `D04` | `long-headline` | warning | a headline over 100 characters |
+| `D05` | `undefined-documentation-key` | error | a key, `@TO@` link or `SeeAlso` entry nothing defines — `endPackage` would reject it |
+| `D06` | `duplicate-documentation` | error | a key documented twice, or both documented and listed in `undocumented` |
+| `D07` | `undocumented-export` | warning | an exported symbol without documentation in a package documented in the same file |
+| `D08` | `documentation-outside-package` | error | documentation after `endPackage`, where no package can hold it |
+| `D09` | `documentation-before-begin` | error | `doc` before `beginDocumentation()`, which is what loads it |
+
+Unused bindings are also tagged *unnecessary*, which most editors render by
+fading the name rather than underlining it.
+
+## The installation checks { #installations }
+
+The `E` rules around method installation are the ones that save the most
+debugging, because Macaulay2 itself fails late or not at all:
+
+```m2
+f = x -> x
+f ZZ := n -> n
+-- E01: Installing a method on `f` has no effect: `f` is not a method function.
+--      Define it with `f = method()` to make method installations take effect.
+
+opts = method(Options => {Limit => 1})
+opts QQ := {} >> o -> x -> x
+-- E11: `opts` passes its options as a table to the installed function, so a
+--      function declaring options with `>>` never receives them and the call
+--      fails. Install `o -> x -> …`.
+
+plain = method()
+plain ZZ := {Limit => 1} >> o -> n -> n
+-- E12: `plain` has no options, so calls cannot pass any and the defaults
+--      declared with `>>` always apply.
+```
+
+Where a finding points at another place — `f` defined as a plain function on
+an earlier line — the diagnostic carries it as related information, which
+editors show as a clickable note.
+
+## Silencing a diagnostic { #suppression }
+
+Settings turn rules off everywhere
+([`diagnostics.disabled`](../getting-started/configuration.md#diagnostics)).
+For one place, write a directive comment in the file:
+
+```m2
+-- m2-ls: disable S04 unused-binding
+-- m2-ls: disable-next-line ring-variable-naming
+R = QQ[x0, x1]
+```
+
+`-- m2-ls: disable …`
+: Silences the listed rules in the whole file, wherever the comment stands.
+
+`-- m2-ls: disable-next-line …`
+: Silences them on the following line only.
+
+Rules are named by code or name, as in the settings; a directive that names
+none silences every rule. You rarely need to type these:
+every diagnostic offers **Disable … on this line** and **Disable … in this
+file** as [code actions](code-actions.md#suppression).
+
+See the [complete inline directive reference](../getting-started/inline-directives.md)
+for separators, unknown selectors, blank lines, cumulative scope, limitations,
+and the separate `primaryCode` analysis property.
+
+## Fine print
+
+- Diagnostics are recomputed on every change and published for the version of
+  the document they were computed from.
+- Type diagnostics fire only on what inference can prove. A condition whose
+  type is unknown is not reported; one known to be `ZZ` is.
+- Documentation rules (`D`) apply to `doc ///…///` strings and `document {…}`
+  calls in package files.
+
+### Prefer method dispatch for class-specific behavior
+
+`E19` highlights chains that choose behavior by repeatedly checking the class of
+one value:
+
+```m2
+renderLabel = x -> if instance(x, String) then x
+    else if instance(x, ZZ) then toString x
+    else "other"
+```
+
+Separate method specializations keep each class's behavior together and let new
+classes extend the operation:
+
+```m2
+renderLabel = method()
+renderLabel String := String => x -> x
+renderLabel ZZ := String => x -> toString x
+renderLabel Thing := String => x -> "other"
+```
+
+This warning is advisory. Review inheritance and branch order before changing a
+chain: methods choose the most specific domain, whereas a chain chooses the first
+matching test. Single validation guards, branches consisting only of `error ...`, computed subjects such as `x#0`, locally derived values, repeated
+tests of the same class, and tests of different subjects do not trigger it. The
+check recognizes direct positive `instance` calls with a direct function parameter and a named class; it does
+not cover compound conditions or separate early-return guards.
+
+### Prefer named fields for records
+
+`E20` suggests a hash-table-based type when a condition checks both list
+membership and a fixed multi-field length:
+
+```m2
+if not instance(task, VisibleList) or #task != 2 then
+    error "task needs two fields"
+```
+
+A fixed number of positional entries can indicate a record whose fields would
+be clearer with names. Consider making a struct-like type based on hash tables
+instead of a list. This is advisory: fixed-length lists can also represent
+legitimate mathematical or external data formats.
+
+The check recognizes `List`, `BasicList`, and `VisibleList`, combined through
+`and` or `or`, including negated tests. Length comparisons must use `==` or `!=`
+and an integer literal greater than one, in either operand order. Both tests
+must refer to the same written subject. Subjects can be parameters, local or
+global values, or expressions such as `task#0`. Tests of lengths zero or one,
+variable lengths, ordering comparisons, and unrelated subjects stay quiet.
+
+### Share a method's usual result type
+
+`S07` suggests setting `TypicalValue` in a locally created method's declaration
+when at least five effective installations exist and more than three quarters
+explicitly annotate the same codomain. For example, four `String` annotations
+out of five installations qualify; six out of eight do not.
+
+```m2
+renderLabel = method(TypicalValue => String, Options => {Width => 80})
+```
+
+Keep the declaration's existing options and differing per-method codomain
+annotations. Those annotations override the shared typical value. Unannotated
+installations count toward the total but not toward the annotated majority.
+Inferred codomains do not count as explicit annotations. Reinstalling a domain
+counts only its effective installation. A declaration already specifying a
+`TypicalValue` receives no hint. This whole-document hint is refreshed on save.

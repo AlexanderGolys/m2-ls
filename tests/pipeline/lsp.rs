@@ -1217,7 +1217,7 @@ async fn formatting_preserves_collection_and_assignment_control_flow_layout() {
                 "formatting": {
                     "indent": 4,
                     "useTabs": false,
-                    "softLineWidth": null,
+                    "softWrapWidth": null,
                     "hardLineWidth": null,
                     "controlFlowLayout": "multilineCompactElse",
                     "compactFactorOperators": false,
@@ -1337,10 +1337,8 @@ impl LibraryFixture {
 
     fn sources_settings(&self, enabled: bool) -> Value {
         json!({
-            "sources": {
-                "enabled": enabled,
-                "paths": [self.root.join("usr-dist")]
-            }
+            "sources": {"enabled": enabled},
+            "macaulay2": {"prefix": self.root.join("usr-dist")}
         })
     }
 }
@@ -1991,4 +1989,37 @@ async fn opening_core_source_omits_prelude_completions() {
         assert_eq!(has_builtin, expects_prelude, "{uri}: {completion}");
     }
     server.shutdown().await;
+}
+
+/// Disabling the optional catalog removes builtin documentation while preserving local analysis.
+#[tokio::test]
+async fn catalog_can_be_disabled_before_loading_builtin_metadata() {
+    let source = "localValue = 2\nlocalValue\nmatrix\n";
+    let workspace = TestWorkspace::new(source);
+    for enabled in [true, false] {
+        let mut server = LspProcess::spawn().await;
+        server.initialize_with_options(
+            &workspace.root_uri(),
+            json!({"catalog": {"enabled": enabled}, "initialization": {"files": []}, "sources": {"enabled": false}}),
+        ).await;
+        server.open_document(&workspace.uri, source).await;
+        let builtin = server
+            .request(
+                "textDocument/hover",
+                document_position(&workspace.uri, position(source, "matrix", 0)),
+            )
+            .await;
+        assert_eq!(!builtin.is_null(), enabled, "{builtin}");
+        let local = server
+            .request(
+                "textDocument/definition",
+                document_position(&workspace.uri, position(source, "localValue", 1)),
+            )
+            .await;
+        assert_eq!(
+            local["uri"], workspace.uri,
+            "local definition remains available: {local}"
+        );
+        server.shutdown().await;
+    }
 }

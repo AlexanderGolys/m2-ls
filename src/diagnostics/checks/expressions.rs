@@ -8,12 +8,12 @@
 //! does not hold — rewrite sites and the targets of control transfers — are
 //! computed for the cell first and looked up by expression.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ptr;
 
 use m2_syn::nodes::{
     AssignmentArgument, AssignmentList, AssignmentListContent, Expr, ExprAssign, ExprCollection,
-    ExprControl, ExprLambda, ExprOp, ExprOpBin, ExprOpBinAdj, Symbol,
+    ExprControl, ExprIf, ExprLambda, ExprLiteral, ExprOp, ExprOpBin, ExprOpBinAdj, Symbol,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Delimiter, DelimiterValue, Span, Spanned, Token};
@@ -26,12 +26,13 @@ use crate::analysis::{
 use crate::diagnostics::rewrites::{RewriteKind, RewriteSite, RewriteSites};
 use crate::diagnostics::{catalog, DiagnosticRule, Finding};
 use crate::document::FileProperties;
+use crate::meta::BindingRole;
 use crate::node_metadata::{ParsedCell, SyntaxSnapshot};
 use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry, ObjectRegistryView};
 use crate::source::{DocumentSource, SourceNavigation, SyntaxNavigation, SyntaxSource};
 use crate::syntax::{
     AssignmentListSyntax, AssignmentOperator, AssignmentParts, AssignmentSyntax, AssignmentTarget,
-    ControlSyntax, ExpressionSyntax, PackedArguments,
+    ClauseSyntax, ControlSyntax, ExpressionSyntax, PackedArguments,
 };
 use crate::typesystem::{SubtypeEvidence, TypeKnowledge, TypeRole};
 
@@ -40,6 +41,15 @@ const PROTECT: &str = "protect";
 
 /// The type name a `protect` argument must statically have.
 const SYMBOL_TYPE: &str = "Symbol";
+
+/// Inheritance predicate whose repeated calls indicate manual dispatch.
+const INSTANCE: &str = "instance";
+
+/// Failure operation excluded from behavior-dispatch branches.
+const ERROR: &str = "error";
+
+/// Collection classes whose fixed length can encode positional record fields.
+const RECORD_LIST_CLASSES: [&str; 3] = ["List", "BasicList", "VisibleList"];
 
 /// What the expression occasion provides for every cell of one document.
 pub(super) struct ExpressionContext<'a> {
@@ -91,6 +101,7 @@ pub(super) fn spawn<'a>(
         snapshot: context.source.syntax(),
         rewrites,
         transfers,
+        dispatch_branches: HashSet::new(),
         sink,
     }
     .visit_cell(syntax);
@@ -107,6 +118,8 @@ struct ExpressionChecks<'a, 'context> {
     /// Control transfers of the cell, with the construct receiving each;
     /// absent when the cell's structure is unknown.
     transfers: HashMap<*const ExprControl, Option<ControlTransferTarget<'a>>>,
+    /// Else-if branches already included in a dispatch warning.
+    dispatch_branches: HashSet<*const ExprIf>,
     /// Findings spawned so far.
     sink: &'context mut DiagnosticSink,
 }
@@ -174,6 +187,10 @@ impl<'a> ExpressionChecks<'a, '_> {
         if let Some((_, parts)) = &assignment {
             self.explicit_install_required(expression, parts);
         }
+        if let Expr::If(conditional) = expression {
+            self.instance_dispatch(conditional);
+            self.list_record_shape(conditional);
+        }
         self.condition_type(expression, &knowledge);
         if let Some((node, _)) = &assignment {
             self.install_codomain(node, &knowledge);
@@ -182,6 +199,190 @@ impl<'a> ExpressionChecks<'a, '_> {
             self.call_domain(call, &knowledge);
             self.call_options(call, &knowledge);
         }
+    }
+
+    /// Repeated class tests on a parameter express manual method dispatch.
+    /// At least two distinct classes must have non-error behavior; validation
+    /// guards and tests of computed or locally derived values stay quiet.
+    fn instance_dispatch(&mut self, conditional: &ExprIf) {
+        if self.dispatch_branches.contains(&ptr::from_ref(conditional)) {
+            return;
+        }
+        let Some((subject, class)) = self.instance_test(&conditional.condition) else {
+            return;
+        };
+        let mut classes = HashSet::new();
+        if !self.error_only(conditional.then_clause.clause_value()) {
+            classes.insert(class);
+        }
+        let mut branches = Vec::new();
+        let mut current = conditional;
+        while let Some(Expr::If(next)) = current
+            .else_clause
+            .as_ref()
+            .and_then(|clause| clause.clause_value().unparenthesized())
+        {
+            let Some((next_subject, next_class)) = self.instance_test(&next.condition) else {
+                break;
+            };
+            if next_subject != subject {
+                break;
+            }
+            if !self.error_only(next.then_clause.clause_value()) {
+                classes.insert(next_class);
+            }
+            branches.push(ptr::from_ref(next));
+            current = next;
+        }
+        if classes.len() < 2 {
+            return;
+        }
+        self.dispatch_branches.extend(branches);
+        self.spawn(
+            &catalog::MANUAL_TYPE_DISPATCH,
+            &conditional.condition,
+            format!("Repeated class tests on `{subject}` implement manual dispatch; consider a method with one specialization per class."),
+        );
+    }
+
+    /// Whether a branch consists solely of an unshadowed `error` call.
+    fn error_only(&self, expression: &Expr) -> bool {
+        let Some(Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call)))) = expression.unparenthesized() else {
+            return false;
+        };
+        if call.left_operand.symbol_name() != Some(ERROR) {
+            return false;
+        }
+        let Some(position) = self.context.source.position_for_syntax(call) else {
+            return false;
+        };
+        let knowledge = self.context.knowledge.at(position);
+        self.context
+            .analysis
+            .visible_source_binding_at(ERROR, position, &knowledge)
+            .is_none()
+    }
+
+    /// Parameter and class names of a direct `instance(parameter, Class)` test.
+    fn instance_test<'test>(&self, expression: &'test Expr) -> Option<(&'test str, &'test str)> {
+        let (subject, class) = self.instance_operands(expression)?;
+        let position = self.context.source.position_for_syntax(expression)?;
+        let knowledge = self.context.knowledge.at(position);
+        let subject = subject.unparenthesized()?.symbol_name()?;
+        let binding = self
+            .context
+            .analysis
+            .visible_source_binding_at(subject, position, &knowledge)?;
+        if binding.role != BindingRole::Parameter {
+            return None;
+        }
+        Some((subject, class.unparenthesized()?.symbol_name()?))
+    }
+
+    /// Operands of an unshadowed inheritance predicate, without parameter restrictions.
+    fn instance_operands<'test>(
+        &self,
+        expression: &'test Expr,
+    ) -> Option<(&'test Expr, &'test Expr)> {
+        let Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) = expression.unparenthesized()? else {
+            return None;
+        };
+        if call.left_operand.symbol_name()? != INSTANCE {
+            return None;
+        }
+        let position = self.context.source.position_for_syntax(call)?;
+        let knowledge = self.context.knowledge.at(position);
+        if self
+            .context
+            .analysis
+            .visible_source_binding_at(INSTANCE, position, &knowledge)
+            .is_some()
+        {
+            return None;
+        }
+        let arguments = call.right_operand.arguments();
+        let [Some(subject), Some(class)] = arguments.as_slice() else {
+            return None;
+        };
+        Some((subject, class))
+    }
+
+    /// A list-family check and fixed multi-field length suggest a record type.
+    fn list_record_shape(&mut self, conditional: &ExprIf) {
+        let mut terms = Vec::new();
+        Self::condition_terms(&conditional.condition, &mut terms);
+        let mut list_subjects = Vec::new();
+        let mut length_subjects = Vec::new();
+        for term in terms {
+            if let Some((subject, class)) = self.instance_operands(term) {
+                if RECORD_LIST_CLASSES
+                    .iter()
+                    .any(|role| class.symbol_name() == Some(*role))
+                {
+                    list_subjects.push(subject);
+                }
+            }
+            if let Some(subject) = Self::fixed_record_length(term) {
+                length_subjects.push(subject);
+            }
+        }
+        if list_subjects.iter().any(|subject| {
+            let subject = subject.unparenthesized().unwrap_or(subject);
+            length_subjects.iter().any(|length_subject| {
+                let length_subject = length_subject.unparenthesized().unwrap_or(length_subject);
+                self.text(subject) == self.text(length_subject)
+            })
+        }) {
+            self.spawn(
+                &catalog::LIST_RECORD_SHAPE,
+                &conditional.condition,
+                "Consider making a struct-like type based on hash tables instead of a list.",
+            );
+        }
+    }
+
+    /// Leaves of boolean conditions, including negated validation predicates.
+    fn condition_terms<'test>(expression: &'test Expr, terms: &mut Vec<&'test Expr>) {
+        let Some(expression) = expression.unparenthesized() else {
+            return;
+        };
+        if let Some(binary) = expression.infix_operands() {
+            if matches!(binary.operator, "and" | "or") {
+                Self::condition_terms(binary.left, terms);
+                Self::condition_terms(binary.right, terms);
+                return;
+            }
+        }
+        if let Expr::Op(ExprOp::Prefix(prefix)) = expression {
+            if prefix.operator.spelling() == "not" {
+                Self::condition_terms(&prefix.operand, terms);
+                return;
+            }
+        }
+        terms.push(expression);
+    }
+
+    /// Subject of a length equality or inequality against a literal integer above one.
+    fn fixed_record_length(expression: &Expr) -> Option<&Expr> {
+        let binary = expression.infix_operands()?;
+        if !matches!(binary.operator, "==" | "!=") {
+            return None;
+        }
+        for (length, count) in [(binary.left, binary.right), (binary.right, binary.left)] {
+            let Some(Expr::Literal(ExprLiteral::Integer(integer))) = count.unparenthesized() else {
+                continue;
+            };
+            if !integer.text().parse::<u64>().is_ok_and(|count| count > 1) {
+                continue;
+            }
+            let Some(Expr::Op(ExprOp::Prefix(prefix))) = length.unparenthesized() else {
+                continue;
+            };
+            if prefix.operator.spelling() == "#" {
+                return Some(&prefix.operand);
+            }
+        }
+        None
     }
 
     /// Spawns a finding of `rule` on `syntax`.

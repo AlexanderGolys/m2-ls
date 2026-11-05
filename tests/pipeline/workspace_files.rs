@@ -668,7 +668,7 @@ async fn unavailable_catalog_uses_installed_package_sources() {
             .initialize_with_options(
                 &workspace.root_uri(),
                 json!({
-                    "sources": {"paths": [sources], "initFile": false}
+                    "sources": {"packagePaths": [sources]}, "initialization": {"files": []}
                 }),
             )
             .await;

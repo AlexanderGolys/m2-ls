@@ -2,7 +2,7 @@
 //!
 //! The catalog is generated and published by the M2Book package: every M2Book
 //! release carries it as a release asset, next to a SHA-256 checksum asset.
-//! The server follows M2Book's latest release by default;
+//! The server follows the compatible M2Book release line by default;
 //! `M2_LS_CATALOG_VERSION` can restrict it with a Cargo-style version requirement.
 //! A catalog is downloaded on first use (or by `m2-ls --download-catalog`) and again only when M2Book publishes
 //! a new release; otherwise the cached copy is used offline. The cache holds a
@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use ureq::ResponseExt;
 
 use crate::builtin_index::BuiltinIndex;
+use crate::settings::CatalogSettings;
 
 /// M2Book release page used to discover the latest catalog version.
 const RELEASES_URL: &str = "https://github.com/AlexanderGolys/M2Book/releases";
@@ -89,7 +90,7 @@ impl CatalogSource {
             None => {
                 let requirement = match env::var(CATALOG_VERSION_ENV) {
                     Ok(requirement) => requirement,
-                    Err(env::VarError::NotPresent) => "*".to_owned(),
+                    Err(env::VarError::NotPresent) => CatalogSettings::DEFAULT_VERSION.to_owned(),
                     Err(error) => return Err(IOError::new(ErrorKind::InvalidInput, error)),
                 };
                 let requirement = if requirement == "latest" {
@@ -108,7 +109,36 @@ impl CatalogSource {
         }
     }
 
-    /// Path of a verified catalog, downloading M2Book's latest one when
+    /// Select the local override or a cache isolated for the configured release bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no platform cache directory can be determined.
+    pub fn configured(settings: &CatalogSettings) -> io::Result<Self> {
+        match env::var_os(CATALOG_ENV) {
+            Some(path) => Ok(Self::Override(PathBuf::from(path))),
+            None => CatalogCache::user()
+                .map(|cache| Self::Cache(cache.with_requirement(settings.version.clone()))),
+        }
+    }
+
+    /// Load optional metadata according to configuration, without accessing it when disabled.
+    /// Unavailable catalogs leave source analysis enabled and report the failure on stderr.
+    pub fn load_configured(settings: &CatalogSettings) -> String {
+        if !settings.enabled {
+            return String::new();
+        }
+        Self::configured(settings)
+            .and_then(|source| source.load())
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "m2-ls: builtin catalog unavailable: {error}; continuing with source analysis"
+                );
+                String::new()
+            })
+    }
+
+    /// Path of a verified catalog, downloading the selected M2Book release when
     /// nothing is cached yet.
     ///
     /// Cached downloads are checked against their checksum-addressed filename.

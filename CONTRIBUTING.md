@@ -65,8 +65,9 @@ Treat every `target/` directory as build output.
 
 Run Cargo from the repository root. `cargo run` starts the server on stdio;
 point an editor at `target/debug/m2-ls` after `cargo build` to try a change.
-`./install.sh` installs this checkout and prepares the external catalog. It
-accepts Cargo install options, including `--root` for an isolated installation.
+`cargo install --path . --locked` installs this checkout on all supported
+platforms. Use `--root` for an isolated installation. The optional catalog is
+prepared automatically on first use.
 
 Before committing, run:
 
@@ -94,13 +95,13 @@ continues with source analysis when no valid catalog can be loaded. The catalog
 is never embedded in the executable or included in the crate archive.
 
 The catalog is published as the `m2-index.jsonl` asset of each M2Book release,
-next to its `m2-index.jsonl.sha256` checksum. The server follows the latest
+next to its `m2-index.jsonl.sha256` checksum. The server follows the latest compatible `0.1.*`
 release by default (`M2_LS_CATALOG_VERSION` accepts Cargo-style constraints)
 and refuses a download that does not match the wire format, so release an
 incompatible format change together with the server that reads it.
 
 Tests use the same catalog loader as the server. They download the latest
-catalog once and then work offline. To use a local copy instead, set
+compatible catalog once and then work offline. To use a local copy instead, set
 `M2_LS_CATALOG` to its absolute path before running Cargo. Keep local copies
 outside tracked source; `/m2-index.jsonl` is ignored for this purpose.
 
@@ -108,3 +109,10 @@ outside tracked source; `/m2-index.jsonl` is ignored for this purpose.
 
 Keep `README.md` short and user-facing: what the server does, how to install
 and connect it, and the settings it accepts.
+
+## Test logging
+
+Tests must not write to the usage history or operational log. Library tests do
+not initialize file writers. Every test subprocess running a tool must set both
+`M2_LS_USAGE_LOG=off` and `M2_LS_LOG=off`, even if the parent process enables
+logging. Exercise event formatting through in-memory output instead.

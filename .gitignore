@@ -9,7 +9,6 @@
 opencode.json
 .codex/
 
-docs/
 example_m2_code/
 example-workspace/
 
@@ -24,3 +23,15 @@ example-workspace/
 
 # Local copy of the separately downloaded builtin catalog
 /m2-index.jsonl
+
+# Rendered user guide
+/docs/book/
+
+# Local documentation setup and generated highlighting assets
+/docs/parsers/
+/docs/queries/
+/docs/setup.sh
+/docs/theme/treesitter.css
+
+# Local spelling configuration
+/codebook.toml

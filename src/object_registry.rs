@@ -245,8 +245,10 @@ impl ObjectRegistry {
     /// one starts with: the packages it loads are loaded from the start.
     pub fn with_init_file(&self, init_file: InitFileStart) -> Self {
         let mut registry = self.without_init_file();
-        for package in init_file.file().map_or(&[][..], |file| file.packages()) {
-            registry.register_package(package, None, true);
+        for file in init_file.files() {
+            for package in file.packages() {
+                registry.register_package(package, None, true);
+            }
         }
         registry.init_file = init_file;
         registry

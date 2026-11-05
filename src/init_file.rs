@@ -4,8 +4,8 @@
 //!
 //! Macaulay2 runs the init file as if it were imported on the first line of
 //! every file the session runs: the packages it loads are loaded, and its
-//! global definitions are known. The settings select the file every document
-//! starts with (`sources.initFile`); a document's
+//! global definitions are known. `initialization.files` selects the files each
+//! document starts with; a document's
 //! `-- m2-ls: initFile …` comment selects another, or none, for that document
 //! alone. Each selected file is read and analyzed once, and again whenever it
 //! changes on disk.
@@ -39,8 +39,8 @@ const DIRECTIVE_COMMAND: &str = "initFile";
 /// The directive argument starting a document without an init file.
 const NO_INIT_FILE_ARGUMENT: &str = "none";
 
-/// Which init file sessions start with: the value of `sources.initFile`, and
-/// of a `-- m2-ls: initFile …` directive.
+/// A single-file selection used by `-- m2-ls: initFile …` directives and
+/// the previous `sources.initFile` configuration key.
 ///
 /// In JSON, `true` is [`Self::Discovered`], `false` [`Self::Disabled`], and a
 /// string [`Self::Path`]. A directive writes `none` for [`Self::Disabled`] and
@@ -264,12 +264,15 @@ pub enum InitFileStart {
     /// The selected file, which cannot be read: the session starts without
     /// one.
     Unavailable(InitFileUnavailable),
+    /// Ordered initialization files, including individual read failures.
+    Sequence(Vec<InitFileStart>),
 }
 
 impl PartialEq for InitFileStart {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::None, Self::None) => true,
+            (Self::Sequence(files), Self::Sequence(other)) => files == other,
             (Self::Read(file), Self::Read(other)) => Arc::ptr_eq(file, other),
             (Self::Unavailable(problem), Self::Unavailable(other)) => problem == other,
             _ => false,
@@ -291,7 +294,17 @@ impl InitFileStart {
     pub fn file(&self) -> Option<&Arc<InitFile>> {
         match self {
             Self::Read(file) => Some(file),
+            Self::Sequence(files) => files.iter().rev().find_map(Self::file),
             Self::None | Self::Unavailable(_) => None,
+        }
+    }
+
+    /// Every successfully read initialization file, in configured order.
+    pub fn files(&self) -> Vec<&Arc<InitFile>> {
+        match self {
+            Self::Read(file) => vec![file],
+            Self::Sequence(starts) => starts.iter().flat_map(Self::files).collect(),
+            Self::None | Self::Unavailable(_) => Vec::new(),
         }
     }
 
@@ -299,6 +312,7 @@ impl InitFileStart {
     pub fn problem(&self) -> Option<&InitFileUnavailable> {
         match self {
             Self::Unavailable(problem) => Some(problem),
+            Self::Sequence(files) => files.iter().find_map(Self::problem),
             Self::None | Self::Read(_) => None,
         }
     }
@@ -313,19 +327,40 @@ pub enum InitFileLocation {
     Discovered(PathBuf),
     /// A configured file, which has to.
     Configured(PathBuf),
+    /// Initialization files selected in execution order.
+    Files(Vec<InitFileLocation>),
 }
 
 impl InitFileLocation {
-    /// The file, whether or not it exists.
+    /// The first selected file, whether or not it exists.
+    ///
+    /// # Panics
+    /// Panics for a manually constructed empty [`Self::Files`] list. Settings
+    /// resolution represents an empty list as no location instead.
     pub fn path(&self) -> &Path {
         match self {
             Self::Discovered(path) | Self::Configured(path) => path,
+            Self::Files(files) => files
+                .first()
+                .expect("nonempty initialization locations")
+                .path(),
+        }
+    }
+
+    /// All selected paths, including files that do not currently exist.
+    pub fn paths(&self) -> Vec<&Path> {
+        match self {
+            Self::Files(files) => files.iter().flat_map(Self::paths).collect(),
+            Self::Configured(path) | Self::Discovered(path) => vec![path],
         }
     }
 
     /// The start of sessions with the file here: none when a discovered file
     /// is not there.
     fn read(&self, registry: &ObjectRegistry) -> InitFileStart {
+        if let Self::Files(files) = self {
+            return InitFileStart::Sequence(files.iter().map(|file| file.read(registry)).collect());
+        }
         match (self, InitFileStart::read(self.path(), registry)) {
             (Self::Discovered(_), InitFileStart::Unavailable(problem))
                 if problem.reason == io::ErrorKind::NotFound =>
@@ -387,6 +422,63 @@ impl InitFiles {
                 }
             }
         }
+    }
+
+    /// Resolve the initialization list, expanding application-directory placeholders.
+    pub fn locate_settings(
+        settings: &crate::settings::ServerSettings,
+        workspace_folder: Option<&Path>,
+        environment: &Macaulay2Environment,
+    ) -> Result<Option<InitFileLocation>, InitFileUnavailable> {
+        if settings.sources.init_file != InitFileChoice::Discovered {
+            return Self::locate(
+                &settings.sources.init_file,
+                settings.sources.enabled,
+                workspace_folder,
+                environment,
+            );
+        }
+        let application = settings
+            .macaulay2
+            .application_directory
+            .as_ref()
+            .map(|path| environment.expand_home(path))
+            .or_else(|| {
+                environment
+                    .init_file_path()
+                    .and_then(|path| path.parent().map(Path::to_path_buf))
+            });
+        let mut locations = Vec::new();
+        for written in &settings.initialization.files {
+            let text = written.to_string_lossy();
+            let path = if let Some(relative) = text.strip_prefix("${applicationDirectory}/") {
+                let Some(application) = application.as_ref() else {
+                    continue;
+                };
+                let path = application.join(relative);
+                locations.push(if relative == Macaulay2Conventions::INITIALIZATION_FILE {
+                    InitFileLocation::Discovered(path)
+                } else {
+                    InitFileLocation::Configured(path)
+                });
+                continue;
+            } else {
+                environment.expand_home(written)
+            };
+            if let Some(location) = Self::locate(
+                &InitFileChoice::Path(path),
+                true,
+                workspace_folder,
+                environment,
+            )? {
+                locations.push(location);
+            }
+        }
+        Ok(match locations.len() {
+            0 => None,
+            1 => locations.pop(),
+            _ => Some(InitFileLocation::Files(locations)),
+        })
     }
 
     /// Make the file at `location` the one every document without a
@@ -467,7 +559,7 @@ impl InitFiles {
                     .clone()
             }
         };
-        let is_itself = start.file().is_some_and(|file| {
+        let is_itself = start.files().iter().any(|file| {
             file.uri() == uri
                 || document_path
                     .as_deref()
@@ -489,7 +581,7 @@ impl InitFiles {
             if let Some(location) = configured
                 .location
                 .clone()
-                .filter(|location| location.path() == path)
+                .filter(|location| location.paths().contains(&path))
             {
                 configured.start = location.read(registry);
                 reloaded = true;
@@ -506,9 +598,9 @@ impl InitFiles {
     pub fn files(&self) -> Vec<Arc<InitFile>> {
         let mut files = self
             .configured()
-            .file()
-            .cloned()
+            .files()
             .into_iter()
+            .cloned()
             .collect::<Vec<_>>();
         for start in self.selected_by_directives.iter() {
             if let Some(file) = start.file() {

@@ -4029,6 +4029,9 @@ async fn abbreviated_constructors_infer_the_constructed_type() {
         "header = Header {1,2};\n",
         "sequence = Header (1,2);\n",
         "plain = new Type of BasicList;\n",
+        "MarkdownBlock = new Type of BasicList;\n",
+        "new MarkdownBlock from MarkdownSpan := (t,x) -> {x};\n",
+        "c = MarkdownText [1];\n",
     );
     let mut session = DocumentSession::open(source).await;
     assert!(
@@ -4041,8 +4044,9 @@ async fn abbreviated_constructors_infer_the_constructed_type() {
         (6, "Wrapped"),
         (8, "Header"),
         (9, "Header"),
+        (13, "MarkdownText"),
     ] {
-        assert_eq!(hover_type_at(&mut session, line, 1).await, expected);
+        assert_eq!(hover_type_at(&mut session, line, 0).await, expected);
     }
     session
         .set_inlay_hint_settings(json!({"showLiteral": true}))
@@ -4083,8 +4087,14 @@ async fn string_tokens_distinguish_patterns_packages_and_ordinary_text() {
     for needle in ["\"a+\"", "///b+///", "\"c+\"", "\"d+\"", "\"e+\""] {
         assert_eq!(
             token_at(&tokens, source, needle, 0).0,
-            session.semantic_token_type("regexp"),
+            session.semantic_token_type("string"),
             "{needle}"
+        );
+    }
+    for occurrence in 0..5 {
+        assert_eq!(
+            token_at(&tokens, source, "+", occurrence).0,
+            session.semantic_token_type("regexp")
         );
     }
     for needle in [
@@ -4115,5 +4125,441 @@ async fn string_tokens_distinguish_patterns_packages_and_ordinary_text() {
         token_at(&tokens, source, "\"JSON\"", 0).0,
         session.semantic_token_type("namespace")
     );
+    session.shutdown().await;
+}
+
+/// Adjacent type labels collapse to the final label, independently of their types.
+#[tokio::test]
+async fn sequential_type_hints_keep_only_the_final_label() {
+    let source = concat!(
+        "MarkdownBlock = new Type of BasicList;\n",
+        "MarkdownSpan = new Type of BasicList;\n",
+        "new MarkdownBlock from MarkdownSpan := (t,x) -> {x};\n",
+        "new MarkdownBlock from BasicList := (t,x) -> (toList x);\n",
+        "new MarkdownBlock from Thing := (t,x) -> {x};\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let settings = |sequential| {
+        json!({
+            "argNames": {"enabled": false},
+        "showRepeated": true,
+            "types": {"after": {"return": true}},
+            "hide": {"literal": false, "trivial": false, "sequential": sequential, "calls": []}
+        })
+    };
+    session.set_inlay_hint_settings(settings(false)).await;
+    let before = session.request("textDocument/inlayHint", json!({
+        "textDocument": {"uri": session.uri()},
+        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 100, "character": 0}}
+    })).await;
+    session.set_inlay_hint_settings(settings(true)).await;
+    let after = session.request("textDocument/inlayHint", json!({
+        "textDocument": {"uri": session.uri()},
+        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 100, "character": 0}}
+    })).await;
+    for line in [2, 4] {
+        let ending = source.lines().nth(line).unwrap().find(';').unwrap() as u64;
+        let labels_at_end = |hints: &Value| {
+            response_array(hints)
+                .iter()
+                .filter(|hint| {
+                    hint["position"]["line"] == line as u64
+                        && hint["position"]["character"] == ending
+                })
+                .map(|hint| hint["label"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let complete = labels_at_end(&before);
+        assert!(
+            complete
+                .iter()
+                .any(|label| label.contains("FunctionClosure")),
+            "{before}"
+        );
+        assert!(
+            complete.iter().any(|label| label.contains("MarkdownBlock")),
+            "{before}"
+        );
+        assert_eq!(
+            labels_at_end(&after),
+            vec![complete.last().unwrap().clone()]
+        );
+    }
+    session.shutdown().await;
+}
+
+/// Literal filtering covers written values without classifying constructor calls as literals.
+#[tokio::test]
+async fn grouped_literal_filter_distinguishes_literals_from_constructor_calls() {
+    let source = concat!(
+        "ordinaryValue = \"a\";\n",
+        "rawValue = ///b///;\n",
+        "integerValue = 1;\n",
+        "realValue = 1.2;\n",
+        "booleanValue = true;\n",
+        "nothingValue = null;\n",
+        "listValue = {isPrime 7};\n",
+        "arrayValue = [1];\n",
+        "sequenceValue = (1,2);\n",
+        "closureValue = x -> x;\n",
+        "constructedValue = new String from 1;\n",
+        "convertedValue = matrix {{1},{1}};\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    session
+        .set_inlay_hint_settings(json!({
+            "everywhere": false,
+            "argNames": {"enabled": false},
+            "types": {"after": {"call": false, "endOfLine": false, "endOfCell": false,
+                "assignment": true, "brackets": [], "return": false}},
+            "hide": {"literal": true, "trivial": false, "types": [], "calls": [],
+                "sequential": false, "operatorCalls": false}
+        }))
+        .await;
+    let labels = inlay_labels_by_line(&mut session).await;
+    assert!(!labels.is_empty(), "{labels:?}");
+    assert!(labels.iter().all(|(line, _)| *line == 11), "{labels:?}");
+    assert!(
+        labels.iter().any(|(_, label)| label.contains("Matrix")),
+        "{labels:?}"
+    );
+    session.shutdown().await;
+}
+
+/// The name limit applies separately to each parameter, preserving types and colons.
+#[tokio::test]
+async fn argument_name_truncation_preserves_domains_and_value_positions() {
+    let source = concat!(
+        "pairLabel = method();\n",
+        "pairLabel(ZZ,String) := (longParameterName,anotherParameterName) -> longParameterName;\n",
+        "pairLabel(1,\"x\")\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    session
+        .set_inlay_hint_settings(json!({
+            "everywhere": false,
+            "argNames": {"enabled": true, "maxLength": 4}, "argTypes": true,
+            "maxLabelLength": 2,
+            "types": {"after": {"call": false, "endOfLine": false, "endOfCell": false,
+                "assignment": false, "brackets": [], "return": false}}
+        }))
+        .await;
+    let hints = inlay_hints(&mut session).await;
+    let arguments = hints
+        .iter()
+        .filter(|hint| hint["kind"] == 2)
+        .collect::<Vec<_>>();
+    assert_eq!(arguments.len(), 2, "{hints:?}");
+    for (hint, column, label, full_name) in [
+        (arguments[0], 10, "ZZ lon…:", "longParameterName"),
+        (arguments[1], 12, "String ano…:", "anotherParameterName"),
+    ] {
+        assert_eq!(hint["position"], json!({"line": 2, "character": column}));
+        assert_eq!(hint["label"], label);
+        assert_eq!(hint["tooltip"], full_name);
+    }
+    session.shutdown().await;
+}
+
+/// Sequence parentheses and holders are distinct, and holders explicitly request hints.
+#[tokio::test]
+async fn delimiter_hints_distinguish_sequences_holders_and_collections() {
+    let mut session = DocumentSession::open("(2,2)\n(1)\n((1,1))\n[1]\n{1}\n").await;
+    let settings = |brackets: Vec<&str>, hide_literals| {
+        json!({
+            "everywhere": false, "argNames": {"enabled": false},
+            "types": {"after": {"call": false, "endOfLine": false, "endOfCell": false,
+                "assignment": false, "brackets": brackets, "return": false}},
+            "hide": {"literal": hide_literals, "trivial": hide_literals, "sequential": false}
+        })
+    };
+    session
+        .set_inlay_hint_settings(settings(vec!["parentheses"], false))
+        .await;
+    let sequences = inlay_hints(&mut session).await;
+    assert_eq!(sequences.len(), 2, "{sequences:?}");
+    assert_eq!(sequences[0]["position"], json!({"line": 0, "character": 5}));
+    assert_eq!(sequences[1]["position"], json!({"line": 2, "character": 6}));
+    assert!(sequences.iter().all(|hint| hint["label"] == "Sequence"));
+    session
+        .set_inlay_hint_settings(settings(vec!["holder"], true))
+        .await;
+    let holders = inlay_hints(&mut session).await;
+    assert_eq!(holders.len(), 2, "{holders:?}");
+    assert_eq!(holders[0]["position"], json!({"line": 1, "character": 3}));
+    assert_eq!(holders[0]["label"], "ZZ");
+    assert_eq!(holders[1]["position"], json!({"line": 2, "character": 7}));
+    assert_eq!(holders[1]["label"], "Sequence");
+    session
+        .set_inlay_hint_settings(settings(vec!["array", "list"], false))
+        .await;
+    let collections = inlay_hints(&mut session).await;
+    assert_eq!(collections.len(), 2, "{collections:?}");
+    assert_eq!(collections[0]["label"], "Array");
+    assert_eq!(collections[1]["label"], "List");
+    session.shutdown().await;
+}
+
+/// Operator-call filtering removes operand parameter labels while preserving type hints.
+#[tokio::test]
+async fn operator_call_filter_hides_parameter_labels_without_hiding_expression_types() {
+    let source = concat!(
+        "Token = new Type of BasicList;\n",
+        "Token + Token := (leftValue,rightValue) -> leftValue;\n",
+        "a = new Token from {};\n",
+        "b = new Token from {};\n",
+        "a + b\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let settings = |hidden| {
+        json!({
+            "argNames": {"enabled": true, "requireBracket": false},
+            "hide": {"operatorCalls": hidden, "sequential": false, "literal": true, "trivial": false, "calls": []}
+        })
+    };
+    session.set_inlay_hint_settings(settings(false)).await;
+    let visible = inlay_hints(&mut session).await;
+    let labels = visible
+        .iter()
+        .filter(|hint| hint["kind"] == 2)
+        .collect::<Vec<_>>();
+    assert_eq!(labels.len(), 2, "{visible:?}");
+    assert_eq!(labels[0]["position"], json!({"line": 4, "character": 0}));
+    assert_eq!(labels[0]["label"], "leftValue:");
+    assert_eq!(labels[1]["position"], json!({"line": 4, "character": 4}));
+    assert_eq!(labels[1]["label"], "rightValue:");
+    session.set_inlay_hint_settings(settings(true)).await;
+    let hidden = inlay_hints(&mut session).await;
+    assert!(hidden.iter().all(|hint| hint["kind"] != 2), "{hidden:?}");
+    let types = |hints: Vec<Value>| {
+        hints
+            .into_iter()
+            .filter(|hint| hint["kind"] == 1)
+            .collect::<Vec<_>>()
+    };
+    let expected = types(visible);
+    assert!(!expected.is_empty());
+    assert_eq!(types(hidden), expected);
+    session.shutdown().await;
+}
+
+/// Explicit holder requests retain their location instead of moving to the assigned name.
+#[tokio::test]
+async fn explicit_holder_hint_takes_precedence_over_assignment_hint() {
+    let source = "value = (isPrime 7)\n";
+    let mut session = DocumentSession::open(source).await;
+    session
+        .set_inlay_hint_settings(json!({
+            "everywhere": false, "argNames": {"enabled": false},
+            "types": {"after": {"call": false, "endOfLine": true, "endOfCell": true,
+                "assignment": true, "brackets": ["holder"], "return": true}},
+            "hide": {"literal": true, "trivial": true, "sequential": true}
+        }))
+        .await;
+    let hints = inlay_hints(&mut session).await;
+    assert_eq!(hints.len(), 1, "{hints:?}");
+    assert_eq!(hints[0]["position"], json!({"line": 0, "character": 19}));
+    assert_eq!(hints[0]["label"], "Boolean");
+    session.shutdown().await;
+}
+
+/// Class-based branch chains suggest method specializations, without flagging guards.
+#[tokio::test]
+async fn repeated_instance_tests_suggest_method_dispatch() {
+    let mut session = DocumentSession::open("").await;
+    for (source, expected) in [
+        ("f = x -> if instance(x, String) then x else if instance(x, ZZ) then toString x else if instance(x, List) then toString x else null\n", true),
+        ("f = x -> if instance(x, String) then x else (if instance(x, ZZ) then toString x else null)\n", true),
+        ("f = x -> if instance(x, String) then x else null\n", false),
+        ("f = x -> if not instance(x, String) then error \"text required\"\n", false),
+        ("f = (x, y) -> if instance(x, String) then x else if instance(y, ZZ) then y else null\n", false),
+        ("f = x -> if instance(x, String) then x else if instance(x, String) then x else null\n", false),
+        ("instance = (x, T) -> true\nf = x -> if instance(x, String) then x else if instance(x, ZZ) then x else null\n", false),
+        ("f = x -> if instance(x, String) then error \"invalid\" else if instance(x, ZZ) then toString x else null\n", false),
+        ("f = x -> if instance(x, String) then x else if instance(x, ZZ) then (error \"invalid\") else null\n", false),
+        ("f = x -> if instance(x, String) then error \"invalid\" else if instance(x, ZZ) then toString x else if instance(x, List) then toString x else null\n", true),
+        ("f = x -> (y := x#0; if instance(y, String) then y else if instance(y, ZZ) then toString y else null)\n", false),
+        ("x = 3\nif instance(x, String) then x else if instance(x, ZZ) then toString x else null\n", false),
+        ("f = x -> if instance(x#0, String) then x else if instance(x#0, ZZ) then x else null\n", false),
+    ] {
+        replace_and_assert_diagnostic(&mut session, source, "E19", expected).await;
+        if expected {
+            let findings = session.diagnostics().iter().filter(|item| item["code"] == "E19").collect::<Vec<_>>();
+            assert_eq!(findings.len(), 1, "one warning per dispatch chain");
+            assert_eq!(findings[0]["severity"], 2);
+        }
+    }
+    session.shutdown().await;
+}
+
+/// Fixed-size list validation suggests named record fields for any subject.
+#[tokio::test]
+async fn fixed_list_shapes_suggest_hash_table_records() {
+    let mut session = DocumentSession::open("").await;
+    for (condition, expected) in [
+        ("not instance(task, VisibleList) or #task != 2", true),
+        ("instance(task, List) and #task == 3", true),
+        ("#task != 4 or not instance(task, BasicList)", true),
+        ("instance(task#0, List) and #(task#0) == 2", true),
+        ("(instance(task, List)) and (2 == #task)", true),
+        ("instance(task, List) and #task == 1", false),
+        ("instance(task, List) and #task != 0", false),
+        ("instance(task, List) and #task > 2", false),
+        ("instance(task, List) and #task === 2", false),
+        ("instance(task, List) and #other == 2", false),
+        ("instance(task, HashTable) and #task == 2", false),
+        ("instance(task, List) and #task == count", false),
+        ("instance(task, List)", false),
+        ("#task == 2", false),
+    ] {
+        let source = format!("task = {{1, 2}}\nif {condition} then null else null\n");
+        replace_and_assert_diagnostic(&mut session, &source, "E20", expected).await;
+    }
+    let shadowed = "instance = (x, T) -> true\nif instance(task, List) and #task == 2 then null\n";
+    replace_and_assert_diagnostic(&mut session, shadowed, "E20", false).await;
+    session.shutdown().await;
+}
+
+/// Pattern tokens preserve literal delimiters and source-mapped escape spelling.
+#[tokio::test]
+async fn regex_tokens_split_text_syntax_and_escapes() {
+    let source = concat!(
+        r#"match(///a[b-d].*\d\.\x41///, "text")"#,
+        "\n",
+        r#"regex("a\\d\\.[x]", "text")"#,
+        "\n",
+        r#"match(///😀é[.*]///, "text")"#,
+        "\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let response = session
+        .request(
+            "textDocument/semanticTokens/full",
+            json!({"textDocument": {"uri": session.uri()}}),
+        )
+        .await;
+    let data = response["data"].as_array().expect("semantic token data");
+    let mut line = 0;
+    let mut character = 0;
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut patterns = [Vec::new(), Vec::new(), Vec::new()];
+    for token in data.chunks_exact(5) {
+        let delta_line = token[0].as_u64().unwrap() as usize;
+        line += delta_line;
+        character =
+            if delta_line == 0 { character } else { 0 } + token[1].as_u64().unwrap() as usize;
+        let length = token[2].as_u64().unwrap() as usize;
+        let pattern_start = 6;
+        let pattern_end = lines[line]
+            .split(',')
+            .next()
+            .unwrap()
+            .encode_utf16()
+            .count();
+        if character >= pattern_start && character < pattern_end {
+            let spelling = String::from_utf16(
+                &lines[line]
+                    .encode_utf16()
+                    .skip(character)
+                    .take(length)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let kind = token[3].as_u64().unwrap();
+            patterns[line].push((spelling, kind));
+        }
+    }
+    let string = session.semantic_token_type("string");
+    let regex = session.semantic_token_type("regexp");
+    let escape = session.semantic_token_type("escapeSequence");
+    assert_eq!(
+        patterns[0],
+        vec![
+            ("///a".into(), string),
+            ("[".into(), regex),
+            ("b".into(), string),
+            ("-".into(), regex),
+            ("d".into(), string),
+            ("].*".into(), regex),
+            (r"\d\.\x41".into(), escape),
+            ("///".into(), string)
+        ]
+    );
+    assert_eq!(
+        patterns[1],
+        vec![
+            ("\"a".into(), string),
+            (r"\\d\\.".into(), escape),
+            ("[".into(), regex),
+            ("x".into(), string),
+            ("]".into(), regex),
+            ("\"".into(), string)
+        ]
+    );
+    assert_eq!(
+        patterns[2],
+        vec![
+            ("///😀é".into(), string),
+            ("[".into(), regex),
+            (".*".into(), string),
+            ("]".into(), regex),
+            ("///".into(), string)
+        ]
+    );
+    session.shutdown().await;
+}
+
+/// Shared defaults require five methods and a strict three-quarter annotation majority.
+#[tokio::test]
+async fn dominant_method_codomains_suggest_a_typical_value() {
+    let mut session = DocumentSession::open("").await;
+    for (types, expected) in [
+        (vec!["String"; 4], false),
+        (vec!["String"; 5], true),
+        (vec!["String", "String", "String", "String", "ZZ"], true),
+        (vec!["String", "String", "String", "String", ""], true),
+        (vec!["String", "String", "String", "ZZ", "ZZ"], false),
+        (
+            vec![
+                "String", "String", "String", "String", "String", "String", "ZZ", "ZZ",
+            ],
+            false,
+        ),
+    ] {
+        let mut source = String::from("renderLabel = method()\n");
+        for (index, codomain) in types.iter().enumerate() {
+            source.push_str(&format!("Domain{index} = new Type of List\n"));
+            let annotation = if codomain.is_empty() {
+                String::new()
+            } else {
+                format!("{codomain} => ")
+            };
+            source.push_str(&format!(
+                "renderLabel Domain{index} := {annotation}x -> \"text\"\n"
+            ));
+        }
+        session.replace(&source).await;
+        session.save().await;
+        assert_eq!(
+            session.diagnostic_codes().contains(&"S07"),
+            expected,
+            "{source}\n{:?}",
+            session.diagnostics()
+        );
+        if expected {
+            let findings = session
+                .diagnostics()
+                .iter()
+                .filter(|item| item["code"] == "S07")
+                .collect::<Vec<_>>();
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0]["severity"], 4);
+            assert_eq!(findings[0]["range"]["start"]["line"], 0);
+            let declared = source.replace("method()", "method(TypicalValue => String)");
+            session.replace(&declared).await;
+            session.save().await;
+            assert!(!session.diagnostic_codes().contains(&"S07"));
+        }
+    }
     session.shutdown().await;
 }

@@ -25,7 +25,7 @@ fn main() -> ExitCode {
         }
         [argument] if argument == "--help" || argument == "-h" => {
             println!(
-                "Usage: m2-ls [OPTIONS]\n\nWithout options, starts the language server on stdio.\n\n    --download-catalog  Download the selected M2Book builtin catalog unless cached, and print its path\n    -h, --help          Show help\n    -V, --version       Show version\n\nM2_LS_CATALOG_VERSION selects a Cargo-style release requirement (default: latest or *).\nM2_LS_CATALOG selects a local catalog instead."
+                "Usage: m2-ls [OPTIONS]\n\nWithout options, starts the language server on stdio.\n\n    --download-catalog  Download the selected M2Book builtin catalog unless cached, and print its path\n    -h, --help          Show help\n    -V, --version       Show version\n\nM2_LS_CATALOG_VERSION selects a Cargo-style release requirement (default: 0.1.*).\nM2_LS_CATALOG selects a local catalog instead."
             );
             ExitCode::SUCCESS
         }

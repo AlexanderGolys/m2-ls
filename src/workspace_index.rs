@@ -287,7 +287,7 @@ pub struct WorkspaceIndex {
     /// sessions see.
     init_files: DashSet<Url>,
     /// The init file each indexed document's session starts with.
-    init_file_of_document: DashMap<Url, Url>,
+    init_file_of_document: DashMap<Url, Vec<Url>>,
     /// Whether files outside a package see only its exports.
     privacy: PackagePrivacy,
     /// Installed sources analyzed as workspace code when builtin metadata is unavailable.
@@ -351,7 +351,9 @@ impl WorkspaceIndex {
             "workspace.dependencies",
             serde_json::json!({"roots": files.len()}),
         );
+        let started = std::time::Instant::now();
         let mut processed = 0;
+        let mut cache_hits = 0;
         let mut pending = files;
         while !pending.is_empty() {
             pending.sort();
@@ -361,6 +363,7 @@ impl WorkspaceIndex {
             crate::telemetry::event(
                 serde_json::json!({"operation": "workspace.index_wave", "queued": pending.len(), "cache_hits": candidates - pending.len()}),
             );
+            cache_hits += candidates - pending.len();
             processed += pending.len();
             let workers = thread::available_parallelism()
                 .map_or(1, usize::from)
@@ -391,6 +394,27 @@ impl WorkspaceIndex {
                 }
             });
             pending = loaded.into_inner().expect("loaded lock");
+        }
+        if processed > 0 {
+            let packages = self
+                .declared_packages_by_file
+                .iter()
+                .flat_map(|file| {
+                    file.value()
+                        .iter()
+                        .map(|package| package.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            crate::usage_log::record(
+                "indexing",
+                serde_json::json!({
+                    "scope": "workspace", "processed_files": processed,
+                    "indexed_files": self.loads_by_file.len(), "packages": packages,
+                    "cache_hits": cache_hits, "duration_ms": started.elapsed().as_secs_f64() * 1000.0,
+                }),
+            );
         }
         timing.record("processed_files", processed);
         timing.record("cached_files", self.loads_by_file.len());
@@ -443,9 +467,16 @@ impl WorkspaceIndex {
         self.remove_file(uri);
         self.hierarchies_by_file
             .insert(uri.clone(), HierarchySnapshot::new(snapshot, uri));
-        if let Some(init_file) = snapshot.object_registry().init_file().file() {
+        let initialization = snapshot
+            .object_registry()
+            .init_file()
+            .files()
+            .into_iter()
+            .map(|file| file.uri().clone())
+            .collect::<Vec<_>>();
+        if !initialization.is_empty() {
             self.init_file_of_document
-                .insert(uri.clone(), init_file.uri().clone());
+                .insert(uri.clone(), initialization);
         }
         let declarations = snapshot.packages().declarations().to_vec();
         if !declarations.is_empty() {
@@ -734,7 +765,7 @@ impl WorkspaceIndex {
                 WorkspaceViewer::Document(requester) => self
                     .init_file_of_document
                     .get(requester)
-                    .is_some_and(|init_file| init_file.value() == uri),
+                    .is_some_and(|init_file| init_file.value().contains(uri)),
                 WorkspaceViewer::PackageSession => false,
             };
         }

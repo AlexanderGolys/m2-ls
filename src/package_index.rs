@@ -15,7 +15,7 @@ use m2_syn::visit::{self, Visit};
 use tower_lsp::lsp_types::{Location, Position, Range as TextRange, Url};
 
 use crate::object_registry::ObjectName;
-use crate::settings::SourceSettings;
+use crate::settings::{CorePathSetting, ServerSettings, SourceSettings};
 use crate::source::SourceNavigation;
 use crate::string_literal::LiteralSource;
 use crate::syntax::ExpressionSyntax;
@@ -158,6 +158,14 @@ impl Installation {
     /// taken instead if that one has package sources and the first does not.
     /// If neither exposes sources, query the executable for its prefix.
     pub fn of_executable(executable: &Path) -> Option<Self> {
+        Self::of_executable_with_discovery(executable, true)
+    }
+
+    /// Infer an installation from its executable, optionally querying wrappers.
+    pub fn of_executable_with_discovery(
+        executable: &Path,
+        runtime_discovery: bool,
+    ) -> Option<Self> {
         let directory = fs::canonicalize(executable.parent()?).ok()?;
         let direct = Layout::of_bin_directory(&directory);
         let linked = fs::read_link(directory.join(executable.file_name()?))
@@ -179,7 +187,11 @@ impl Installation {
                 linked
             }
             (Some(direct), _) => direct,
-            (None, _) => return Self::query_executable(executable),
+            (None, _) => {
+                return runtime_discovery
+                    .then(|| Self::query_executable(executable))
+                    .flatten()
+            }
         };
         let installation = Self::new(prefix, layout, build_directory);
         if installation
@@ -188,7 +200,9 @@ impl Installation {
         {
             Some(installation)
         } else {
-            Self::query_executable(executable)
+            runtime_discovery
+                .then(|| Self::query_executable(executable))
+                .flatten()
         }
     }
 
@@ -457,6 +471,70 @@ impl SourceResolver {
                 .map(|directory| environment.expand_home(directory))
                 .collect(),
             ..discovered
+        }
+    }
+
+    /// Configure source search from the separated installation and source settings.
+    pub fn for_settings(environment: &Macaulay2Environment, settings: &ServerSettings) -> Self {
+        let sources = &settings.sources;
+        let runtime = &settings.macaulay2;
+        if !sources.enabled {
+            return Self::configured(environment, sources);
+        }
+        let installation = runtime
+            .prefix
+            .as_ref()
+            .and_then(|prefix| Installation::of_prefix(&environment.expand_home(prefix)))
+            .or_else(|| {
+                let executable = runtime
+                    .executable
+                    .as_ref()
+                    .map(|path| environment.expand_home(path))
+                    .or_else(|| environment.executable())?;
+                Installation::of_executable_with_discovery(&executable, runtime.runtime_discovery)
+            });
+        // Configured entries are package directories, independently of runtime availability.
+        let mut path = sources
+            .paths
+            .iter()
+            .map(|path| environment.expand_home(path))
+            .collect::<Vec<_>>();
+        if let Some(paths) = environment.source_path_override.as_deref() {
+            path.extend(env::split_paths(paths));
+        }
+        if let Some(application) = runtime
+            .application_directory
+            .as_ref()
+            .map(|path| environment.expand_home(path))
+        {
+            path.push(application.join(Macaulay2Conventions::APPLICATION_CODE));
+            path.push(
+                application
+                    .join(Macaulay2Conventions::APPLICATION_PREFIX)
+                    .join(Layout::Unified.packages()),
+            );
+        } else {
+            path.extend(environment.user_path());
+        }
+        path.extend(installation.iter().flat_map(Installation::package_path));
+        let core_path = match &sources.core_path {
+            CorePathSetting::Enabled(false) => Vec::new(),
+            CorePathSetting::Path(path) if path != Path::new("auto") => {
+                vec![environment.expand_home(path)]
+            }
+            _ => installation
+                .iter()
+                .flat_map(Installation::core_path)
+                .collect(),
+        };
+        Self {
+            path: Self::existing_directories(path),
+            core_path: Self::existing_directories(core_path),
+            primary_code_directories: sources
+                .primary_code_paths
+                .iter()
+                .map(|path| environment.expand_home(path))
+                .collect(),
         }
     }
 
@@ -980,7 +1058,12 @@ mod import_trigger_tests {
             executable_search_path: vec![executable.parent().unwrap().to_path_buf()],
             ..Macaulay2Environment::default()
         };
-        let resolver = SourceResolver::discover(&environment, &[]);
+        let mut settings = crate::settings::ServerSettings::default();
+        settings.macaulay2.runtime_discovery = false;
+        let resolver = SourceResolver::for_settings(&environment, &settings);
+        assert_eq!(resolver.resolve_package_file("Text"), None);
+        settings.macaulay2.runtime_discovery = true;
+        let resolver = SourceResolver::for_settings(&environment, &settings);
         assert_eq!(
             resolver.resolve_package_file("Text"),
             Some(installed.join("share/Macaulay2/Text.m2"))

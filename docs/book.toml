@@ -1,0 +1,37 @@
+[book]
+title = "m2-ls User Guide"
+description = "A practical guide to using m2-ls with Macaulay2"
+authors = ["Alexander Golys"]
+language = "en"
+src = "src"
+
+[preprocessor.tsitter]
+after = ["links"]
+
+[preprocessor.tsitter.languages]
+macaulay2 = { aliases = ["m2", "macaulay2"] }
+bash = { aliases = ["bash", "sh", "shell"] }
+json = {}
+lua = {}
+rust = {}
+toml = {}
+markdown = { aliases=["md"] }
+
+[output.html]
+default-theme = "everforest"
+preferred-dark-theme = "everforest"
+theme = "theme"
+additional-css = ["theme/everforest.css"]
+git-repository-url = "https://github.com/AlexanderGolys/m2-ls"
+git-repository-icon = "fab-github"
+
+[output.html.print]
+enable = false
+
+[output.html.playground]
+runnable = false
+editable = false
+
+[output.html.fold]
+enable = true
+level = 1

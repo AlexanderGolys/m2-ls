@@ -44,93 +44,25 @@ rather than guess.
 
 ## Install
 
-From a checkout, install the tools and automatically prepare the catalog:
-
-```sh
-./install.sh
-```
-
-The installer forwards options such as `--root /path/to/install` to
-`cargo install`, then runs the installed `m2-ls --download-catalog`.
-It downloads the catalog unless the latest one is already cached.
-
-You can also install directly from crates.io:
+Install from crates.io:
 
 ```sh
 cargo install m2-ls
 ```
 
-Requires Rust 1.88 or newer. Macaulay2 itself is optional. Plain `cargo install`
-has no post-install hook, so this route prepares the catalog on first use.
-`m2-ls` and `m2-lint` download the builtin catalog from the latest
-[M2Book](https://github.com/AlexanderGolys/M2Book/releases) release over HTTPS
-and verify it against the SHA-256 checksum published with it. Later starts use
-the cached copy and work offline. The server checks for a new M2Book release in
-the background and uses its catalog from the next start; upgrading the server
-itself reuses the cache.
-Set `M2_LS_CATALOG_VERSION` before starting the editor to restrict M2Book
-releases. The default is `latest` (also written `*`). Cargo-style requirements
-include `=0.1.1` for an exact pin, `^0.1.1`, and `>=0.1.1, <0.2` for a range.
-The newest published matching semantic version is selected; prereleases need
-an explicit prerelease requirement. Each constraint uses a separate cache.
-For example:
+From a checkout, use `cargo install --path . --locked`. Cargo supports
+installation options such as `--root` on Linux, macOS, and Windows.
+Requires Rust 1.88 or newer.
 
-```sh
-M2_LS_CATALOG_VERSION='=0.1.1' m2-ls --download-catalog
-```
-
-If no usable catalog can be loaded, the server and linter report the failure
-and continue with source analysis. The server follows imported installed
-package sources as it does user code, providing the definitions it can find.
-Builtin documentation and catalog-dependent type information remain unavailable
-until a catalog can be loaded on a later start. A failed background update
-keeps the current session and its working cache.
-
-`m2-fmt` does not need the catalog or network access.
-
-To download the catalog before opening your editor, run:
-
-```sh
-m2-ls --download-catalog
-```
-
-This prints the catalog's local path, downloading it only when M2Book has
-published a newer one.
-
-The catalog is stored under `$XDG_CACHE_HOME/m2-ls` (normally
-`~/.cache/m2-ls`) on Linux, `~/Library/Caches/m2-ls` on macOS, and
-`%LOCALAPPDATA%/m2-ls` on Windows. For offline installation or a custom catalog,
-set `M2_LS_CATALOG` to an existing JSONL file; this bypasses downloading and
-cache writes. Neither M2Book nor Macaulay2 is needed to download or use it.
-
-## Command-line tools
-
-Installation also provides `m2-lint` and `m2-fmt`, using the same diagnostics
-and formatter as the server:
-
-```sh
-m2-lint file.m2                 # Lint one file
-m2-lint --deny-warnings file.m2 # Fail on warnings as well as errors
-m2-fmt file.m2                  # Format one file in place
-m2-fmt --check file.m2          # Check formatting without writing (CI)
-m2-fmt --stdout file.m2         # Print the formatted file
-cat file.m2 | m2-fmt -          # Format stdin to stdout
-```
-
-Each command takes exactly one file, or `-` alone to read stdin. The
-`--config settings.json` option reads the same JSON settings as the server,
-including `diagnostics` and `formatting`; invalid values fail the command. No
-configuration file is loaded automatically.
-
-Exit status is `0` on success, `1` for lint errors (also warnings with
-`--deny-warnings`) or formatting differences with `--check`, and `2` for usage,
-configuration, or I/O errors. Lint hints and information are printed but do not
-fail the command. Diagnostic columns use one-based UTF-16 positions.
-
-For a local build, use `cargo run --bin m2-lint -- file.m2` or
-`cargo run --bin m2-fmt -- --check file.m2`; `cargo run` still starts the server.
+Macaulay2 is optional. The server automatically downloads and caches a small
+optional catalog from [M2Book](https://github.com/AlexanderGolys/M2Book/releases)
+for builtin documentation and type information. No catalog setup is needed.
+If it is unavailable, source analysis still works. Later starts retry
+automatically, and an existing cache works offline.
 
 ## Connect your editor
+
+Configure your editor to run `m2-ls` from `PATH`.
 
 Neovim 0.11+:
 
@@ -149,7 +81,8 @@ vim.lsp.enable('m2_ls')
 Any other LSP client: run `m2-ls` over stdio for `.m2` files and give it a
 project root, which is the scope of workspace search and cross-file rename.
 Navigation also enters the Macaulay2 library source of the loaded packages when
-it can find them; point `sources.paths` at an installation it does not find.
+it can find them; use `macaulay2.prefix` for another installation and
+`sources.packagePaths` for additional package directories.
 Packages you write are read from source: importing `P` whose `P.m2` sits next
 to the importing file makes only the names `P` exports visible, and the code of
 each `TEST` block is analyzed like the session `check` runs it in.
@@ -162,59 +95,61 @@ in `primaryCode` mode, without automatic imports of prelude packages.
 
 ## Configuration
 
-Every setting is optional and applies without a restart. Send them under the
-`m2-ls` section of your client's settings (or as `initializationOptions`):
+Settings are grouped by what they control. The editor sends JSON under its
+`m2-ls` settings section or as `initializationOptions`:
 
 ```json
 {
   "m2-ls": {
-    "diagnostics": { "disabled": ["unused-binding", "T02"] },
-    "formatting": { "indent": 4, "hardLineWidth": 100 },
-    "inlayHints": { "afterCall": true, "hideTypes": ["ZZ"] }
+    "diagnostics": {
+      "emitAs": { "hint": ["unused-binding"] }
+    },
+    "formatting": { "softWrapWidth": 88 },
+    "inlayHints": {
+      "argNames": { "enabled": true, "requireBracket": true },
+      "types": { "after": { "call": true } },
+      "hide": { "types": ["Thing", "Nothing", "ZZ"] }
+    }
   }
 }
 ```
 
-| Setting | Default | Effect |
-| --- | --- | --- |
-| `diagnostics.enabled` | `true` | Shows or hides all diagnostics. |
-| `diagnostics.disabled` | `[]` | Hides rules by name or code, e.g. `unused-binding` or `T02`. |
-| `diagnostics.warningsAsHint`, `diagnostics.warningsAsInfo` | `[]` | Shows these rules' warnings as hints or information instead. |
-| `formatting.indent`, `formatting.useTabs` | See source | Indentation used by the formatter. |
-| `formatting.softLineWidth`, `formatting.hardLineWidth` | See source | Preferred and forced wrapping widths; `0` disables. |
-| `formatting.controlFlowLayout` | See source | `compact`, `multiline`, `multilineCompactElse`, or `leadingKeywords` (`then` and `else` start lines under their `if`). |
-| `formatting.compactFactorOperators` | See source | `2*x` instead of `2 * x`. |
-| `formatting.breakAfterSemicolon` | See source | Starts the next statement on a new line. |
-| `formatting.keepLineBreaks` | `false` | Keeps every line break as written; only spacing and indentation change. |
-| `formatting.spaceInBraces` | `null` | `{ b }` when `true`, `{b}` when `false`, as written when `null`. |
-| `inlayHints.afterCall` | `false` | After each call with bracketed arguments, `f(x)`, `f()` or `f(x, y)` (not `f x`): the type it returns. |
-| `inlayHints.afterLineEnd` | `true` | At each line end: the type of the last expression complete on it, so `2+` shows `2` and the next line `2` shows `2+2`. |
-| `inlayHints.afterCell` | `true` | After each top-level value, as Macaulay2's `oN : T` line. |
-| `inlayHints.duringAssignment` | `true` | After a name being assigned, where its type is first known or changes. |
-| `inlayHints.argNames` | `false` | Before each argument, the name of the parameter it is passed to, as `f(x: 2)`. |
-| `inlayHints.argTypes` | `false` | Before each argument, the type its parameter is declared for, as `f(Number 2)`; with `argNames`, `f(x: Number 2)`. A domain takes its subtypes, so it is never marked with `↑`. |
-| `inlayHints.afterBrackets` | `false` | After each parenthesized value such as `(2)` or `(a + b)`; not after collections such as `(2,)`, `[2]` or `{2}`, nor after call arguments. |
-| `inlayHints.afterReturn` | `true` | After the value a function returns. |
-| `inlayHints.everywhere` | `false` | After every expression. |
-| `inlayHints.showLiteral` | `false` | Also shows types a literal states, as in `x = 3`. |
-| `inlayHints.showUpperClosure` | `true` | Marks a type that also stands for its subtypes with `↑`, as `↑Ring`. |
-| `inlayHints.showThing` | `false` | Also shows hints that say nothing, of values only known to be a `Thing`. |
-| `inlayHints.showNothing` | `false` | Also shows hints of values known to be `null`. |
-| `inlayHints.showRepeated` | `false` | Also shows types a nearby hint already shows, such as a binding's unchanged type. |
-| `inlayHints.hideTypes` | `[]` | Types never shown, e.g. `["ZZ", "String"]`. |
-| `inlayHints.hideAfterSemicolon` | `false` | Hides the hints of values a `;` discards. |
-| `inlayHints.maxLabelLength` | `40` | Cuts longer labels, with the whole type in the tooltip; `0` disables. |
-| `inlayHints.excludedCalls` | `[]` | Functions whose calls and arguments get no hints, e.g. `["print"]`. |
-| `semanticTokens.standardOnly` | `false` | Drops the custom semantic token modifiers. Token types are always LSP-standard. |
-| `semanticTokens.defaultLibrary` | `"CompiledFunction"` | Selects which bindings carry `defaultLibrary`; accepts a policy name or an array of package names. |
-| `sources.enabled` | `true` | Lets navigation enter the Macaulay2 library source. |
-| `sources.paths` | `[]` | Extra places to find it: an `M2` executable, an installation prefix (a build tree's `usr-dist` included), or a directory to add to Macaulay2's `path`. |
-| `sources.primaryCodePaths` | `[]` | Directories whose files implement the library itself, analyzed as if each declared `-- m2-ls: primaryCode`; the discovered Core sources are included automatically. |
+A [complete TOML example](tests/fixtures/configuration.toml) lists the defaults.
 
-The 2.0.0 inlay hint keys are deprecated but still read, with a warning:
-`expressionTypes` as `everywhere`, `allKnownTypes` as `everywhere` with
-`showLiteral` and `showRepeated`, `calls` as `afterLineEnd` (`off`,
-`lineEnds`) or `afterCall` (`every`), and `unknownTypes` as `showThing`.
+| Group | Purpose and defaults |
+| --- | --- |
+| `catalog` | `enabled = true`; set to `false` to skip catalog reads, downloads, and updates. `version = "0.1.*"` bounds updates to compatible M2Book releases. The server reads this group from `initializationOptions`; restart to change it. |
+| `diagnostics` | Enabled by default; `disabled` lists rule names or codes. |
+| `diagnostics.emitAs` | `error`, `warning`, `info`, `hint`, and `fixActionOnly` select publication categories; all lists default to empty. `fixActionOnly` retains quick fixes without publishing diagnostics. |
+| `formatting` | Four-column indentation with tabs, soft wrapping at `78`, hard width `90`. `keepLineBreaks = true` preserves existing line breaks. |
+| `inlayHints.argNames` | Enabled; requires bracketed arguments, ignores variadic parameter names, and limits names to `15` characters. |
+| `inlayHints.types` | Enables type hints independently of argument names. `after` selects calls, line ends, cell ends, assignments, delimiters, and returns. Return hints default to off. |
+| `inlayHints.hide` | Filters types, calls, literal and trivial results, adjacent type labels, and operator parameter labels. `nonExactMark` hides only the `↑` marker. |
+| `semanticTokens` | `standardOnly` defaults to `false`; `defaultLibrary` defaults to `["CompiledFunction"]` and combines policy names and package names. |
+| `macaulay2` | Optional `executable`, `prefix`, and `applicationDirectory` overrides. `runtimeDiscovery` defaults to `true`; disabling it prevents executable queries. |
+| `sources` | `enabled = true`, extra `packagePaths = []`, `corePath = "auto"`, and `primaryCodePaths = []`. |
+| `initialization` | `files = ["${applicationDirectory}/init.m2"]`; use `[]` for no initialization files. Relative paths are resolved against the first workspace folder. |
+
+To try source analysis without the catalog, pass
+`{"catalog": {"enabled": false}}` in the editor's `initializationOptions`.
+This also ignores `M2_LS_CATALOG` and existing downloaded catalogs.
+
+`catalog.version` accepts Cargo-style SemVer requirements, such as `0.1.*`,
+`=0.1.1`, or `>=0.1.1, <0.2`. The highest published matching release is selected;
+prereleases need an explicit prerelease comparator. Each bound has its own cache.
+The default `0.1.*` excludes `0.2.0` and later breaking releases. A local catalog
+selected by `M2_LS_CATALOG` bypasses release selection. The legacy environment
+variable `M2_LS_CATALOG_VERSION` controls the standalone download command;
+server and linter configuration uses `catalog.version`.
+
+Without the catalog, builtin hover documentation, signatures, completion entries,
+and recorded type and option information are unavailable unless the installed
+sources provide them. Local definitions, navigation, syntax diagnostics,
+formatting, and inference from source remain available. Imported installed
+packages are analyzed from source, which can take longer than catalog lookups.
+
+Except for `catalog`, changes apply to the running server. Each configuration message replaces the
+whole configuration, so omitted fields return to their defaults.
 
 Method call inference respects single-argument sequence dispatch and left
 folding for binary methods. `T05` (`call-domain-mismatch`) warns when no known
@@ -329,13 +264,21 @@ objects, types, and packages, preserves alias identities, and records public
 package dependencies separately from namespace ownership. Standard type
 hierarchy requests use the same graph to navigate source and library types.
 
+Actual diagnostic results and completed indexing counts are saved separately in
+`~/.local/state/m2-ls/usage.jsonl` (`$XDG_STATE_HOME/m2-ls/usage.jsonl` when set).
+The linter and server share this JSONL history; it contains findings, source
+hashes and indexing summaries, without RPC traffic or test results.
+`M2_LS_USAGE_LOG` overrides its path; `off` disables it. See
+[Usage history](docs/src/beyond/command-line.md#usage-history) for fields and an
+analysis example. Tests leave both result and operational logging disabled.
+
 The server writes structured JSON lines to `/tmp/m2-ls.log`. Request errors
 include the method, request ID, document URI, and error code. Operations taking
 at least 100 ms are recorded automatically, with timing summaries every 30
 seconds of activity and at shutdown. Summaries include count, total, mean, and
 maximum wall time per operation; nested operations overlap.
 
-Set `M2_LS_LOG=1` before starting the editor to record every operation's start
+Set `M2_LS_LOG=off` to disable operational logging, or `M2_LS_LOG=1` before starting the editor to record every operation's start
 and finish, including parsing, inference, diagnostics, documentation, dependency
 indexing, and queue waits. Set it to a file path to use that path instead.
 Logs include paths and timing metadata, without document contents or full
@@ -374,3 +317,35 @@ as the working directory. They run only when invoked; analysis never runs them.
 Results contain `success`, `exitCode`, `stdout`, and `stderr`. Processes use normal
 M2 initialization. Cells do not retain definitions between invocations. Package
 installation and documentation generation are not currently implemented.
+
+
+## Command-line tools
+
+Installation also provides `m2-lint` and `m2-fmt`, using the same diagnostics
+and formatter as the server:
+
+```sh
+m2-lint file.m2                 # Lint one file
+m2-lint --deny-warnings file.m2 # Fail on warnings as well as errors
+m2-fmt file.m2                  # Format one file in place
+m2-fmt --check file.m2          # Check formatting without writing (CI)
+m2-fmt --stdout file.m2         # Print the formatted file
+cat file.m2 | m2-fmt -          # Format stdin to stdout
+```
+
+Each command takes exactly one file, or `-` alone to read stdin. The
+`--config settings.json` option reads the same JSON settings as the server,
+including `diagnostics` and `formatting`; invalid values fail the command. No
+configuration file is loaded automatically.
+
+Exit status is `0` on success, `1` for lint errors (also warnings with
+`--deny-warnings`) or formatting differences with `--check`, and `2` for usage,
+configuration, or I/O errors. Lint hints and information are printed but do not
+fail the command. Diagnostic columns use one-based UTF-16 positions.
+
+For a local build, use `cargo run --bin m2-lint -- file.m2` or
+`cargo run --bin m2-fmt -- --check file.m2`; `cargo run` still starts the server.
+
+The standalone tools also accept TOML configuration through `--config FILE`.
+Settings files are not discovered automatically. `m2-fmt` does not need the
+catalog or network access.

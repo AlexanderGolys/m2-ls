@@ -255,7 +255,7 @@ pub fn visible_diagnostics(
         .diagnostics()
         .iter()
         .chain(&located)
-        .filter(|diagnostic| settings.allows(diagnostic.rule.code))
+        .filter(|diagnostic| settings.publishes(diagnostic.rule.code))
         .filter(|diagnostic| !document.diagnostic_suppressions().suppresses(diagnostic))
         .map(|diagnostic| {
             let mut published = diagnostic.to_lsp(uri);
@@ -278,6 +278,7 @@ pub async fn publish_diagnostics(
     version: Option<i32>,
 ) {
     let diagnostics = visible_diagnostics(document, &uri, settings, sources);
+    crate::usage_log::diagnostics(&uri, document.text(), &diagnostics);
     client.publish_diagnostics(uri, diagnostics, version).await;
 }
 
