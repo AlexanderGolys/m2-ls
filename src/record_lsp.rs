@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use m2_syn::Token;
-use tower_lsp::lsp_types::{Hover, SymbolKind};
+use tower_lsp::lsp_types::Hover;
 
 use crate::analysis::CallSignatureFacts;
 use crate::builtin_index::{MethodSignature, OperatorInfo, Record};
@@ -11,9 +11,7 @@ use crate::capabilities::hover::layout::{HoverLayout, SectionContent};
 use crate::macaulay2::Macaulay2Conventions;
 use crate::node_metadata::matches_token;
 use crate::node_metadata::SyntaxSnapshot;
-use crate::object_registry::{
-    ObjectId, ObjectKnowledge, ObjectName, ObjectRegistry, ObjectRegistryView, TypeId,
-};
+use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry, ObjectRegistryView};
 use crate::typesystem::TypeKnowledge;
 
 /// The most callables a hover names among those an option belongs to, or
@@ -69,53 +67,6 @@ pub trait LspKnowledge: TypeKnowledge {
 
     /// Packages currently visible through this knowledge view.
     fn loaded_packages(&self) -> Vec<ObjectName>;
-}
-
-/// Package-addressed record lookup used by static type-hierarchy navigation.
-pub trait PartitionedTypeKnowledge {
-    /// Looks up an object specifically within its owning package partition.
-    fn get_record_from_package(&self, package: &str, name: &ObjectName) -> Option<&Record>;
-
-    /// Type record and package associated with a resolved runtime class identity.
-    fn get_type_by_id(&self, type_id: &TypeId) -> Option<(String, &Record)>;
-
-    /// Runtime class identity of the supplied canonical object, when it denotes a type.
-    fn type_id(&self, object_id: &ObjectId) -> Option<TypeId>;
-
-    /// Visible type records whose immediate parent is the requested class.
-    fn direct_subtypes(&self, type_id: &TypeId) -> Vec<(String, &Record)>;
-}
-
-impl PartitionedTypeKnowledge for ObjectRegistry {
-    fn get_record_from_package(&self, package: &str, name: &ObjectName) -> Option<&Record> {
-        let package = self.catalog_package_id(&ObjectName::new(package))?;
-        let object = self.package_objects(package)?.objects_by_name.get(name)?;
-        self.object(object)
-    }
-
-    fn get_type_by_id(&self, type_id: &TypeId) -> Option<(String, &Record)> {
-        let record = self.object(type_id.object())?;
-        record.type_info()?;
-        Some((self.package_name(&record.package)?.to_string(), record))
-    }
-
-    fn type_id(&self, object_id: &ObjectId) -> Option<TypeId> {
-        ObjectKnowledge::type_id(self, object_id)
-    }
-
-    fn direct_subtypes(&self, type_id: &TypeId) -> Vec<(String, &Record)> {
-        self.catalog_records()
-            .iter()
-            .filter_map(|record| {
-                record
-                    .type_info()
-                    .and_then(|type_info| type_info.parent.as_ref())
-                    .filter(|parent| *parent == type_id)
-                    .filter(|_| &record.id != type_id.object())
-                    .and_then(|_| Some((self.package_name(&record.package)?.to_string(), record)))
-            })
-            .collect()
-    }
 }
 
 /// The installed signatures that apply at one call site: the one the
@@ -440,24 +391,6 @@ fn dedup_resolved_signatures(signatures: &mut Vec<ResolvedSignature>) {
     signatures.retain(|signature| {
         seen.insert((signature.signature.clone(), signature.output_types.clone()))
     });
-}
-
-/// Editor symbol category appropriate for this catalog record.
-pub fn record_symbol_kind(record: &Record) -> SymbolKind {
-    if record.type_info().is_some() {
-        return SymbolKind::CLASS;
-    }
-
-    if record.callable().is_some() {
-        return SymbolKind::FUNCTION;
-    }
-
-    match record.class.0.as_str() {
-        "Package" => SymbolKind::NAMESPACE,
-        "Type" => SymbolKind::CLASS,
-        "Option" => SymbolKind::PROPERTY,
-        _ => SymbolKind::VARIABLE,
-    }
 }
 
 /// The hover of `record`, an object of `package`: its signature at the

@@ -125,7 +125,7 @@ pub enum M2SemanticTokenType {
     /// option name that is not a protected symbol.
     Property = SemanticTokenType::PROPERTY,
     /// A package.
-    Namespace = SemanticTokenType::NAMESPACE,
+    Package = SemanticTokenType::NAMESPACE,
     /// A name used as a `Symbol` rather than for a value: a protected symbol
     /// (`Strategy`, an option value such as `Linear`) or a quoted name
     /// (`symbol f`). Sent as `enumMember`, the standard type closest to it.
@@ -184,15 +184,18 @@ impl M2SemanticTokenType {
 pub enum M2SemanticTokenModifier {
     /// An option key, such as `Strategy` in `Strategy => Linear`.
     Option = SemanticTokenModifier::new("option"),
+
     /// Where a name is bound — `x := 1`, a ring generator in `QQ[x]` — or
     /// what an installation installs on, the `f` of `f ZZ := …`.
     Declaration = SemanticTokenModifier::DECLARATION,
+
     /// A value selected by `semanticTokens.defaultLibrary`: by default a
     /// `CompiledFunction`, optionally a compiled closure or package global.
     DefaultLibrary = SemanticTokenModifier::DEFAULT_LIBRARY,
 
     /// A binding protected from reassignment, independently of value mutability.
     Readonly = SemanticTokenModifier::READONLY,
+
     /// Documentation: a documentation call with its tags and values, the
     /// string a `doc` call reads as SimpleDoc, an attached documentation
     /// comment, and the code they embed.
@@ -399,6 +402,8 @@ pub enum SourceSemanticRole {
     /// The operator of an access, the `_` of `L_0` or the `.` of `H.key`:
     /// it joins what is selected to what it is selected from.
     AccessOperator,
+    /// A string used as a regular-expression pattern.
+    RegularExpression,
     /// A string naming a loaded package.
     NamespaceArgument,
     /// The path a `load`/`needs`/`input` call runs, the `"foo.m2"` of
@@ -533,7 +538,7 @@ pub fn local_symbol_semantic_token(
         Some(SymbolKind::VARIABLE) => M2SemanticTokenType::Variable,
         Some(SymbolKind::METHOD) => M2SemanticTokenType::Method,
         Some(SymbolKind::CLASS) => M2SemanticTokenType::Type,
-        Some(SymbolKind::NAMESPACE) => M2SemanticTokenType::Namespace,
+        Some(SymbolKind::NAMESPACE) => M2SemanticTokenType::Package,
         Some(SymbolKind::PROPERTY) => M2SemanticTokenType::Property,
         Some(SymbolKind::CONSTANT) => M2SemanticTokenType::Symbol,
         _ => M2SemanticTokenType::Variable,
@@ -594,6 +599,7 @@ fn source_role_semantic_token(
 ) -> Option<M2SemanticToken> {
     let token = match role {
         SourceSemanticRole::InstallationHead => return None,
+        SourceSemanticRole::RegularExpression => M2SemanticToken::new(M2SemanticTokenType::Regexp),
         SourceSemanticRole::RingGenerator => M2SemanticToken::new(M2SemanticTokenType::Variable)
             .with_modifier(M2SemanticTokenModifier::Algebraic),
         SourceSemanticRole::RingGeneratorDeclaration => {
@@ -616,7 +622,7 @@ fn source_role_semantic_token(
             .with_modifier(M2SemanticTokenModifier::Access),
         SourceSemanticRole::QuotedSymbol => M2SemanticToken::new(M2SemanticTokenType::Symbol),
         SourceSemanticRole::NamespaceArgument | SourceSemanticRole::LoadedFilePath => {
-            M2SemanticToken::new(M2SemanticTokenType::Namespace)
+            M2SemanticToken::new(M2SemanticTokenType::Package)
         }
     };
     Some(token)
@@ -764,7 +770,7 @@ pub fn semantic_token_for_static_type_from_knowledge(
     let token_type = if METHOD_FUNCTION_CLASSES.into_iter().any(subtype_of) {
         M2SemanticTokenType::Method
     } else if subtype_of("Package") {
-        M2SemanticTokenType::Namespace
+        M2SemanticTokenType::Package
     } else if subtype_of("Type") {
         M2SemanticTokenType::Type
     } else if COMMAND_CLASSES.into_iter().any(subtype_of)

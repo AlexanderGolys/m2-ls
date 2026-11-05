@@ -29,6 +29,8 @@ impl TypeKey {
 pub struct Type {
     /// Name used to resolve and present this item.
     name: ObjectName,
+    /// Canonical identity retained when this type was resolved.
+    identity: Option<TypeId>,
     /// Resolved ancestor identities used for subtype comparisons.
     ancestry: Arc<[TypeKey]>,
 }
@@ -45,6 +47,7 @@ impl Type {
         };
         Self {
             name,
+            identity: None,
             ancestry: ancestry.into(),
         }
     }
@@ -56,7 +59,7 @@ impl Type {
         types: &(impl TypeStore + ?Sized),
     ) -> Option<Self> {
         let mut ancestry = Vec::new();
-        let mut current = type_id;
+        let mut current = type_id.clone();
         let mut visited = HashSet::new();
         loop {
             if !visited.insert(current.clone()) {
@@ -72,6 +75,7 @@ impl Type {
         ancestry.reverse();
         Some(Self {
             name,
+            identity: Some(type_id),
             ancestry: ancestry.into(),
         })
     }
@@ -171,6 +175,16 @@ impl TypeRange {
         }
     }
 
+    /// Canonical identity of the sole expressible type, when it was resolved.
+    /// An unknown identity is not reconstructed from a potentially shadowed name.
+    pub fn single_identity(&self) -> Option<&TypeId> {
+        match (self.exact.len(), self.generators.len()) {
+            (1, 0) => self.exact.iter().next()?.identity.as_ref(),
+            (0, 1) => self.generators.iter().next()?.identity.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Exact type names included in this range.
     pub fn exact_points(&self) -> impl Iterator<Item = &ObjectName> {
         self.exact.iter().map(Type::name)
@@ -185,11 +199,23 @@ impl TypeRange {
     pub fn resolved_by(mut self, mut resolve: impl FnMut(&ObjectName) -> Option<Type>) -> Self {
         let exact = std::mem::take(&mut self.exact)
             .into_iter()
-            .map(|point| resolve(point.name()).unwrap_or(point))
+            .map(|point| {
+                if point.identity.is_some() {
+                    point
+                } else {
+                    resolve(point.name()).unwrap_or(point)
+                }
+            })
             .collect::<Vec<_>>();
         let generators = std::mem::take(&mut self.generators)
             .into_iter()
-            .map(|generator| resolve(generator.name()).unwrap_or(generator))
+            .map(|generator| {
+                if generator.identity.is_some() {
+                    generator
+                } else {
+                    resolve(generator.name()).unwrap_or(generator)
+                }
+            })
             .collect::<Vec<_>>();
         Self::new(exact, generators)
     }
@@ -354,6 +380,7 @@ mod tests {
 
     fn ty(path: &[&str]) -> Type {
         Type {
+            identity: None,
             name: ObjectName::new(*path.last().expect("type path")),
             ancestry: path
                 .iter()

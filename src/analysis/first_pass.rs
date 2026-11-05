@@ -208,6 +208,8 @@ struct Scope {
     range: TextRange,
     /// `None` only for [`ROOT_SCOPE`].
     parent: Option<ScopeId>,
+    /// Scope owning the runtime lexical dictionary; branches share their enclosing one.
+    dictionary: ScopeId,
 }
 
 /// Every scope of a file, indexed by [`ScopeId`] in pre-order.
@@ -224,6 +226,7 @@ impl Default for ScopeTree {
             scopes: vec![Scope {
                 range: TextRange::new(pos!(), pos_max!()),
                 parent: None,
+                dictionary: ROOT_SCOPE,
             }],
         }
     }
@@ -231,10 +234,16 @@ impl Default for ScopeTree {
 
 impl ScopeTree {
     /// Appends a lexical scope and returns its index in traversal order.
-    fn push(&mut self, range: TextRange, parent: ScopeId) -> ScopeId {
+    fn push(&mut self, range: TextRange, parent: ScopeId, owns_dictionary: bool) -> ScopeId {
+        let dictionary = if owns_dictionary {
+            self.scopes.len()
+        } else {
+            self.scopes[parent].dictionary
+        };
         self.scopes.push(Scope {
             range,
             parent: Some(parent),
+            dictionary,
         });
         self.scopes.len() - 1
     }
@@ -255,6 +264,28 @@ impl ScopeTree {
     /// The number of scopes, including the root.
     pub(super) fn len(&self) -> usize {
         self.scopes.len()
+    }
+
+    /// Runtime dictionary scopes with their extents and enclosing dictionary identities.
+    pub(super) fn entries(
+        &self,
+    ) -> impl Iterator<Item = (ScopeId, TextRange, Option<ScopeId>)> + '_ {
+        self.scopes
+            .iter()
+            .enumerate()
+            .filter(|(index, scope)| *index == scope.dictionary)
+            .map(|(index, scope)| {
+                (
+                    index,
+                    scope.range,
+                    scope.parent.map(|parent| self.scopes[parent].dictionary),
+                )
+            })
+    }
+
+    /// Dictionary owning the bindings of this analysis scope.
+    pub(super) fn dictionary(&self, scope: ScopeId) -> Option<ScopeId> {
+        Some(self.scopes.get(scope)?.dictionary)
     }
 
     /// The enclosing scope; `None` for the root and for unknown ids.
@@ -376,7 +407,9 @@ impl<'source, Source: SourceNavigation + ?Sized> TypedWalker<'source, Source> {
             return visit(self);
         };
         let inherited = self.context;
-        let scope = self.scopes.push(range, inherited.scope);
+        let scope = self
+            .scopes
+            .push(range, inherited.scope, kind.owns_dictionary());
         self.context = inherited.enter(scope, &kind);
         visit(self);
         self.context = inherited;

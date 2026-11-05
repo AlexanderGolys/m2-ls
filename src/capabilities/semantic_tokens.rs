@@ -1299,21 +1299,21 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 .iter()
                 .map(|token| token.token_type)
                 .filter(|token_type| {
-                    *token_type == M2SemanticTokenType::Namespace as u32
+                    *token_type == M2SemanticTokenType::Package as u32
                         || *token_type == M2SemanticTokenType::String as u32
                 })
                 .collect::<Vec<_>>(),
             vec![
-                M2SemanticTokenType::Namespace as u32, // loadPackage "Graphs"
-                M2SemanticTokenType::Namespace as u32, // installPackage("Normaliz")
-                M2SemanticTokenType::Namespace as u32, // uninstallPackage "Foo"
-                M2SemanticTokenType::Namespace as u32, // needsPackage "Core"
-                M2SemanticTokenType::String as u32,    // export "thing" — a symbol name
-                M2SemanticTokenType::Namespace as u32, // endPackage "Pkg"
-                M2SemanticTokenType::Namespace as u32, // newPackage("Pkg")
-                M2SemanticTokenType::Namespace as u32, // importFrom("Pkg") — first arg
-                M2SemanticTokenType::String as u32,    // exportFrom {"Pkg"} — list element
-                M2SemanticTokenType::String as u32,    // print "ordinary"
+                M2SemanticTokenType::Package as u32, // loadPackage "Graphs"
+                M2SemanticTokenType::Package as u32, // installPackage("Normaliz")
+                M2SemanticTokenType::Package as u32, // uninstallPackage "Foo"
+                M2SemanticTokenType::Package as u32, // needsPackage "Core"
+                M2SemanticTokenType::String as u32,  // export "thing" — a symbol name
+                M2SemanticTokenType::Package as u32, // endPackage "Pkg"
+                M2SemanticTokenType::Package as u32, // newPackage("Pkg")
+                M2SemanticTokenType::Package as u32, // importFrom("Pkg") — first arg
+                M2SemanticTokenType::String as u32,  // exportFrom {"Pkg"} — list element
+                M2SemanticTokenType::String as u32,  // print "ordinary"
             ]
         );
     }
@@ -1336,15 +1336,15 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 .iter()
                 .map(|token| token.token_type)
                 .filter(|token_type| {
-                    *token_type == M2SemanticTokenType::Namespace as u32
+                    *token_type == M2SemanticTokenType::Package as u32
                         || *token_type == M2SemanticTokenType::String as u32
                 })
                 .collect::<Vec<_>>(),
             vec![
-                M2SemanticTokenType::Namespace as u32, // load "foo.m2"
-                M2SemanticTokenType::Namespace as u32, // needs("../lib/bar.m2")
-                M2SemanticTokenType::Namespace as u32, // input ///baz.m2///
-                M2SemanticTokenType::String as u32,    // print "ordinary.m2"
+                M2SemanticTokenType::Package as u32, // load "foo.m2"
+                M2SemanticTokenType::Package as u32, // needs("../lib/bar.m2")
+                M2SemanticTokenType::Package as u32, // input ///baz.m2///
+                M2SemanticTokenType::String as u32,  // print "ordinary.m2"
             ]
         );
         assert!(
@@ -1369,7 +1369,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
 
         for line in [1, 3] {
             let token = token_at(&tokens, line, 0).expect("package reference is highlighted");
-            assert_eq!(token.token_type, M2SemanticTokenType::Namespace as u32);
+            assert_eq!(token.token_type, M2SemanticTokenType::Package as u32);
         }
     }
 
@@ -1393,7 +1393,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
 
         assert_eq!(
             token_type_at(&tokens, 0, 0),
-            Some(M2SemanticTokenType::Namespace as u32)
+            Some(M2SemanticTokenType::Package as u32)
         );
     }
 
@@ -1413,12 +1413,12 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 .iter()
                 .map(|token| token.token_type)
                 .filter(|token_type| {
-                    *token_type == M2SemanticTokenType::Namespace as u32
+                    *token_type == M2SemanticTokenType::Package as u32
                         || *token_type == M2SemanticTokenType::String as u32
                 })
                 .collect::<Vec<_>>(),
             vec![
-                M2SemanticTokenType::Namespace as u32,
+                M2SemanticTokenType::Package as u32,
                 M2SemanticTokenType::String as u32,
                 M2SemanticTokenType::String as u32,
             ]
@@ -1446,19 +1446,19 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 .iter()
                 .map(|token| token.token_type)
                 .filter(|token_type| {
-                    *token_type == M2SemanticTokenType::Namespace as u32
+                    *token_type == M2SemanticTokenType::Package as u32
                         || *token_type == M2SemanticTokenType::String as u32
                 })
                 .collect::<Vec<_>>(),
             vec![
-                M2SemanticTokenType::String as u32,    // "installMacro"
-                M2SemanticTokenType::String as u32,    // "expandSource"
-                M2SemanticTokenType::String as u32,    // "state"
-                M2SemanticTokenType::Namespace as u32, // importFrom "Core" — the package
-                M2SemanticTokenType::String as u32,    // "first" — imported symbol
-                M2SemanticTokenType::String as u32,    // "second" — imported symbol
-                M2SemanticTokenType::Namespace as u32, // exportFrom "Pkg" — the package
-                M2SemanticTokenType::String as u32,    // "only" — exported symbol
+                M2SemanticTokenType::String as u32,  // "installMacro"
+                M2SemanticTokenType::String as u32,  // "expandSource"
+                M2SemanticTokenType::String as u32,  // "state"
+                M2SemanticTokenType::Package as u32, // importFrom "Core" — the package
+                M2SemanticTokenType::String as u32,  // "first" — imported symbol
+                M2SemanticTokenType::String as u32,  // "second" — imported symbol
+                M2SemanticTokenType::Package as u32, // exportFrom "Pkg" — the package
+                M2SemanticTokenType::String as u32,  // "only" — exported symbol
             ]
         );
     }

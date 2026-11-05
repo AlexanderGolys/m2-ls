@@ -18,6 +18,8 @@ use m2_syn::visit::{self, Visit};
 use m2_syn::{Lex, Spanned, Token, TokenStream, TokenTree, Trivia};
 
 use super::*;
+use crate::macaulay2::Macaulay2Conventions;
+use crate::object_registry::ObjectKnowledge;
 use crate::semantic_token::{lexical_semantic_token_type, M2SemanticTokenType};
 use crate::source::SyntaxSource;
 use crate::syntax::{AssignmentSyntax, AssignmentTarget};
@@ -245,12 +247,27 @@ where
 
     fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
         if let Some(head) = call.left_operand.symbol_name() {
-            if let Some(argument) = call.right_operand.arguments().into_iter().next().flatten() {
+            let arguments = call
+                .right_operand
+                .arguments()
+                .into_iter()
+                .filter(|argument| !matches!(argument, Some(Expr::Option(_))))
+                .collect::<Vec<_>>();
+            if let Some(argument) = arguments.first().copied().flatten() {
                 if argument.literal_source(self.source).is_some() {
                     if let Some(range) = self.source.range_for_syntax(argument) {
                         let knowledge = self.knowledge_provider.at_position(range.start);
-                        let role = if indexed_string_names_package(head, &knowledge) {
+                        let role = if Macaulay2Conventions::PACKAGE_NAME_FUNCTIONS.contains(&head)
+                            && knowledge.get_record(&ObjectName::new(head)).is_some()
+                            && self.analysis.get_binding_at(head, range.start).is_none()
+                        {
                             Some(SourceSemanticRole::NamespaceArgument)
+                        } else if Macaulay2Conventions::REGEXP_FUNCTIONS.contains(&head)
+                            && knowledge.get_record(&ObjectName::new(head)).is_some()
+                            && self.analysis.get_binding_at(head, range.start).is_none()
+                            && (head != "separate" || arguments.len() > 1)
+                        {
+                            Some(SourceSemanticRole::RegularExpression)
                         } else if FileLoad::is_load_function(head) {
                             Some(SourceSemanticRole::LoadedFilePath)
                         } else {
@@ -270,38 +287,6 @@ where
         }
         visit::visit_expr_op_bin_adj(self, call);
     }
-}
-
-/// Callable symbol directly to the left of this application argument.
-/// Whether the literal string denotes a package recognized by the available object knowledge.
-fn indexed_string_names_package(
-    callable_name: &str,
-    knowledge: &(impl TypeKnowledge + ?Sized),
-) -> bool {
-    let Some(callable) = knowledge
-        .get_record(&ObjectName::new(callable_name))
-        .and_then(|record| record.callable())
-    else {
-        return false;
-    };
-    let (Some(string), Some(package)) = (
-        knowledge.type_role_id(TypeRole::String),
-        knowledge.type_role_id(TypeRole::Package),
-    ) else {
-        return false;
-    };
-    let accepts_string = callable
-        .methods
-        .iter()
-        .any(|method| method.domain.first() == Some(string.object()));
-    let accepts_package = callable
-        .methods
-        .iter()
-        .any(|method| method.domain.first() == Some(package.object()));
-    let returns_package = callable.methods.iter().any(|method| {
-        method.domain.first() == Some(string.object()) && method.codomain.as_ref() == Some(&package)
-    });
-    accepts_string && (accepts_package || returns_package)
 }
 
 /// What the syntax around a symbol says about how it is used.

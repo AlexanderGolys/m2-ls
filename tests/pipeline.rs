@@ -2,6 +2,7 @@
 
 mod pipeline {
     mod analysis;
+    mod hierarchies;
     mod init_file;
     mod lsp;
     mod workspace_files;

@@ -15,7 +15,7 @@ use m2_syn::nodes::{
     ExprOpBinAdj, PackedContent, Symbol,
 };
 use m2_syn::visit::{self, Visit};
-use m2_syn::{Lex, Spanned, TokenStream, TokenTree};
+use m2_syn::{Lex, Spanned, Token, TokenStream, TokenTree};
 use tower_lsp::lsp_types::{
     InlayHint, InlayHintKind, InlayHintLabel, InlayHintServerCapabilities, InlayHintTooltip, OneOf,
     Position, Range as TextRange,
@@ -774,18 +774,40 @@ impl<'request, 'a> HintContext<'request, 'a> {
                         .received_returns
                         .contains(&std::ptr::from_ref(transfer)) =>
                 {
-                    node.value.as_deref()
+                    node.value.as_deref().map(|value| (value, None))
                 }
-                Expr::Lambda(lambda) => lambda_final_value(lambda),
+                Expr::Lambda(lambda) => {
+                    let installation = self
+                        .document
+                        .analysis()
+                        .installation_receiving_arguments(lambda, self.document);
+                    let constructed = installation
+                        .filter(|installation| {
+                            installation.method.head.name().name() == <Token![new]>::SPELLING
+                        })
+                        .and_then(|installation| installation.method.codomain.as_ref());
+                    lambda_final_value(lambda).map(|value| (value, constructed))
+                }
                 _ => None,
             })
-            .filter(|value| self.options.show_literal || !is_self_describing_value(value))
-            .filter_map(|value| {
+            .filter(|(value, constructed)| {
+                constructed.is_some()
+                    || self.options.show_literal
+                    || !is_self_describing_value(value)
+            })
+            .filter_map(|(value, constructed)| {
                 let value_range = self.document.range_for_syntax(value)?;
                 if !self.range.contains_position(value_range.end) {
                     return None;
                 }
-                let type_name = self.inferred_type_label(value)?;
+                let type_name = match constructed {
+                    Some(class) => self.displayed_type(
+                        value_range.start,
+                        &InferredType::exact_from_id(class.clone()),
+                        TypedSubject::Value,
+                    )?,
+                    None => self.inferred_type_label(value)?,
+                };
                 Some(PlacedHint {
                     value: self.document.range_for_syntax(described_value(value)),
                     source: HintSource::Return,

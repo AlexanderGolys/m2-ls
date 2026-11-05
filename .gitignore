@@ -2,6 +2,7 @@
 *.py
 
 # Local tooling
+/config.toml
 .agents/
 .claude/
 .opencode/

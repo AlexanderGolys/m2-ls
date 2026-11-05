@@ -12,6 +12,7 @@ use std::mem;
 use serde::Deserialize;
 use std::{collections::HashMap, iter};
 
+use crate::macaulay2::Macaulay2Conventions;
 use crate::object_registry::{ObjectId, ObjectName, OperatorForm, TypeData, TypeId};
 use corpus::{deserialize_records, parse_records, RawOperatorForm, RawOptionSpec, RawRecord};
 
@@ -24,8 +25,12 @@ pub struct Record {
     pub name: ObjectName,
     /// Runtime class recorded for the object.
     pub class: ObjectName,
+    /// Canonical class identity, kept separately from the source-visible class name.
+    pub class_id: Option<TypeId>,
     /// Owning package's canonical identity.
     pub package: ObjectId,
+    /// Publicly forwarded packages; `None` means the metadata is unavailable.
+    pub package_exports: Option<Vec<ObjectName>>,
     /// Type, callable, or ordinary-object payload associated with this canonical record.
     pub data: ObjectData,
     /// Whether Macaulay2 forbids ordinary reassignment of this object.
@@ -320,6 +325,7 @@ impl BuiltinIndex {
         let mut pending_type_parents = Vec::new();
         let mut pending_callable_types = Vec::new();
         let mut referenced_packages = HashMap::new();
+        let mut class_references = HashMap::new();
         for mut raw in deserialize_records(corpus) {
             if raw.kind != "meta" {
                 let package = package_object_id(&raw);
@@ -328,9 +334,22 @@ impl BuiltinIndex {
                     .or_insert_with(|| package_object_name(&raw));
             }
 
+            if let Some(class) = &raw.class {
+                class_references.insert(canonical_object_id(&raw), ObjectName::new(class));
+            }
             // name + aliases + extra_keys all resolve to this record.
             let mut keys = raw.aliases.clone();
             keys.extend(raw.extra_keys.iter().cloned());
+            if raw.kind == "package" {
+                let qualified = format!("{}${}", Macaulay2Conventions::PACKAGE_NAMESPACE, raw.name);
+                keys.retain(|name| {
+                    !name.contains('$')
+                        || (raw.name != Macaulay2Conventions::USER_PACKAGE && name == &qualified)
+                });
+                if raw.name != Macaulay2Conventions::USER_PACKAGE && !keys.contains(&qualified) {
+                    keys.push(qualified);
+                }
+            }
 
             match raw.kind.as_str() {
                 "type" => {
@@ -487,12 +506,77 @@ impl BuiltinIndex {
                 id: package.clone(),
                 name,
                 class: ObjectName::new("Package"),
+                class_id: None,
                 package: package.clone(),
+                package_exports: None,
                 data: ObjectData::Plain,
                 protected: true,
                 aliases: Vec::new(),
                 markdown: None,
             });
+        }
+        // User is an implicit runtime package. It has a bare binding, but
+        // neither `User$User` nor `Package$User` is an alias for that object.
+        if !index.records.is_empty()
+            && !index.records.iter().any(|record| {
+                record.name.name() == Macaulay2Conventions::USER_PACKAGE
+                    && record.id == record.package
+            })
+        {
+            let user = ObjectId::session_package(Macaulay2Conventions::USER_PACKAGE);
+            index.insert(Record {
+                id: user.clone(),
+                name: ObjectName::new(Macaulay2Conventions::USER_PACKAGE),
+                class: ObjectName::new("Package"),
+                class_id: None,
+                package: user.clone(),
+                package_exports: Some(Vec::new()),
+                data: ObjectData::Plain,
+                protected: true,
+                aliases: Vec::new(),
+                markdown: None,
+            });
+            class_references.insert(user, ObjectName::new("$Core$Package"));
+        }
+        // Resolve the original qualified reference before a same-named class
+        // from another package can affect its source-visible spelling.
+        loop {
+            let mut record_index = 0;
+            while record_index < index.records.len() {
+                let record = &index.records[record_index];
+                if record.class_id.is_none() {
+                    let reference = class_references
+                        .get(&record.id)
+                        .unwrap_or(&record.class)
+                        .clone();
+                    let class_id = index.resolve_or_insert_type_reference(&reference);
+                    index.records[record_index].class_id = Some(class_id);
+                }
+                record_index += 1;
+            }
+            let missing_packages = index
+                .records()
+                .iter()
+                .map(|record| record.package.clone())
+                .filter(|package| index.object(package).is_none())
+                .collect::<std::collections::BTreeSet<_>>();
+            if missing_packages.is_empty() {
+                break;
+            }
+            for package in missing_packages {
+                index.insert(Record {
+                    name: package_name_from_id(&package),
+                    id: package.clone(),
+                    class: ObjectName::new("Package"),
+                    class_id: None,
+                    package,
+                    package_exports: None,
+                    data: ObjectData::Plain,
+                    protected: true,
+                    aliases: Vec::new(),
+                    markdown: None,
+                });
+            }
         }
         index
     }
@@ -573,7 +657,9 @@ impl BuiltinIndex {
             id: id.clone(),
             name: ObjectName(display_name),
             class: ObjectName::new("Type"),
+            class_id: None,
             package,
+            package_exports: None,
             data: ObjectData::Type(TypeData { parent: None }),
             protected: true,
             aliases: Vec::new(),
@@ -599,7 +685,9 @@ impl BuiltinIndex {
             id: id.clone(),
             name: ObjectName::new(deref_ref(reference.name())),
             class: ObjectName::new("Type"),
+            class_id: None,
             package: unresolved_package_id(),
+            package_exports: None,
             data: ObjectData::Type(TypeData { parent: None }),
             protected: true,
             aliases: Vec::new(),
@@ -743,7 +831,12 @@ fn base_record(
                 .map(|class| deref_ref(&class))
                 .unwrap_or_else(|| default_class.to_string()),
         ),
+        class_id: None,
         package: package_object_id(raw),
+        package_exports: raw
+            .package_exports
+            .take()
+            .map(|names| names.into_iter().map(ObjectName::new).collect()),
         data: ObjectData::Plain,
         protected: raw.protected.unwrap_or(true),
         aliases,

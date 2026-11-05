@@ -258,7 +258,7 @@ where
         Some(M2SemanticTokenType::Method) => "user-defined method function",
         Some(M2SemanticTokenType::Type) => "user-defined type",
         Some(M2SemanticTokenType::Variable) => "user-defined binding",
-        Some(M2SemanticTokenType::Namespace) => "user-defined package",
+        Some(M2SemanticTokenType::Package) => "user-defined package",
         _ => "user-defined symbol",
     };
     let code = workspace

@@ -6,17 +6,18 @@ use std::fmt::Formatter;
 use std::fmt::{Debug, Display, Result};
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::builtin_index::{BuiltinIndex, OptionFacts, Record};
 use crate::init_file::InitFileStart;
+use crate::macaulay2::Macaulay2Conventions;
 #[cfg(test)]
 use crate::package_index::collect_imported_packages;
 use crate::package_index::PackageImport;
 use tower_lsp::lsp_types::Position;
 
 /// Nominal spelling used to resolve a Macaulay2 object in an environment.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct ObjectName(pub String);
 
@@ -384,19 +385,9 @@ impl ObjectRegistry {
         &self.catalog.option_facts
     }
 
-    /// The objects of the package `package`, loaded or not.
-    pub fn package_objects(&self, package: &ObjectId) -> Option<&PackageObjects> {
-        self.catalog.packages.get(package)
-    }
-
     /// The package named `name` in the catalog, loaded or not.
     pub fn catalog_package_id(&self, name: &ObjectName) -> Option<&ObjectId> {
         self.catalog.packages_by_name.get(name)
-    }
-
-    /// Every record of the catalog, loaded or not.
-    pub fn catalog_records(&self) -> &[Record] {
-        self.catalog.index.records()
     }
 
     /// The registry as the source sees it at `position`: only the packages
@@ -466,13 +457,20 @@ impl ObjectRegistryView<'_> {
 /// Package records retain their qualified corpus symbol (for example
 /// `$Core$Thing`). That qualification is internal to the linked corpus; source
 /// lookup uses [`ObjectName`] spellings and aliases.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ObjectId(ObjectName);
 
 impl ObjectId {
     /// The identity spelled `name`, qualified as the catalog qualifies it.
     pub fn new(name: impl Into<String>) -> Self {
         Self(ObjectName(name.into()))
+    }
+
+    /// An implicit session package absent from the downloaded catalog.
+    /// Its internal identity is not a Macaulay2 qualified-name alias.
+    pub fn session_package(name: &str) -> Self {
+        Self::new(format!("$SessionPackage${name}"))
     }
 
     /// The identity as spelled.
@@ -491,7 +489,8 @@ impl Borrow<ObjectName> for ObjectId {
 ///
 /// Indexed identities require registry validation; source identities require a
 /// validated parent and the reserved source namespace.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
 pub struct TypeId(ObjectId);
 
 impl TypeId {
@@ -568,6 +567,12 @@ pub trait ObjectKnowledge: TypeStore {
         self.object(&object)
     }
 
+    /// The runtime class of any object, using its canonical identity.
+    /// This relation is independent of the parent relation used for inheritance.
+    fn class_type_id(&self, object_id: &ObjectId) -> Option<TypeId> {
+        self.object(object_id)?.class_id.clone()
+    }
+
     /// The type `name` resolves to, if it names a type.
     fn resolve_type_id(&self, name: &ObjectName) -> Option<TypeId> {
         let object = self.resolve_object(name)?;
@@ -619,7 +624,7 @@ impl ObjectRegistry {
         name: &ObjectName,
         position: Position,
     ) -> Option<(ObjectId, Option<Position>)> {
-        self.packages.iter().rev().find_map(|registration| {
+        let registered = self.packages.iter().rev().find_map(|registration| {
             if !registration.is_effective_at(position) {
                 return None;
             }
@@ -631,6 +636,17 @@ impl ObjectRegistry {
                 .get(name)
                 .cloned()?;
             Some((object, registration.effective_from))
+        });
+        registered.or_else(|| {
+            (name.name() == Macaulay2Conventions::USER_PACKAGE)
+                .then(|| {
+                    self.catalog
+                        .packages_by_name
+                        .get(name)
+                        .cloned()
+                        .map(|package| (package, None))
+                })
+                .flatten()
         })
     }
 }

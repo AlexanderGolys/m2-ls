@@ -55,6 +55,7 @@ mod library_index;
 mod macaulay2;
 mod meta;
 mod node_metadata;
+mod object_hierarchy;
 mod object_registry;
 mod package_documentation;
 mod package_index;
@@ -111,6 +112,7 @@ use session::{ClientInput, ExitNotificationService, SessionEnd};
 
 use crate::catalog::CatalogSource;
 use crate::diagnostics::DiagnosticCode;
+use crate::object_hierarchy::{HierarchySnapshot, WorkspaceHierarchy};
 use crate::object_registry::ObjectRegistry;
 use crate::semantic_token::M2SemanticToken;
 use crate::settings::{ServerSettings, SettingProblem, SettingsStore, SourceSettings};
@@ -448,13 +450,17 @@ impl Backend {
             })
     }
 
-    /// What type hierarchy requests resolve types against: the builtin catalog
-    /// and the sources of `library`.
-    fn type_hierarchy_context<'a>(
-        &'a self,
-        library: &'a LibraryIndex,
-    ) -> TypeHierarchyContext<'a, ObjectRegistry> {
-        TypeHierarchyContext::new(&self.registry, library.source_resolver())
+    /// Materializes the common hierarchy from retained indexed and open analyses.
+    fn workspace_hierarchy(&self) -> WorkspaceHierarchy {
+        let mut snapshots = self.workspace_index.hierarchy_snapshots();
+        for document in &self.documents {
+            let mut snapshot = HierarchySnapshot::new(document.value(), document.key());
+            snapshot.package_context = snapshots
+                .get(document.key())
+                .and_then(|indexed| indexed.package_context.clone());
+            snapshots.insert(document.key().clone(), snapshot);
+        }
+        WorkspaceHierarchy::new(snapshots, &self.registry)
     }
 
     /// Point library navigation at the sources `sources` configures.
@@ -981,6 +987,72 @@ fn install_panic_logging() {
     );
 }
 
+impl Backend {
+    /// Runs an explicitly requested operation in a fresh M2 process.
+    async fn execute_runtime_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<serde_json::Value> {
+        let invalid =
+            |message: &str| tower_lsp::jsonrpc::Error::invalid_params(message.to_string());
+        let argument = params
+            .arguments
+            .first()
+            .ok_or_else(|| invalid("expected one object argument"))?;
+        let uri: Url = serde_json::from_value(
+            argument
+                .get("uri")
+                .cloned()
+                .ok_or_else(|| invalid("uri is required"))?,
+        )
+        .map_err(|_| invalid("invalid uri"))?;
+        let path = uri
+            .to_file_path()
+            .map_err(|_| invalid("uri must name a local file"))?;
+        let directory = path
+            .parent()
+            .ok_or_else(|| invalid("file has no parent directory"))?;
+        let quote = |text: &str| serde_json::to_string(text).expect("string serialization");
+        let code = match params.command.as_str() {
+            "m2-ls.executeCell" => argument
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| invalid("executeCell requires code containing the selected cell"))?
+                .to_string(),
+            "m2-ls.runTests" => {
+                let package = argument
+                    .get("package")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| invalid("runTests requires a package name"))?;
+                format!(
+                    "check(loadPackage({}, FileName => {}), Verbose => true)",
+                    quote(package),
+                    quote(&path.to_string_lossy())
+                )
+            }
+            _ => format!("input {}", quote(&path.to_string_lossy())),
+        };
+        let child = tokio::process::Command::new("M2")
+            .args(["--silent", "--no-readline", "--no-prompts", "--stop", "-e"])
+            .arg(format!("{code}\nexit 0"))
+            .current_dir(directory)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| invalid(&format!("cannot start M2: {error}")))?;
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|error| invalid(&format!("M2 failed: {error}")))?;
+        Ok(
+            serde_json::json!({"success": output.status.success(), "exitCode": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout), "stderr": String::from_utf8_lossy(&output.stderr)}),
+        )
+    }
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
@@ -1018,6 +1090,15 @@ impl LanguageServer for Backend {
                         ..Default::default()
                     },
                 )),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![
+                        WorkspaceHierarchy::COMMAND.to_string(),
+                        "m2-ls.executeFile".into(),
+                        "m2-ls.executeCell".into(),
+                        "m2-ls.runTests".into(),
+                    ],
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
@@ -1591,16 +1672,45 @@ impl LanguageServer for Backend {
         }))
     }
 
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        if matches!(
+            params.command.as_str(),
+            "m2-ls.executeFile" | "m2-ls.executeCell" | "m2-ls.runTests"
+        ) {
+            return self.execute_runtime_command(params).await.map(Some);
+        }
+        if params.command != WorkspaceHierarchy::COMMAND {
+            return Err(tower_lsp::jsonrpc::Error::invalid_params("unknown command"));
+        }
+        if !params.arguments.is_empty() {
+            return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                "printHierarchies takes no arguments",
+            ));
+        }
+        let report = self.workspace_hierarchy();
+        self.client
+            .log_message(MessageType::INFO, report.text.clone())
+            .await;
+        serde_json::to_value(report)
+            .map(Some)
+            .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())
+    }
+
     async fn prepare_type_hierarchy(
         &self,
         params: TypeHierarchyPrepareParams,
     ) -> Result<Option<Vec<TypeHierarchyItem>>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
+        let hierarchy = self.workspace_hierarchy().hierarchy;
+        let library = self.library.snapshot();
+        let context = TypeHierarchyContext::new(&hierarchy, library.source_resolver());
         Ok(self
-            .with_source_at(&uri, position, |document, knowledge, _| {
-                self.type_hierarchy_context(&self.library.snapshot())
-                    .prepare(document, &knowledge.at(position), &uri, position)
+            .with_source_at(&uri, position, |document, _, workspace| {
+                context.prepare(document, &uri, position, &workspace)
             })
             .flatten())
     }
@@ -1609,18 +1719,21 @@ impl LanguageServer for Backend {
         &self,
         params: TypeHierarchySupertypesParams,
     ) -> Result<Option<Vec<TypeHierarchyItem>>> {
-        Ok(self
-            .type_hierarchy_context(&self.library.snapshot())
-            .supertypes(&params.item))
+        let hierarchy = self.workspace_hierarchy().hierarchy;
+        let library = self.library.snapshot();
+        Ok(
+            TypeHierarchyContext::new(&hierarchy, library.source_resolver())
+                .supertypes(&params.item),
+        )
     }
 
     async fn subtypes(
         &self,
         params: TypeHierarchySubtypesParams,
     ) -> Result<Option<Vec<TypeHierarchyItem>>> {
-        Ok(self
-            .type_hierarchy_context(&self.library.snapshot())
-            .subtypes(&params.item))
+        let hierarchy = self.workspace_hierarchy().hierarchy;
+        let library = self.library.snapshot();
+        Ok(TypeHierarchyContext::new(&hierarchy, library.source_resolver()).subtypes(&params.item))
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {

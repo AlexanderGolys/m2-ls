@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.4.0 - 2026-11-05
+
+- Share one workspace hierarchy between type navigation and the new
+  `m2-ls.printHierarchies` command. Include source and library objects, packages,
+  lexical dictionaries, class relations and inheritance; preserve alias
+  identities and distinguish package dependencies from namespace ownership.
+- Add explicit `m2-ls.executeFile`, `m2-ls.executeCell` and `m2-ls.runTests`
+  commands. Each runs in a fresh Macaulay2 process and returns its exit status,
+  standard output and standard error.
+- Preserve resolved type identities across aliases, shadowing and independent
+  source snapshots, keeping inference and hierarchy navigation consistent.
+- Infer constructor installation parameters and return hints using the
+  requested type object and constructed class.
+- Highlight regular-expression patterns passed to builtin functions using the
+  standard `regexp` semantic token type.
+
 ## 2.3.0 - 2026-11-03
 
 - Run analysis, diagnostics, editor queries, formatting and folding on one

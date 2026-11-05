@@ -37,7 +37,21 @@ impl Analysis {
     /// Types a lambda's parameters by the domain of the installation
     /// receiving its arguments.
     fn enrich_lambda(&mut self, lambda: &ExprLambda, source: &(impl SourceNavigation + ?Sized)) {
-        let parameter_types = self.argument_lambda_domain(lambda, source).cloned();
+        let mut parameter_types = self.argument_lambda_domain(lambda, source).cloned();
+        if self
+            .installation_receiving_arguments(lambda, source)
+            .is_some_and(|installation| {
+                installation.method.head.name().name()
+                    == <m2_syn::Token![new] as m2_syn::Token>::SPELLING
+            })
+        {
+            if let Some(class_parameter) =
+                parameter_types.as_mut().and_then(|types| types.first_mut())
+            {
+                // `new` passes the requested type object, not an instance of it.
+                *class_parameter = TypeRole::Type.object_name();
+            }
+        }
         let parameters = lambda.bound_symbols();
         let typed_parameters = parameter_types
             .as_deref()
@@ -133,6 +147,10 @@ impl Analysis {
             );
         }
 
+        if let Some(symbol) = assigned_symbol {
+            self.enrich_alias_identity(symbol, value, source, &knowledge);
+        }
+
         if let Some(ring) = assigned_symbol {
             if RingSemantics::may_be_ring(&inferred_type, &knowledge) {
                 self.collect_ring_generator_bindings(ring, value, scope_idx, source, &knowledge);
@@ -151,6 +169,58 @@ impl Analysis {
         }
 
         self.record_assignment_fact(assignment, &parts, scope_idx, installation_id, source);
+    }
+
+    /// An alias names the same object, including types and packages from either origin.
+    fn enrich_alias_identity(
+        &mut self,
+        target: &Symbol,
+        value: &Expr,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) {
+        let Some(name) = value
+            .unparenthesized()
+            .and_then(ExpressionSyntax::symbol_name)
+        else {
+            return;
+        };
+        let Some(position) = source.position_for_syntax(value) else {
+            return;
+        };
+        let identity = self
+            .visible_source_binding_at(name, position, knowledge)
+            .map(|binding| {
+                (
+                    self.binding_object_id(binding),
+                    binding.state.source_type.clone(),
+                )
+            })
+            .or_else(|| {
+                let object = knowledge.resolve_object(&ObjectName::new(name))?;
+                let type_id = knowledge.type_id(&object);
+                Some((object, type_id))
+            });
+        let Some((identity, type_id)) = identity else {
+            return;
+        };
+        let Some(state) = source.range_for_syntax(target).and_then(|range| {
+            self.registry
+                .binding_states_by_range
+                .get(&source_range_key(range))
+                .copied()
+        }) else {
+            return;
+        };
+        if let Some(binding) = self
+            .registry
+            .bindings
+            .get_mut(state.binding.0 as usize)
+            .and_then(|binding| binding.states.get_mut(state.state))
+        {
+            binding.value_identity = Some(identity);
+            binding.source_type = type_id;
+        }
     }
 
     /// Records an assignment fact for later editor queries: installations,

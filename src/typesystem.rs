@@ -64,6 +64,12 @@ pub enum TypeRole {
     Thing,
     /// A runtime class identity or its catalog data.
     Type,
+    /// Metaclass whose instances construct themselves through `new T from x`.
+    SelfInitializingType,
+    /// Metaclass whose instances wrap arbitrary values in lists.
+    WrapperType,
+    /// Metaclass whose instances construct lists from lists or sequences.
+    HeaderType,
     /// The runtime class of visible list-like values.
     VisibleList,
 }
@@ -105,6 +111,9 @@ impl TypeRole {
             Self::Thing => "Thing",
             Self::Type => "Type",
             Self::VisibleList => "VisibleList",
+            Self::SelfInitializingType => "SelfInitializingType",
+            Self::WrapperType => "WrapperType",
+            Self::HeaderType => "HeaderType",
         })
     }
 }
@@ -158,11 +167,6 @@ pub trait TypeKnowledge: ObjectKnowledge + PositionedTypeKnowledge {
     /// Proof available for assigning a semantic runtime-class role to a type.
     fn type_role_evidence(&self, candidate: &ObjectName, role: TypeRole) -> SubtypeEvidence {
         self.subtype_evidence(candidate, &role.object_name())
-    }
-
-    /// Resolved runtime class identity corresponding to a semantic role.
-    fn type_role_id(&self, role: TypeRole) -> Option<TypeId> {
-        self.resolve_type_id(&role.object_name())
     }
 }
 

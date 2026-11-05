@@ -27,6 +27,7 @@ use crate::capabilities::document_symbols::{collect_workspace_symbols, Workspace
 use crate::document::DocumentSnapshot;
 use crate::file_load::FileLoad;
 use crate::macaulay2::Macaulay2Conventions;
+use crate::object_hierarchy::HierarchySnapshot;
 use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::package_documentation::DocumentedSubject;
 use crate::package_index::SourceResolver;
@@ -254,6 +255,8 @@ impl<T: WorkspaceDefinitionKnowledge + ?Sized> WorkspaceDefinitionKnowledge for 
 /// they load and the user packages they import, from disk.
 #[derive(Debug, Default)]
 pub struct WorkspaceIndex {
+    /// Shared object and namespace relations retained from the indexed analysis.
+    hierarchies_by_file: DashMap<Url, HierarchySnapshot>,
     /// The top-level bindings of every indexed file, by name.
     definitions_by_name: DashMap<ObjectName, Vec<DefLocation>>,
     /// The bound functions and method installations of every indexed file, by
@@ -393,6 +396,22 @@ impl WorkspaceIndex {
         timing.record("cached_files", self.loads_by_file.len());
     }
 
+    /// Relations of all indexed files, including unopened loaded source files.
+    /// The copy owns its data so protocol handlers do not hold index guards.
+    pub fn hierarchy_snapshots(&self) -> std::collections::BTreeMap<Url, HierarchySnapshot> {
+        self.hierarchies_by_file
+            .iter()
+            .map(|entry| {
+                let mut snapshot = entry.value().clone();
+                snapshot.package_context = self
+                    .package_of_loaded_file
+                    .get(entry.key())
+                    .map(|package| package.name().to_string());
+                (entry.key().clone(), snapshot)
+            })
+            .collect()
+    }
+
     /// Whether `uri` is indexed, even when it could not be parsed.
     pub fn is_indexed(&self, uri: &Url) -> bool {
         self.loads_by_file.contains_key(uri)
@@ -422,6 +441,8 @@ impl WorkspaceIndex {
         knowledge_provider: &ObjectRegistry,
     ) -> Vec<Url> {
         self.remove_file(uri);
+        self.hierarchies_by_file
+            .insert(uri.clone(), HierarchySnapshot::new(snapshot, uri));
         if let Some(init_file) = snapshot.object_registry().init_file().file() {
             self.init_file_of_document
                 .insert(uri.clone(), init_file.uri().clone());
@@ -576,6 +597,7 @@ impl WorkspaceIndex {
     /// Drop the facts recorded for `uri`, keeping the package a loading file
     /// placed it in, as when it is about to be indexed again.
     pub fn remove_file(&self, uri: &Url) {
+        self.hierarchies_by_file.remove(uri);
         self.loads_by_file.remove(uri);
         self.file_loads_by_file.remove(uri);
         self.symbols_by_file.remove(uri);

@@ -23,37 +23,6 @@ use super::*;
 use crate::object_registry::TypeStore;
 use crate::source::{SyntaxNavigation, SyntaxSource};
 
-/// Partial-order view combining source and external type edges without copying.
-struct SourceTypeOrder<'analysis, Knowledge: ?Sized> {
-    /// Source-declared runtime classes supplementing the external type graph.
-    source: &'analysis SourceTypeFacts,
-    /// External type knowledge supplementing source-declared facts.
-    external: &'analysis Knowledge,
-}
-
-impl<Knowledge: TypeKnowledge + ?Sized> TypeStore for SourceTypeOrder<'_, Knowledge> {
-    fn parent_type_id(&self, type_id: &TypeId) -> Option<TypeId> {
-        self.source
-            .data
-            .get(type_id)
-            .and_then(|data| data.parent.clone())
-            .or_else(|| {
-                self.external
-                    .object(type_id.object())?
-                    .type_info()
-                    .and_then(|data| data.parent.clone())
-            })
-    }
-
-    fn has_strict_subtype_id(&self, type_id: &TypeId) -> bool {
-        self.source
-            .data
-            .iter()
-            .any(|(candidate, data)| candidate != type_id && data.parent.as_ref() == Some(type_id))
-            || self.external.has_strict_subtype_id(type_id)
-    }
-}
-
 /// Shared callable and type knowledge for typed sessions and diagnostic queries.
 pub struct TypeChecker<'analysis, 'knowledge, Knowledge: ?Sized> {
     /// Semantic facts for the current document snapshot.
@@ -132,11 +101,8 @@ impl Analysis {
         checker
             .resolve_type_id_at(name, position, knowledge)
             .is_some_and(|type_id| {
-                SourceTypeOrder {
-                    source: &self.registry.source_types,
-                    external: knowledge,
-                }
-                .has_strict_subtype_id(&type_id)
+                self.object_relations(knowledge)
+                    .has_strict_subtype_id(&type_id)
             })
     }
 }
@@ -230,10 +196,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
                 .map(|signature| signature.signature_index)
                 .collect();
         };
-        let order = SourceTypeOrder {
-            source: &self.registry.source_types,
-            external: knowledge,
-        };
+        let order = self.object_relations(knowledge);
         let mut witnesses = Vec::new();
 
         for product in products {
@@ -1036,10 +999,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         position: Position,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> SubtypeEvidence {
-        let order = SourceTypeOrder {
-            source: &self.registry.source_types,
-            external: knowledge,
-        };
+        let order = self.object_relations(knowledge);
         let Some((actual, expected)) = self
             .resolve_type_id_at(actual, position, knowledge)
             .zip(self.resolve_type_id_at(expected, position, knowledge))
@@ -1080,14 +1040,7 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<Type> {
         let type_id = self.resolve_type_id_at(name, position, knowledge)?;
-        Type::from_id(
-            name.clone(),
-            type_id,
-            &SourceTypeOrder {
-                source: &self.registry.source_types,
-                external: knowledge,
-            },
-        )
+        Type::from_id(name.clone(), type_id, &self.object_relations(knowledge))
     }
 }
 /// External candidate indices remaining after applying source visibility and dispatch specificity.

@@ -9,164 +9,180 @@ use tower::Service;
 use tower_lsp::jsonrpc::{Request, Response};
 use tower_lsp::lsp_types::{Position, Range as TextRange, TypeHierarchyItem, Url};
 
-use crate::builtin_index::Record;
 use crate::document::DocumentSnapshot;
-use crate::object_registry::ObjectName;
+use crate::object_hierarchy::{HierarchyObject, NamespaceId, ObjectHierarchy};
+use crate::object_registry::{ObjectId, ObjectKnowledge, ObjectName};
 use crate::package_index::SourceResolver;
-use crate::record_lsp::record_symbol_kind;
-use crate::record_lsp::{LspKnowledge, PartitionedTypeKnowledge};
 use crate::source::SourceNavigation;
+use crate::workspace_index::WorkspaceDefinitionKnowledge;
+use tower_lsp::lsp_types::SymbolKind;
 
 /// Protocol request name intercepted for dynamic type-hierarchy support.
 pub const TYPE_HIERARCHY_METHOD: &str = "textDocument/prepareTypeHierarchy";
 
-/// The static-metadata side of type hierarchy: resolve a record by name,
-/// walk its parent/subtype edges, and materialize `TypeHierarchyItem`s. Born
-/// out of the `Backend` handlers — kept here so `main.rs` only wires LSP
-/// requests to thin shims, matching the other capability modules.
-pub struct TypeHierarchyContext<'a, K: ?Sized> {
-    /// Positioned object and type facts available to this request.
-    knowledge: &'a K,
-    /// Package and file lookup paths for resolving source locations.
+/// Type hierarchy over shared object identities and their inheritance edges.
+/// Source locations and catalog metadata affect presentation, not traversal.
+pub struct TypeHierarchyContext<'a> {
+    /// Common graph including objects from the surrounding workspace and packages.
+    hierarchy: &'a ObjectHierarchy,
+    /// Resolves source locations for objects supplied by installed packages.
     source_resolver: &'a SourceResolver,
 }
 
-impl<'a, K: PartitionedTypeKnowledge + ?Sized> TypeHierarchyContext<'a, K> {
-    /// Constructs this value from the supplied dependencies and initial state.
-    pub fn new(knowledge: &'a K, source_resolver: &'a SourceResolver) -> Self {
+impl<'a> TypeHierarchyContext<'a> {
+    /// Uses the shared object graph for every prepare and traversal request.
+    pub fn new(hierarchy: &'a ObjectHierarchy, source_resolver: &'a SourceResolver) -> Self {
         Self {
-            knowledge,
+            hierarchy,
             source_resolver,
         }
     }
 
-    /// Prepare the type-hierarchy root for the symbol at `position`, when that
-    /// symbol names a top-level type/class record in scope. The caller owns
-    /// the document guard lookup and constructs the scoped knowledge view;
-    /// everything past the snapshot lives here.
+    /// Resolves the object under the cursor, then prepares its type hierarchy.
+    /// A type object selects itself; other objects select their runtime class.
     pub fn prepare(
         &self,
         document: &DocumentSnapshot,
-        scoped: &(impl LspKnowledge + ?Sized),
         uri: &Url,
         position: Position,
+        workspace: &(impl WorkspaceDefinitionKnowledge + ?Sized),
     ) -> Option<Vec<TypeHierarchyItem>> {
         let symbol = document.reference_symbol_at(position)?.symbol;
         let name = symbol.text();
         let range = document.range_for_syntax(symbol)?;
-
-        let (package, record) = scoped.get_record_with_package(&ObjectName::new(name))?;
-        record.type_info()?;
-
-        Some(vec![self.item(
-            &package,
-            record,
-            Some(uri.clone()),
-            Some(range),
-        )])
-    }
-
-    /// The parent type's item, if the originating item's record has one and we
-    /// can resolve it (preferring the originating package, falling back to Core).
-    /// A record with no resolvable parent yields an empty vec (rather than
-    /// `None`, which the LSP treats as "no supertypes response at all").
-    pub fn supertypes(&self, item: &TypeHierarchyItem) -> Option<Vec<TypeHierarchyItem>> {
-        let package = Self::package_of(item);
-        let (_, record) = self.record(package, &item.name)?;
-
-        // Empty parent (no parent, self-parent, or unresolved edge) → empty
-        // vec, not `None`.
-        let resolved = (|| {
-            let parent = record.type_info()?.parent.as_ref()?;
-            if parent.object() == &record.id {
-                return None;
+        let source = document
+            .binding_at_position(position)
+            .or_else(|| document.source_binding_at(name, position));
+        let objects = if let Some(binding) = source {
+            vec![document.analysis().binding_object_id(binding)]
+        } else {
+            let locations = workspace.definitions(name, uri);
+            let objects = self
+                .hierarchy
+                .objects
+                .values()
+                .filter(|object| {
+                    object
+                        .location
+                        .as_ref()
+                        .is_some_and(|location| locations.contains(location))
+                })
+                .map(|object| object.id.clone())
+                .collect::<Vec<_>>();
+            if objects.is_empty() {
+                let qualified = self.hierarchy.resolve_qualified(name, uri);
+                if qualified.is_empty() {
+                    document
+                        .object_registry()
+                        .at(position)
+                        .resolve_object(&ObjectName::new(name))
+                        .into_iter()
+                        .collect()
+                } else {
+                    qualified
+                }
+            } else {
+                objects
             }
-            let (parent_package, parent_record) = self.knowledge.get_type_by_id(parent)?;
-            Some(self.item(&parent_package, parent_record, None, None))
-        })();
-        Some(resolved.into_iter().collect())
-    }
-
-    /// Every resolved subtype item of the originating item's record (skipping
-    /// self-edges and unresolved names).
-    pub fn subtypes(&self, item: &TypeHierarchyItem) -> Option<Vec<TypeHierarchyItem>> {
-        let package = Self::package_of(item);
-        let (_, record) = self.record(package, &item.name)?;
-
-        let type_id = self.knowledge.type_id(&record.id)?;
+        };
+        let mut seen = std::collections::HashSet::new();
         Some(
-            self.knowledge
-                .direct_subtypes(&type_id)
+            objects
                 .into_iter()
-                .map(|(subtype_package, subtype_record)| {
-                    self.item(&subtype_package, subtype_record, None, None)
+                .filter_map(|id| {
+                    let object = self.hierarchy.objects.get(&id)?;
+                    let selected = object.type_id.as_ref().or(object.class_of.as_ref())?;
+                    if !seen.insert(selected.clone()) {
+                        return None;
+                    }
+                    let selected = self.hierarchy.objects.get(selected.object())?;
+                    let mut item = self.item(selected);
+                    item.uri = uri.clone();
+                    item.range = range;
+                    item.selection_range = range;
+                    Some(item)
                 })
                 .collect(),
         )
     }
 
-    /// The originating package name stashed in the item's `data`, set when the
-    /// item was first materialized (so follow-up supertypes/subtypes know which
-    /// partition to resolve from before falling back to Core).
-    fn package_of(item: &TypeHierarchyItem) -> Option<&str> {
-        item.data
+    /// The direct inheritance parent, independent of the selected type's class.
+    pub fn supertypes(&self, item: &TypeHierarchyItem) -> Option<Vec<TypeHierarchyItem>> {
+        let object = self.object(item)?;
+        Some(
+            object
+                .parent_of
+                .as_ref()
+                .filter(|parent| parent.object() != &object.id)
+                .and_then(|parent| self.hierarchy.objects.get(parent.object()))
+                .map(|parent| self.item(parent))
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// All direct inheritance children, including edges across object origins.
+    pub fn subtypes(&self, item: &TypeHierarchyItem) -> Option<Vec<TypeHierarchyItem>> {
+        let object = self.object(item)?;
+        let type_id = object.type_id.as_ref()?;
+        Some(
+            self.hierarchy
+                .subtypes(type_id)
+                .into_iter()
+                .map(|child| self.item(child))
+                .collect(),
+        )
+    }
+
+    /// Resolves the canonical identity retained in a hierarchy item.
+    fn object(&self, item: &TypeHierarchyItem) -> Option<&HierarchyObject> {
+        let id = item.data.as_ref()?.get("objectId")?.as_str()?;
+        self.hierarchy.objects.get(&ObjectId::new(id))
+    }
+
+    /// Presents one type identically whether source or catalog supplied its facts.
+    fn item(&self, object: &HierarchyObject) -> TypeHierarchyItem {
+        let package = match &object.namespace {
+            NamespaceId::Package(_) | NamespaceId::PackagePrivate(_) => self
+                .hierarchy
+                .namespaces
+                .iter()
+                .find(|namespace| namespace.id == object.namespace)
+                .map(|namespace| namespace.name.as_str()),
+            _ => None,
+        };
+        let location = object
+            .location
+            .clone()
+            .or_else(|| package.and_then(|package| self.source_resolver.package_location(package)));
+        let range = location
             .as_ref()
-            .and_then(|data| data.get("package"))
-            .and_then(|package| package.as_str())
-    }
-
-    /// Resolve the originating record itself, ensuring it carries type info (a
-    /// non-type record has no hierarchy edges).
-    fn record(&self, package: Option<&str>, name: &str) -> Option<(String, &Record)> {
-        let package = package.unwrap_or("Core");
-        let record = self
-            .knowledge
-            .get_record_from_package(package, &ObjectName::new(name))?;
-        record.type_info()?;
-        Some((package.to_string(), record))
-    }
-
-    /// Materialize a `TypeHierarchyItem` for `record`, filling in the
-    /// occurrence URI/range when the request comes from an editor position, and
-    /// the resolved source location otherwise (so a builtin type without an
-    /// in-editor occurrence still has a navigable target).
-    fn item(
-        &self,
-        package: &str,
-        record: &Record,
-        occurrence_uri: Option<Url>,
-        occurrence_range: Option<TextRange>,
-    ) -> TypeHierarchyItem {
-        let location = self.source_resolver.package_location(package);
-        let uri = occurrence_uri
-            .or_else(|| location.as_ref().map(|location| location.uri.clone()))
-            .unwrap_or_else(|| Url::parse("macaulay2:/builtins").expect("valid builtin URI"));
-        let range = occurrence_range
-            .or_else(|| location.as_ref().map(|location| location.range))
+            .map(|location| location.range)
             .unwrap_or_else(|| TextRange::new(pos!(), pos!()));
-        let detail = record
-            .type_info()
-            .and_then(|type_info| {
-                type_info
-                    .parent
-                    .as_ref()
-                    .filter(|parent| parent.object() != &record.id)
-                    .and_then(|parent| self.knowledge.get_type_by_id(parent))
-            })
-            .map(|(_, parent)| format!("Parent: {}", parent.name));
-
+        let uri = location
+            .map(|location| location.uri)
+            .unwrap_or_else(|| Url::parse("macaulay2:/builtins").expect("valid builtin URI"));
+        let class = object
+            .class_of
+            .as_ref()
+            .and_then(|class| self.hierarchy.objects.get(class.object()))
+            .map(|class| class.name.as_str())
+            .unwrap_or("unknown");
+        let parent = object
+            .parent_of
+            .as_ref()
+            .and_then(|parent| self.hierarchy.objects.get(parent.object()))
+            .map(|parent| parent.name.as_str())
+            .unwrap_or("unknown");
         TypeHierarchyItem {
-            name: record.name.0.clone(),
-            kind: record_symbol_kind(record),
+            name: object.name.clone(),
+            kind: SymbolKind::CLASS,
             tags: None,
-            detail,
+            detail: Some(format!("classOf: {class}; parentOf: {parent}")),
             uri,
             range,
             selection_range: range,
-            data: Some(json!({
-                "name": record.name.0.clone(),
-                "package": package,
-            })),
+            data: Some(json!({"objectId": object.id.name()})),
         }
     }
 }
@@ -266,15 +282,21 @@ mod tests {
     #[test]
     fn prepares_type_and_resolves_its_parent_from_partitioned_knowledge() {
         let knowledge = ObjectRegistry::load(corpus());
-        let scoped = knowledge.with_source_imports("");
+        let mut hierarchy = ObjectHierarchy::default();
+        hierarchy.include_environment(&knowledge, pos_max!());
         let document = DocumentSnapshot::from_text("ZZ\n".to_string(), &knowledge)
             .expect("source should parse");
         let resolver = SourceResolver::default();
-        let context = TypeHierarchyContext::new(&knowledge, &resolver);
+        let context = TypeHierarchyContext::new(&hierarchy, &resolver);
         let uri = Url::parse("file:///type-hierarchy-test.m2").expect("valid test URI");
 
         let items = context
-            .prepare(&document, &scoped, &uri, pos!())
+            .prepare(
+                &document,
+                &uri,
+                pos!(),
+                &crate::workspace_index::WorkspaceIndex::default(),
+            )
             .expect("ZZ should be a known type");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "ZZ");

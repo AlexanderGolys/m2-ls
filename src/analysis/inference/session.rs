@@ -14,7 +14,7 @@ use crate::node_metadata::SyntaxSnapshot;
 use crate::object_registry::{ObjectKnowledge, ObjectName, OperatorForm};
 use crate::source::SourceNavigation;
 use crate::typesystem::{
-    InferredType, LiteralOption, PositionedTypeKnowledge, TypeKnowledge, TypeRole,
+    InferredType, LiteralOption, PositionedTypeKnowledge, Type, TypeKnowledge, TypeRole,
 };
 
 use super::syntax::{InfixSyntax, MethodConstructor};
@@ -294,6 +294,33 @@ where
                 })
                 .unwrap_or_else(InferredType::unknown);
         }
+        if let (Some(name), Some(class)) = (name, head.single()) {
+            let constructs_instance = [TypeRole::SelfInitializingType, TypeRole::WrapperType]
+                .into_iter()
+                .any(|role| checker.is_subtype(class, &role.object_name(), position, &knowledge));
+            let constructs_list = checker.is_subtype(
+                class,
+                &TypeRole::HeaderType.object_name(),
+                position,
+                &knowledge,
+            ) && self.expression(argument).single().is_some_and(
+                |argument_class| {
+                    [TypeRole::List, TypeRole::Sequence]
+                        .into_iter()
+                        .any(|role| {
+                            checker.is_subtype(
+                                argument_class,
+                                &role.object_name(),
+                                position,
+                                &knowledge,
+                            )
+                        })
+                },
+            );
+            if constructs_instance || constructs_list {
+                return self.named_class(callable.as_ref(), name);
+            }
+        }
         checker.dispatch_codomain(
             &knowledge,
             &Operator {
@@ -380,7 +407,20 @@ where
         }
         knowledge.get_record(&ObjectName::new(name)).map_or_else(
             || self.exact(symbol, TypeRole::Symbol),
-            |record| InferredType::exact_from_id(record.class.clone()),
+            |record| {
+                record
+                    .class_id
+                    .clone()
+                    .and_then(|class| {
+                        Type::from_id(
+                            record.class.clone(),
+                            class,
+                            &checker.object_relations(&knowledge),
+                        )
+                    })
+                    .map(InferredType::exact_type)
+                    .unwrap_or_else(|| InferredType::exact_from_id(record.class.clone()))
+            },
         )
     }
     fn application(&self, application: &'ast ExprOpBinAdj) -> InferredType {

@@ -4013,3 +4013,107 @@ async fn typed_ring_values_follow_aliases_across_document_revisions() {
     assert_eq!(diagnostic_lines(&session, "E14"), vec![3]);
     session.shutdown().await;
 }
+
+/// Constructor calls retain their requested class through inherited metaclasses.
+#[tokio::test]
+async fn abbreviated_constructors_infer_the_constructed_type() {
+    let source = concat!(
+        "Markdown = new Type of SelfInitializingType;\n",
+        "MarkdownSpan = new Type of BasicList;\n",
+        "new MarkdownSpan from Thing := (t,x) -> {x};\n",
+        "MarkdownText = new Markdown of MarkdownSpan;\n",
+        "text = MarkdownText \"hello\";\n",
+        "Wrapped = new WrapperType of BasicList;\n",
+        "wrapped = Wrapped 1;\n",
+        "Header = new HeaderType of BasicList;\n",
+        "header = Header {1,2};\n",
+        "sequence = Header (1,2);\n",
+        "plain = new Type of BasicList;\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    assert!(
+        !session.diagnostic_codes().contains(&"T03"),
+        "{:?}",
+        session.diagnostics()
+    );
+    for (line, expected) in [
+        (4, "MarkdownText"),
+        (6, "Wrapped"),
+        (8, "Header"),
+        (9, "Header"),
+    ] {
+        assert_eq!(hover_type_at(&mut session, line, 1).await, expected);
+    }
+    session
+        .set_inlay_hint_settings(json!({"showLiteral": true}))
+        .await;
+    let labels = inlay_labels_by_line(&mut session).await;
+    assert!(
+        labels
+            .iter()
+            .any(|(line, label)| *line == 2 && label.contains("MarkdownSpan")),
+        "{labels:?}"
+    );
+    assert!(
+        !labels
+            .iter()
+            .any(|(line, label)| *line == 2 && label.contains("List")),
+        "{labels:?}"
+    );
+    session.shutdown().await;
+}
+
+/// Only pattern arguments receive regexp tokens; package-like method domains do not recolor strings.
+#[tokio::test]
+async fn string_tokens_distinguish_patterns_packages_and_ordinary_text() {
+    let source = concat!(
+        "toString \"_\"\n",
+        "net \"__\"\n",
+        "replace(\"a+\", \"replacement\", \"subject\")\n",
+        "match(///b+///, \"target\")\n",
+        "regex(\"c+\", \"text\")\n",
+        "select(\"d+\", \"input\")\n",
+        "separate(\"e+\", \"words\")\n",
+        "separate \"lines\"\n",
+        "needsPackage \"JSON\"\n",
+        "f = (replace) -> replace(\"local\", 1)\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let tokens = semantic_tokens(&mut session).await;
+    for needle in ["\"a+\"", "///b+///", "\"c+\"", "\"d+\"", "\"e+\""] {
+        assert_eq!(
+            token_at(&tokens, source, needle, 0).0,
+            session.semantic_token_type("regexp"),
+            "{needle}"
+        );
+    }
+    for needle in [
+        "\"_\"",
+        "\"__\"",
+        "\"replacement\"",
+        "\"subject\"",
+        "\"target\"",
+        "\"lines\"",
+        "\"local\"",
+    ] {
+        // This client augments syntax highlighting, so ordinary strings may
+        // be omitted from semantic tokens and colored by the editor instead.
+        let position = position(source, needle, 0);
+        let token_type = tokens
+            .iter()
+            .find(|(line, character, _, _)| {
+                *line == position["line"].as_u64().unwrap()
+                    && *character == position["character"].as_u64().unwrap()
+            })
+            .map(|(_, _, token_type, _)| *token_type);
+        assert!(
+            token_type.is_none() || token_type == Some(session.semantic_token_type("string")),
+            "{needle}: {token_type:?}"
+        );
+    }
+    assert_eq!(
+        token_at(&tokens, source, "\"JSON\"", 0).0,
+        session.semantic_token_type("namespace")
+    );
+    session.shutdown().await;
+}

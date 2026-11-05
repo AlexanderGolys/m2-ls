@@ -34,6 +34,7 @@ pub mod suppression;
 
 pub use checks::{collect, collect_located, DiagnosticInputs};
 
+use serde::{Deserialize, Deserializer};
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, DiagnosticTag, Location,
     NumberOrString, Range as TextRange, Url,
@@ -83,8 +84,8 @@ impl DiagnosticCode {
 }
 
 /// A settings entry naming a diagnostic, by code or by name.
-impl<'de> serde::Deserialize<'de> for DiagnosticCode {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+impl<'de> Deserialize<'de> for DiagnosticCode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let selector = String::deserialize(deserializer)?;
         Self::from_selector(&selector)
             .ok_or_else(|| serde::de::Error::custom(format!("unknown diagnostic `{selector}`")))

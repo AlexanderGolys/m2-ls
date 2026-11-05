@@ -63,6 +63,10 @@ pub struct RawRecord {
     /// The class of the object, as a corpus reference; absent means `Thing`, or
     /// `Package` for a package record.
     pub class: Option<String>,
+    /// Publicly forwarded package dependencies, when the catalog records them.
+    /// Missing metadata remains distinct from a known empty export list.
+    #[serde(alias = "PackageExports", alias = "packageExports")]
+    pub package_exports: Option<Vec<String>>,
     /// The parent of a type record, as a corpus reference.
     pub parent: Option<String>,
     /// The documented value type of a callable as a whole, beside the per-

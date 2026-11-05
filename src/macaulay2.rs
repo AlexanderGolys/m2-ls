@@ -31,6 +31,32 @@ impl Macaulay2Conventions {
     pub const PACKAGE_IMPORT_FUNCTIONS: [&str; 4] =
         ["needsPackage", "loadPackage", "debug", "importFrom"];
 
+    /// Runtime dictionary that binds names to package objects.
+    pub const PACKAGE_DICTIONARY: &str = "PackageDictionary";
+
+    /// Qualified-name prefix for package objects, independent of their class.
+    pub const PACKAGE_NAMESPACE: &str = "Package";
+
+    /// Package owning ordinary workspace globals.
+    pub const USER_PACKAGE: &str = "User";
+
+    /// Core calls whose first string argument identifies a package.
+    pub const PACKAGE_NAME_FUNCTIONS: [&str; 10] = [
+        "needsPackage",
+        "loadPackage",
+        "debug",
+        "importFrom",
+        "exportFrom",
+        "newPackage",
+        "endPackage",
+        "installPackage",
+        "uninstallPackage",
+        "check",
+    ];
+
+    /// Core functions taking a regular expression as their first positional argument.
+    pub const REGEXP_FUNCTIONS: [&str; 5] = ["match", "regex", "replace", "select", "separate"];
+
     /// Functions whose first string argument identifies a source file to run.
     pub const FILE_LOAD_FUNCTIONS: [&str; 3] = ["load", "needs", "input"];
 

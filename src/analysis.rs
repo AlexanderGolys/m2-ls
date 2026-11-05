@@ -45,7 +45,7 @@ use crate::meta::{BindingRole, Meta, Metadata};
 use crate::node_metadata::matches_token;
 
 use crate::object_registry::ObjectName;
-use crate::object_registry::{ObjectId, OperatorForm, TypeData, TypeId};
+use crate::object_registry::{ObjectId, ObjectKnowledge, OperatorForm, TypeData, TypeId};
 use crate::package_index::PackageLoadingOption;
 use crate::semantic_token::{SourceSemanticRole, SourceSemanticToken};
 use crate::source::{ByteRange, SourceNavigation, SyntaxSource};
@@ -572,6 +572,8 @@ pub struct BindingStateInfo {
     pub known_value: Option<known_value::KnownValue>,
     /// Whether this value is a generator introduced by a ring constructor.
     pub is_ring_generator: bool,
+    /// Canonical value identity when construction or aliasing establishes one.
+    pub value_identity: Option<ObjectId>,
     /// Identity of a runtime class declared by the source.
     pub source_type: Option<TypeId>,
     /// Source extent of the expression supplying the binding's value.
@@ -623,11 +625,28 @@ impl Metadata for BindingView<'_> {
 }
 
 /// Typed source-declared type edges and their source-symbol identities.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SourceTypeFacts {
     /// Stored semantic data indexed by the corresponding identity.
     data: HashMap<TypeId, TypeData>,
+    /// Distinguishes independently analyzed documents and embedded sessions.
+    namespace: u64,
+    /// Canonical runtime classes of source-created objects and type objects.
+    classes: HashMap<ObjectId, TypeId>,
 }
+
+impl Default for SourceTypeFacts {
+    fn default() -> Self {
+        Self {
+            data: HashMap::new(),
+            namespace: NEXT_SOURCE_NAMESPACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            classes: HashMap::new(),
+        }
+    }
+}
+
+/// Monotonic identities prevent source objects in different snapshots from colliding.
+static NEXT_SOURCE_NAMESPACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Start and end UTF-16 coordinates used as a compact source-range lookup key.
 type SourceRangeKey = [u32; 4];
@@ -662,7 +681,7 @@ struct SemanticRegistry {
     operator_functions: HashMap<Operator, FunctionInfo>,
     /// Method installations associated with this callable or analysis.
     installations: Vec<MethodInstallation>,
-    /// Function-head installations by the lambda receiving their arguments,
+    /// Installations by the lambda receiving their arguments,
     /// whose parameters take the installation's domain types.
     installations_by_argument_lambda: HashMap<SourceRangeKey, MethodInstallationId>,
     /// Source-ordered assignments used by later editor features.
@@ -1138,6 +1157,16 @@ impl Analysis {
         self.registry.scopes.at(pos)
     }
 
+    /// Runtime lexical dictionaries with their extents and enclosing dictionary identities.
+    pub fn scope_ranges(&self) -> impl Iterator<Item = (usize, TextRange, Option<usize>)> + '_ {
+        self.registry.scopes.entries()
+    }
+
+    /// Runtime lexical dictionary containing a semantic analysis scope.
+    pub fn dictionary_scope(&self, scope: usize) -> Option<usize> {
+        self.registry.scopes.dictionary(scope)
+    }
+
     /// Runs binding collection and semantic enrichment against positioned object knowledge.
     pub fn new_with_knowledge(
         syntax: &SyntaxSnapshot,
@@ -1161,6 +1190,7 @@ impl Analysis {
             serde_json::json!({"source_bytes": source.text().len()}),
         );
         analysis.enrich_types(&source, knowledge);
+        analysis.retain_object_classes(knowledge);
         drop(inference_timing);
         let _semantics_timing = crate::telemetry::Timing::start(
             "analysis.semantic_tokens",
@@ -1168,6 +1198,72 @@ impl Analysis {
         );
         analysis.collect_semantics(&source, knowledge);
         analysis
+    }
+
+    /// Canonical identity of a value assigned to a source binding in this snapshot.
+    pub fn source_object_id(&self, binding: BindingId, state: usize) -> ObjectId {
+        ObjectId::new(format!(
+            "$Source${}:{}:{state}",
+            self.registry.source_types.namespace, binding.0
+        ))
+    }
+
+    /// The object represented by a source binding state, independent of its kind.
+    pub fn binding_object_id(&self, binding: BindingView<'_>) -> ObjectId {
+        if let Some(identity) = &binding.state.value_identity {
+            return identity.clone();
+        }
+        let state = binding
+            .binding
+            .states
+            .iter()
+            .position(|state| std::ptr::eq(state, binding.state))
+            .expect("binding views reference a retained state");
+        self.source_object_id(binding.binding_id, state)
+    }
+
+    /// Resolves class edges once at each assignment rather than through later names.
+    fn retain_object_classes(&mut self, knowledge: &(impl PositionedTypeKnowledge + ?Sized)) {
+        let classes = self
+            .binding_states()
+            .filter_map(|binding| {
+                let class = binding.state.inferred_type.as_ref()?.single()?;
+                let position = binding
+                    .state
+                    .value_range
+                    .map_or(binding.state.span.start, |value| value.start);
+                let positioned = knowledge.at_position(position);
+                let object = self.binding_object_id(binding);
+                let class = binding
+                    .state
+                    .inferred_type
+                    .as_ref()
+                    .and_then(InferredType::single_identity)
+                    .cloned()
+                    .or_else(|| positioned.class_type_id(&object))
+                    .or_else(|| {
+                        TypeChecker::new(self, knowledge).resolve_type_id_at(
+                            class,
+                            position,
+                            &positioned,
+                        )
+                    })?;
+                Some((object, class))
+            })
+            .collect::<Vec<_>>();
+        self.registry.source_types.classes.extend(classes);
+    }
+
+    /// Parent and class relations queried identically for source and catalog objects.
+    pub fn object_relations<'a, K: ObjectKnowledge + ?Sized>(
+        &'a self,
+        knowledge: &'a K,
+    ) -> crate::object_hierarchy::ObjectRelations<'a, K> {
+        crate::object_hierarchy::ObjectRelations::new(
+            &self.registry.source_types.data,
+            &self.registry.source_types.classes,
+            knowledge,
+        )
     }
 
     /// Incorporates one syntax-pass binding fact into semantic state.
@@ -1287,7 +1383,7 @@ impl Analysis {
     ) {
         let source_type = enrichment.parent_type.map(|parent_type| {
             let type_id = TypeId::from_source_type(
-                ObjectId::new(format!("$Source${}:{state_index}", binding_id.0)),
+                self.source_object_id(binding_id, state_index),
                 &parent_type,
             );
             self.registry.source_types.data.insert(
@@ -1310,6 +1406,7 @@ impl Analysis {
         state.inferred_type = enrichment.inferred_type;
         state.object_id = enrichment.object_id;
         state.indexed_element_type = enrichment.indexed_element_type;
+        state.value_identity = source_type.as_ref().map(|type_id| type_id.object().clone());
         state.source_type = source_type;
     }
 
@@ -1326,6 +1423,7 @@ impl Analysis {
             known_value: None,
             is_ring_generator: false,
             source_type: None,
+            value_identity: None,
             value_range: fact.value,
             definition_range: fact.definition,
             span: range,
@@ -1370,6 +1468,7 @@ impl Analysis {
             known_value: None,
             is_ring_generator: false,
             source_type: None,
+            value_identity: None,
             value_range: fact.value,
             definition_range: fact.definition,
             span: fact.target,

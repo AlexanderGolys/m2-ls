@@ -321,6 +321,14 @@ server reports what it ignored in a warning message.
 
 ## Troubleshooting
 
+The LSP command `m2-ls.printHierarchies` returns the current workspace's package
+and namespace tree, `classOf` relations, and `parentOf` inheritance edges, and
+prints the report to the language-server output log. Invoke it through
+`workspace/executeCommand` with no arguments. It includes source and library
+objects, types, and packages, preserves alias identities, and records public
+package dependencies separately from namespace ownership. Standard type
+hierarchy requests use the same graph to navigate source and library types.
+
 The server writes structured JSON lines to `/tmp/m2-ls.log`. Request errors
 include the method, request ID, document URI, and error code. Operations taking
 at least 100 ms are recorded automatically, with timing summaries every 30
@@ -350,3 +358,19 @@ Macaulay2, copyright The Macaulay2 Authors, under their
 [GPL version 2 or version 3 terms](https://macaulay2.com/doc/Macaulay2/share/doc/Macaulay2/Macaulay2Doc/html/___Copyright_spand_splicense.html).
 Individual packages retain their authors' copyright notices and licenses.
 Downloading and displaying this material does not change its license.
+
+### Explicit runtime commands
+
+Invoke these through `workspace/executeCommand`, with one object in `arguments`.
+They start `M2` from `PATH` in a fresh process, using the source file's directory
+as the working directory. They run only when invoked; analysis never runs them.
+
+| Command | Argument fields |
+| --- | --- |
+| `m2-ls.executeFile` | `uri`: local file URI; executes the saved file |
+| `m2-ls.executeCell` | `uri`, `code`: selected cell source supplied by the caller |
+| `m2-ls.runTests` | `uri`, `package`: loads that package from the named file and runs its tests |
+
+Results contain `success`, `exitCode`, `stdout`, and `stderr`. Processes use normal
+M2 initialization. Cells do not retain definitions between invocations. Package
+installation and documentation generation are not currently implemented.

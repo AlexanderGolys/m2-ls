@@ -499,9 +499,13 @@ impl Analysis {
         let operand_arity = domain.len();
         let span = source.range_for_syntax(assignment)?;
         let codomain_annotation = codomain_annotation(&parts);
-        let codomain = codomain_annotation
-            .and_then(ExpressionSyntax::symbol_name)
-            .map(ObjectName::new);
+        // `new` resets the initializer's result class to its requested class.
+        let codomain = match parts.target {
+            AssignmentTarget::New(new) => new.class.symbol_name().map(ObjectName::new),
+            _ => codomain_annotation
+                .and_then(ExpressionSyntax::symbol_name)
+                .map(ObjectName::new),
+        };
         // Domain types, the written codomain, and the method function named
         // on the left or the operator written between its operands.
         let method_type_spans = shape
@@ -544,7 +548,13 @@ impl Analysis {
         Some(ClassifiedInstallation {
             installation: MethodInstallation {
                 id,
-                codomain_origin: codomain.is_some().then_some(CodomainOrigin::Annotation),
+                codomain_origin: codomain.as_ref().map(|_| {
+                    if matches!(parts.target, AssignmentTarget::New(_)) {
+                        CodomainOrigin::Deduction
+                    } else {
+                        CodomainOrigin::Annotation
+                    }
+                }),
                 method: Method::new(shape.head, domain, codomain),
                 span,
                 expected_argument_arity,
@@ -703,10 +713,7 @@ impl Analysis {
         let argument_lambda =
             installed.and_then(|installed| installation.options.argument_lambda(installed));
         installation.argument_lambda_dispatch = argument_lambda.map(LambdaSyntax::dispatch);
-        if let (MethodHead::Function(_), Some(range)) = (
-            &installation.method.head,
-            argument_lambda.and_then(|lambda| source.range_for_syntax(lambda)),
-        ) {
+        if let Some(range) = argument_lambda.and_then(|lambda| source.range_for_syntax(lambda)) {
             self.registry
                 .installations_by_argument_lambda
                 .insert(source_range_key(range), installation.id);
@@ -807,6 +814,9 @@ impl Analysis {
     ) -> Option<MethodCodomainDeduction> {
         let installation = self.installation_for(assignment, source)?;
         let parts = assignment.parts();
+        if matches!(parts.target, AssignmentTarget::New(_)) {
+            return None;
+        }
         // The annotation precedes the installed lambda, while the codomain is
         // the value of the lambda receiving the arguments.
         let installed = InstalledFunction::of(parts.value)?;
