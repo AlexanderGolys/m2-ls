@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.5.1 - 2026-11-05
+
+- Add simplification hints and code actions for early-return null guards,
+  mapped function compositions, strict comparisons of Boolean values with
+  `true` or `false`, forwarding callbacks, and fixed-first-argument partial
+  applications. Keep rewrites available as refactors when their hints
+  are suppressed, and preserve expression grouping.
+- Give each expression rewrite its own lint name and code. S05 now identifies
+  `unnecessary-null-branch`; use the individual S11–S18 selectors instead of
+  the former `simplifiable-expression` selector for other simplifications.
+- Add E21 `float-key`, S08 `naming-convention`, S09 `bound-option-key`, and
+  S10 `constructor-typical-value`. Exempt function parameters from naming
+  checks so type arguments such as `T` remain valid.
+- Check option names and unbound symbolic values in declarations and calls;
+  keep bound default values and ordinary hash-table entries outside these
+  naming checks.
+- Refine semantic highlighting for embedded documentation and class roles,
+  document custom-token fallbacks, and refresh semantic tokens after loaded
+  dependencies are indexed.
+- Expand the user guide with lint examples, simplification requirements, and
+  the distinction between formatting and expression rewrites.
+
 ## 2.5.0 - 2026-11-05
 
 - Add grouped TOML and JSON configuration for hint placement, argument names,

@@ -33,7 +33,8 @@ Each of these fixes the diagnostic it is attached to:
   construction sets the result class to the requested type.
 
 **Capitalize option key** — `S01`
-: `method(Options => {verbose => false})` becomes `{Verbose => false}`.
+: Changes `verbose` to `Verbose` in an option declaration or call, when
+  capitalizing the first letter is enough to produce a PascalCase name.
 
 **Use `??` coalescence**, **Use `??=` coalescing assignment** — `S04`
 : `if x === null then 0 else x` becomes `x ?? 0`; an `if` that only assigns a
@@ -44,19 +45,80 @@ Each of these fixes the diagnostic it is attached to:
 
 ## Rewrites { #rewrites }
 
-These have no diagnostic; they appear when the cursor is on code they can
-improve.
+These appear when the cursor is on code they can improve. Expression
+simplifications each have their own diagnostic name and code. Each offers a
+preferred quick fix; disabling its hint leaves the rewrite available as a
+refactor. Redundant control parentheses have their own hint, `S03`. Raw-string
+conversion is a refactor without a diagnostic.
 
-**Simplify unnecessary null branch**
+**Simplify null-return guard** — `S11`
+: An early-return guard, `if x === null then return y;`, becomes
+  `x ?? return y;` when the conditional's result is unused and it has no
+  `else` branch. For example, inside a function:
+
+```m2,pane="Before"
+if x === null then
+    return y;
+```
+
+```m2,pane="After"
+x ?? return y;
+```
+
+The return guard must test a symbol or an expression wrapped in `try`, since
+`??` also catches errors while evaluating its left operand. A conditional
+whose result is used stays unchanged: when `x` is non-null, the original
+returns `null` while the shorter expression yields `x`.
+
+**Simplify unnecessary null branch** — `S05`
 : `if ready then value else null` → `if ready then value`, and
   `if linkStyles#?style then null else error(…)` →
   `if not linkStyles#?style then error(…)`.
 
-**Simplify try**
+**Simplify mapped composition** — `S12`
+: `apply(rows, r -> blocksOf(contents r))` → `rows / blocksOf @@ contents`.
+  The callback must forward its sole parameter through two unary calls.
+  `/` maps over the input, and `@@` composes the functions in the same order.
+  Composition binds more tightly, so the result means
+  `rows / (blocksOf @@ contents)`.
+
+Lowercase function names are eligible even when their types are unknown.
+PascalCase callees are excluded as type constructors by convention, including
+`SelfInitializingType` constructors. An inferred `Thing` does not suppress this
+hint; the rewrite does not require proof of a `Function` type.
+Shadowed `apply`, computed callees, extra arguments, and integer-count inputs
+stay unchanged. Parentheses preserve grouping when the rewritten call is part
+of a larger expression.
+
+**Simplify Boolean comparison** — `S13`
+: `linked === true or ready` → `linked or ready`, when `linked` is known to
+  be Boolean. `linked === false` and `linked =!= true` become `not linked`;
+  `linked =!= false` becomes `linked`. The literal may appear on either side.
+
+Unknown and non-Boolean subjects keep their strict test. For example,
+`null === true` is `false`, while a bare `null` is not a valid Boolean
+condition. Comparisons using `==` or `!=` are left unchanged.
+
+**Replace forwarding lambda with function** — `S14`
+: `c -> inlineOf c` → `inlineOf`; `run -> inlineRun(run)` → `inlineRun`.
+  Parentheses around the call or its argument are allowed. The callback must
+  forward its sole parameter directly to a named lowercase function, with
+  no extra arguments or statements.
+
+**Replace lambda with partial application** — `S18`
+: `y -> f(x, y)` → `f_x`. The callback passes its sole parameter as the second
+  argument after a fixed symbol. PascalCase callees, computed fixed arguments,
+  reordered or repeated parameters, and extra statements keep their wrappers.
+
+Each rule can be disabled independently. For example,
+`-- m2-ls: disable forwarding-lambda` silences `S14` while keeping
+`partial-application-lambda` (`S18`) enabled.
+
+**Simplify try** — `S15`
 : `try value then value` → `try value`;
   `try value then result else null` → `try value then result`.
 
-**Simplify if condition**
+**Simplify if condition** — `S16`
 : `if not (left == right) then …` → `if left != right then …`. A negation is
   only pushed inward when the result is genuinely simpler:
   `not linkStyles#?style` is left alone.
@@ -64,7 +126,7 @@ improve.
 **Remove redundant parentheses**
 : `if (ready) then value` → `if ready then value`.
 
-**Flatten nested if into else-if chain**
+**Flatten nested if into else-if chain** — `S17`
 : `if a then x else (if b then y else z)` → `if a then x else if b then y else z`.
 
 **Convert to raw string**

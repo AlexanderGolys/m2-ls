@@ -946,7 +946,37 @@ async fn installation_and_syntax_diagnostics_run_through_the_server_pipeline() {
         ("f = method(Options => {strategy => 4})\n", "S01", true),
         ("f = method(Options => {Strategy => 4})\n", "S01", false),
         ("g = {limit => 10} >> o -> x -> x\n", "S01", true),
-        ("gb(I, strategy => 4)\n", "S01", false),
+        ("g = {badName => GoodValue} >> o -> x -> x\n", "S01", true),
+        ("g = {GoodName => badValue} >> o -> x -> x\n", "S01", true),
+        ("g = {GoodName => GoodValue} >> o -> x -> x\n", "S01", false),
+        ("Limit = 3\ng = {Limit => 10} >> o -> x -> x\n", "S09", true),
+        ("defaultLimit = 3\ng = {Limit => defaultLimit} >> o -> x -> x\n", "S09", false),
+        ("g = {Limit => 10} >> o -> x -> x\n", "S09", false),
+        ("h = hashTable {1.5 => 7}\n", "E21", true),
+        ("h#1.5\n", "E21", true),
+        ("h#?1.5\n", "E21", true),
+        ("k = 1.5\nh#k\n", "E21", true),
+        ("h = hashTable {Key => 1.5}\n", "E21", false),
+        ("h#1\n", "E21", false),
+        ("BadName = x -> x\n", "S08", true),
+        ("goodName = x -> x\n", "S08", false),
+        ("f = BadName -> BadName\n", "S08", false),
+        ("f = goodName -> goodName\n", "S08", false),
+        ("f = T -> T\n", "S08", false),
+        ("f = (T, U) -> (T, U)\n", "S08", false),
+        ("f = method()\nf Type := T -> T\n", "S08", false),
+        ("f = T -> (T = true; T)\n", "S08", false),
+        ("f = T -> (BadLocal := T; BadLocal)\n", "S08", true),
+        ("badType = new Type of HashTable\n", "S08", true),
+        ("GoodType = new Type of HashTable\n", "S08", false),
+        ("GOODTYPE = new Type of HashTable\n", "S08", false),
+        ("Widget = new Type of HashTable\ntoWidget = method()\ntoWidget ZZ := n -> new Widget\n", "S10", true),
+        ("Widget = new Type of HashTable\ntoWidget = method(TypicalValue => Widget)\ntoWidget ZZ := n -> new Widget\n", "S10", false),
+        ("Widget = new Type of HashTable\ntoWidget = method()\ntoWidget ZZ := Widget => n -> new Widget\n", "S10", false),
+        ("frobnicate = method()\nfrobnicate ZZ := n -> n\n", "S10", false),
+        ("HashTable = new Type of Thing\nhashTable = method()\nhashTable ZZ := n -> n\n", "S10", true),
+        ("MyType = new Type of HashTable\nmytype = method()\nmytype ZZ := n -> n\n", "S10", false),
+        ("gb(I, strategy => 4)\n", "S01", true),
         ("hashTable {a => 1, b => 2}\n", "S01", false),
         ("new OptionTable from {a => 1}\n", "S01", false),
         (
@@ -1544,6 +1574,456 @@ async fn declarative_diagnostics_expose_their_coupled_quick_fixes() {
     session.shutdown().await;
 }
 
+/// Early-return null guards share the simplification hint and preferred quick fix.
+/// The edit keeps the statement terminator and is withheld when a result is
+/// consumed, an else branch exists, or evaluating the subject may fail.
+#[tokio::test]
+async fn null_return_guards_offer_simplification_hints_and_quick_fixes() {
+    let mut session = DocumentSession::open("").await;
+    for (guard, replacement) in [
+        ("if x === null then\n        return y", "x ?? return y"),
+        ("if null === x then return y", "x ?? return y"),
+        ("if x === null then (return y)", "x ?? return y"),
+        ("if x === null then return", "x ?? return"),
+        (
+            "if (try lookup x) === null then return y",
+            "lookup x ?? return y",
+        ),
+    ] {
+        session
+            .replace(&format!("f = x -> (\n    {guard};\n    x\n)\n"))
+            .await;
+        let diagnostic = session
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic["code"] == "S11")
+            .unwrap_or_else(|| panic!("expected simplification hint for `{guard}`"))
+            .clone();
+        assert_eq!(diagnostic["severity"], 4);
+        assert_eq!(
+            diagnostic["message"],
+            format!("This expression can be simplified to `{replacement}`")
+        );
+        let uri = session.uri().to_string();
+        let response = session
+            .request(
+                "textDocument/codeAction",
+                json!({
+                    "textDocument": {"uri": uri},
+                    "range": diagnostic["range"],
+                    "context": {"diagnostics": [diagnostic]}
+                }),
+            )
+            .await;
+        let action = response_array(&response)
+            .iter()
+            .find(|action| action["title"] == "Simplify null-return guard")
+            .expect("simplification quick fix");
+        assert_eq!(action["kind"], "quickfix");
+        assert_eq!(action["isPreferred"], true);
+        let edit = &action["edit"]["changes"][&uri][0];
+        assert_eq!(edit["newText"], replacement);
+        assert_eq!(edit["range"]["start"], json!({"line": 1, "character": 4}));
+        assert_eq!(
+            edit["range"]["end"]["character"],
+            guard.lines().last().expect("guard line").len()
+                + if guard.contains('\n') { 0 } else { 4 }
+        );
+    }
+    for source in [
+        "f = x -> if x === null then return y\n",
+        "f = x -> (result := if x === null then return y; result)\n",
+        "f = x -> (if x === null then return y else z; x)\n",
+        "f = x -> (if x =!= null then return y; x)\n",
+        "f = x -> (if lookup x === null then return y; x)\n",
+    ] {
+        session.replace(source).await;
+        assert!(
+            session
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic["code"] != "S11"),
+            "unexpected simplification for `{source}`"
+        );
+    }
+    session.shutdown().await;
+}
+
+/// Mapping a unary call chain offers operator composition with the same order.
+/// Both quick fixes and suppressed-hint refactors preserve expression grouping;
+/// shadowed `apply`, computed heads, and callback-dependent heads stay unchanged.
+#[tokio::test]
+async fn mapped_compositions_offer_simplification_hints_and_grouped_edits() {
+    let definitions = "f = n -> n + 10\ng = n -> 2 * n\n";
+    let mut session = DocumentSession::open("").await;
+    for (expression, replacement) in [
+        ("apply(rows, x -> f(g(x)))", "rows/f@@g"),
+        ("apply(rows, x -> f(g x))", "rows/f@@g"),
+        ("apply(rows, x -> f (g x))", "rows/f@@g"),
+        (
+            "apply(rows, r -> blocksOf(contents r))",
+            "rows/blocksOf@@contents",
+        ),
+        ("apply(left | right, x -> f(g(x)))", "(left | right)/f@@g"),
+        ("2 * apply(rows, x -> f(g(x)))", "(rows/f@@g)"),
+        ("h apply(rows, x -> f(g(x)))", "(rows/f@@g)"),
+    ] {
+        for suppressed in [false, true] {
+            let directive = if suppressed {
+                "-- m2-ls: disable S12\n"
+            } else {
+                ""
+            };
+            let source = format!("{directive}{definitions}result = {expression}\n");
+            session.replace(&source).await;
+            let diagnostics = session.diagnostics().to_vec();
+            let hints = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic["code"] == "S12")
+                .collect::<Vec<_>>();
+            assert_eq!(hints.len(), usize::from(!suppressed), "{source}");
+            if !suppressed {
+                assert_eq!(hints[0]["severity"], 4);
+            }
+            let uri = session.uri().to_string();
+            let line = if suppressed { 3 } else { 2 };
+            let character = source
+                .lines()
+                .nth(line)
+                .expect("mapping line")
+                .find("apply")
+                .expect("mapping call");
+            let position = json!({"line": line, "character": character});
+            let response = session
+                .request(
+                    "textDocument/codeAction",
+                    json!({
+                        "textDocument": {"uri": uri},
+                        "range": {"start": position, "end": position},
+                        "context": {"diagnostics": diagnostics}
+                    }),
+                )
+                .await;
+            let action = response_array(&response)
+                .iter()
+                .find(|action| action["title"] == "Simplify mapped composition")
+                .unwrap_or_else(|| panic!("expected composition for `{source}`"));
+            assert_eq!(
+                action["kind"],
+                if suppressed {
+                    "refactor.rewrite"
+                } else {
+                    "quickfix"
+                }
+            );
+            assert_eq!(action["edit"]["changes"][&uri][0]["newText"], replacement);
+        }
+    }
+    for expression in [
+        "apply(rows, x -> f(g(x), x))",
+        "apply(rows, x -> f(g(x, x)))",
+        "apply(rows, x -> f(g(other)))",
+        "apply(rows, x -> x(g(x)))",
+        "apply(rows, x -> f(x(x)))",
+        "apply(rows, (x, y) -> f(g(x)))",
+        "apply(rows, x -> (makeFunction x)(g(x)))",
+        "apply(rows, x -> f(g(x)), extra)",
+        "apply(rows, x -> (print x; f(g(x))))",
+        "apply(rows, x -> f(g(print x; x)))",
+        "apply(3, x -> f(g(x)))",
+        "apply(rows, x -> Constructor(g(x)))",
+        "apply(rows, x -> f(Constructor(x)))",
+    ] {
+        session
+            .replace(&format!("{definitions}{expression}\n"))
+            .await;
+        assert!(
+            session
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic["code"] != "S12"),
+            "unexpected composition for `{expression}`"
+        );
+    }
+    for source in [
+        "apply = (a, b) -> a\nf = n -> n\ng = n -> n\napply(rows, x -> f(g(x)))\n",
+        "Constructor = new SelfInitializingType of List\ng = n -> n\napply({}, x -> Constructor(g(x)))\n",
+    ] {
+        session.replace(source).await;
+        assert!(
+            session
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic["code"] != "S12"),
+            "unexpected composition for `{source}`"
+        );
+    }
+    for source in [
+        "mapRows = method()\nmapRows Thing := f -> apply(rows, x -> f(g(x)))\n",
+        "mapRows = method()\nmapRows Thing := g -> apply(rows, x -> f(g(x)))\n",
+    ] {
+        session.replace(source).await;
+        assert!(
+            session
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "S12"),
+            "a Thing parameter must not suppress composition: `{source}`"
+        );
+    }
+    session.shutdown().await;
+}
+
+/// Strict comparisons with Boolean literals reduce to a Boolean subject or its
+/// negation, including within `and`/`or`. Hints and suppressed-hint refactors
+/// share the edit; non-Boolean and unknown subjects keep their explicit test.
+#[tokio::test]
+async fn boolean_comparisons_offer_simplification_hints_and_quick_fixes() {
+    let definitions = "linked = true\nready = false\n";
+    let mut session = DocumentSession::open("").await;
+    for (expression, replacement) in [
+        ("linked === true or ready", "linked"),
+        ("linked === false or ready", "not linked"),
+        ("linked =!= true and ready", "not linked"),
+        ("linked =!= false and ready", "linked"),
+        ("true === linked", "linked"),
+        ("false === linked", "not linked"),
+        ("true =!= linked", "not linked"),
+        ("false =!= linked", "linked"),
+        ("linked === (true)", "linked"),
+        ("(linked or ready) === true", "(linked or ready)"),
+        ("(linked or ready) === false", "not (linked or ready)"),
+        ("(not linked) === false", "linked"),
+        ("(left === right) === false", "left =!= right"),
+        ("not (linked === false)", "not linked"),
+    ] {
+        for suppressed in [false, true] {
+            let directive = if suppressed {
+                "-- m2-ls: disable S13\n"
+            } else {
+                ""
+            };
+            let source = format!("{directive}{definitions}result = {expression}\n");
+            session.replace(&source).await;
+            let diagnostics = session.diagnostics().to_vec();
+            let hints = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic["code"] == "S13")
+                .collect::<Vec<_>>();
+            assert_eq!(hints.len(), usize::from(!suppressed), "{source}");
+            if !suppressed {
+                assert_eq!(hints[0]["severity"], 4);
+                assert_eq!(
+                    hints[0]["message"],
+                    format!("This expression can be simplified to `{replacement}`")
+                );
+            }
+            let uri = session.uri().to_string();
+            let line = if suppressed { 3 } else { 2 };
+            let character = source
+                .lines()
+                .nth(line)
+                .expect("comparison line")
+                .find("===")
+                .or_else(|| {
+                    source
+                        .lines()
+                        .nth(line)
+                        .expect("comparison line")
+                        .find("=!=")
+                })
+                .expect("strict comparison");
+            let position = json!({"line": line, "character": character});
+            let response = session
+                .request(
+                    "textDocument/codeAction",
+                    json!({
+                        "textDocument": {"uri": uri},
+                        "range": {"start": position, "end": position},
+                        "context": {"diagnostics": diagnostics}
+                    }),
+                )
+                .await;
+            let action = response_array(&response)
+                .iter()
+                .find(|action| action["title"] == "Simplify Boolean comparison")
+                .unwrap_or_else(|| panic!("expected Boolean comparison rewrite for `{source}`"));
+            assert_eq!(
+                action["kind"],
+                if suppressed {
+                    "refactor.rewrite"
+                } else {
+                    "quickfix"
+                }
+            );
+            assert_eq!(action["edit"]["changes"][&uri][0]["newText"], replacement);
+        }
+    }
+    for source in [
+        "linked = null\nlinked === true or false\n",
+        "linked = 1\nlinked === false\n",
+        "linked = \"true\"\ntrue === linked\n",
+        "linked === true or false\n",
+        "linked = true\nlinked === other\n",
+        "linked = true\nlinked == true\n",
+        "linked = true\nlinked != false\n",
+        "true === false\n",
+        "false =!= true\n",
+        "f = true -> linked -> linked === true\n",
+    ] {
+        session.replace(source).await;
+        assert!(
+            session
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic["code"] != "S13"),
+            "unexpected Boolean rewrite for `{source}`"
+        );
+    }
+    session.shutdown().await;
+}
+
+/// Unary forwarding and fixed-first-argument callbacks have separate diagnostics
+/// and edits, including parenthesized calls. Statements and parameter-dependent
+/// callees or fixed arguments keep their callback wrappers.
+#[tokio::test]
+async fn forwarding_callbacks_have_separate_rules_and_quick_fixes() {
+    let cases = [
+        (
+            "c -> inlineOf c",
+            "S14",
+            "Replace forwarding lambda with function",
+            "inlineOf",
+        ),
+        (
+            "run -> inlineRun(run)",
+            "S14",
+            "Replace forwarding lambda with function",
+            "inlineRun",
+        ),
+        (
+            "c -> ((inlineOf(c)))",
+            "S14",
+            "Replace forwarding lambda with function",
+            "inlineOf",
+        ),
+        (
+            "c -> inlineOf((c))",
+            "S14",
+            "Replace forwarding lambda with function",
+            "inlineOf",
+        ),
+        (
+            "y -> f(x, y)",
+            "S18",
+            "Replace lambda with partial application",
+            "f_x",
+        ),
+        (
+            "y -> f(x, (y))",
+            "S18",
+            "Replace lambda with partial application",
+            "f_x",
+        ),
+        (
+            "y -> (f((x), y))",
+            "S18",
+            "Replace lambda with partial application",
+            "f_x",
+        ),
+    ];
+    let mut session = DocumentSession::open("").await;
+    for (expression, code, title, replacement) in cases {
+        for suppressed in [false, true] {
+            let directive = if suppressed {
+                format!("-- m2-ls: disable {code}\n")
+            } else {
+                String::new()
+            };
+            let source = format!("{directive}result = {expression}\n");
+            session.replace(&source).await;
+            let diagnostics = session.diagnostics().to_vec();
+            let hints = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic["code"] == code)
+                .collect::<Vec<_>>();
+            assert_eq!(hints.len(), usize::from(!suppressed), "{source}");
+            if !suppressed {
+                assert_eq!(hints[0]["severity"], 4);
+                assert_eq!(
+                    hints[0]["message"],
+                    format!("This expression can be simplified to `{replacement}`")
+                );
+            }
+            let uri = session.uri().to_string();
+            let position = json!({"line": usize::from(suppressed), "character": 9});
+            let response = session
+                .request(
+                    "textDocument/codeAction",
+                    json!({
+                        "textDocument": {"uri": uri},
+                        "range": {"start": position, "end": position},
+                        "context": {"diagnostics": diagnostics}
+                    }),
+                )
+                .await;
+            let action = response_array(&response)
+                .iter()
+                .find(|action| action["title"] == title)
+                .unwrap_or_else(|| panic!("expected {title} for `{source}`"));
+            assert_eq!(
+                action["kind"],
+                if suppressed {
+                    "refactor.rewrite"
+                } else {
+                    "quickfix"
+                }
+            );
+            assert_eq!(action["edit"]["changes"][&uri][0]["newText"], replacement);
+        }
+    }
+    for expression in [
+        "c -> inlineOf other",
+        "c -> c c",
+        "c -> (print c; inlineOf c)",
+        "c -> inlineOf(print c; c)",
+        "c -> (inlineOf c;)",
+        "c -> (getFunction c) c",
+        "c -> Constructor c",
+        "(c) -> inlineOf c",
+        "(c, d) -> inlineOf c",
+        "y -> f(y, x)",
+        "y -> f(y, y)",
+        "y -> y(x, y)",
+        "y -> f(x, y, extra)",
+        "y -> f(compute x, y)",
+        "y -> (print y; f(x, y))",
+        "y -> f(x, (print y; y))",
+        "y -> Constructor(x, y)",
+    ] {
+        session.replace(&format!("result = {expression}\n")).await;
+        assert!(
+            session
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic["code"] != "S14" && diagnostic["code"] != "S18"),
+            "unexpected forwarding rewrite for `{expression}`"
+        );
+    }
+    session
+        .replace("-- m2-ls: disable S14\nfirst = c -> inlineOf c\nsecond = y -> f(x, y)\n")
+        .await;
+    assert!(session
+        .diagnostics()
+        .iter()
+        .all(|diagnostic| diagnostic["code"] != "S14"));
+    assert!(session
+        .diagnostics()
+        .iter()
+        .any(|diagnostic| diagnostic["code"] == "S18"));
+    session.shutdown().await;
+}
+
 /// Style simplifications are hints naming the shorter form, and their rewrite
 /// is the hint's preferred quick fix. Where the hint is turned off, the
 /// rewrite stays available as a refactor.
@@ -1562,15 +2042,15 @@ async fn expression_simplifications_are_hints_with_quick_fixes() {
         ),
         (
             "if not (left == right) then value\n",
-            "S05",
+            "S16",
             "Simplify if condition",
         ),
         (
             "if outer then one else (if inner then two else three)\n",
-            "S05",
+            "S17",
             "Flatten nested if into else-if chain",
         ),
-        ("try value then value\n", "S05", "Simplify try"),
+        ("try value then value\n", "S15", "Simplify try"),
     ];
     let mut session = DocumentSession::open(cases[0].0).await;
 

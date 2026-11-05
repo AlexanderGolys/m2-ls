@@ -13,16 +13,26 @@ use std::ptr;
 
 use m2_syn::nodes::{
     Cell, ElseClause, Expr, ExprAssign, ExprAssignSimple, ExprControl, ExprDebug, ExprIf,
-    ExprLiteral, ExprOp, ExprOpBin, ExprOpBinAdj, ExprProfile, ExprTry, ExprWhile, FromInstance,
-    Holder, OfClass, PackedContent, RangeBoundFrom, RangeBoundTo, Statement, ThenClause,
-    TokenParseRule, TryFallback, TryFallbackExcept, WhenCondition, TOKEN_PARSE_RULES,
+    ExprLambda, ExprLiteral, ExprOp, ExprOpBin, ExprOpBinAdj, ExprProfile, ExprTry, ExprWhile,
+    FromInstance, Holder, OfClass, PackedContent, RangeBoundFrom, RangeBoundTo, Statement,
+    ThenClause, TokenParseRule, TryFallback, TryFallbackExcept, WhenCondition, TOKEN_PARSE_RULES,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Spanned, Token};
 
-use crate::analysis::InfixSyntax;
-use crate::source::{ByteRange, SourceNavigation};
+use crate::analysis::{Analysis, InfixSyntax};
+use crate::diagnostics::{catalog, DiagnosticRule};
+use crate::object_registry::ObjectRegistry;
+use crate::source::{ByteRange, SourceNavigation, SyntaxSource};
 use crate::syntax::{AssignmentSyntax, ClauseSyntax, ControlSyntax, ExpressionSyntax};
+
+mod boolean_comparison;
+mod composition;
+mod unary_call;
+
+use boolean_comparison::BooleanComparison;
+use composition::MappingComposition;
+use unary_call::UnarySymbolCall;
 
 /// What a rewrite site simplifies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +46,16 @@ pub enum RewriteKind {
     CoalescingAssignment,
     /// A null test that `??` expresses.
     Coalescence,
+    /// An unused null guard whose branch returns from the function.
+    NullReturnGuard,
+    /// Mapping a callback consisting of two composed unary function calls.
+    MappingComposition,
+    /// A Boolean expression strictly compared with `true` or `false`.
+    BooleanComparison,
+    /// A callback doing nothing but forwarding its parameter to a named function.
+    ForwardingLambda,
+    /// A callback forwarding its parameter after a fixed first argument.
+    PartialApplicationLambda,
     /// An `if` with a `null` branch.
     NullBranch,
     /// A `try` repeating its value or falling back to `null`.
@@ -47,13 +67,39 @@ pub enum RewriteKind {
 }
 
 impl RewriteKind {
-    /// Whether the rewrite shortens a conditional or `try`, reported as one
+    /// Whether the rewrite shortens an expression, reported as one
     /// simplifiable expression.
     pub fn is_simplification(self) -> bool {
         matches!(
             self,
-            Self::NullBranch | Self::TrySimplification | Self::IfCondition | Self::ElseIfChain
+            Self::NullReturnGuard
+                | Self::MappingComposition
+                | Self::BooleanComparison
+                | Self::ForwardingLambda
+                | Self::PartialApplicationLambda
+                | Self::NullBranch
+                | Self::TrySimplification
+                | Self::IfCondition
+                | Self::ElseIfChain
         )
+    }
+
+    /// The independently configurable diagnostic reporting this rewrite.
+    pub fn rule(self) -> &'static DiagnosticRule {
+        match self {
+            Self::AmbiguousFloatMemberAccess => &catalog::AMBIGUOUS_FLOAT_MEMBER_ACCESS,
+            Self::RedundantControlParentheses => &catalog::REDUNDANT_CONTROL_PARENTHESES,
+            Self::CoalescingAssignment | Self::Coalescence => &catalog::PREFER_COALESCENCE,
+            Self::NullBranch => &catalog::UNNECESSARY_NULL_BRANCH,
+            Self::NullReturnGuard => &catalog::NULL_RETURN_GUARD,
+            Self::MappingComposition => &catalog::MAPPED_COMPOSITION,
+            Self::BooleanComparison => &catalog::REDUNDANT_BOOLEAN_COMPARISON,
+            Self::ForwardingLambda => &catalog::FORWARDING_LAMBDA,
+            Self::PartialApplicationLambda => &catalog::PARTIAL_APPLICATION_LAMBDA,
+            Self::TrySimplification => &catalog::SIMPLIFIABLE_TRY,
+            Self::IfCondition => &catalog::SIMPLIFIABLE_IF_CONDITION,
+            Self::ElseIfChain => &catalog::FLATTENABLE_IF_CHAIN,
+        }
     }
 
     /// Whether the rewrite turns a null test into a coalescence.
@@ -88,6 +134,8 @@ pub struct RewriteSites<'ast, 'source, Source: ?Sized> {
     covered: HashSet<*const Expr>,
     /// Sites found so far.
     sites: Vec<RewriteSite<'ast>>,
+    /// Parent of the current expression, for grouping an operator replacement.
+    parent: Option<&'ast Expr>,
 }
 
 impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'source, Source> {
@@ -102,11 +150,38 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             discarded: HashSet::new(),
             covered: HashSet::new(),
             sites: Vec::new(),
+            parent: None,
         };
         for cell in cells {
             collector.visit_cell(cell);
         }
         collector.sites
+    }
+
+    /// Collects rewrites and validates those requiring name and type facts.
+    /// Use this entry point for diagnostics and actions so both offer the same
+    /// edits, including when a hint is suppressed or fixing the whole file.
+    pub fn collect_analyzed(
+        cells: impl IntoIterator<Item = &'ast Cell>,
+        source: &'source Source,
+        analysis: &Analysis,
+        knowledge: &ObjectRegistry,
+    ) -> Vec<RewriteSite<'ast>>
+    where
+        Source: SyntaxSource,
+    {
+        Self::collect(cells, source)
+            .into_iter()
+            .filter(|site| match site.kind {
+                RewriteKind::MappingComposition => MappingComposition::of(site.expression)
+                    .is_some_and(|mapping| mapping.is_applicable(analysis, source, knowledge)),
+                RewriteKind::BooleanComparison => BooleanComparison::of(site.expression)
+                    .is_some_and(|comparison| {
+                        comparison.is_applicable(analysis, source, knowledge)
+                    }),
+                _ => true,
+            })
+            .collect()
     }
 
     /// Source text of typed syntax.
@@ -143,6 +218,29 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
 
     /// The rewrites of one expression, in the order diagnostics report them.
     fn rewrite(&mut self, expression: &'ast Expr) {
+        let replacement = self.forwarding_lambda(expression);
+        self.push(RewriteKind::ForwardingLambda, expression, None, replacement);
+        let replacement = self.partial_application_lambda(expression);
+        self.push(
+            RewriteKind::PartialApplicationLambda,
+            expression,
+            None,
+            replacement,
+        );
+        let replacement = self.boolean_comparison(expression);
+        self.push(
+            RewriteKind::BooleanComparison,
+            expression,
+            None,
+            replacement,
+        );
+        let replacement = self.mapping_composition(expression);
+        self.push(
+            RewriteKind::MappingComposition,
+            expression,
+            None,
+            replacement,
+        );
         if let Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) = expression {
             let replacement = self.ambiguous_float_member_access(call);
             self.push(
@@ -179,7 +277,12 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
         }
         match expression {
             Expr::If(conditional) => {
+                let discarded = self.discarded.contains(&ptr::from_ref(expression));
                 let rewrites = [
+                    (
+                        RewriteKind::NullReturnGuard,
+                        self.null_return_guard(conditional, discarded),
+                    ),
                     (RewriteKind::NullBranch, self.null_branch(conditional)),
                     (RewriteKind::IfCondition, self.if_condition(conditional)),
                     (RewriteKind::ElseIfChain, self.else_if_chain(conditional)),
@@ -213,6 +316,98 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
         let fractional = self.text(float).strip_prefix('.')?;
         (adjacent && !fractional.is_empty() && fractional.chars().all(|ch| ch.is_ascii_digit()))
             .then(|| format!("{name}#{fractional}"))
+    }
+
+    /// The named function supplied by `x -> f x` or `x -> f(x)`. A direct
+    /// variadic parameter forwards the same argument value as the original
+    /// function. Fixed parameter lists, computed callees, type constructors,
+    /// extra arguments, and statement-bearing holders keep their wrappers.
+    fn forwarding_lambda(&self, expression: &Expr) -> Option<String> {
+        let Expr::Lambda(ExprLambda::Variadic(lambda)) = expression else {
+            return None;
+        };
+        let call = UnarySymbolCall::of(&lambda.body)?;
+        let function = call.function.symbol_name()?;
+        (call.argument.symbol_name()? == lambda.argument.text()
+            && function != lambda.argument.text()
+            && UnarySymbolCall::has_function_name(call.function))
+        .then(|| self.text(call.function).trim().to_string())
+    }
+
+    /// Partial application for `y -> f(x, y)`, with a fixed symbol argument.
+    /// A symbol callee and fixed symbol avoid moving computed expressions out
+    /// of the callback. Neither may refer to the disappearing parameter.
+    fn partial_application_lambda(&self, expression: &Expr) -> Option<String> {
+        let Expr::Lambda(ExprLambda::Variadic(lambda)) = expression else {
+            return None;
+        };
+        let call = UnarySymbolCall::application(&lambda.body)?;
+        let function = UnarySymbolCall::grouped_value(&call.left_operand)?;
+        if !UnarySymbolCall::has_function_name(function) {
+            return None;
+        }
+        let arguments = UnarySymbolCall::grouped_value(&call.right_operand)?.arguments();
+        let [Some(fixed), Some(forwarded)] = arguments.as_slice() else {
+            return None;
+        };
+        let fixed = UnarySymbolCall::grouped_value(fixed)?;
+        let forwarded = UnarySymbolCall::grouped_value(forwarded)?;
+        let parameter = lambda.argument.text();
+        (forwarded.symbol_name()? == parameter
+            && fixed.symbol_name()? != parameter
+            && function.symbol_name()? != parameter)
+            .then(|| format!("{}_{}", self.text(function).trim(), self.text(fixed).trim()))
+    }
+
+    /// A Boolean comparison as its subject or its negation. Keep the subject's
+    /// grouping when dropping the comparison, and reuse comparison inversion
+    /// and double-negation removal when negating. An enclosing non-Boolean
+    /// operator may need parentheses around the shorter expression.
+    fn boolean_comparison(&self, expression: &Expr) -> Option<String> {
+        let comparison = BooleanComparison::of(expression)?;
+        if !comparison.negated {
+            return Some(self.text(comparison.subject).trim().to_string());
+        }
+        let replacement = self.negated_condition(comparison.subject.unparenthesized()?);
+        let needs_parentheses = self.parent.is_some_and(|parent| {
+            matches!(parent, Expr::Op(_))
+                && parent.infix_operands().is_none_or(|operands| {
+                    !matches!(
+                        operands.operator,
+                        <Token![and]>::SPELLING | <Token![or]>::SPELLING
+                    )
+                })
+        });
+        Some(if needs_parentheses {
+            format!("({replacement})")
+        } else {
+            replacement
+        })
+    }
+
+    /// Operator notation for mapping a callback made of two unary calls.
+    /// Parentheses preserve an input expression's grouping and prevent an
+    /// enclosing call or operator from capturing the replacement's `/`.
+    fn mapping_composition(&self, expression: &Expr) -> Option<String> {
+        let mapping = MappingComposition::of(expression)?;
+        let collection = mapping.collection;
+        let grouped = collection.infix_operands().is_some()
+            || starts_with_keyword(collection)
+            || matches!(collection, Expr::Lambda(_));
+        let replacement = format!(
+            "{} / {} @@ {}",
+            self.parenthesized_if(collection, grouped),
+            self.text(mapping.outer).trim(),
+            self.text(mapping.inner).trim(),
+        );
+        let needs_parentheses = self.parent.is_some_and(|parent| {
+            !matches!(parent, Expr::Assign(_) | Expr::Lambda(_) | Expr::Holder(_))
+        });
+        Some(if needs_parentheses {
+            format!("({replacement})")
+        } else {
+            replacement
+        })
     }
 
     /// The `??` form of a null test at `expression`:
@@ -346,6 +541,24 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
                 self.coalescence_operand(fallback)
             ),
         ))
+    }
+
+    /// A null guard returning early, with no `else` and an unused result.
+    /// A non-null subject falls through in both forms, but only the original
+    /// yields `null`, so a caller consuming that result must keep the `if`.
+    /// Reuse the subject's error restrictions because `??` also catches errors.
+    fn null_return_guard(&self, conditional: &ExprIf, discarded: bool) -> Option<String> {
+        if !discarded || conditional.else_clause.is_some() {
+            return None;
+        }
+        let NullTest {
+            subject,
+            null_branch,
+        } = self.null_test(conditional, SubjectErrors::Propagate)?;
+        let fallback = conditional.then_clause.clause_value().unparenthesized()?;
+        (null_branch == NullBranch::Then
+            && matches!(fallback, Expr::Control(ExprControl::Return(_))))
+        .then(|| self.coalescence_expression(subject, fallback))
     }
 
     /// `fallback` as the right operand of `??`, parenthesized when it binds more
@@ -609,7 +822,9 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
 impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for RewriteSites<'ast, '_, Source> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
         self.rewrite(expression);
+        let parent = self.parent.replace(expression);
         visit::visit_expr(self, expression);
+        self.parent = parent;
     }
 
     fn visit_cell(&mut self, cell: &'ast Cell) {

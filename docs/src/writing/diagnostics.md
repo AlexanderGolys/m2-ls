@@ -79,19 +79,31 @@ next.
 | `E18` | `unavailable-init-file` | warning | an [`initFile` directive](../getting-started/inline-directives.md#init-file) naming a file that cannot be read: `-- m2-ls: initFile no-such-init.m2`; the file starts without an init file |
 | `E19` | `manual-type-dispatch` | warning | repeated `instance(x, Class)` tests of the same function parameter against distinct named classes with at least two non-error branches in an `if` / `else if` chain; consider method specializations |
 | `E20` | `list-record-shape` | warning | a list-family `instance` check combined with a fixed length above one; consider a hash-table-based record type |
+| `E21` | `float-key` | error | a floating-point key or index, including a key inferred to have floating-point type; approximate equality makes lookup unreliable |
 | `T01` | `parallel-assignment-type` | error | `(a, b) = 5` |
 | `T02` | `condition-type` | warning | an `if` or `while` condition known not to be `Boolean` |
 | `T03` | `install-codomain-missing` | hint | an installation other than `new` without a codomain that inference can deduce; fix: insert `ZZ =>` |
 | `T04` | `install-codomain-mismatch` | warning | a declared codomain contradicting the inferred result: `g ZZ := String => n -> n + 1` |
 | `T05` | `call-domain-mismatch` | warning | no known method domain can accept the inferred argument types; uncertain matches remain valid |
 | `T06` | `option-value-mismatch` | warning | an option value of none of the documented types, or a symbol outside the values the option accepts |
-| `S01` | `option-key-convention` | hint | a lowercase option name in `method(Options => {…})` or `{…} >> o -> …` |
+| `S01` | `option-key-convention` | hint | an option name or unbound symbol value that does not use PascalCase in an option declaration or a call |
 | `S02` | `unused-binding` | warning | a local that is never read; names starting with `_` are exempt |
 | `S03` | `redundant-control-parentheses` | hint | parentheses the keyword already delimits: `if (n > 0) then` |
 | `S04` | `prefer-coalescence` | hint | a null test `??` says directly: `if x === null then 0 else x` |
-| `S05` | `simplifiable-expression` | hint | an `if` or `try` with a shorter form, which the message names: `if v === null then null else w` |
+| `S05` | `unnecessary-null-branch` | hint | an `if` with a removable `null` branch |
 | `S06` | `ring-variable-naming` | hint | a multi-character ring variable such as `x0` instead of `x_0` |
 | `S07` | `shared-method-codomain` | hint | at least five method installations, with more than 75% explicitly annotating the same result type; consider declaring a shared `TypicalValue` |
+| `S08` | `naming-convention` | hint | a type name outside PascalCase or uppercase, or a function or ordinary local name outside camelCase; function parameters are exempt |
+| `S09` | `bound-option-key` | warning | an option key whose existing source binding is evaluated instead of supplying the name as a symbol; bound values are allowed |
+| `S10` | `constructor-typical-value` | hint | an installation of a method named after a known type, such as `matrix` or `toMatrix`, without that type as its declared typical value |
+| `S11` | `null-return-guard` | hint | an unused `if x === null then return y` guard expressible as `x ?? return y` |
+| `S12` | `mapped-composition` | hint | `apply(rows, x -> f(g(x)))` expressible as `rows / f @@ g` |
+| `S13` | `redundant-boolean-comparison` | hint | a known Boolean strictly compared with `true` or `false` |
+| `S14` | `forwarding-lambda` | hint | `c -> inlineOf c` or `c -> inlineOf(c)` expressible as `inlineOf` |
+| `S15` | `simplifiable-try` | hint | a `try` with a repeated success value or redundant `null` fallback |
+| `S16` | `simplifiable-if-condition` | hint | an `if` condition with an invertible comparison or cancellable double negation |
+| `S17` | `flattenable-if-chain` | hint | nested conditionals that can become an `else if` chain |
+| `S18` | `partial-application-lambda` | hint | `y -> f(x, y)` expressible as `f_x`, with a fixed symbol as the first argument |
 | `D01` | `unknown-documentation-section` | error | a SimpleDoc keyword or `document` option that does not exist there |
 | `D02` | `malformed-documentation` | error | documentation SimpleDoc or `document` rejects: a repeated section, a multi-line headline, `Inputs` without `Usage`, … |
 | `D03` | `missing-documentation-key` | error | a documentation page without a `Key` |
@@ -131,6 +143,59 @@ plain ZZ := {Limit => 1} >> o -> n -> n
 Where a finding points at another place — `f` defined as a plain function on
 an earlier line — the diagnostic carries it as related information, which
 editors show as a clickable note.
+
+## Naming, options, and constructors { #naming }
+
+`S08` checks PascalCase or uppercase type names and camelCase function and
+ordinary local names. Function parameters are exempt: a parameter such as
+`T` can represent a type. Ring generators and ordinary global values are
+also outside this check. Leading underscores on local names are allowed.
+
+```m2
+convert = T -> value -> new T from value
+```
+
+Option names and unbound symbolic defaults use PascalCase (`S01`), both where
+options are declared and where they are passed to a call:
+
+```m2
+render = method(Options => {Layout => Compact})
+```
+
+A source-bound option key produces `S09`: its value would be evaluated instead
+of supplying the key as a symbol. A bound default value is allowed:
+
+```m2
+defaultLimit = 10
+render = method(Options => {Limit => defaultLimit})
+```
+
+Ordinary hash-table entries are not option declarations. `S01` leaves known
+library symbols and bound values alone.
+
+`S10` recognizes conversion methods named after known types, such as `widget`
+or `toWidget` for `Widget`. Declare the result with `TypicalValue => Widget`
+on the method or a `Widget =>` annotation on each installation:
+
+```m2
+Widget = new Type of HashTable
+toWidget = method(TypicalValue => Widget)
+toWidget ZZ := n -> new Widget from {"value" => n}
+```
+
+## Floating-point keys { #float-keys }
+
+`E21` reports floating-point keys in pairs and indexed access with `#` or
+`#?`. This includes a key whose inferred type is floating point, even when
+the literal is assigned on another line:
+
+```m2
+key = 1.5
+table#key
+```
+
+Use exact values or another stable identifier for keys. A floating-point value
+stored under a key is allowed, as in `hashTable {Weight => 1.5}`.
 
 ## Silencing a diagnostic { #suppression }
 

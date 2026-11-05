@@ -112,10 +112,8 @@ PARALLEL_ASSIGNMENT_ARITY {
         severity: ERROR,
     }
 
-    /// A lowercase option name where a function declares its options, in
-    /// `method(Options => {…})` or `{…} >> o -> …`; Macaulay2 option names
-    /// are capitalized. Entries of hash tables and options passed to a call
-    /// are not checked: their keys are not declared there.
+    /// An option name or unbound symbol default in an option declaration that
+    /// does not use PascalCase. Ordinary hash table entries are not checked.
     ///
     /// ```m2
     /// f = method(Options => {verbose => false})
@@ -124,6 +122,57 @@ PARALLEL_ASSIGNMENT_ARITY {
 OPTION_KEY_CONVENTION {
         code: "S01",
         name: "option-key-convention",
+        severity: HINT,
+    }
+
+    /// A floating-point value used as a key or index. Approximate values are
+    /// unsuitable for reliable key equality, even where Macaulay2 accepts them.
+    ///
+    /// ```m2
+    /// h = hashTable {1.5 => "value"}
+    /// ```
+FLOAT_KEY {
+        code: "E21",
+        name: "float-key",
+        severity: ERROR,
+    }
+
+    /// A type, function, or local binding does not follow its naming convention.
+    /// Types use PascalCase or uppercase; functions and locals use camelCase.
+    /// Function parameters are exempt because they may stand for types.
+    ///
+    /// ```m2
+    /// BadFunction = x -> x
+    /// ```
+NAMING_CONVENTION {
+        code: "S08",
+        name: "naming-convention",
+        severity: HINT,
+    }
+
+    /// An option uses a source-bound name for a key.
+    /// Its binding is evaluated instead of supplying the name as a symbol.
+    ///
+    /// ```m2
+    /// Limit = 3
+    /// f = {Limit => 1} >> opts -> x -> x
+    /// ```
+BOUND_OPTION_KEY {
+        code: "S09",
+        name: "bound-option-key",
+        severity: WARNING,
+    }
+
+    /// A conversion method named after a known type should declare that type
+    /// as its shared or per-installation typical value.
+    ///
+    /// ```m2
+    /// toWidget = method()
+    /// toWidget ZZ := n -> new Widget
+    /// ```
+CONSTRUCTOR_TYPICAL_VALUE {
+        code: "S10",
+        name: "constructor-typical-value",
         severity: HINT,
     }
 
@@ -170,16 +219,103 @@ PREFER_COALESCENCE {
         severity: HINT,
     }
 
-    /// An `if` or `try` with a shorter equivalent form: a redundant `null`
-    /// branch, a negated condition, or a nesting that flattens into an
-    /// `else if` chain.
+    /// An `if` whose redundant null branch can be removed.
     ///
     /// ```m2
-    /// f = (key, val) -> if val === null then null else (key, val)
+    /// if ready then value else null
     /// ```
-SIMPLIFIABLE_EXPRESSION {
+UNNECESSARY_NULL_BRANCH {
         code: "S05",
-        name: "simplifiable-expression",
+        name: "unnecessary-null-branch",
+        severity: HINT,
+    }
+
+    /// An unused null guard that returns early, expressible with `??`.
+    ///
+    /// ```m2
+    /// f = x -> (if x === null then return 0; x)
+    /// ```
+NULL_RETURN_GUARD {
+        code: "S11",
+        name: "null-return-guard",
+        severity: HINT,
+    }
+
+    /// A mapped callback expressible as a composition of named functions.
+    ///
+    /// ```m2
+    /// apply(rows, r -> blocksOf(contents r))
+    /// ```
+MAPPED_COMPOSITION {
+        code: "S12",
+        name: "mapped-composition",
+        severity: HINT,
+    }
+
+    /// A known Boolean strictly compared with `true` or `false`.
+    ///
+    /// ```m2
+    /// linked = true
+    /// linked === true
+    /// ```
+REDUNDANT_BOOLEAN_COMPARISON {
+        code: "S13",
+        name: "redundant-boolean-comparison",
+        severity: HINT,
+    }
+
+    /// A callback whose sole effect is forwarding its parameter to a function.
+    ///
+    /// ```m2
+    /// c -> inlineOf c
+    /// ```
+FORWARDING_LAMBDA {
+        code: "S14",
+        name: "forwarding-lambda",
+        severity: HINT,
+    }
+
+    /// A `try` with a repeated success value or redundant null fallback.
+    ///
+    /// ```m2
+    /// try value then value
+    /// ```
+SIMPLIFIABLE_TRY {
+        code: "S15",
+        name: "simplifiable-try",
+        severity: HINT,
+    }
+
+    /// An `if` condition whose negation can be inverted or cancelled.
+    ///
+    /// ```m2
+    /// if not (left == right) then value
+    /// ```
+SIMPLIFIABLE_IF_CONDITION {
+        code: "S16",
+        name: "simplifiable-if-condition",
+        severity: HINT,
+    }
+
+    /// Nested conditionals that can be flattened into an `else if` chain.
+    ///
+    /// ```m2
+    /// if outer then one else (if inner then two else three)
+    /// ```
+FLATTENABLE_IF_CHAIN {
+        code: "S17",
+        name: "flattenable-if-chain",
+        severity: HINT,
+    }
+
+    /// A callback forwarding its parameter after a fixed first argument.
+    ///
+    /// ```m2
+    /// y -> f(x, y)
+    /// ```
+PARTIAL_APPLICATION_LAMBDA {
+        code: "S18",
+        name: "partial-application-lambda",
         severity: HINT,
     }
 

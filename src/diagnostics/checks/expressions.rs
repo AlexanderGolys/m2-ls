@@ -76,7 +76,12 @@ pub(super) fn spawn<'a>(
         return;
     };
     let mut rewrites: HashMap<*const Expr, Vec<RewriteSite<'a>>> = HashMap::new();
-    for site in RewriteSites::collect([syntax], context.source) {
+    for site in RewriteSites::collect_analyzed(
+        [syntax],
+        context.source,
+        context.analysis,
+        context.knowledge,
+    ) {
         rewrites
             .entry(ptr::from_ref(site.expression))
             .or_default()
@@ -168,7 +173,8 @@ impl<'a> ExpressionChecks<'a, '_> {
             self.protected_assignment(node, parts, &knowledge);
         }
         self.ring_variable(expression, &knowledge);
-        self.option_key_convention(expression);
+        self.float_key(expression, &knowledge);
+        self.option_key_convention(expression, &knowledge);
         self.rewrite(expression, RewriteKind::RedundantControlParentheses);
         self.coalescence(expression);
         self.simplification(expression);
@@ -198,6 +204,38 @@ impl<'a> ExpressionChecks<'a, '_> {
         if let Some(call) = call {
             self.call_domain(call, &knowledge);
             self.call_options(call, &knowledge);
+            for entry in call.right_operand.arguments().into_iter().flatten() {
+                self.option_symbol_convention(entry, &knowledge);
+            }
+        }
+    }
+
+    /// Rejects floating-point keys in pairs and indexed reads or writes.
+    fn float_key(&mut self, expression: &'a Expr, knowledge: &ObjectRegistryView<'_>) {
+        let key = match expression {
+            Expr::Option(option) => option.key.as_ref(),
+            Expr::Op(ExprOp::Bin(ExprOpBin::Index(index))) => index.index.as_ref(),
+            Expr::Op(ExprOp::Bin(ExprOpBin::Regular(operation)))
+                if operation.operator.spelling() == <Token![#?]>::SPELLING =>
+            {
+                operation.right_operand.as_ref()
+            }
+            _ => return,
+        };
+        let literal = matches!(
+            key.unparenthesized(),
+            Some(Expr::Literal(ExprLiteral::Float(_)))
+        );
+        let inferred =
+            self.context
+                .analysis
+                .infer_expression_static_type(key, self.context.source, knowledge);
+        if literal
+            || inferred
+                .as_ref()
+                .is_some_and(|ty| ty == &TypeRole::Real.object_name())
+        {
+            self.spawn(&catalog::FLOAT_KEY, key, "Floating-point values must not be used as keys: approximate equality makes lookups unreliable".to_string());
         }
     }
 
@@ -461,11 +499,19 @@ impl<'a> ExpressionChecks<'a, '_> {
         }
     }
 
-    /// The first shorter form of an `if` or `try`.
+    /// Reports each expression simplification under its own configurable rule.
     fn simplification(&mut self, expression: &Expr) {
-        if let Some(replacement) = self.site(expression, RewriteKind::is_simplification) {
+        let rewrites = self
+            .rewrites
+            .get(&ptr::from_ref(expression))
+            .into_iter()
+            .flatten()
+            .filter(|site| site.kind.is_simplification())
+            .map(|site| (site.kind.rule(), site.replacement.clone()))
+            .collect::<Vec<_>>();
+        for (rule, replacement) in rewrites {
             self.spawn(
-                &catalog::SIMPLIFIABLE_EXPRESSION,
+                rule,
                 expression,
                 format!("This expression can be simplified to `{replacement}`"),
             );
@@ -790,8 +836,8 @@ impl<'a> ExpressionChecks<'a, '_> {
         self.spawn(rule, expression, format!("{error}; {hint}"));
     }
 
-    /// Lowercase keys of an option declaration list.
-    fn option_key_convention(&mut self, expression: &Expr) {
+    /// Names and evaluated bindings in a function's option declaration list.
+    fn option_key_convention(&mut self, expression: &Expr, knowledge: &ObjectRegistryView<'_>) {
         let Some((_, list)) = OptionDeclaration::declared_list(expression) else {
             return;
         };
@@ -801,29 +847,47 @@ impl<'a> ExpressionChecks<'a, '_> {
             .map(PackedArguments::arguments)
             .unwrap_or_default();
         for entry in entries.into_iter().flatten() {
-            let Expr::Option(option) = entry else {
+            self.option_symbol_convention(entry, knowledge);
+        }
+    }
+
+    /// Checks the operands of one option in a declaration or a call.
+    fn option_symbol_convention(&mut self, entry: &Expr, knowledge: &ObjectRegistryView<'_>) {
+        let Expr::Option(option) = entry else { return };
+        for (operand, key) in [(&option.key, true), (&option.value, false)] {
+            let Expr::Symbol(symbol) = operand.as_ref() else {
                 continue;
             };
-            let Expr::Symbol(key) = option.key.as_ref() else {
+            let name = symbol.text();
+            let Some(range) = self.context.source.range_for_syntax(symbol) else {
                 continue;
             };
-            let name = key.text();
-            if !name.starts_with(|first: char| first.is_ascii_lowercase()) {
+            let bound = self
+                .context
+                .analysis
+                .visible_source_binding_at(name, range.start, knowledge)
+                .is_some();
+            let indexed = knowledge.get_record(&ObjectName::new(name)).is_some();
+            if bound && key {
+                self.sink.spawn(&catalog::BOUND_OPTION_KEY, Finding::new(range, format!("Option key `{name}` evaluates its existing binding instead of naming a symbol")));
+            }
+            if bound || indexed || super::naming::follows_case(name, true) {
                 continue;
             }
-            let Some(range) = self.context.source.range_for_syntax(key) else {
-                continue;
+            let role = if key {
+                "Option name"
+            } else {
+                "Symbol option value"
             };
-            let mut capitalized = name.to_string();
-            capitalized[..1].make_ascii_uppercase();
-            self.sink.spawn(
-                &catalog::OPTION_KEY_CONVENTION,
-                Finding::new(
-                    range,
-                    format!("Option name `{name}` should be capitalized by Macaulay2 convention"),
-                )
-                .with_fix("Capitalize option key", range, capitalized),
-            );
+            let mut finding = Finding::new(range, format!("{role} `{name}` should use PascalCase"));
+            if key && name.starts_with(|first: char| first.is_ascii_lowercase()) {
+                let mut capitalized = name.to_string();
+                capitalized[..1].make_ascii_uppercase();
+                if super::naming::follows_case(&capitalized, true) {
+                    finding = finding.with_fix("Capitalize option key", range, capitalized);
+                }
+            }
+            self.sink.spawn(&catalog::OPTION_KEY_CONVENTION, finding);
         }
     }
 

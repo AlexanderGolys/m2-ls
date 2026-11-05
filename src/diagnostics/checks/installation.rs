@@ -2,14 +2,15 @@
 //! the analysis characterized.
 
 use m2_syn::Token;
+use tower_lsp::lsp_types::SymbolKind;
 
 use super::{DiagnosticSink, InstallationContext};
 use crate::analysis::{
-    CallableHeadKind, Dispatch, InstalledValue, MethodHead, MethodInstallationSyntax,
-    MethodOptions, Operator,
+    CallableHeadKind, CodomainOrigin, Dispatch, InstalledValue, MethodHead,
+    MethodInstallationSyntax, MethodOptions, Operator,
 };
 use crate::diagnostics::{catalog, Finding};
-use crate::object_registry::OperatorForm;
+use crate::object_registry::{ObjectKnowledge, ObjectName, OperatorForm};
 use crate::typesystem::{TypeKnowledge, TypeRole};
 
 /// Spawns every diagnostic found for the context's installation.
@@ -18,6 +19,54 @@ pub(super) fn spawn(context: &InstallationContext, sink: &mut DiagnosticSink) {
     operator_not_flexible(context, sink);
     install_arity(context, sink);
     install_option_form(context, sink);
+    constructor_typical_value(context, sink);
+}
+
+/// Hints when a conversion named for a known type does not declare that type
+/// as the result of its installation or its method function.
+fn constructor_typical_value(context: &InstallationContext, sink: &mut DiagnosticSink) {
+    let installation = context.installation;
+    let MethodHead::Function(name) = &installation.method.head else {
+        return;
+    };
+    let name = name.name();
+    let target = if let Some(rest) = name
+        .strip_prefix("to")
+        .filter(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
+    {
+        rest.to_string()
+    } else {
+        let mut target = name.to_string();
+        if !target.starts_with(|c: char| c.is_ascii_lowercase()) {
+            return;
+        }
+        target[..1].make_ascii_uppercase();
+        target
+    };
+    let position = installation.span.start;
+    let source_type = context
+        .analysis
+        .get_binding_at(&target, position)
+        .is_some_and(|binding| binding.state.presentation_kind == SymbolKind::CLASS);
+    let indexed_type = context
+        .knowledge
+        .get_record(&ObjectName::new(&target))
+        .is_some_and(|record| record.type_info().is_some());
+    if !source_type && !indexed_type {
+        return;
+    }
+    if matches!(
+        installation.codomain_origin,
+        Some(CodomainOrigin::Annotation | CodomainOrigin::TypicalValue)
+    ) && installation
+        .method
+        .codomain
+        .as_ref()
+        .is_some_and(|codomain| codomain.name() == target)
+    {
+        return;
+    }
+    sink.spawn(&catalog::CONSTRUCTOR_TYPICAL_VALUE, Finding::new(installation.span, format!("`{name}` names the type `{target}`; declare `{target}` as the method or installation's typical value")));
 }
 
 /// Reports method installations that cannot affect the callable they target.

@@ -84,11 +84,16 @@ tracking some compile-time computable characteristic, like a bound on dimension.
 
 [Diagnostics](../writing/diagnostics.md)
 : Reports syntax, runtime, type, style, and package-documentation problems as you
-  edit. Every rule has a stable code and configurable suppression.
+  edit, including floating-point keys, option names, constructor result types,
+  and declaration naming. Function parameters are exempt from naming checks.
+  Every rule has a stable code and configurable suppression.
 
 [Code actions](../writing/code-actions.md)
 : Applies diagnostic fixes and expression rewrites. Suppression and library-code
   directives are available as explicit actions; automatic fix-all omits them.
+  Simplifications include early-return null guards, mapped compositions, and
+  redundant strict Boolean comparisons, forwarding callbacks, and partial
+  applications. Each rewrite has its own configurable lint code.
 
 [Formatting](../writing/formatting.md)
 : Formats the whole document with configurable spacing, wrapping, indentation,

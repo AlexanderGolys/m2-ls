@@ -19,6 +19,32 @@ pub(super) fn spawn(context: &DocumentContext, sink: &mut DiagnosticSink) {
     super::method_typical_value::MethodTypicalValue::spawn(context, sink);
 }
 
+/// Checks names on source declarations, excluding function parameters, ring
+/// generators, and globals that are neither functions nor types. A parameter
+/// can stand for a type, so its name need not follow ordinary local casing.
+pub(super) fn naming_conventions(context: &DocumentContext, sink: &mut DiagnosticSink) {
+    for binding in context.analysis.bindings() {
+        if binding.role == BindingRole::Parameter || binding.state.is_ring_generator {
+            continue;
+        }
+        let kind = binding.state.presentation_kind;
+        let (uppercase, description) = if kind == SymbolKind::CLASS {
+            (true, "Type names should use PascalCase or uppercase")
+        } else if kind == SymbolKind::FUNCTION || binding.binding.is_local() {
+            (false, "Function and local names should use camelCase")
+        } else {
+            continue;
+        };
+        let name = binding.name.name();
+        if !super::naming::follows_case(name, uppercase) {
+            sink.spawn(
+                &catalog::NAMING_CONVENTION,
+                Finding::new(binding.range, format!("{description}: `{name}`")),
+            );
+        }
+    }
+}
+
 /// Reports ordinary source bindings that have no value-reading references.
 fn unused_binding(context: &DocumentContext, sink: &mut DiagnosticSink) {
     let &DocumentContext {

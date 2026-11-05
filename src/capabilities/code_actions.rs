@@ -55,25 +55,15 @@ fn rewrite_title(site: &RewriteSite<'_>) -> &'static str {
         RewriteKind::RedundantControlParentheses => "Remove redundant parentheses",
         RewriteKind::CoalescingAssignment => "Use `??=` coalescing assignment",
         RewriteKind::Coalescence => "Use `??` coalescence",
+        RewriteKind::MappingComposition => "Simplify mapped composition",
+        RewriteKind::BooleanComparison => "Simplify Boolean comparison",
+        RewriteKind::PartialApplicationLambda => "Replace lambda with partial application",
+        RewriteKind::ForwardingLambda => "Replace forwarding lambda with function",
+        RewriteKind::NullReturnGuard => "Simplify null-return guard",
         RewriteKind::NullBranch => "Simplify unnecessary null branch",
         RewriteKind::TrySimplification => "Simplify try",
         RewriteKind::IfCondition => "Simplify if condition",
         RewriteKind::ElseIfChain => "Flatten nested if into else-if chain",
-    }
-}
-
-/// The hint reporting rewrites of `kind`.
-fn rewrite_rule(kind: RewriteKind) -> &'static DiagnosticRule {
-    match kind {
-        RewriteKind::AmbiguousFloatMemberAccess => &catalog::AMBIGUOUS_FLOAT_MEMBER_ACCESS,
-        RewriteKind::RedundantControlParentheses => &catalog::REDUNDANT_CONTROL_PARENTHESES,
-        RewriteKind::CoalescingAssignment | RewriteKind::Coalescence => {
-            &catalog::PREFER_COALESCENCE
-        }
-        RewriteKind::NullBranch
-        | RewriteKind::TrySimplification
-        | RewriteKind::IfCondition
-        | RewriteKind::ElseIfChain => &catalog::SIMPLIFIABLE_EXPRESSION,
     }
 }
 
@@ -108,7 +98,12 @@ impl<'a> CodeActionContext<'a, '_> {
             uri,
             position,
             enclosing: CursorSyntax::at(cells.clone(), byte, document).expressions,
-            sites: RewriteSites::collect(cells, document),
+            sites: RewriteSites::collect_analyzed(
+                cells,
+                document,
+                document.analysis(),
+                document.object_registry(),
+            ),
             diagnostics,
         })
     }
@@ -156,7 +151,7 @@ impl<'a> CodeActionContext<'a, '_> {
     /// or suppressed.
     fn rewrite(&self, site: &RewriteSite<'_>) -> Option<CodeAction> {
         let range = self.document.range_for_syntax(site.expression)?;
-        let diagnostic = self.diagnostic_covering(rewrite_rule(site.kind), range);
+        let diagnostic = self.diagnostic_covering(site.kind.rule(), range);
         if diagnostic.is_none() && requires_diagnostic(site.kind) {
             return None;
         }
@@ -180,6 +175,14 @@ impl<'a> CodeActionContext<'a, '_> {
         self.sites
             .iter()
             .find(|site| site.kind == kind && std::ptr::eq(site.expression, expression))
+    }
+
+    /// The innermost enclosing expression offering a rewrite of `kind`.
+    fn innermost_site(&self, kind: RewriteKind) -> Option<&RewriteSite<'a>> {
+        self.enclosing
+            .iter()
+            .rev()
+            .find_map(|expression| self.site_of(expression, kind))
     }
 
     /// The rewrites offered at the cursor, each kind once:
@@ -209,9 +212,7 @@ impl<'a> CodeActionContext<'a, '_> {
             })
             .min_by_key(|(length, _)| *length)
             .map(|(_, site)| site);
-        let member_access = self.enclosing.iter().rev().find_map(|expression| {
-            self.site_of(expression, RewriteKind::AmbiguousFloatMemberAccess)
-        });
+        let member_access = self.innermost_site(RewriteKind::AmbiguousFloatMemberAccess);
         let coalescence = self.enclosing.iter().rev().find_map(|expression| {
             self.site_of(expression, RewriteKind::Coalescence)
                 .or_else(|| self.site_of(expression, RewriteKind::CoalescingAssignment))
@@ -226,6 +227,11 @@ impl<'a> CodeActionContext<'a, '_> {
             member_access,
             coalescence,
             parentheses,
+            self.innermost_site(RewriteKind::BooleanComparison),
+            self.innermost_site(RewriteKind::ForwardingLambda),
+            self.innermost_site(RewriteKind::PartialApplicationLambda),
+            self.innermost_site(RewriteKind::MappingComposition),
+            innermost(RewriteKind::NullReturnGuard, is_if),
             innermost(RewriteKind::NullBranch, is_if),
             innermost(RewriteKind::TrySimplification, is_try),
             innermost(RewriteKind::IfCondition, is_if),
@@ -342,7 +348,12 @@ fn fix_all_action(
     for cell in cells.clone() {
         literals.visit_cell(cell);
     }
-    let sites = RewriteSites::collect(cells, document);
+    let sites = RewriteSites::collect_analyzed(
+        cells,
+        document,
+        document.analysis(),
+        document.object_registry(),
+    );
     let context = CodeActionContext {
         document,
         uri,

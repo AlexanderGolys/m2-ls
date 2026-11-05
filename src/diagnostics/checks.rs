@@ -12,6 +12,7 @@ mod expressions;
 mod installation;
 mod location;
 mod method_typical_value;
+mod naming;
 mod parse;
 
 use tower_lsp::lsp_types::Url;
@@ -157,14 +158,22 @@ pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
         };
         installation::spawn(&context, &mut sink);
     }
-    if live {
-        return sink.diagnostics;
-    }
     let context = DocumentContext {
         analysis,
         syntax,
         source,
     };
+    let mut naming = DiagnosticSink::default();
+    document::naming_conventions(&context, &mut naming);
+    sink.diagnostics
+        .extend(naming.diagnostics.into_iter().filter(|diagnostic| {
+            source
+                .bytes_for_range(diagnostic.finding.range)
+                .is_some_and(&selected)
+        }));
+    if live {
+        return sink.diagnostics;
+    }
     document::spawn(&context, &mut sink);
     let context = DocumentationContext {
         documentation,

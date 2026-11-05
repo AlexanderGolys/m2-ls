@@ -421,6 +421,8 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
             "Simplify if condition",
             "Disable S05 on this line",
             "Disable S05 in this file",
+            "Disable S16 on this line",
+            "Disable S16 in this file",
             "Fix all in file"
         ]
     );

@@ -4,6 +4,10 @@ The formatter rewrites the whole document into one consistent layout:
 indentation, spacing around operators and commas, where long expressions wrap,
 and how control flow breaks across lines.
 
+Expression simplifications are separate [code actions](code-actions.md#rewrites).
+For example, formatting keeps `linked === true`; **Simplify Boolean comparison**
+can replace it with `linked` when its type is known to be Boolean.
+
 ```m2,pane="Before"
 normalize = (v,limit) -> (
 if v === null then 0 else if v > limit then limit else v
