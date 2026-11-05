@@ -6,7 +6,8 @@ named record fields, and shared typical values where the source supports them.
 Each capability below has its own chapter with
 examples, settings, and limits. Your editor decides how to expose the requests.
 
-## Read and understand
+
+## Implemented capabilities
 
 [Semantic highlighting](../reading/semantic-highlighting.md)
 : Distinguishes types, methods, functions, parameters, and ring variables by
@@ -42,9 +43,6 @@ tracking some compile-time computable characteristic, like a bound on dimension.
   their source structure.
 
 
-
-## Navigate and reorganize
-
 [Declaration, definition, implementation, and type definition](../navigating/go-to.md)
 : Jump respectively to a name's first binding, its assignments, applicable method
   installations, or the definition of its inferred type. Available library sources
@@ -79,8 +77,6 @@ tracking some compile-time computable characteristic, like a bound on dimension.
 [Workspace files](../navigating/workspace-files.md)
 : Follows literal `load`, `needs`, and `input` dependencies, completes paths,
   watches changes on disk, and updates load strings during editor file moves.
-
-## Write and check
 
 [Completion](../writing/completion.md)
 : Suggests package names, paths, types after `new`, option keys and values, and

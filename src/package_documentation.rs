@@ -197,6 +197,13 @@ pub enum DocumentationMarkupKind {
     /// string naming a documentation key by a symbol's name, the `f` of
     /// `TO "f"`.
     Name,
+    /// A quoted documentation name, with lookup restricted to the literal content.
+    QuotedName {
+        /// First byte of the symbol name inside the string.
+        start: usize,
+        /// First byte following the symbol name.
+        end: usize,
+    },
     /// The option a key or a link names an optional argument by, the
     /// `Limit` of `[f, Limit]`.
     OptionName,
@@ -874,7 +881,11 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 })
                 .into_iter()
                 .collect(),
-            key_string_candidates: code.content_bytes(key).into_iter().collect(),
+            key_string_candidates: code
+                .content_bytes(key)
+                .map(|body| (body, code.bytes(key)))
+                .into_iter()
+                .collect(),
         };
         self.record_code_markup(marks);
     }
@@ -884,7 +895,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     fn record_code_markup(&mut self, code: CodeMarkup) {
         self.documentation.markup.extend(code.markup);
         let source = self.source;
-        for bytes in code.key_string_candidates {
+        for (bytes, literal) in code.key_string_candidates {
             if !self.names_symbol(&source.text()[bytes.clone()]) {
                 continue;
             }
@@ -892,8 +903,11 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 .key_strings
                 .push(self.source.span_for_bytes(bytes.clone()));
             self.documentation.markup.push(DocumentationMarkup {
-                bytes,
-                kind: DocumentationMarkupKind::Name,
+                bytes: literal,
+                kind: DocumentationMarkupKind::QuotedName {
+                    start: bytes.start,
+                    end: bytes.end,
+                },
             });
         }
     }
@@ -1050,7 +1064,7 @@ struct CodeMarkup {
     markup: Vec<DocumentationMarkup>,
     /// The document bytes of the content of each string in a key position:
     /// the key itself, or the key a `TO`, `TOH`, or `TO2` link links to.
-    key_string_candidates: Vec<ByteRange>,
+    key_string_candidates: Vec<(ByteRange, ByteRange)>,
 }
 
 impl CodeMarkup {
@@ -1103,15 +1117,37 @@ impl CodeMarkup {
     ) {
         for token in stream {
             if let TokenTree::Group(group) = token {
+                for span in std::iter::once(group.delimiter().opening_span())
+                    .chain(group.delimiter().closing_span())
+                {
+                    let Some(parsed) = code.navigation.syntax_bytes(&span) else {
+                        continue;
+                    };
+                    // Parentheses added to evaluate SimpleDoc are absent from the source.
+                    if parsed.start < code.origin.added
+                        || parsed.end > code.navigation.text().len() - code.origin.added
+                    {
+                        continue;
+                    }
+                    self.markup.push(DocumentationMarkup {
+                        bytes: code.origin.source_range(parsed),
+                        kind: DocumentationMarkupKind::Syntax(M2SemanticTokenType::Delimiter),
+                    });
+                }
                 self.tokens(group.stream(), symbol_starts, code);
                 continue;
             }
-            let Some(token_type) = lexical_semantic_token_type(token).filter(|token_type| {
-                !matches!(
-                    token_type,
-                    M2SemanticTokenType::Comment | M2SemanticTokenType::String
-                )
-            }) else {
+            let Some(token_type) = lexical_semantic_token_type(token)
+                .or_else(|| {
+                    matches!(token, TokenTree::Punct(_)).then_some(M2SemanticTokenType::Punctuation)
+                })
+                .filter(|token_type| {
+                    !matches!(
+                        token_type,
+                        M2SemanticTokenType::Comment | M2SemanticTokenType::String
+                    )
+                })
+            else {
                 continue;
             };
             let bytes = code.bytes(token);
@@ -1145,9 +1181,11 @@ impl<'ast, N: SourceNavigation + ?Sized> Visit<'ast> for SymbolMarks<'_, '_, N> 
         if self.code.content_bytes(expression).is_some()
             && self.link_key_bytes.contains(&self.code.bytes(expression))
         {
-            self.marks
-                .key_string_candidates
-                .extend(self.code.content_bytes(expression));
+            self.marks.key_string_candidates.extend(
+                self.code
+                    .content_bytes(expression)
+                    .map(|body| (body, self.code.bytes(expression))),
+            );
         }
         visit::visit_expr(self, expression);
     }

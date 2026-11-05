@@ -600,11 +600,33 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                         &self.reassemble(part.content),
                     ));
                 }
+                for fragment in &fragments {
+                    self.mark_shown_code(fragment.bytes.clone());
+                }
                 page.examples.extend(fragments);
             }
             CannedExample => {
+                let mut input = true;
                 for line in part.nonblank() {
-                    self.mark_shown_code(line.text.clone());
+                    let text = &self.source.text()[line.text.clone()];
+                    let prompt = text.find([':', '=']).and_then(|separator| {
+                        let label = text[..separator].trim();
+                        let mut characters = label.chars();
+                        let kind = characters.next()?;
+                        let digits = characters.as_str();
+                        (matches!(kind, 'i' | 'o')
+                            && !digits.is_empty()
+                            && digits.bytes().all(|byte| byte.is_ascii_digit()))
+                        .then_some((kind, separator))
+                    });
+                    if let Some((kind, separator)) = prompt {
+                        input = kind == 'i';
+                        if input {
+                            self.mark_shown_code(line.text.start + separator + 1..line.text.end);
+                        }
+                    } else if input {
+                        self.mark_shown_code(line.text.clone());
+                    }
                 }
                 page.markdown.description.push(NodeMarkdown::fenced_code(
                     Macaulay2Conventions::MARKDOWN_CODE_LANGUAGE,
@@ -840,6 +862,8 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 TextSegment::Expression(range) => {
                     let start = bytes.start + range.start;
                     let end = bytes.start + range.end;
+                    self.mark_text_markup(start - 1..start);
+                    self.mark_text_markup(end..end + 1);
                     let rendered = self
                         .evaluate_simple_doc_expression(
                             start..end,

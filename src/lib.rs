@@ -921,6 +921,9 @@ impl Backend {
     /// document's facts. Installed sources are analyzed only when opened;
     /// their dependencies stay out of the workspace index.
     async fn index_loaded_in_background(&self, loaded: Vec<Url>) {
+        if loaded.is_empty() {
+            return;
+        }
         let index = Arc::clone(&self.workspace_index);
         let registry = self.workspace_registry();
         let library = self.library.snapshot();
@@ -937,6 +940,7 @@ impl Backend {
         })
         .await
         .expect("workspace indexing task panicked");
+        let _ = refresh_if_changed(&self.semantic_tokens_refresh, &self.client, true).await;
     }
 
     /// Analyze a saved document in full off the session task, keeping the

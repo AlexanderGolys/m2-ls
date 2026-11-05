@@ -52,6 +52,7 @@ use crate::settings::SemanticTokenSettings;
 use crate::source::DocumentSpan;
 use crate::typesystem::TypeKnowledge;
 use m2_syn::{LiteralKind, Token, TokenTree};
+use serde::Deserialize;
 use strum::{EnumIter, IntoEnumIterator};
 use these_macros_should_be_illegal::enum_fn;
 use tower_lsp::lsp_types::{
@@ -101,7 +102,7 @@ pub trait SemanticTokenKnowledge: TypeKnowledge {
 }
 
 /// The token types, named in Macaulay2 terms and sent as standard LSP
-/// types except for the custom `escapeSequence` classification. Each
+/// types except for custom escapes, delimiters, and punctuation. Each
 /// discriminant is its legend index; finer distinctions are
 /// carried by [modifiers](M2SemanticTokenModifier). The module documentation
 /// says which objects are functions and which are methods.
@@ -154,15 +155,18 @@ pub enum M2SemanticTokenType {
     /// The text it styles stays a [`String`](Self::String) carrying the
     /// style's modifier.
     Macro = SemanticTokenType::MACRO,
-    /// A documentation annotation: a SimpleDoc section keyword such as
-    /// `Key` or `Description`, or a link to another
-    /// documentation page, `TO`, `TOH` or `TO2`. Sent as `decorator`.
+    /// A link to another documentation page, such as `TO`, `TOH`, or
+    /// `TO2`. Sent as `decorator`; section labels use `keyword`.
     Annotation = SemanticTokenType::DECORATOR,
     /// Regular-expression punctuation classified using the protocol regexp category.
     Regexp = SemanticTokenType::REGEXP,
     /// An escaped character in a pattern, including its source backslashes.
     /// Falls back to `string` under `standardOnly`.
     EscapeSequence = SemanticTokenType::new("escapeSequence"),
+    /// Group boundaries in embedded code, such as parentheses and brackets.
+    Delimiter = SemanticTokenType::new("delimiter"),
+    /// Embedded code separators, such as commas and semicolons.
+    Punctuation = SemanticTokenType::new("punctuation"),
 }
 
 impl M2SemanticTokenType {
@@ -177,10 +181,48 @@ impl M2SemanticTokenType {
     }
 }
 
+/// Named semantic modifier available to configuration consumers.
+#[derive(Debug, Eq, PartialEq, Hash, PartialOrd, Clone, Deserialize)]
+#[allow(
+    dead_code,
+    reason = "Reserved modifier vocabulary for configuration consumers."
+)]
+pub struct SemanticModifier(pub SemanticTokenModifier);
+
+#[allow(
+    dead_code,
+    reason = "Reserved modifier vocabulary for configuration consumers."
+)]
+impl SemanticModifier {
+    /// Marks a binding introduction.
+    pub const DECLARATION: SemanticModifier = SemanticModifier(SemanticTokenModifier::DECLARATION);
+    /// Marks a definition.
+    pub const DEFINITION: SemanticModifier = SemanticModifier(SemanticTokenModifier::DEFINITION);
+    /// Marks a protected binding.
+    pub const PROTECTED: SemanticModifier = SemanticModifier(SemanticTokenModifier::READONLY);
+    /// Marks a deprecated object.
+    pub const DEPRECATED: SemanticModifier = SemanticModifier(SemanticTokenModifier::DEPRECATED);
+    /// Marks a modified binding.
+    pub const MODIFICATION: SemanticModifier =
+        SemanticModifier(SemanticTokenModifier::MODIFICATION);
+    /// Marks documentation content.
+    pub const DOCUMENTATION: SemanticModifier =
+        SemanticModifier(SemanticTokenModifier::DOCUMENTATION);
+    /// Marks a selected library object.
+    pub const DEFAULT_LIBRARY: SemanticModifier =
+        SemanticModifier(SemanticTokenModifier::DEFAULT_LIBRARY);
+    /// Marks abstract content.
+    pub const ABSTRACT: SemanticModifier = SemanticModifier(SemanticTokenModifier::ABSTRACT);
+    /// Marks a structural index in an indexed generator name.
+    pub const INDEX: SemanticModifier = SemanticModifier(SemanticTokenModifier::new("index"));
+    /// Reserved companion to abstract mathematical content.
+    pub const NONSENSE: SemanticModifier = SemanticModifier(SemanticTokenModifier::new("nonsense"));
+}
+
 /// The modifiers m2-ls attaches to tokens. Like [`M2SemanticTokenType`],
 /// the legend lists the variants in declaration order, so a variant's
 /// discriminant is its bit position. Some are standard LSP modifiers; the
-/// rest are Macaulay2's own, and `standardOnly` drops them.
+/// rest are Macaulay2's own; `standardOnly` maps or removes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 #[enum_fn(pub const lsp_modifier -> SemanticTokenModifier)]
 #[non_exhaustive]
@@ -227,6 +269,13 @@ pub enum M2SemanticTokenModifier {
     Example = SemanticTokenModifier::new("example"),
     /// Code in a `TEST` block.
     Test = SemanticTokenModifier::new("test"),
+
+    /// Reserved standard modifier for abstract content; no automatic emission rule.
+    Abstract = SemanticTokenModifier::ABSTRACT,
+    /// Structural index in a known indexed generator name; reserved for span emission.
+    Index = SemanticTokenModifier::new("index"),
+    /// Reserved companion to abstract mathematical content; no automatic emission rule.
+    Nonsense = SemanticTokenModifier::new("nonsense"),
 }
 
 impl M2SemanticTokenModifier {
@@ -236,12 +285,31 @@ impl M2SemanticTokenModifier {
         1 << self as u32
     }
 
+    /// Standard-only representation, including contextual fallbacks.
+    pub const fn standard_fallback(self) -> Option<Self> {
+        match self {
+            Self::Example
+            | Self::Strong
+            | Self::Emphasis
+            | Self::Monospace
+            | Self::Link
+            | Self::Math => Some(Self::Documentation),
+            Self::Nonsense | Self::Algebraic => Some(Self::Abstract),
+            modifier if modifier.is_standard() => Some(modifier),
+            _ => None,
+        }
+    }
+
     /// Whether the modifier is one the LSP specification defines, and so
     /// is still sent under `standardOnly`.
     pub const fn is_standard(self) -> bool {
         matches!(
             self,
-            Self::Declaration | Self::DefaultLibrary | Self::Readonly | Self::Documentation
+            Self::Declaration
+                | Self::DefaultLibrary
+                | Self::Readonly
+                | Self::Documentation
+                | Self::Abstract
         )
     }
 }
@@ -356,22 +424,25 @@ impl M2SemanticToken {
     }
 
     /// The token as sent against [`legend`](Self::legend): its type index and
-    /// modifier bitset, without the M2-specific modifiers under
-    /// `standardOnly`; custom escape tokens fall back to `string`.
+    /// modifier bitset, mapping M2-specific classifications under
+    /// `standardOnly`; custom types use their standard fallbacks.
     pub fn encode(self, settings: &SemanticTokenSettings) -> (u32, u32) {
         if !settings.standard_only {
             return (self.token_type as u32, self.modifiers.0);
         }
         let modifiers = M2SemanticTokenModifier::iter()
-            .filter(|modifier| self.modifiers.contains(*modifier) && modifier.is_standard())
+            .filter(|modifier| self.modifiers.contains(*modifier))
+            .filter_map(M2SemanticTokenModifier::standard_fallback)
             .fold(
                 M2SemanticTokenModifiers::default(),
                 M2SemanticTokenModifiers::with,
             );
-        let token_type = if self.token_type == M2SemanticTokenType::EscapeSequence {
-            M2SemanticTokenType::String
-        } else {
-            self.token_type
+        let token_type = match self.token_type {
+            M2SemanticTokenType::EscapeSequence => M2SemanticTokenType::String,
+            M2SemanticTokenType::Delimiter | M2SemanticTokenType::Punctuation => {
+                M2SemanticTokenType::Operator
+            }
+            token_type => token_type,
         };
         (token_type as u32, modifiers.0)
     }

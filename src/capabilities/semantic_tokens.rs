@@ -616,7 +616,7 @@ where
                 let source = self.document.span_for_bytes(markup.bytes.clone());
                 let token = match markup.kind {
                     DocumentationMarkupKind::SectionKeyword => {
-                        M2SemanticToken::new(M2SemanticTokenType::Annotation)
+                        M2SemanticToken::new(M2SemanticTokenType::Keyword)
                     }
                     DocumentationMarkupKind::TextMarkup => {
                         M2SemanticToken::new(M2SemanticTokenType::Macro)
@@ -651,6 +651,11 @@ where
                     }
                     DocumentationMarkupKind::Name => self
                         .mention_token(&SymbolMention::new(source.clone()))?
+                        .within_string()?,
+                    DocumentationMarkupKind::QuotedName { start, end } => self
+                        .mention_token(&SymbolMention::new(
+                            self.document.span_for_bytes(start..end),
+                        ))?
                         .within_string()?,
                     DocumentationMarkupKind::ItemName => {
                         M2SemanticToken::new(M2SemanticTokenType::Parameter)
@@ -2151,7 +2156,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 let tag = token_at(&tokens, 0, "document { ".len() as u32).unwrap();
                 assert_eq!(
                     tag.token_type,
-                    M2SemanticTokenType::Annotation as u32,
+                    M2SemanticTokenType::Keyword as u32,
                     "{option}"
                 );
                 assert_eq!(
@@ -2205,7 +2210,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             let token = token_at(&tokens, position.line, position.character).unwrap();
             assert_eq!(
                 token.token_type,
-                M2SemanticTokenType::Annotation as u32,
+                M2SemanticTokenType::Keyword as u32,
                 "{keyword}"
             );
             assert_eq!(
@@ -2213,6 +2218,74 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 expected,
                 "{keyword}"
             );
+        }
+    }
+
+    /// Quoted links and styled literals include both quote characters.
+    #[test]
+    fn documentation_literal_highlights_include_quotes() {
+        let text = r#"doc ///
+Key
+  page
+Description
+  Text
+    @TO "Matrix"@ and @TT "code"@.
+///
+"#;
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
+        let document = document(text, &builtins);
+        let tokens = collect_tokens(&document, &builtins, true);
+        for (literal, kind) in [
+            (r#""Matrix""#, M2SemanticTokenType::Type),
+            (r#""code""#, M2SemanticTokenType::String),
+        ] {
+            let position = document.position_for_byte(text.find(literal).unwrap());
+            let token = token_at(&tokens, position.line, position.character).unwrap();
+            assert_eq!(token.token_type, kind as u32);
+            assert_eq!(token.length, literal.len() as u32);
+        }
+    }
+
+    /// SimpleDoc retains markup boundaries and separates transcript prompts and output from code.
+    #[test]
+    fn simple_doc_markup_and_transcript_boundaries() {
+        let text = r#"doc ///
+Key
+  page
+Description
+  Text
+    @TO "Matrix"@ and {\tt curated}, then @TO Matrix@.
+  CannedExample
+    i1 : matrix {{1,2}}
+    o1 = file://result/123
+    output continues 456
+    i2 : (3 + 4)
+///
+"#;
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
+        let document = document(text, &builtins);
+        for augments in [false, true] {
+            let tokens = collect_tokens(&document, &builtins, augments);
+            for (needle, kind) in [
+                ("@TO", M2SemanticTokenType::Macro),
+                ("@ and", M2SemanticTokenType::Macro),
+                (r"{\tt", M2SemanticTokenType::Macro),
+                ("curated", M2SemanticTokenType::String),
+                ("i1 :", M2SemanticTokenType::String),
+                ("o1 =", M2SemanticTokenType::String),
+                ("456", M2SemanticTokenType::String),
+                ("{{", M2SemanticTokenType::Delimiter),
+                (",2", M2SemanticTokenType::Punctuation),
+                ("(3", M2SemanticTokenType::Delimiter),
+                ("3 +", M2SemanticTokenType::Number),
+            ] {
+                let position = document.position_for_byte(text.find(needle).unwrap());
+                let token = token_at(&tokens, position.line, position.character).unwrap();
+                assert_eq!(
+                    token.token_type, kind as u32,
+                    "{needle}, augments={augments}"
+                );
+            }
         }
     }
 
@@ -2370,6 +2443,28 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         }
     }
 
+    /// Context modifiers collapse to their documented standard categories.
+    #[test]
+    fn standard_only_maps_context_modifiers() {
+        use M2SemanticTokenModifier::*;
+        let settings = SemanticTokenSettings {
+            standard_only: true,
+            ..SemanticTokenSettings::default()
+        };
+        for modifier in M2SemanticTokenModifier::iter() {
+            let expected = match modifier {
+                Example | Strong | Emphasis | Monospace | Link | Math | Documentation => {
+                    Documentation.bit()
+                }
+                Nonsense | Algebraic | Abstract => Abstract.bit(),
+                Declaration | DefaultLibrary | Readonly => modifier.bit(),
+                _ => 0,
+            };
+            let token = M2SemanticToken::new(M2SemanticTokenType::Variable).with_modifier(modifier);
+            assert_eq!(token.encode(&settings).1, expected, "{modifier:?}");
+        }
+    }
+
     #[test]
     fn standard_only_sends_only_standard_modifiers() {
         let standard_only = SemanticTokenSettings {
@@ -2410,6 +2505,11 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 M2SemanticToken::new(token_type).encode(&standard_only).0,
                 if token_type == M2SemanticTokenType::EscapeSequence {
                     M2SemanticTokenType::String as u32
+                } else if matches!(
+                    token_type,
+                    M2SemanticTokenType::Delimiter | M2SemanticTokenType::Punctuation
+                ) {
+                    M2SemanticTokenType::Operator as u32
                 } else {
                     token_type as u32
                 }

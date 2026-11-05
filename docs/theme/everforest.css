@@ -19,7 +19,7 @@
 
     --links: #7fbbb3;
 
-    --inline-code-color: #83c092;
+    --inline-code-color: #dbbc7f;
 
     --theme-popup-bg: #343f44;
     --theme-popup-border: #4f585e;
@@ -79,7 +79,7 @@
     --ts-comment:     var(--ts-gray);
     --ts-keyword:     var(--ts-red);
     --ts-string:      var(--ts-cyan);
-    --ts-escape:      var(--ts-green);
+    --ts-escape:      var(--ts-yellow);
     --ts-number:      var(--ts-purple);
     --ts-function:    var(--ts-green);
     --ts-declaration: var(--ts-green);
@@ -237,7 +237,7 @@
 .everforest .ts-keyword-operator { color: #e69875; }
 .everforest .ts-keyword-repeat { color: #e67e80; }
 .everforest .ts-keyword-return { color: #e67e80; }
-.everforest .ts-keyword-storage { color: #e69875; }
+.everforest .ts-keyword-storage { color: #e67e80; }
 .everforest .ts-keyword-type { color: #e67e80; }
 .everforest .ts-markup-emphasis { font-style: italic; }
 .everforest .ts-markup-environment { color: #83c092; }

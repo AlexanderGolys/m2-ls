@@ -242,9 +242,10 @@ pub struct InlayHintSettings {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct SemanticTokenSettings {
-    /// Only LSP-standard classifications: custom escape sequences fall back
-    /// to strings and Macaulay2-specific modifiers such as `option` and
-    /// `algebraic` are dropped. Other token types remain standard. Default `false`.
+    /// Only LSP-standard classifications: custom escapes become strings,
+    /// delimiters and punctuation become operators, algebraic modifiers become
+    /// abstract, and documentation styles become documentation. Remaining custom
+    /// modifiers are dropped. Default `false`.
     pub standard_only: bool,
     /// Which values receive `defaultLibrary`: a named policy or a list of
     /// policies and defining packages. Default `["CompiledFunction"]`.

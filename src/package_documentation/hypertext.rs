@@ -428,10 +428,10 @@ impl<'ast, N: SourceNavigation + ?Sized> Visit<'ast> for SemanticMarkup<'_, '_, 
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
-        if let Some(bytes) = self.code.content_bytes(expression) {
+        if self.code.content_bytes(expression).is_some() {
             if let Some(style) = self.enclosing.iter().rev().find_map(|f| text_style(*f)) {
                 self.markup.push(DocumentationMarkup {
-                    bytes,
+                    bytes: self.code.bytes(expression),
                     kind: DocumentationMarkupKind::Styled(style),
                 });
             }

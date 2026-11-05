@@ -23,8 +23,9 @@ has `algebraic`. A method installation keeps its `method` type and adds
   exports do not acquire protection merely by sharing a spelling.
 
 `algebraic`
-: Marks generators introduced by algebraic constructors, allowing a distinct
-  style for polynomial variables.
+: Marks ring generators and inferred nonnumeric values whose classes have
+  a known `ring` installation, including ideals, modules, and matrices.
+  Rings themselves remain `type`. See [algebraic values](semantic-highlighting.md#algebraic).
 
 `option`
 : Marks an option key. Its value retains its own token classification.
@@ -57,12 +58,24 @@ has `algebraic`. A method installation keeps its `method` type and adds
 `math`
 : Marks TeX mathematics in documentation.
 
+## Reserved modifiers
+
+`index`
+: Reserved for structural indices in known indexed generator names. It is
+  registered in the legend but currently has no emission rule; indexed
+  generators still receive their existing combined spans.
+
+`abstract`, `nonsense`
+: `abstract` is standard LSP vocabulary and the standard-only fallback for
+  `algebraic` and `nonsense`. The custom companion `nonsense` has no
+  automatic emission rule.
+
 ## Editor support and configuration
 
-`declaration`, `defaultLibrary`, `readonly`, and `documentation` are standard
-LSP modifiers. The others are Macaulay2-specific extensions. Setting
-`semanticTokens.standardOnly = true` retains only the four standard modifiers;
-ordinary semantic token types remain available.
+`declaration`, `defaultLibrary`, `readonly`, `documentation`, and `abstract`
+are standard LSP modifiers. The remaining modifiers are extensions.
+Compatibility mode maps some extensions to standard modifiers and removes
+others; consult the complete [standard-only mapping](semantic-highlighting.md#standard-only).
 
 Modifiers combine with token types. In Neovim, for example,
 `@lsp.typemod.variable.algebraic.macaulay2` styles algebraic variables, while

@@ -3562,10 +3562,7 @@ async fn documentation_strings_highlight_their_code_as_what_it_names() {
     let token_type =
         |needle: &str, occurrence: usize| token_at(&tokens, source, needle, occurrence).0;
 
-    assert_eq!(
-        token_type("Key", 0),
-        session.semantic_token_type("decorator")
-    );
+    assert_eq!(token_type("Key", 0), session.semantic_token_type("keyword"));
     assert_eq!(
         token_type("bar, ZZ", 0),
         session.semantic_token_type("method")
@@ -3593,7 +3590,7 @@ async fn documentation_strings_highlight_their_code_as_what_it_names() {
         session.semantic_token_type("parameter")
     );
     assert_eq!(
-        token_type("Foo\"@", 0),
+        token_type("\"Foo\"@", 0),
         session.semantic_token_type("namespace")
     );
     assert_eq!(token_type("Baz@", 0), session.semantic_token_type("type"));
@@ -3702,7 +3699,7 @@ async fn simple_doc_prose_reads_its_tex_markup_and_the_string_is_documentation()
     assert_eq!(
         token_at(&tokens, source, "Text", 0),
         (
-            session.semantic_token_type("decorator"),
+            session.semantic_token_type("keyword"),
             session.semantic_token_modifier("documentation")
         ),
         "a part of a section is a section keyword like any other"
@@ -3783,12 +3780,12 @@ async fn documentation_markup_marks_delimiters_links_and_option_keys() {
         "styled text stays text"
     );
     assert_eq!(token("TT", 0).0, macro_type);
-    assert_eq!(token("mono", 0), (string, documentation | monospace));
+    assert_eq!(token("\"mono\"", 0), (string, documentation | monospace));
     for occurrence in [0, 1] {
         assert_eq!(token("TO area", occurrence).0, decorator, "a link is a tag");
     }
     let (keyword_type, keyword_modifiers) = token("Example", 0);
-    assert_eq!(keyword_type, decorator);
+    assert_eq!(keyword_type, session.semantic_token_type("keyword"));
     assert_eq!(
         keyword_modifiers & example,
         0,
@@ -4560,6 +4557,46 @@ async fn dominant_method_codomains_suggest_a_typical_value() {
             session.save().await;
             assert!(!session.diagnostic_codes().contains(&"S07"));
         }
+    }
+    session.shutdown().await;
+}
+
+/// Loaded type bindings classify identically in source and documentation references.
+#[tokio::test]
+async fn loaded_types_keep_their_code_classification_in_documentation() {
+    let source = r#"newPackage "DocTypes"
+export {"Block", "Inline"}
+load "related.m2"
+Block
+Inline
+beginDocumentation()
+doc ///
+Key
+  Block
+Description
+  Text
+    See @TO Block@ and @TO Inline@.
+///
+"#;
+    let mut session = DocumentSession::open_with_related(
+        source,
+        "Meta = new Type of SelfInitializingType\nBlock = new Type of BasicList\nInline = new Meta of Block\n",
+    )
+    .await;
+    let tokens = semantic_tokens(&mut session).await;
+    let expected = session.semantic_token_type("type");
+    for (needle, occurrence) in [
+        ("Block\n", 0),
+        ("Inline\n", 0),
+        ("Block\n", 1),
+        ("Block@", 0),
+        ("Inline@", 0),
+    ] {
+        assert_eq!(
+            token_at(&tokens, source, needle, occurrence).0,
+            expected,
+            "{needle}"
+        );
     }
     session.shutdown().await;
 }

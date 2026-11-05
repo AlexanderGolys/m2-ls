@@ -694,3 +694,19 @@ async fn unavailable_catalog_uses_installed_package_sources() {
         server.shutdown().await;
     }
 }
+
+/// Loading definitions invalidates tokens a client may have requested before indexing finished.
+#[tokio::test]
+async fn loading_type_definitions_refreshes_semantic_tokens() {
+    let source = "load \"types.m2\"\nLoadedType\n";
+    let workspace = TestWorkspace::new(source);
+    workspace.write_file("types.m2", "LoadedType = new Type of BasicList\n");
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    server.open_document(&workspace.uri, source).await;
+    assert!(server
+        .server_requests
+        .iter()
+        .any(|method| method == "workspace/semanticTokens/refresh"));
+    server.shutdown().await;
+}

@@ -262,7 +262,10 @@ should use the groups above.
 ## Semantic tokens { #semantic-tokens }
 
 `semanticTokens.standardOnly` (boolean, default `false`)
-: Drop custom modifiers and emit pattern escape sequences as `string`, retaining standard token types and modifiers.
+: Emit standard LSP vocabulary: map pattern escapes to `string`, embedded
+  delimiters and punctuation to `operator`, algebraic values to `abstract`,
+  and documentation styles and examples to `documentation`. Other custom
+  modifiers are removed. See the [complete fallback table](../reading/semantic-highlighting.md#standard-only).
   This does not disable [semantic highlighting](../reading/semantic-highlighting.md).
 
 `semanticTokens.defaultLibrary` (array of selectors, default `["CompiledFunction"]`)

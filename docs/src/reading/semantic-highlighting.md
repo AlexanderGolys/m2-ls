@@ -19,7 +19,9 @@ needsPackage "JSON"               -- "JSON" namespace
 load "lib/helper.m2"              -- "lib/helper.m2" namespace
 ```
 
-Most tokens use standard LSP types. Pattern escapes use the custom
+Most tokens use standard LSP types. Embedded code uses custom `delimiter`
+and `punctuation` types for group boundaries and separators, both falling
+back to `operator` under `standardOnly`. Pattern escapes use the custom
 `escapeSequence` type; a theme can style this separately. The finer Macaulay2 distinctions travel as
 modifiers, which a theme may style when it wants to.
 
@@ -39,16 +41,18 @@ the second column — that is the name your editor and theme see.
 | Namespace | `namespace` | a package, including package names in strings, and the file a `load`, `needs` or `input` call runs | `Core`, `"JSON"` in `needsPackage "JSON"`, `"lib/helper.m2"` in `load "lib/helper.m2"` |
 | Symbol | `enumMember` | a name used as a `Symbol` rather than for its value | `Strategy`, `Linear`, `g` in `symbol g` |
 | Domain or codomain | `typeParameter` | the types an installation is made on and returns | `Matrix`, `ZZ` in `area Matrix := ZZ => …` |
-| Annotation | `decorator` | a SimpleDoc section keyword, a `document` option name, or a documentation link | `Key`, `Headline`, `TO` |
+| Annotation | `decorator` | a documentation link | `TO`, `TOH`, `TO2` |
 | Markup | `macro` | markup around documentation text | `{\tt`, `}`, `PARA`, `TT` |
 | Modifier keyword | `modifier` | the quoting keywords | `symbol`, `local`, `global`, `threadVariable` |
-| Keyword | `keyword` | language keywords | `if`, `then`, `for`, `TEST` |
+| Keyword | `keyword` | language keywords, SimpleDoc section keywords, and document option names | `if`, `then`, `for`, `TEST`, `Key`, `Description` |
 | String | `string` | string literals | `"done"`, `///…///` |
 | Regular expression | `regexp` | special syntax within literal patterns of `match`, `regex`, `replace`, `select`, and `separate`; delimiters and plain text stay `string` | `+` in `replace(///a+///, "b", text)` |
 | Escape sequence | `escapeSequence` | escaped characters in patterns, retaining their source spelling | `\d`, `\.`, `\\d` in quoted strings |
 | Number | `number` | integer and float literals | `2`, `0.5` |
 | Operator | `operator` | operators | `=`, `:=`, `->`, `<<`, `_` |
 | Comment | `comment` | comments | `-- note` |
+| Delimiter | `delimiter` | group boundaries in embedded documentation code | `(`, `)`, `[`, `]`, `{`, `}` |
+| Punctuation | `punctuation` | separators in embedded documentation code | `,`, `;` |
 
 Macaulay2 does not separate classes from types, so neither does highlighting:
 there is no `class` token, only `type`.
@@ -85,7 +89,7 @@ makes `area` a method, `twice = n -> …` a function.
 | `defaultLibrary` | <i class="fa-solid fa-check"></i> | a value selected by `semanticTokens.defaultLibrary` | by default, compiled functions such as `apply` and `scan` |
 | `readonly` | <i class="fa-solid fa-check"></i> | a binding protected from reassignment, independently of value mutability | `ZZ`, a protected package export |
 | `documentation` | <i class="fa-solid fa-check"></i> | inside documentation: a `doc` string, a `document` call, a [documentation comment](../beyond/documentation-comments.md) | everything inside `doc ///…///` |
-| `algebraic` | | a generator made by an algebraic constructor | `x`, `y` in `QQ[x, y]` |
+| `algebraic` | | a ring generator or a known nonnumeric value living over a ring | `x`, an ideal, a module, a matrix |
 | `option` | | an option key | `Strategy` in `Strategy => Linear` |
 | `access` | | an operator selecting a part of its left operand | `_` in `S_1`, `.`, `.?`, binary `#` and `#?` |
 | `example` | | code run as a documentation example | the lines under `Example` |
@@ -95,6 +99,9 @@ makes `area` a method, `twice = n -> …` a function.
 | `monospace` | | monospace documentation text | `{\tt …}`, `TT`, `CODE`, a `Pre` block |
 | `link` | | the address of a link | `\url{…}`, `HREF` |
 | `math` | | TeX mathematics | `$x^2$` |
+| `abstract` | <i class="fa-solid fa-check"></i> | standard fallback for `algebraic` and `nonsense`; otherwise reserved | `variable+abstract` in standard-only mode |
+| `index` | | reserved for structural indices in known indexed generator names; currently not emitted | no source spans yet |
+| `nonsense` | | reserved companion to `abstract`; currently not emitted | no source spans yet |
 
 The complete list of `defaultLibrary` policies and their alias behavior is in
 [Configuration](../getting-started/configuration.md#semantic-tokens). The
@@ -102,11 +109,55 @@ compiled policies describe the value; package policies describe the binding's
 origin. `readonly` independently describes symbol protection. Local aliases and
 shadows remain assignable, and `exportMutable` names remain unmarked.
 
-With [`semanticTokens.standardOnly`](../getting-started/configuration.md#semantic-tokens)
-only the four standard modifiers are sent, and `escapeSequence` falls back to
-`string`. The former `command`, `file`,
-`mutable`, and `unresolved` modifiers are not emitted. Unbound expression names
-use `variable`.
+## Standard-only compatibility { #standard-only }
+
+By default the full vocabulary is available to themes. Enable
+[`semanticTokens.standardOnly`](../getting-started/configuration.md#semantic-tokens)
+when your editor or theme needs standard LSP classifications. The legend stays
+stable; emitted tokens use these fallbacks:
+
+| Full vocabulary | Standard-only output |
+| --- | --- |
+| `escapeSequence` type | `string` |
+| `delimiter`, `punctuation` types | `operator` |
+| All other token types | unchanged |
+| `algebraic`, `nonsense` modifiers | `abstract` |
+| `example`, `strong`, `emphasis`, `monospace`, `link`, `math` modifiers | `documentation` |
+| `option`, `access`, `index`, `test` modifiers | removed |
+| `declaration`, `defaultLibrary`, `readonly`, `documentation`, `abstract` modifiers | unchanged |
+
+Fallbacks combine without duplicating modifiers: a
+`string+documentation+monospace` token becomes `string+documentation`.
+An ideal classified as `variable+algebraic` becomes `variable+abstract`.
+Compatibility mode sacrifices visual distinctions; it does not change name
+resolution or type inference.
+
+
+## Algebraic values { #algebraic }
+
+Rings are type objects; their elements and the objects built over them are
+values. Highlighting preserves that distinction:
+
+```m2
+R = QQ[x, y]
+I = ideal(x^2, y)
+S = R/I
+M = S^2
+A = matrix {{x, y}}
+f = x^2 + y
+n = 3
+```
+
+Here `R` and `S` receive `type`. The inferred ideal `I`, module `M`,
+matrix `A`, polynomial `f`, and generators `x` and `y` receive
+`variable+algebraic`. Their binding introductions also carry `declaration`.
+The numeric binding `n` remains a plain variable.
+
+For known inferred classes, `algebraic` means that the catalog records an
+installation of `ring` on that class or an ancestor. Numbers are excluded,
+and type classification takes precedence. This supports package-defined
+objects too, provided their type and `ring` installations are known.
+Incomplete inference can leave a value as an ordinary variable.
 
 ## Subscripts { #subscripts }
 
@@ -140,7 +191,7 @@ export {"double"}               -- "double" colored as the function it exports
 exportMutable {"verbosity"}     -- "verbosity" variable, without readonly
 beginDocumentation()
 doc ///
-Key                             -- decorator+documentation
+Key                             -- keyword+documentation
   double                        -- function+documentation
 Headline
   doubles a number              -- string+documentation+strong
@@ -158,6 +209,31 @@ so its names resolve against the package exactly as they would when the tests
 run. A plain variable named inside a string keeps the string's color instead of
 dropping to the default text color.
 
+SimpleDoc section names such as `Key`, `Description`, and `Example`
+receive `keyword+documentation`. Hypertext link constructors such as `TO`
+receive `decorator+documentation`; formatting constructors such as `TT`
+receive `macro+documentation`. Both `@` delimiters of an inline expression
+and the delimiters of TeX formatting receive markup tokens.
+
+Quoted documentation references and styled strings include their quotation
+marks in the highlight. For example, `TO "Matrix"` resolves the name
+`Matrix`, but colors the entire `"Matrix"` literal as a type; `TT "code"`
+marks the entire literal as `string+monospace`. TeX formatting such as
+`{\tt code}` keeps its markup delimiters separate from its styled content.
+
+Embedded code includes its group boundaries as `delimiter` and its commas
+and semicolons as `punctuation`. These are emitted even when the editor
+already highlights ordinary source syntax.
+
+In `CannedExample` transcripts, `i1 :` prompts remain text while their
+input bodies receive code tokens. An `o1 =` output and its continuation lines
+remain text until the next input prompt.
+
+References use local, catalog, and workspace information, including loaded
+files. A supported client receives a semantic-token refresh after loaded-file
+indexing finishes, replacing classifications requested before those definitions
+were available.
+
 ## Syntax tokens and your editor's highlighter { #syntax }
 
 Keywords, strings, numbers, operators and comments are also sent as tokens,
@@ -173,7 +249,7 @@ sent, so the code inside them is colored.
 When several facts apply to one name, the most specific one wins:
 
 1. **Its role in the source** — a ring generator, the domain or codomain of an
-   installation, an option key or value, a quoted name after `symbol`, a
+   installation, an option key, a quoted name after `symbol`, a
    package name, an access operator or the literal it selects with.
 2. **A local binding**, by its inferred type: a parameter, a method function,
    a type.
@@ -186,8 +262,8 @@ An installation head keeps the token its object has elsewhere and adds
 
 ## Fine print
 
-- A function used as an `if` or `while` condition is shown as a plain variable
-  : it is a value there, not a call.
+- A function used as an `if` or `while` condition is shown as a plain variable:
+  it is a value there, not a call.
 - A local `n := 5` is a variable, never a number — literal types do not leak
   into names.
 - The `option` modifier applies to keys only; values retain their ordinary
@@ -211,9 +287,15 @@ link('@lsp.mod.readonly.macaulay2', '@constant')
 link('@lsp.mod.defaultLibrary.macaulay2', '@function.builtin')
 link('@lsp.type.typeParameter.macaulay2', '@type.definition')
 link('@lsp.type.decorator.macaulay2', '@attribute')
+link('@lsp.type.delimiter.macaulay2', '@punctuation.bracket')
+link('@lsp.type.punctuation.macaulay2', '@punctuation.delimiter')
+link('@lsp.type.escapeSequence.macaulay2', '@string.escape')
 ```
 
-`:Inspect` on a name lists the groups applied to it.
+`:Inspect` on a name lists the groups applied to it. A modifier can be present
+without a visible style: themes need their own bold, italic, or foreground
+settings for custom documentation modifiers. Apply custom groups after the
+colorscheme loads, and reapply them when switching colorschemes.
 
 Regular-expression highlighting applies to the first positional pattern argument
 of the Core functions above. Replacement and subject strings keep their string
