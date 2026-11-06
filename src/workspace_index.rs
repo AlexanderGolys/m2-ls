@@ -506,6 +506,17 @@ impl WorkspaceIndex {
         }
     }
 
+    /// The repository's sources, or none when it is too large to be a project;
+    /// the refusal is recorded in telemetry.
+    fn scanned(root: &Path) -> Vec<Url> {
+        RepositorySources::files(root).unwrap_or_else(|refusal| {
+            crate::telemetry::event(serde_json::json!({
+                "operation": "repository_scan_refused", "message": refusal.to_string(),
+            }));
+            Vec::new()
+        })
+    }
+
     /// Discovers a repository once, so opening an included file also discovers
     /// its unopened package entry point and siblings. Open buffers remain authoritative.
     pub fn repository_files(&self, file: &Url, folders: &[PathBuf]) -> Vec<Url> {
@@ -515,13 +526,13 @@ impl WorkspaceIndex {
         if !self.discovered_repositories.insert(root.clone()) {
             return Vec::new();
         }
-        RepositorySources::files(&root)
+        Self::scanned(&root)
     }
 
     /// Source files newly created below a workspace path, including a package
     /// entry point that no open fragment explicitly imports.
     pub fn sources_under(&self, path: &Path) -> Vec<Url> {
-        RepositorySources::files(path)
+        Self::scanned(path)
     }
 
     /// Reconstructs package ownership through load edges after all files have

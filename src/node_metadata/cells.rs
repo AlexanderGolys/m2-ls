@@ -143,10 +143,13 @@ impl ParsedCell {
                     Ok(syntax) => {
                         let mut cells = syntax.cells.into_iter();
                         data.syntax = cells.next();
-                        assert!(
-                            cells.next().is_none(),
-                            "a framed source slice must contain at most one cell"
-                        );
+                        if let Some(surplus) = cells.next() {
+                            data.parse_error = Some(NativeParseError::Unexpected {
+                                found: "an additional cell".into(),
+                                expected: "at most one cell in a framed source slice",
+                                span: surplus.span(),
+                            });
+                        }
                         if let Some(cell) = &data.syntax {
                             data.file = Some(cell.span().file());
                         }
