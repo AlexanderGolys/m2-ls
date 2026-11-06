@@ -27,7 +27,7 @@ For example, in Neovim:
 vim.lsp.config('m2_ls', {
   cmd = { 'm2-ls' },
   filetypes = { 'macaulay2' },
-  root_markers = { '.git' },
+  root_markers = { 'M2LS.toml', '.git' },
   settings = {
     ['m2-ls'] = {
       inlayHints = {
@@ -39,17 +39,34 @@ vim.lsp.config('m2_ls', {
 })
 ```
 
-Each message replaces the complete configuration: omitted fields return to
-their defaults. The settings apply to that server instance. Changes republish
-diagnostics, rebuild source/session knowledge where needed, and request hint
-and token refreshes when the editor supports them. Formatting uses the new
-settings on its next request.
+Settings are merged in this order, with later values taking precedence:
 
-No project or global settings file is automatically discovered. The standalone
-[`m2-fmt` and `m2-lint`](../beyond/command-line.md#settings) read TOML files with
-`--config settings.toml`, or JSON files with `--config settings.json`. TOML
-uses the same groups without an outer `m2-ls` table. The editor still sends
-JSON objects through the language-server protocol.
+1. Global `~/.m2-ls/M2LS.toml`.
+2. `M2LS.toml` in the editor's workspace root.
+3. Explicit settings sent by the editor.
+
+Tables merge recursively; arrays and individual values replace earlier values.
+Omitted fields use the previous layer, then the built-in defaults. Each editor
+configuration message replaces the editor layer. Project file changes reload
+settings and refresh affected diagnostics, hints, and highlighting.
+
+On macOS and Linux, the global directory is `.m2-ls` under your home directory.
+On Windows, it is `%USERPROFILE%\.m2-ls`; no `HOME` environment variable is
+required. If the operating system cannot supply a home directory, global settings
+are skipped. Local and editor settings still work.
+
+The editor chooses the workspace root. Configure `M2LS.toml` and `.git` as root
+markers; an empty `M2LS.toml` is enough to mark a project. The server uses the
+workspace folders or root URI the editor sends and does not search parent Git
+repositories itself. With several workspace roots in one server instance, the
+lexically first root supplies the shared project configuration; use separate
+server instances when projects need different settings.
+
+The standalone [`m2-fmt` and `m2-lint`](../beyond/command-line.md#settings)
+read the global file and the nearest ancestor `M2LS.toml` of the input file
+(or the current directory for stdin). `--config settings.toml` or
+`--config settings.json` adds the highest precedence layer. TOML uses the same
+groups as editor settings, without requiring an outer `m2-ls` table.
 
 ## Invalid values { #invalid }
 

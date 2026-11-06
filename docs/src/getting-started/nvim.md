@@ -15,7 +15,7 @@ vim.filetype.add({
 vim.lsp.config('m2_ls', {
   cmd = { 'm2-ls' },
   filetypes = { 'macaulay2' },
-  root_markers = { '.git' },
+  root_markers = { 'M2LS.toml', '.git' },
   settings = {
     ['m2-ls'] = {
       inlayHints = { types = { after = { call = true } } },

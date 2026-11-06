@@ -80,6 +80,7 @@ next.
 | `E19` | `manual-type-dispatch` | warning | repeated `instance(x, Class)` tests of the same function parameter against distinct named classes with at least two non-error branches in an `if` / `else if` chain; consider method specializations |
 | `E20` | `list-record-shape` | warning | a list-family `instance` check combined with a fixed length above one; consider a hash-table-based record type |
 | `E21` | `float-key` | error | a floating-point key or index, including a key inferred to have floating-point type; approximate equality makes lookup unreliable |
+| `E22` | `unresolved-value` | error | an unbound callable, constructor type, Boolean operand or condition, or indexed receiver; declare or explicitly import the value |
 | `T01` | `parallel-assignment-type` | error | `(a, b) = 5` |
 | `T02` | `condition-type` | warning | an `if` or `while` condition known not to be `Boolean` |
 | `T03` | `install-codomain-missing` | hint | an installation other than `new` without a codomain that inference can deduce; fix: insert `ZZ =>` |
@@ -104,6 +105,9 @@ next.
 | `S16` | `simplifiable-if-condition` | hint | an `if` condition with an invertible comparison or cancellable double negation |
 | `S17` | `flattenable-if-chain` | hint | nested conditionals that can become an `else if` chain |
 | `S18` | `partial-application-lambda` | hint | `y -> f(x, y)` expressible as `f_x`, with a fixed symbol as the first argument |
+| `S19` | `self-initializing-constructor` | hint | `new T from value` expressible as `T value` for a known `SelfInitializingType` |
+| `S20` | `header-constructor` | hint | `new T from values` expressible as `T values` for a known `HeaderType`, with List or Sequence input |
+| `S21` | `wrapper-constructor` | hint | `new T from values` expressible as `T values` for a known `WrapperType`, with List or Sequence input |
 | `D01` | `unknown-documentation-section` | error | a SimpleDoc keyword or `document` option that does not exist there |
 | `D02` | `malformed-documentation` | error | documentation SimpleDoc or `document` rejects: a repeated section, a multi-line headline, `Inputs` without `Usage`, … |
 | `D03` | `missing-documentation-key` | error | a documentation page without a `Key` |
@@ -300,3 +304,16 @@ installations count toward the total but not toward the annotated majority.
 Inferred codomains do not count as explicit annotations. Reinstalling a domain
 counts only its effective installation. A declaration already specifying a
 `TypicalValue` receives no hint. This whole-document hint is refreshed on save.
+
+## Resolved values and symbolic names
+
+`E22` requires a definition where syntax needs a value: the function in a call,
+the class after `new`, a bare `if`/`while` condition, a Boolean operand, or the
+receiver of indexed access. Parameters and declared values remain valid even
+when their types are unknown. Option keys, enum-like symbols, and quoted symbols
+do not become missing-value errors.
+
+Package fragments use their declared package's include order, rather than an
+arbitrary caller's globals. See [package context](../navigating/workspace-files.md#package-context).
+An unresolved use is an error even though the runtime can initially represent
+an unknown name as a Symbol.

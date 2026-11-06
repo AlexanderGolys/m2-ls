@@ -137,6 +137,18 @@ FLOAT_KEY {
         severity: ERROR,
     }
 
+    /// A required callable, type, receiver, or condition has no binding in the
+    /// declared environment. An intentional symbol is valid outside these slots.
+    ///
+    /// ```m2
+    /// missingFunction 1
+    /// ```
+UNRESOLVED_VALUE {
+        code: "E22",
+        name: "unresolved-value",
+        severity: ERROR,
+    }
+
     /// A type, function, or local binding does not follow its naming convention.
     /// Types use PascalCase or uppercase; functions and locals use camelCase.
     /// Function parameters are exempt because they may stand for types.
@@ -316,6 +328,43 @@ FLATTENABLE_IF_CHAIN {
 PARTIAL_APPLICATION_LAMBDA {
         code: "S18",
         name: "partial-application-lambda",
+        severity: HINT,
+    }
+
+    /// A self-initializing type can be called directly to initialize an instance.
+    ///
+    /// ```m2
+    /// Node = new SelfInitializingType of List
+    /// new Node from {1, 2}
+    /// ```
+SELF_INITIALIZING_CONSTRUCTOR {
+        code: "S19",
+        name: "self-initializing-constructor",
+        severity: HINT,
+    }
+
+    /// A header type accepts list or sequence initialization through call syntax.
+    ///
+    /// ```m2
+    /// Node = new HeaderType of List
+    /// new Node from {1, 2}
+    /// ```
+HEADER_CONSTRUCTOR {
+        code: "S20",
+        name: "header-constructor",
+        severity: HINT,
+    }
+
+    /// A wrapper type accepts list or sequence initialization through call syntax.
+    /// Scalar shorthand instead wraps the input and is not the same rewrite.
+    ///
+    /// ```m2
+    /// Node = new WrapperType of List
+    /// new Node from {1, 2}
+    /// ```
+WRAPPER_CONSTRUCTOR {
+        code: "S21",
+        name: "wrapper-constructor",
         severity: HINT,
     }
 

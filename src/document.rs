@@ -239,6 +239,17 @@ impl DocumentSnapshot {
         knowledge_provider: &ObjectRegistry,
         implied_properties: FileProperties,
     ) -> Option<Self> {
+        Self::from_text_in_namespace(text, knowledge_provider, implied_properties, None)
+    }
+
+    /// Parses source while retaining declaration identities when only its
+    /// environment changed. A changed syntax revision uses a new namespace.
+    pub fn from_text_in_namespace(
+        text: String,
+        knowledge_provider: &ObjectRegistry,
+        implied_properties: FileProperties,
+        namespace: Option<u64>,
+    ) -> Option<Self> {
         let source = DocumentSource::new(text);
         let mut parsing = crate::telemetry::Timing::start(
             "document.parse",
@@ -256,6 +267,7 @@ impl DocumentSnapshot {
             Vec::new(),
             true,
             implied_properties,
+            namespace,
         ))
     }
 
@@ -282,6 +294,7 @@ impl DocumentSnapshot {
             Vec::new(),
             false,
             FileProperties::default(),
+            None,
         ))
     }
 
@@ -298,6 +311,7 @@ impl DocumentSnapshot {
         previous_sessions: Vec<PackageSession>,
         full: bool,
         implied_properties: FileProperties,
+        namespace: Option<u64>,
     ) -> Self {
         let mut source = source;
         source.register_syntax(&tree);
@@ -315,7 +329,12 @@ impl DocumentSnapshot {
             "document.analysis",
             serde_json::json!({"source_bytes": source.text().len(), "full": full}),
         );
-        let analysis = Analysis::new_with_knowledge(typed_ast, &source, &knowledge);
+        let analysis = match namespace {
+            Some(namespace) => {
+                Analysis::new_in_namespace(typed_ast, &source, &knowledge, Some(namespace))
+            }
+            None => Analysis::new_with_knowledge(typed_ast, &source, &knowledge),
+        };
         drop(analysis_timing);
         let documentation_timing = crate::telemetry::Timing::start(
             "document.documentation",
@@ -403,7 +422,9 @@ impl DocumentSnapshot {
             previous_sessions: Mutex::new(previous_sessions),
             // `check` and `installPackage` run the code with `-q`, which
             // skips the init file.
-            session_knowledge: knowledge_provider.without_init_file(),
+            session_knowledge: knowledge_provider
+                .without_init_file()
+                .without_source_context(),
         };
         if full {
             let _timing = crate::telemetry::Timing::start(
@@ -431,7 +452,18 @@ impl DocumentSnapshot {
                 .clone()
         });
         let implied_properties = self.implied_properties;
-        move || Self::analyze(source, tree, &knowledge, previous, true, implied_properties)
+        let namespace = Some(self.analysis.source_namespace());
+        move || {
+            Self::analyze(
+                source,
+                tree,
+                &knowledge,
+                previous,
+                true,
+                implied_properties,
+                namespace,
+            )
+        }
     }
 
     /// Analyze the document again if its location now implies other
@@ -453,6 +485,7 @@ impl DocumentSnapshot {
             previous_sessions,
             true,
             implied_properties,
+            Some(self.analysis.source_namespace()),
         );
         true
     }
@@ -462,7 +495,9 @@ impl DocumentSnapshot {
     /// when its directive or the settings select another, or the file
     /// changed. Returns whether it was analyzed again.
     pub fn restart_session(&mut self, knowledge_provider: &ObjectRegistry) -> bool {
-        if knowledge_provider.init_file() == self.object_registry.init_file() {
+        if knowledge_provider.init_file() == self.object_registry.init_file()
+            && knowledge_provider.same_source_context(&self.object_registry)
+        {
             return false;
         }
         let previous_sessions = self.take_sessions();
@@ -473,6 +508,7 @@ impl DocumentSnapshot {
             previous_sessions,
             true,
             self.implied_properties,
+            Some(self.analysis.source_namespace()),
         );
         true
     }
@@ -530,6 +566,7 @@ impl DocumentSnapshot {
                 Vec::new(),
                 true,
                 implied_properties,
+                None,
             );
             return Some(());
         }
@@ -565,6 +602,7 @@ impl DocumentSnapshot {
             previous_sessions,
             false,
             implied_properties,
+            None,
         );
         self.diagnostics.extend(retained);
         Some(())

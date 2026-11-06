@@ -1173,9 +1173,29 @@ impl Analysis {
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl PositionedTypeKnowledge + ?Sized),
     ) -> Self {
+        Self::new_in_namespace(syntax, source, knowledge, None)
+    }
+
+    /// Identity namespace for declarations of this syntax revision. Context-only
+    /// reanalysis retains it so importing files keep referring to the same objects.
+    pub fn source_namespace(&self) -> u64 {
+        self.registry.source_types.namespace
+    }
+
+    /// Analyzes a syntax revision using an existing declaration namespace, or
+    /// allocates one for new syntax when `namespace` is absent.
+    pub fn new_in_namespace(
+        syntax: &SyntaxSnapshot,
+        source: &(impl SourceNavigation + ?Sized),
+        knowledge: &(impl PositionedTypeKnowledge + ?Sized),
+        namespace: Option<u64>,
+    ) -> Self {
         let mut analysis = Analysis {
             registry: SemanticRegistry::default(),
         };
+        if let Some(namespace) = namespace {
+            analysis.registry.source_types.namespace = namespace;
+        }
         let source = crate::source::SyntaxNavigation::new(source, syntax);
         let bindings_timing = crate::telemetry::Timing::start(
             "analysis.bindings",

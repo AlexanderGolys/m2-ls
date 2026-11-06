@@ -18,6 +18,7 @@ impl Workspace {
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
+        fs::write(path.join("M2LS.toml"), "").unwrap();
         Self(path)
     }
 
@@ -28,6 +29,7 @@ impl Workspace {
             .args(args)
             .current_dir(&self.0)
             .env("HOME", &self.0)
+            .env("USERPROFILE", &self.0)
             .env(
                 "M2_LS_CATALOG",
                 m2_ls::catalog::CatalogSource::current()
@@ -350,4 +352,42 @@ fn grouped_toml_configuration_controls_formatting_and_diagnostic_emission() {
         !String::from_utf8_lossy(&hidden.stdout).contains("unused-binding"),
         "{hidden:?}"
     );
+}
+
+/// Global defaults, nearest project settings, and explicit options form overlays.
+#[test]
+fn automatic_configuration_respects_overlay_precedence() {
+    let workspace = Workspace::new();
+    fs::create_dir(workspace.0.join(".m2-ls")).unwrap();
+    fs::write(
+        workspace.0.join(".m2-ls/M2LS.toml"),
+        "[diagnostics]\nenabled = false\n",
+    )
+    .unwrap();
+    let source = "missingFunction 1\n";
+    let global = workspace.run(LINT, &["-"], source);
+    assert!(global.status.success(), "{global:?}");
+    assert!(global.stdout.is_empty());
+    fs::write(
+        workspace.0.join("M2LS.toml"),
+        "[diagnostics]\nenabled = true\n",
+    )
+    .unwrap();
+    let local = workspace.run(LINT, &["-"], source);
+    assert_eq!(local.status.code(), Some(1), "{local:?}");
+    assert!(
+        String::from_utf8_lossy(&local.stdout).contains("E22"),
+        "{local:?}"
+    );
+    fs::write(
+        workspace.0.join("explicit.toml"),
+        "[diagnostics]\nenabled = false\n",
+    )
+    .unwrap();
+    let explicit = workspace.run(LINT, &["--config", "explicit.toml", "-"], source);
+    assert!(explicit.status.success(), "{explicit:?}");
+    fs::write(workspace.0.join("M2LS.toml"), "not valid [toml").unwrap();
+    let invalid = workspace.run(LINT, &["-"], source);
+    assert_eq!(invalid.status.code(), Some(2), "{invalid:?}");
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("M2LS.toml"));
 }

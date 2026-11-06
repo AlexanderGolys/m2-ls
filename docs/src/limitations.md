@@ -15,11 +15,12 @@ that also sets its boundary.
   source, found next to `M2` or configured in `sources.packagePaths`; without it, the
   rest of the package knowledge remains available. Functions compiled into
   Macaulay2 have no source definition, so jumps to them return nothing.
-- **The workspace is what your files load.** Cross-file navigation, search and
-  rename cover the open files, what they `load`/`needs`/`input`, the user
-  packages they import, and `init.m2` — not every `.m2` file below the project
-  root. A file nothing opens or loads stays invisible, except that moving a
-  file also edits the loads in the workspace folders that mention it.
+- **Discovery and visibility differ.** The server indexes repository `.m2`
+  files below the editor's workspace roots, alongside explicit dependencies and
+  initialization files. A definition in an unrelated file does not enter your
+  environment. Package fragments inherit earlier loader bindings; ordinary
+  fragments need explicit dependencies. Computed imports and contradictory
+  package contexts may leave a value unresolved.
 - **Incomplete syntax reduces context.** While a construct is half typed, some
   semantic features may temporarily disappear and return when its shape is
   recognizable again.

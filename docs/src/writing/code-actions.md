@@ -114,6 +114,23 @@ Each rule can be disabled independently. For example,
 `-- m2-ls: disable forwarding-lambda` silences `S14` while keeping
 `partial-application-lambda` (`S18`) enabled.
 
+**Use self-initializing constructor call** — `S19`
+: `new T from value` → `T value`, when the metaclass is known to inherit from
+  `SelfInitializingType`, including source-defined metaclasses.
+
+**Use header constructor call** — `S20`
+: The same shorthand for a known `HeaderType`, with List or Sequence input.
+
+**Use wrapper constructor call** — `S21`
+: The same shorthand for a known `WrapperType`, with List or Sequence input.
+  Scalar input keeps `new`: calling a wrapper with a scalar introduces a list
+  around it and can change its contents.
+
+These are three independent hints. Parentheses preserve the argument and the
+surrounding expression's precedence. Constructions with an explicit `of`
+clause keep their original form. Review custom call-method overrides: a custom
+metaclass can normalize the argument differently from direct `new` construction.
+
 **Simplify try** — `S15`
 : `try value then value` → `try value`;
   `try value then result else null` → `try value then result`.

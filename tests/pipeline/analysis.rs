@@ -524,6 +524,7 @@ async fn method_codomains_use_type_annotations_and_all_known_types_are_configura
 #[tokio::test]
 async fn control_flow_conditions_require_booleans_without_function_coloring() {
     let source = concat!(
+        "load \"related.m2\"\n",
         "while i do 2;\n",
         "while i == 0 do 2;\n",
         "while i(0) do 2;\n",
@@ -555,7 +556,7 @@ async fn control_flow_conditions_require_booleans_without_function_coloring() {
         token_at(&tokens, source, "callable", 1).0,
         session.semantic_token_type("variable")
     );
-    assert_eq!(diagnostic_lines(&session, "T02"), vec![0, 6, 7, 10, 12]);
+    assert_eq!(diagnostic_lines(&session, "T02"), vec![1, 7, 8, 11, 13]);
 
     session.shutdown().await;
 }
@@ -705,6 +706,7 @@ async fn compiled_function_aliases_keep_compiled_but_not_binding_protection() {
 #[tokio::test]
 async fn default_library_policies_refresh_without_reopening_the_document() {
     let source = concat!(
+        "needsPackage \"UserPkg\"\n",
         "needsPackage \"Graphs\"\n",
         "needsPackage \"UserPkg\"\n",
         "alias = scan\n",
@@ -2581,6 +2583,7 @@ async fn type_definitions_and_method_implementations_use_analysis_facts() {
 #[tokio::test]
 async fn implementations_are_workspace_scoped_method_installations_or_lambda_assignments() {
     let source = concat!(
+        "load \"related.m2\"\n",
         "p = method()\n",
         "p(ZZ) := x -> x\n",
         "p(QQ) := x -> x\n",
@@ -2604,7 +2607,7 @@ async fn implementations_are_workspace_scoped_method_installations_or_lambda_ass
         "ideal\n",
     );
     let related = concat!(
-        "workspaceLambda := (x -> x)\n",
+        "workspaceLambda = (x -> x)\n",
         "workspaceMethod = method()\n",
         "workspaceMethod(ZZ) := x -> x\n",
         "p(RR) := x -> x\n",
@@ -2691,7 +2694,7 @@ async fn implementations_are_workspace_scoped_method_installations_or_lambda_ass
 
 #[tokio::test]
 async fn workspace_method_declarations_validate_live_unresolved_installations() {
-    let source = "p(ZZ) := x -> x\np\n";
+    let source = "load \"related.m2\"\np(ZZ) := x -> x\np\n";
     let mut session = DocumentSession::open_with_related(source, "p = method()\n").await;
 
     let implementation = session
@@ -5077,6 +5080,47 @@ Description
             expected,
             "{needle}"
         );
+    }
+    session.shutdown().await;
+}
+
+/// Constructor families have independent diagnostic codes and precedence-safe edits.
+#[tokio::test]
+async fn constructor_shorthand_has_one_rule_per_metaclass() {
+    let source = concat!(
+        "SelfNode = new SelfInitializingType of List\n",
+        "HeaderNode = new HeaderType of List\n",
+        "WrapperNode = new WrapperType of List\n",
+        "new SelfNode from {1, 2}\n",
+        "new HeaderNode from {1, 2}\n",
+        "new WrapperNode from (1, 2)\n",
+        "new WrapperNode from 1\n",
+        "new HeaderNode from 1\n",
+        "new List from {1, 2}\n",
+        "new SelfNode from (1 + 2)\n",
+        "new SelfNode -- preserve this explanation\nfrom {}\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    for (code, lines) in [("S19", vec![3, 9]), ("S20", vec![4]), ("S21", vec![5])] {
+        assert_eq!(
+            diagnostic_lines(&session, code),
+            lines,
+            "{:?}",
+            session.diagnostics()
+        );
+    }
+    for (line, code, expected) in [
+        (3, "S19", "SelfNode {1, 2}"),
+        (4, "S20", "HeaderNode {1, 2}"),
+        (5, "S21", "WrapperNode (1, 2)"),
+        (9, "S19", "SelfNode (1 + 2)"),
+    ] {
+        let actions = session.request("textDocument/codeAction", json!({
+            "textDocument": {"uri": session.uri()},
+            "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 30}},
+            "context": {"diagnostics": session.diagnostics().iter().filter(|diagnostic| diagnostic["code"] == code && diagnostic["range"]["start"]["line"] == line).collect::<Vec<_>>()}
+        })).await;
+        assert!(actions.to_string().contains(expected), "{code}: {actions}");
     }
     session.shutdown().await;
 }

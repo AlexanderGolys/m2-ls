@@ -11,6 +11,40 @@ needs "./config.m2"      -- warned about if the file is not there
 input "lib/|             -- completes the .m2 files and folders of lib/
 ```
 
+## Package fragments and shared definitions { #package-context }
+
+Opening an included implementation file discovers the package entry point even
+when you have never opened it. The server indexes `.m2` files below the workspace
+root and builds their explicit import graph. Hidden directories, build output,
+and symlinked directories are excluded. Open buffers take precedence over disk.
+
+For example, a package entry point can declare its package and load its types
+before its implementation:
+
+```m2
+newPackage "Markup"
+load "Markup/types.m2"
+load "Markup/render.m2"
+endPackage "Markup"
+```
+
+`render.m2` sees the package globals declared before its include, including those
+in `types.m2`. This provides type coloring, definitions, and constructor hints
+inside the fragment. A later include does not supply earlier fragments with
+bindings. File locals declared with `:=` stay in their own file; shared package
+bindings use `=`. Exported names remain the public interface outside the package.
+
+Discovery alone does not make a name visible. A standalone file must declare its
+values or import its dependencies explicitly. A non-package caller cannot supply
+an implicit environment merely by loading a fragment. Unresolved callable, type,
+Boolean, and indexed receiver names produce [`E22`](../writing/diagnostics.md).
+Names used as symbols, such as option keys and quoted names, remain valid.
+
+If several packages include the same fragment, their contexts remain separate.
+Conflicting definitions do not acquire an arbitrarily chosen type; unresolved
+value uses remain errors. Dynamically generated imports cannot establish a
+static package environment.
+
 ## How a name is looked up { #lookup }
 
 The server looks a name up exactly as `load` does, starting from the file

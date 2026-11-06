@@ -60,7 +60,13 @@ where
         } else if let Some((package, record)) =
             knowledge.get_record_with_package(&ObjectName(name.to_string()))
         {
-            record_hover_with_package_and_usage(record, Some(&package), knowledge, None)
+            if record.callable().is_some()
+                && document.object_registry().is_source_object(&record.id)
+            {
+                workspace_symbol_hover(name, uri, workspace)?
+            } else {
+                record_hover_with_package_and_usage(record, Some(&package), knowledge, None)
+            }
         } else {
             workspace_symbol_hover(name, uri, workspace)?
         };
@@ -108,6 +114,9 @@ where
     else {
         return workspace_symbol_hover(node_text, uri, workspace);
     };
+    if record.callable().is_some() && document.object_registry().is_source_object(&record.id) {
+        return workspace_symbol_hover(node_text, uri, workspace);
+    }
     let signature_usage =
         call_signature_usage_for_hover(&hovered, node_text, document, analysis, knowledge);
     Some(record_hover_with_package_and_usage(

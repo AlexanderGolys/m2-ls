@@ -12,6 +12,69 @@ use crate::support::{document_position, position, response_array, LspProcess, Te
 
 const UNLOADABLE_FILE: &str = "E17";
 
+/// Opening a package fragment discovers its unopened entry point and earlier
+/// sibling definitions, including the metaclass required for constructor calls.
+#[tokio::test]
+async fn package_fragments_resolve_through_unopened_reverse_includes() {
+    let main = "newPackage \"ReverseContext\"\nload \"types.m2\"\nload \"impl.m2\"\nendPackage \"ReverseContext\"\n";
+    let workspace = TestWorkspace::new(main);
+    let types = workspace.write_file("types.m2", "Meta = new Type of SelfInitializingType\nMdCodeBlock = new Meta of List\nhelper = x -> x\nfileLocal := x -> x\n");
+    let source = "render = x -> MdCodeBlock {helper x}\nnew MdCodeBlock from {1, 2}\n";
+    let implementation = workspace.write_file("impl.m2", source);
+    let unrelated = workspace.write_file("unrelated.m2", "MdCodeBlock = x -> x\nMdCodeBlock 1\n");
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    let opened = server.open_document(&implementation, source).await;
+    let definition = server
+        .request(
+            "textDocument/definition",
+            document_position(&implementation, position(source, "MdCodeBlock", 0)),
+        )
+        .await;
+    assert!(
+        definition.to_string().contains(&types),
+        "missing sibling definition: {definition}"
+    );
+    let hover = server
+        .request(
+            "textDocument/hover",
+            document_position(&implementation, position(source, "MdCodeBlock", 0)),
+        )
+        .await;
+    assert!(
+        hover.to_string().contains("Meta"),
+        "constructor metaclass must be known: {hover}"
+    );
+    assert!(
+        response_array(&opened["params"]["diagnostics"])
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "S19"),
+        "constructor shorthand must see the source-defined metaclass: {opened}"
+    );
+    let references = server
+        .request(
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": implementation},
+                "position": position(source, "MdCodeBlock", 0),
+                "context": {"includeDeclaration": true}
+            }),
+        )
+        .await;
+    let locations = response_array(&references);
+    assert!(
+        locations.iter().any(|location| location["uri"] == types),
+        "{references}"
+    );
+    assert!(
+        locations
+            .iter()
+            .all(|location| location["uri"] != unrelated),
+        "{references}"
+    );
+    server.shutdown().await;
+}
+
 /// The position just after occurrence `occurrence` of `needle` in `source`.
 fn cursor_after(source: &str, needle: &str, occurrence: usize) -> Value {
     let mut cursor = position(source, needle, occurrence);
@@ -708,5 +771,162 @@ async fn loading_type_definitions_refreshes_semantic_tokens() {
         .server_requests
         .iter()
         .any(|method| method == "workspace/semanticTokens/refresh"));
+    server.shutdown().await;
+}
+
+/// Runtime callers cannot lend globals to a standalone fragment implicitly.
+#[tokio::test]
+async fn nonpackage_loaders_do_not_supply_ambient_values() {
+    let workspace = TestWorkspace::new("outsideHelper = x -> x\nload \"fragment.m2\"\n");
+    let source = "outsideHelper 1\nunknownConstructor {}\nif missingFlag then 1\n";
+    let fragment = workspace.write_file("fragment.m2", source);
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    let opened = server.open_document(&fragment, source).await;
+    let unresolved = response_array(&opened["params"]["diagnostics"])
+        .iter()
+        .filter(|diagnostic| diagnostic["code"] == "E22")
+        .collect::<Vec<_>>();
+    assert_eq!(unresolved.len(), 3, "{opened}");
+    assert!(unresolved
+        .iter()
+        .all(|diagnostic| diagnostic["severity"] == 1));
+    let definition = server
+        .request(
+            "textDocument/definition",
+            document_position(&fragment, position(source, "outsideHelper", 0)),
+        )
+        .await;
+    assert!(
+        definition.is_null() || response_array(&definition).is_empty(),
+        "{definition}"
+    );
+    server.shutdown().await;
+}
+
+/// Earlier includes provide globals; file locals and later includes do not.
+#[tokio::test]
+async fn package_contexts_observe_include_order_and_file_local_boundaries() {
+    let workspace = TestWorkspace::new("newPackage \"Ordered\"\nload \"before.m2\"\nload \"fragment.m2\"\nload \"after.m2\"\nendPackage \"Ordered\"\n");
+    workspace.write_file(
+        "before.m2",
+        "earlierHelper = x -> x\nfileLocalHelper := x -> x\n",
+    );
+    workspace.write_file("after.m2", "laterHelper = x -> x\n");
+    let source = "earlierHelper 1\nfileLocalHelper 1\nlaterHelper 1\n";
+    let fragment = workspace.write_file("fragment.m2", source);
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    let opened = server.open_document(&fragment, source).await;
+    let lines = response_array(&opened["params"]["diagnostics"])
+        .iter()
+        .filter(|diagnostic| diagnostic["code"] == "E22")
+        .map(|diagnostic| diagnostic["range"]["start"]["line"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(lines, vec![1, 2], "{opened}");
+    server.shutdown().await;
+}
+
+/// A shared fragment cannot choose between contradictory package environments.
+#[tokio::test]
+async fn conflicting_package_contexts_do_not_choose_a_type_arbitrarily() {
+    let workspace = TestWorkspace::new("newPackage \"First\"\nSharedType = new Type of SelfInitializingType\nload \"fragment.m2\"\nendPackage \"First\"\n");
+    workspace.write_file("Second.m2", "newPackage \"Second\"\nSharedType = new Type of List\nload \"fragment.m2\"\nendPackage \"Second\"\n");
+    let source = "SharedType {}\nnew SharedType from {}\n";
+    let fragment = workspace.write_file("fragment.m2", source);
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    let opened = server.open_document(&fragment, source).await;
+    let diagnostics = response_array(&opened["params"]["diagnostics"]);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "E22"),
+        "{opened}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "S19"),
+        "{opened}"
+    );
+    server.shutdown().await;
+}
+
+/// An explicit dependency supplies its values only after the import executes.
+#[tokio::test]
+async fn source_imports_activate_in_source_order() {
+    let workspace = TestWorkspace::new("");
+    workspace.write_file(
+        "defs.m2",
+        "sourceHelper = x -> x\nSourceType = new SelfInitializingType of List\n",
+    );
+    let source = "sourceHelper 1\nnew SourceType from {}\nload \"defs.m2\"\nsourceHelper 1\nnew SourceType from {}\ncurrentPackage#\"pkgname\"\ncurrentPackage = currentPackage\n";
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    let opened = server.open_document(&workspace.uri, source).await;
+    let diagnostics = response_array(&opened["params"]["diagnostics"]);
+    let lines = |code: &str| {
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic["code"] == code)
+            .map(|diagnostic| diagnostic["range"]["start"]["line"].as_u64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(lines("E22"), vec![0, 1], "{opened}");
+    assert_eq!(lines("S19"), vec![4], "{opened}");
+    assert!(
+        lines("E13").is_empty(),
+        "currentPackage is mutable: {opened}"
+    );
+    server.shutdown().await;
+}
+
+/// Project configuration reloads without replacing explicit client settings.
+#[tokio::test]
+async fn project_settings_reload_and_explicit_client_values_take_precedence() {
+    let workspace = TestWorkspace::new("");
+    let config = workspace.write_file("M2LS.toml", "[diagnostics]\nenabled = false\n");
+    let source = "unknownCallee 1\n";
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    let opened = server.open_document(&workspace.uri, source).await;
+    assert!(
+        response_array(&opened["params"]["diagnostics"]).is_empty(),
+        "{opened}"
+    );
+    workspace.write_file("M2LS.toml", "[diagnostics]\nenabled = true\n");
+    server
+        .notify(
+            "workspace/didChangeWatchedFiles",
+            json!({"changes": [{"uri": config, "type": 2}]}),
+        )
+        .await;
+    let updated = next_diagnostic_codes(&mut server, &workspace.uri).await;
+    assert!(updated.contains(&"E22".to_string()), "{updated:?}");
+    server
+        .notify(
+            "workspace/didChangeConfiguration",
+            json!({"settings": {"diagnostics": {"enabled": false}}}),
+        )
+        .await;
+    assert!(next_diagnostic_codes(&mut server, &workspace.uri)
+        .await
+        .is_empty());
+    workspace.write_file("M2LS.toml", "[diagnostics]\nenabled = true\n");
+    server
+        .notify(
+            "workspace/didChangeWatchedFiles",
+            json!({"changes": [{"uri": config, "type": 2}]}),
+        )
+        .await;
+    // A request is a protocol barrier for the unchanged configuration layer.
+    let hover = server
+        .request(
+            "textDocument/hover",
+            document_position(&workspace.uri, position(source, "unknownCallee", 0)),
+        )
+        .await;
+    assert!(hover.is_null() || hover.is_object());
     server.shutdown().await;
 }

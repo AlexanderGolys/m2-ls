@@ -881,6 +881,11 @@ impl TypeStore for ObjectHierarchy {
 /// A retained workspace file's source facts and its surrounding package environment.
 #[derive(Debug, Clone)]
 pub struct HierarchySnapshot {
+    /// Declaration namespace retained across context-only reanalysis.
+    pub source_namespace: u64,
+    /// Text of this revision, shared by cached hierarchy snapshots. Identity
+    /// reuse is limited to unchanged syntax, rather than changed declarations.
+    pub source_text: std::sync::Arc<str>,
     /// Source objects extracted from the existing analyzed snapshot.
     pub source: ObjectHierarchy,
     /// Package visibility of this file, sharing the immutable catalog.
@@ -889,6 +894,8 @@ pub struct HierarchySnapshot {
     pub packages: Vec<String>,
     /// Package session inherited by a file loaded inside a package declaration.
     pub package_context: Option<String>,
+    /// Native source package imports with their activation positions.
+    pub package_imports: Vec<crate::package_index::PackageImport>,
     /// Explicit imports, including source packages absent from the catalog.
     pub imports: Vec<String>,
 }
@@ -897,8 +904,11 @@ impl HierarchySnapshot {
     /// Captures existing analysis; never reparses or executes the document.
     pub fn new(document: &DocumentSnapshot, uri: &Url) -> Self {
         Self {
+            source_namespace: document.analysis().source_namespace(),
+            source_text: std::sync::Arc::from(document.text()),
             source: ObjectHierarchy::source_document(document, uri),
             package_context: None,
+            package_imports: document.imported_packages().to_vec(),
             imports: document
                 .imported_packages()
                 .iter()

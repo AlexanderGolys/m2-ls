@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.6.0 - 2026-11-06
+
+- Discover repository source files and resolve package fragments through their
+  unopened entry points and preceding includes. Keep file locals private and
+  preserve distinct contexts when multiple packages include the same file.
+- Add E22 `unresolved-value` errors for unbound callable, constructor, Boolean,
+  and indexed-receiver names. Standalone fragments must declare or explicitly
+  import their dependencies; arbitrary callers no longer supply ambient globals.
+  Intentional symbolic uses remain valid.
+- Restrict cross-file references and renames to shared visible bindings. Refresh
+  source contexts after edits and file operations without restoring deleted
+  definitions or publishing duplicate diagnostics.
+- Load global `~/.m2-ls/M2LS.toml` and workspace-root `M2LS.toml`, with explicit
+  editor settings taking precedence. Reload watched configuration files and
+  support the Windows user profile without requiring `HOME`. Standalone tools
+  discover the nearest project configuration and accept `--config` overrides.
+- Add independent S19 `self-initializing-constructor`, S20 `header-constructor`,
+  and S21 `wrapper-constructor` hints and code actions for `new T from value`.
+  Header and wrapper shorthand requires List or Sequence input; rewrites retain
+  grouping and comments.
+- Preserve source object identities during context-only reanalysis and recognize
+  the mutable runtime `currentPackage` binding when absent from the catalog.
+- Document import visibility, configuration precedence, unresolved-value errors,
+  and constructor shorthand in the user guide.
+
 ## 2.5.1 - 2026-11-05
 
 - Add simplification hints and code actions for early-return null guards,

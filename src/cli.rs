@@ -24,7 +24,8 @@ use crate::init_file::InitFiles;
 use crate::node_metadata::SyntaxSnapshot;
 use crate::object_registry::ObjectRegistry;
 use crate::package_index::{Macaulay2Environment, SourceResolver};
-use crate::settings::{ServerSettings, SettingProblem};
+use crate::settings::{ProjectConfiguration, ServerSettings, SettingProblem};
+use crate::workspace_index::WorkspaceIndex;
 
 /// The standalone tool to execute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,6 +287,35 @@ impl Tool {
         .ok_or("could not parse source")?;
         let directed = session_registry(Some(&document));
         document.restart_session(&directed);
+        if !document.properties().primary_code {
+            let index = WorkspaceIndex::default();
+            let mut loaded = index.index_snapshot(&uri, &document, &registry);
+            let path = uri.to_file_path().ok();
+            let root = path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .and_then(|directory| {
+                    directory.ancestors().find(|ancestor| {
+                        ancestor.join(ProjectConfiguration::FILE_NAME).is_file()
+                            || ancestor.join(".git").exists()
+                    })
+                });
+            if let Some(root) = root {
+                loaded.extend(index.repository_files(&uri, &[root.to_path_buf()]));
+            }
+            index.index_files_from_disk_where(loaded, &directed, |file| {
+                !registry.has_catalog()
+                    || file
+                        .to_file_path()
+                        .is_ok_and(|path| sources.package_of_source_file(&path).is_none())
+            });
+            index.rebuild_import_contexts();
+            index.refresh_closed_contexts(
+                &directed,
+                &std::collections::HashSet::from([uri.clone()]),
+            );
+            document.restart_session(&index.context_registry(&uri, &directed));
+        }
         let diagnostics = visible_diagnostics(&document, &uri, &settings.diagnostics, &sources);
         crate::usage_log::diagnostics(&uri, document.text(), &diagnostics);
         let mut failed = false;
@@ -323,24 +353,34 @@ impl Tool {
 }
 
 impl Options {
-    /// The settings `--config` names, or the defaults; an invalid value fails
-    /// the command, a deprecated key only warns.
+    /// Global and nearest-project defaults, overlaid by explicit `--config`.
+    /// Invalid configuration fails the command; deprecated keys only warn.
     fn settings(&self) -> Result<ServerSettings, String> {
-        let Some(path) = &self.config else {
-            return Ok(ServerSettings::default());
+        let current = env::current_dir().map_err(|error| error.to_string())?;
+        let input_path = match &self.input {
+            Input::File(path) => current.join(path),
+            Input::Stdin => current.clone(),
         };
-        let text =
-            fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-        let value = if path
-            .extension()
-            .is_some_and(|extension| extension == "toml")
-        {
-            toml::from_str::<serde_json::Value>(&text)
-                .map_err(|error| format!("{}: {error}", path.display()))?
-        } else {
-            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?
+        let local = ProjectConfiguration::find_local(&input_path);
+        let root = local.as_deref().and_then(std::path::Path::parent);
+        let value = match &self.config {
+            None => serde_json::Value::Null,
+            Some(path) => {
+                let text = fs::read_to_string(path)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "toml")
+                {
+                    toml::from_str::<serde_json::Value>(&text)
+                        .map_err(|error| format!("{}: {error}", path.display()))?
+                } else {
+                    serde_json::from_str(&text)
+                        .map_err(|error| format!("{}: {error}", path.display()))?
+                }
+            }
         };
-        let parsed = ServerSettings::from_value(&value);
+        let parsed = ProjectConfiguration::load(root, &value);
         let listed = parsed
             .problems
             .iter()
@@ -351,7 +391,7 @@ impl Options {
             return Err(listed);
         }
         if !listed.is_empty() {
-            eprintln!("{}: warning: {listed}", path.display());
+            eprintln!("configuration: warning: {listed}");
         }
         Ok(parsed.settings)
     }

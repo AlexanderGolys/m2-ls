@@ -28,10 +28,12 @@ use crate::syntax::{AssignmentSyntax, ClauseSyntax, ControlSyntax, ExpressionSyn
 
 mod boolean_comparison;
 mod composition;
+mod constructor_call;
 mod unary_call;
 
 use boolean_comparison::BooleanComparison;
 use composition::MappingComposition;
+use constructor_call::ConstructorCall;
 use unary_call::UnarySymbolCall;
 
 /// What a rewrite site simplifies.
@@ -56,6 +58,12 @@ pub enum RewriteKind {
     ForwardingLambda,
     /// A callback forwarding its parameter after a fixed first argument.
     PartialApplicationLambda,
+    /// A `new ... from ...` expression using a self-initializing metaclass.
+    SelfInitializingConstructor,
+    /// A header constructor with list or sequence data.
+    HeaderConstructor,
+    /// A wrapper constructor with list or sequence data.
+    WrapperConstructor,
     /// An `if` with a `null` branch.
     NullBranch,
     /// A `try` repeating its value or falling back to `null`.
@@ -77,6 +85,9 @@ impl RewriteKind {
                 | Self::BooleanComparison
                 | Self::ForwardingLambda
                 | Self::PartialApplicationLambda
+                | Self::SelfInitializingConstructor
+                | Self::HeaderConstructor
+                | Self::WrapperConstructor
                 | Self::NullBranch
                 | Self::TrySimplification
                 | Self::IfCondition
@@ -96,6 +107,9 @@ impl RewriteKind {
             Self::BooleanComparison => &catalog::REDUNDANT_BOOLEAN_COMPARISON,
             Self::ForwardingLambda => &catalog::FORWARDING_LAMBDA,
             Self::PartialApplicationLambda => &catalog::PARTIAL_APPLICATION_LAMBDA,
+            Self::SelfInitializingConstructor => &catalog::SELF_INITIALIZING_CONSTRUCTOR,
+            Self::HeaderConstructor => &catalog::HEADER_CONSTRUCTOR,
+            Self::WrapperConstructor => &catalog::WRAPPER_CONSTRUCTOR,
             Self::TrySimplification => &catalog::SIMPLIFIABLE_TRY,
             Self::IfCondition => &catalog::SIMPLIFIABLE_IF_CONDITION,
             Self::ElseIfChain => &catalog::FLATTENABLE_IF_CHAIN,
@@ -172,14 +186,40 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
     {
         Self::collect(cells, source)
             .into_iter()
-            .filter(|site| match site.kind {
-                RewriteKind::MappingComposition => MappingComposition::of(site.expression)
-                    .is_some_and(|mapping| mapping.is_applicable(analysis, source, knowledge)),
-                RewriteKind::BooleanComparison => BooleanComparison::of(site.expression)
-                    .is_some_and(|comparison| {
-                        comparison.is_applicable(analysis, source, knowledge)
-                    }),
-                _ => true,
+            .filter_map(|mut site| {
+                let applicable = match site.kind {
+                    RewriteKind::MappingComposition => MappingComposition::of(site.expression)
+                        .is_some_and(|mapping| mapping.is_applicable(analysis, source, knowledge)),
+                    RewriteKind::BooleanComparison => BooleanComparison::of(site.expression)
+                        .is_some_and(|comparison| {
+                            comparison.is_applicable(analysis, source, knowledge)
+                        }),
+                    RewriteKind::SelfInitializingConstructor => {
+                        let range = source.syntax_bytes(site.expression)?;
+                        let drops_comment = source
+                            .syntax()
+                            .cells()
+                            .iter()
+                            .flat_map(|cell| cell.trivia())
+                            .any(|comment| {
+                                source.syntax_bytes(comment).is_some_and(|bytes| {
+                                    range.start <= bytes.start
+                                        && bytes.end <= range.end
+                                        && source.text_for_syntax(comment).is_some_and(|text| {
+                                            !site.replacement.contains(text.trim())
+                                        })
+                                })
+                            });
+                        if drops_comment {
+                            return None;
+                        }
+                        site.kind = ConstructorCall::of(site.expression)?
+                            .kind(analysis, source, knowledge)?;
+                        true
+                    }
+                    _ => true,
+                };
+                applicable.then_some(site)
             })
             .collect()
     }
@@ -218,6 +258,13 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
 
     /// The rewrites of one expression, in the order diagnostics report them.
     fn rewrite(&mut self, expression: &'ast Expr) {
+        let replacement = self.constructor_call(expression);
+        self.push(
+            RewriteKind::SelfInitializingConstructor,
+            expression,
+            None,
+            replacement,
+        );
         let replacement = self.forwarding_lambda(expression);
         self.push(RewriteKind::ForwardingLambda, expression, None, replacement);
         let replacement = self.partial_application_lambda(expression);
@@ -316,6 +363,34 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
         let fractional = self.text(float).strip_prefix('.')?;
         (adjacent && !fractional.is_empty() && fractional.chars().all(|ch| ch.is_ascii_digit()))
             .then(|| format!("{name}#{fractional}"))
+    }
+
+    /// Call syntax for a named constructor, with parentheses where an argument
+    /// would otherwise escape the application or capture surrounding syntax.
+    fn constructor_call(&self, expression: &Expr) -> Option<String> {
+        let construction = ConstructorCall::of(expression)?;
+        let value = construction.value;
+        let grouped = !matches!(
+            value,
+            Expr::Symbol(_)
+                | Expr::Literal(_)
+                | Expr::Collection(_)
+                | Expr::Holder(_)
+                | Expr::Op(ExprOp::Bin(ExprOpBin::Adj(_)))
+        );
+        let replacement = format!(
+            "{} {}",
+            self.text(construction.class).trim(),
+            self.parenthesized_if(value, grouped)
+        );
+        let nested = self
+            .parent
+            .is_some_and(|parent| matches!(parent, Expr::Op(_)));
+        Some(if nested {
+            format!("({replacement})")
+        } else {
+            replacement
+        })
     }
 
     /// The named function supplied by `x -> f x` or `x -> f(x)`. A direct

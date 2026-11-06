@@ -29,6 +29,9 @@ use crate::diagnostics::DiagnosticCode;
 use crate::init_file::InitFileChoice;
 use crate::object_registry::ObjectName;
 
+mod project;
+pub use project::ProjectConfiguration;
+
 /// The current value of a setting that requests read while the client
 /// replaces it.
 #[derive(Debug, Default)]
@@ -708,10 +711,9 @@ impl fmt::Display for SettingProblem {
 }
 
 impl ServerSettings {
-    /// Read the settings in `value`, either the section itself or an object
-    /// holding it. Each value that fails to deserialize is reported, removed,
-    /// and the rest read again, until what remains reads cleanly.
-    pub fn from_value(value: &Value) -> ParsedSettings {
+    /// Selects the current wrapper or the legacy wrapper, while keeping the
+    /// native `macaulay2` installation group in an unwrapped settings object.
+    pub fn section(value: &Value) -> &Value {
         let legacy_section = value.get("macaulay2").filter(|section| {
             [
                 "diagnostics",
@@ -723,11 +725,14 @@ impl ServerSettings {
             .iter()
             .any(|group| section.get(group).is_some())
         });
-        let mut section = value
-            .get("m2-ls")
-            .or(legacy_section)
-            .unwrap_or(value)
-            .clone();
+        value.get("m2-ls").or(legacy_section).unwrap_or(value)
+    }
+
+    /// Read the settings in `value`, either the section itself or an object
+    /// holding it. Each value that fails to deserialize is reported, removed,
+    /// and the rest read again, until what remains reads cleanly.
+    pub fn from_value(value: &Value) -> ParsedSettings {
+        let mut section = Self::section(value).clone();
         if section.is_null() {
             section = Value::Object(Default::default());
         }

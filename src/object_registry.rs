@@ -109,6 +109,34 @@ pub struct ObjectRegistry {
     packages: Vec<PackageRegistration>,
     /// The init file the session starts with, whose packages are loaded.
     init_file: InitFileStart,
+    /// Source objects visible through this document's importing contexts.
+    source_context: Arc<SourceContext>,
+}
+
+/// Immutable source records and their unambiguous visible bindings.
+#[derive(Debug, Default)]
+struct SourceContext {
+    /// Canonical source objects, used by the same type relations as catalog objects.
+    records: HashMap<ObjectId, Record>,
+    /// Names consistently bound in the document's possible import contexts.
+    names: HashMap<ObjectName, (ObjectId, Position)>,
+    /// Structural identity used to avoid reanalyzing unchanged context.
+    signature: Vec<SourceBindingSignature>,
+}
+
+/// Source facts whose changes require importing documents to be analyzed again.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SourceBindingSignature {
+    /// Name visible in the importing document.
+    name: ObjectName,
+    /// Canonical object selected for that name.
+    object: ObjectId,
+    /// Runtime class of the selected object.
+    class: Option<TypeId>,
+    /// Inheritance parent when the object is a type.
+    parent: Option<TypeId>,
+    /// First position at which an explicit import supplies the value.
+    effective_from: Position,
 }
 
 /// One source-ordered package inclusion in an object registry.
@@ -199,6 +227,7 @@ impl ObjectRegistry {
             catalog,
             packages: Vec::new(),
             init_file: InitFileStart::None,
+            source_context: Arc::new(SourceContext::default()),
         };
         let mut baseline = registry.catalog.default_loaded.clone();
         if baseline.is_empty() {
@@ -208,6 +237,47 @@ impl ObjectRegistry {
             registry.load_package(&ObjectName::new(package));
         }
         registry
+    }
+
+    /// Adds source definitions visible from the import graph. The underlying
+    /// downloaded catalog is shared and is never modified or regenerated.
+    pub fn with_source_context(&self, records: Vec<(Record, Position)>) -> Self {
+        let mut context = SourceContext::default();
+        for (record, effective_from) in records {
+            context.signature.push(SourceBindingSignature {
+                name: record.name.clone(),
+                object: record.id.clone(),
+                class: record.class_id.clone(),
+                parent: record.type_info().and_then(|ty| ty.parent.clone()),
+                effective_from,
+            });
+            context
+                .names
+                .insert(record.name.clone(), (record.id.clone(), effective_from));
+            context.records.insert(record.id.clone(), record);
+        }
+        context.signature.sort();
+        let mut registry = self.clone();
+        registry.source_context = Arc::new(context);
+        registry
+    }
+
+    /// Whether this identity was supplied by the workspace import graph.
+    pub fn is_source_object(&self, id: &ObjectId) -> bool {
+        self.source_context.records.contains_key(id)
+    }
+
+    /// Drops importing-file bindings for independently executed package tests
+    /// and documentation sessions, where package-private names are unavailable.
+    pub fn without_source_context(&self) -> Self {
+        let mut registry = self.clone();
+        registry.source_context = Arc::new(SourceContext::default());
+        registry
+    }
+
+    /// Whether the file's initialization and imported source facts are unchanged.
+    pub fn same_source_context(&self, other: &Self) -> bool {
+        self.source_context.signature == other.source_context.signature
     }
 
     /// Load the package `name` from the start of the source; returns whether
@@ -238,6 +308,7 @@ impl ObjectRegistry {
             catalog: Arc::clone(&self.catalog),
             packages: Vec::new(),
             init_file: InitFileStart::None,
+            source_context: Arc::clone(&self.source_context),
         }
     }
 
@@ -265,6 +336,7 @@ impl ObjectRegistry {
                 .cloned()
                 .collect(),
             init_file: InitFileStart::None,
+            source_context: Arc::clone(&self.source_context),
         }
     }
 
@@ -359,14 +431,25 @@ impl ObjectRegistry {
     /// each package once.
     pub fn records_by_precedence_at(&self, position: Position) -> impl Iterator<Item = &Record> {
         let mut seen = HashSet::new();
-        self.packages
-            .iter()
-            .rev()
-            .filter(move |registration| registration.is_effective_at(position))
-            .filter(move |registration| seen.insert(&registration.package))
-            .filter_map(|registration| self.catalog.packages.get(&registration.package))
-            .flat_map(|package| package.objects.iter())
-            .filter_map(|object| self.catalog.index.object(object))
+        self.source_context
+            .records
+            .values()
+            .filter(move |record| {
+                self.source_context
+                    .names
+                    .get(&record.name)
+                    .is_some_and(|(_, start)| *start <= position)
+            })
+            .chain(
+                self.packages
+                    .iter()
+                    .rev()
+                    .filter(move |registration| registration.is_effective_at(position))
+                    .filter(move |registration| seen.insert(&registration.package))
+                    .filter_map(|registration| self.catalog.packages.get(&registration.package))
+                    .flat_map(|package| package.objects.iter())
+                    .filter_map(|object| self.catalog.index.object(object)),
+            )
     }
 
     /// The packages loaded at `position`, most recently loaded first.
@@ -448,9 +531,15 @@ impl ObjectRegistryView<'_> {
     /// view's position, hiding the source definition made there.
     pub fn shadows_source(&self, name: &ObjectName, source_position: Position) -> bool {
         self.registry
-            .registration_for_name_at(name, self.position)
-            .and_then(|(_, effective_from)| effective_from)
-            .is_some_and(|effective_from| effective_from > source_position)
+            .source_context
+            .names
+            .get(name)
+            .is_some_and(|(_, start)| *start > source_position && *start <= self.position)
+            || self
+                .registry
+                .registration_for_name_at(name, self.position)
+                .and_then(|(_, effective_from)| effective_from)
+                .is_some_and(|effective_from| effective_from > source_position)
     }
 }
 
@@ -604,7 +693,10 @@ impl ObjectRegistry {
 
     /// The record of `object_id`, loaded or not.
     pub fn object(&self, object_id: &ObjectId) -> Option<&Record> {
-        self.catalog.index.object(object_id)
+        self.source_context
+            .records
+            .get(object_id)
+            .or_else(|| self.catalog.index.object(object_id))
     }
 
     /// The object `name` resolves to once every package is loaded.
@@ -615,8 +707,15 @@ impl ObjectRegistry {
     /// The object `name` resolves to at `position`, in the last package loaded
     /// by then that binds it.
     pub fn object_id_at(&self, name: &ObjectName, position: Position) -> Option<ObjectId> {
-        self.registration_for_name_at(name, position)
-            .map(|(object, _)| object)
+        self.source_context
+            .names
+            .get(name)
+            .filter(|(_, effective_from)| *effective_from <= position)
+            .map(|(id, _)| id.clone())
+            .or_else(|| {
+                self.registration_for_name_at(name, position)
+                    .map(|(object, _)| object)
+            })
     }
 
     /// The object `name` resolves to at `position`, with where the package

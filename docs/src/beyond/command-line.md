@@ -88,9 +88,10 @@ your build system or CI script.
 
 ## Settings
 
-No configuration file is loaded automatically. Pass `--config settings.json`
-to read the same grouped settings the server accepts (TOML or JSON), including the `diagnostics`
-and `formatting` sections:
+Both tools load `~/.m2-ls/M2LS.toml`, then the nearest ancestor `M2LS.toml`
+of the input file (the current directory for stdin). Pass `--config settings.json`
+or `--config settings.toml` to overlay explicit settings. These use the same
+groups as the server, including `diagnostics` and `formatting`:
 
 ```json
 {
@@ -100,6 +101,10 @@ and `formatting` sections:
   }
 }
 ```
+
+`m2-lint` also indexes explicit dependencies. When an ancestor `M2LS.toml`
+or `.git` marks a project, it discovers the package entry point and resolves
+included fragments in their package context. This does not execute the files.
 
 Like the server, `m2-lint` knows the packages your
 [init file](../getting-started/configuration.md#init-file) loads, so names

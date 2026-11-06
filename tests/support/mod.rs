@@ -182,8 +182,14 @@ impl LspProcess {
             }),
         )
         .await;
-        self.wait_for_notification("textDocument/publishDiagnostics")
-            .await
+        loop {
+            let notification = self
+                .wait_for_notification("textDocument/publishDiagnostics")
+                .await;
+            if notification["params"]["uri"] == uri {
+                return notification;
+            }
+        }
     }
 
     pub(crate) async fn wait_for_notification(&mut self, method: &str) -> Value {
@@ -530,8 +536,7 @@ impl DocumentSession {
         .iter()
         .filter_map(|modifier| modifier.as_str().map(str::to_string))
         .collect();
-        // Only open documents and the files they load are indexed, so the
-        // related file joins the workspace by being open as well.
+        // Opening both files does not create an import relationship.
         server
             .open_document(&workspace.related_uri, related_source)
             .await;

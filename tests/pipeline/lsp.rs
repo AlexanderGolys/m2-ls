@@ -626,8 +626,8 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
     assert!(
         response_array(&references)
             .iter()
-            .any(|location| location["uri"] == workspace.related_uri),
-        "global references should cross open workspace documents: {references}"
+            .all(|location| location["uri"] != workspace.related_uri),
+        "an unrelated document does not share this binding: {references}"
     );
 
     let prepare_rename = server
@@ -671,10 +671,8 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
         "rename should update documentation, declaration, and use: {rename}"
     );
     assert!(
-        rename["changes"][&workspace.related_uri]
-            .as_array()
-            .is_some_and(|edits| edits.len() == 1),
-        "rename should include references in another workspace document: {rename}"
+        rename["changes"][&workspace.related_uri].is_null(),
+        "rename must leave an unrelated document alone: {rename}"
     );
 
     let definition = server
@@ -970,6 +968,13 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
         "a full-content change must replace and reanalyze the document: {replacement_hover}"
     );
 
+    // A close invalidates the live buffer even when save analysis is queued.
+    server
+        .notify(
+            "textDocument/didSave",
+            json!({"textDocument": {"uri": workspace.uri}}),
+        )
+        .await;
     server
         .notify(
             "textDocument/didClose",
@@ -991,7 +996,7 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
 }
 
 #[tokio::test]
-async fn runtime_syntax_example_reaches_analysis_without_error_diagnostics() {
+async fn runtime_syntax_example_parses_but_reports_unbound_value_uses() {
     let source = include_str!("../fixtures/weird_valid_syntax.m2");
     let workspace = TestWorkspace::new(source);
     let mut server = LspProcess::spawn().await;
@@ -1018,8 +1023,8 @@ async fn runtime_syntax_example_reaches_analysis_without_error_diagnostics() {
         .filter(|diagnostic| diagnostic["severity"] == 1)
         .collect::<Vec<_>>();
     assert!(
-        errors.is_empty(),
-        "runtime-valid syntax should complete the pipeline without errors: {errors:?}"
+        !errors.is_empty() && errors.iter().all(|diagnostic| diagnostic["code"] == "E22"),
+        "syntax is valid, but free callable/indexed symbols require definitions: {errors:?}"
     );
 
     server.shutdown().await;
@@ -1844,7 +1849,7 @@ async fn configured_primary_code_paths_apply_without_an_installation() {
 /// User package dependencies are followed without opening their implementation,
 /// while unrelated files stay outside workspace symbol search.
 #[tokio::test]
-async fn user_package_dependencies_are_indexed_without_scanning_the_workspace() {
+async fn repository_sources_are_indexed_without_granting_unrelated_bindings() {
     let source = "needsPackage \"LocalPackage\"\nlocalExport 2\n";
     let workspace = TestWorkspace::new(source);
     workspace.write_file("LocalPackage.m2", "newPackage \"LocalPackage\"\nexport {\"localExport\"}\nload \"./LocalPackage/impl.m2\"\nendPackage \"LocalPackage\"\n");
@@ -1883,7 +1888,7 @@ async fn user_package_dependencies_are_indexed_without_scanning_the_workspace() 
     let unrelated = server
         .request("workspace/symbol", json!({"query": "unrelatedSentinel"}))
         .await;
-    assert!(response_array(&unrelated).is_empty(), "{unrelated}");
+    assert_eq!(response_array(&unrelated).len(), 1, "{unrelated}");
     server.shutdown().await;
 }
 

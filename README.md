@@ -72,7 +72,7 @@ vim.filetype.add({ extension = { m2 = 'macaulay2' } })
 vim.lsp.config('m2_ls', {
   cmd = { 'm2-ls' },
   filetypes = { 'macaulay2' },
-  root_markers = { '.git' },
+  root_markers = { 'M2LS.toml', '.git' },
 })
 
 vim.lsp.enable('m2_ls')
@@ -86,14 +86,24 @@ it can find them; use `macaulay2.prefix` for another installation and
 Packages you write are read from source: importing `P` whose `P.m2` sits next
 to the importing file makes only the names `P` exports visible, and the code of
 each `TEST` block is analyzed like the session `check` runs it in.
-Workspace indexing follows opened files and user-package dependencies instead
-of scanning entire folders. Installed packages use the precomputed catalog;
+Workspace indexing discovers `.m2` files below the editor's workspace roots
+and builds their import graph. Package fragments inherit earlier package
+bindings through their loaders; standalone files need explicit dependencies.
+Unbound names used as callable, type, Boolean, or indexed values are errors.
+File locals declared with `:=` remain private to their file.
+Installed packages use the precomputed catalog;
 opening their source does not index their dependency trees. When the catalog
 is unavailable, imported installed packages are analyzed from source as well.
 Core source opens
 in `primaryCode` mode, without automatic imports of prelude packages.
 
 ## Configuration
+
+Settings merge from `~/.m2-ls/M2LS.toml`, then the workspace root's `M2LS.toml`,
+then explicit editor settings. On Windows, the global directory lives under
+`%USERPROFILE%`. An empty project file can serve as an editor root marker,
+alongside `.git`. Standalone tools use the nearest project configuration and
+accept `--config` for explicit overrides.
 
 Settings are grouped by what they control. The editor sends JSON under its
 `m2-ls` settings section or as `initializationOptions`:

@@ -3,6 +3,7 @@
 
 # Local tooling
 /config.toml
+/M2LS.toml
 .agents/
 .claude/
 .opencode/

@@ -536,8 +536,13 @@ where
         let knowledge = self.builtins.at(position);
         knowledge
             .get_record(&ObjectName::new(name))
-            .and_then(|record| knowledge.package_name(&record.package))
-            .map(ObjectName::new)
+            .and_then(|record| {
+                if self.document.object_registry().is_source_object(&record.id) {
+                    self.workspace_index.defining_package(name, self.uri)
+                } else {
+                    knowledge.package_name(&record.package).map(ObjectName::new)
+                }
+            })
             .or_else(|| self.workspace_index.defining_package(name, self.uri))
     }
 
@@ -940,7 +945,8 @@ mod tests {
         workspace_index.index_file(&defs_uri, "TokenStream = new Type of List\n", &builtins);
 
         let main_uri = Url::parse("file:///main.m2").expect("valid uri");
-        let text = "TokenStream\n";
+        let text = "load \"defs.m2\"\nTokenStream\n";
+        workspace_index.index_file(&main_uri, text, &builtins);
         let document = document(text, &builtins);
         let tokens = collect_semantic_tokens(
             &document,
@@ -1433,7 +1439,9 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         workspace_index.index_file(&package_uri, "newPackage \"Pkg\"\n", &builtins);
 
         let main_uri = Url::parse("file:///main.m2").expect("valid uri");
-        let document = document("Pkg\n", &builtins);
+        let text = "needsPackage \"Pkg\"\nPkg\n";
+        workspace_index.index_file(&main_uri, text, &builtins);
+        let document = document(text, &builtins);
         let tokens = collect_semantic_tokens(
             &document,
             &builtins,
@@ -1444,7 +1452,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         );
 
         assert_eq!(
-            token_type_at(&tokens, 0, 0),
+            token_type_at(&tokens, 1, 0),
             Some(M2SemanticTokenType::Package as u32)
         );
     }
@@ -1629,7 +1637,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     #[test]
     fn exported_functions_defined_in_loaded_files_receive_function_tokens() {
         let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
-        let text = "newPackage \"Pkg\"\nexport {\"helper\"}\n";
+        let text = "newPackage \"Pkg\"\nexport {\"helper\"}\nload \"helper.m2\"\n";
         let document = document(text, &builtins);
         let workspace = WorkspaceIndex::default();
         workspace.index_file(
@@ -1637,6 +1645,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             "helper = x -> x\n",
             &builtins,
         );
+        workspace.index_file(&Url::parse("file:///Pkg.m2").unwrap(), text, &builtins);
         let tokens = collect_semantic_tokens(
             &document,
             &builtins,

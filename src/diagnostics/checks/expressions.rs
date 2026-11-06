@@ -156,6 +156,7 @@ impl<'a> ExpressionChecks<'a, '_> {
             return;
         };
         let knowledge = self.context.knowledge.at(position);
+        self.required_values(expression, &knowledge);
         let assignment = match expression {
             Expr::Assign(assignment) => Some((assignment, assignment.parts())),
             _ => None,
@@ -208,6 +209,71 @@ impl<'a> ExpressionChecks<'a, '_> {
                 self.option_symbol_convention(entry, &knowledge);
             }
         }
+    }
+
+    /// Requires names in value-only syntax slots to resolve in the declared
+    /// environment. Bare names in symbolic positions, including option keys,
+    /// enum-like values, and quoted symbols, remain legitimate symbols.
+    fn required_values(&mut self, expression: &Expr, knowledge: &ObjectRegistryView<'_>) {
+        match expression {
+            Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => {
+                self.required_value(&call.left_operand, "callable", knowledge)
+            }
+            Expr::New(node) => self.required_value(&node.class, "type", knowledge),
+            Expr::If(node) => self.required_value(&node.condition, "Boolean condition", knowledge),
+            Expr::While(node) => {
+                self.required_value(&node.condition, "Boolean condition", knowledge)
+            }
+            Expr::Op(ExprOp::Bin(ExprOpBin::Index(index))) => {
+                self.required_value(&index.receiver, "indexed value", knowledge)
+            }
+            Expr::Op(ExprOp::Prefix(prefix))
+                if prefix.operator.spelling() == <Token![not]>::SPELLING =>
+            {
+                self.required_value(&prefix.operand, "Boolean operand", knowledge)
+            }
+            _ => {}
+        }
+        if let Some(operands) = expression.infix_operands() {
+            if matches!(
+                operands.operator,
+                <Token![and]>::SPELLING | <Token![or]>::SPELLING
+            ) {
+                self.required_value(operands.left, "Boolean operand", knowledge);
+                self.required_value(operands.right, "Boolean operand", knowledge);
+            }
+        }
+    }
+
+    /// Reports an unbound name only when its position requires a resolved
+    /// value. Forward global declarations and unknown-typed parameters are
+    /// declarations, so neither is confused with an ambient free symbol.
+    fn required_value(
+        &mut self,
+        expression: &Expr,
+        role: &str,
+        knowledge: &ObjectRegistryView<'_>,
+    ) {
+        let Some(Expr::Symbol(symbol)) = expression.unparenthesized() else {
+            return;
+        };
+        let Some(position) = self.context.source.position_for_syntax(symbol) else {
+            return;
+        };
+        let name = symbol.text();
+        let analysis = self.context.analysis;
+        if analysis
+            .visible_source_binding_at(name, position, knowledge)
+            .is_some()
+            || knowledge.get_record(&ObjectName::new(name)).is_some()
+            || analysis.bindings().any(|binding| {
+                binding.name.name() == name && binding.scope_idx == 0 && binding.potential_export
+            })
+        {
+            return;
+        }
+        self.spawn(&catalog::UNRESOLVED_VALUE, symbol,
+            format!("Unresolved {role} `{name}`: no definition is available in this file's declared environment; declare or explicitly import it"));
     }
 
     /// Rejects floating-point keys in pairs and indexed reads or writes.
@@ -1607,7 +1673,10 @@ mod tests {
             DocumentSnapshot::from_text(text.to_string(), &builtins).expect("fixture should parse");
 
         assert!(
-            document.diagnostics().is_empty(),
+            document
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.rule.code == catalog::UNRESOLVED_VALUE.code),
             "an already-simplest condition must not be reported: {:?}",
             document
                 .diagnostics()

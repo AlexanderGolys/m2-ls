@@ -82,6 +82,30 @@ pub enum CallableKind {
 }
 
 impl Record {
+    /// Retains the same canonical representation for a source object imported
+    /// from another file. Source documentation remains in the navigation index.
+    pub fn from_source(
+        id: ObjectId,
+        name: ObjectName,
+        class: ObjectName,
+        class_id: Option<TypeId>,
+        package: ObjectId,
+        data: ObjectData,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            class,
+            class_id,
+            package,
+            data,
+            package_exports: None,
+            protected: false,
+            aliases: Vec::new(),
+            markdown: None,
+        }
+    }
+
     /// Callable-specific catalog data, absent for non-callable records.
     pub fn callable(&self) -> Option<&CallableInfo> {
         match &self.data {
@@ -537,6 +561,49 @@ impl BuiltinIndex {
                 markdown: None,
             });
             class_references.insert(user, ObjectName::new("$Core$Package"));
+        }
+        // Session context values may be absent from a serialized inventory:
+        // their runtime value changes as packages are entered and left.
+        let package_class = ObjectName::new(format!(
+            "${}${}",
+            Macaulay2Conventions::CORE,
+            Macaulay2Conventions::PACKAGE_NAMESPACE
+        ));
+        let has_package_class = index
+            .object_id(&package_class)
+            .and_then(|id| index.object(&id))
+            .is_some_and(|record| record.type_info().is_some());
+        if has_package_class
+            && index
+                .object_id(&ObjectName::new(Macaulay2Conventions::CURRENT_PACKAGE))
+                .is_none()
+        {
+            let core = index
+                .records
+                .iter()
+                .find(|record| {
+                    record.id == record.package && record.name.name() == Macaulay2Conventions::CORE
+                })
+                .map(|record| record.id.clone());
+            if let Some(core) = core {
+                let id = ObjectId::new(format!(
+                    "$SessionValue${}",
+                    Macaulay2Conventions::CURRENT_PACKAGE
+                ));
+                index.insert(Record {
+                    id: id.clone(),
+                    name: ObjectName::new(Macaulay2Conventions::CURRENT_PACKAGE),
+                    class: ObjectName::new(Macaulay2Conventions::PACKAGE_NAMESPACE),
+                    class_id: None,
+                    package: core,
+                    package_exports: None,
+                    data: ObjectData::Plain,
+                    protected: false,
+                    aliases: Vec::new(),
+                    markdown: None,
+                });
+                class_references.insert(id, package_class);
+            }
         }
         // Resolve the original qualified reference before a same-named class
         // from another package can affect its source-visible spelling.

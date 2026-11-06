@@ -1,21 +1,12 @@
-//! A workspace-wide index of top-level (global) navigation facts across the
-//! files the editor has open, every file they load (`load`/`needs`/`input`),
-//! and every user package they import, transitively, including files the
-//! editor has not opened.
+//! Repository source discovery and explicit dependency visibility.
 //!
-//! M2's top-level symbols are global once loaded, so a name-keyed index of every
-//! file's global facts is a faithful model: a name used in one file and defined
-//! or implemented at the top level of another resolves across the project.
-//!
-//! Packages are the exception. A global defined inside a `newPackage` section
-//! lands in the package's private dictionary: the files of the package see it,
-//! everyone else sees only the names the package exports. A file belongs to a
-//! package by declaring it, or by being loaded from inside its section.
-//!
-//! Init files are the other exception: the globals of one are known only in
-//! the documents whose sessions start with it.
+//! All workspace source files contribute navigation candidates. Only explicit
+//! dependencies and preceding package-loader bindings supply a file's semantic
+//! environment. File locals remain private, and initialization globals are
+//! available only to sessions selecting those initialization files.
 
 use dashmap::{DashMap, DashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -23,12 +14,13 @@ use std::thread;
 use tower_lsp::lsp_types::{Location, Position, Range as TextRange, Url};
 
 use crate::analysis::AssignmentFactKind;
+use crate::builtin_index::{CallableInfo, CallableKind, ObjectData, Record};
 use crate::capabilities::document_symbols::{collect_workspace_symbols, WorkspaceSourceSymbol};
 use crate::document::DocumentSnapshot;
 use crate::file_load::FileLoad;
 use crate::macaulay2::Macaulay2Conventions;
 use crate::object_hierarchy::HierarchySnapshot;
-use crate::object_registry::{ObjectName, ObjectRegistry};
+use crate::object_registry::{ObjectId, ObjectName, ObjectRegistry, TypeData};
 use crate::package_documentation::DocumentedSubject;
 use crate::package_index::SourceResolver;
 use crate::semantic_token::{
@@ -36,6 +28,11 @@ use crate::semantic_token::{
 };
 use crate::settings::SettingsStore;
 use crate::source_package::{ExportAccess, PackageDeclaration, PackageExport};
+use crate::typesystem::{TypeKnowledge, TypeRole};
+
+mod repository;
+
+use repository::RepositorySources;
 
 /// Where one global is bound at the top level of an indexed file, with what
 /// requests about it answer.
@@ -50,6 +47,8 @@ struct DefLocation {
     /// Whether this is where the name is declared, its first binding; later
     /// assignments only rebind it.
     is_declaration: bool,
+    /// Whether this binding belongs to a shared dictionary rather than a file local.
+    shared: bool,
     /// The statement defining the name, as written, when it is more than
     /// the name.
     code: Option<String>,
@@ -282,7 +281,9 @@ pub struct WorkspaceIndex {
     declared_packages_by_file: DashMap<Url, Vec<PackageDeclaration>>,
     /// The package a file belongs to because it is loaded from inside the
     /// package's section.
-    package_of_loaded_file: DashMap<Url, ObjectName>,
+    package_of_loaded_file: DashMap<Url, BTreeSet<ObjectName>>,
+    /// Repository roots whose source files have been discovered for this session.
+    discovered_repositories: DashSet<PathBuf>,
     /// The indexed files sessions start with, whose globals only those
     /// sessions see.
     init_files: DashSet<Url>,
@@ -305,6 +306,383 @@ pub enum WorkspaceView<'index> {
 }
 
 impl WorkspaceIndex {
+    /// Source records supplied by the file's possible loading contexts. Only
+    /// global definitions are shared: `:=` file locals never enter this table.
+    /// Conflicting definitions remain navigation candidates rather than becoming
+    /// an arbitrarily selected semantic value.
+    pub fn context_registry(&self, file: &Url, registry: &ObjectRegistry) -> ObjectRegistry {
+        let limits = self.import_context_limits(file);
+        let inherited = self.inherited_context_limits(file);
+        let snapshots = self.hierarchy_snapshots();
+        let objects = snapshots
+            .values()
+            .flat_map(|snapshot| snapshot.source.objects.iter())
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut records = Vec::new();
+        for entry in &self.definitions_by_name {
+            let candidates = entry
+                .value()
+                .iter()
+                .filter(|definition| {
+                    &definition.uri != file
+                        && definition.shared
+                        && limits
+                            .get(&definition.uri)
+                            .is_some_and(|limit| definition.range.start <= *limit)
+                        && self.is_visible(
+                            WorkspaceViewer::Document(file),
+                            entry.key().name(),
+                            &definition.uri,
+                            definition.range,
+                        )
+                })
+                .filter_map(|definition| {
+                    snapshots
+                        .get(&definition.uri)?
+                        .source
+                        .objects
+                        .values()
+                        .find(|object| {
+                            object.location.as_ref().is_some_and(|location| {
+                                location.uri == definition.uri && location.range == definition.range
+                            })
+                        })
+                })
+                .collect::<Vec<_>>();
+            let Some(object) = candidates.first() else {
+                continue;
+            };
+            if candidates.iter().any(|candidate| candidate.id != object.id) {
+                continue;
+            }
+            let contexts = self.packages_at(file, pos!());
+            if contexts.len() > 1 {
+                let owners = candidates
+                    .iter()
+                    .filter_map(|candidate| candidate.location.as_ref())
+                    .flat_map(|location| self.packages_at(&location.uri, location.range.start))
+                    .collect::<BTreeSet<_>>();
+                if !contexts.is_subset(&owners) {
+                    continue;
+                }
+            }
+            let class = object.class_of.as_ref().and_then(|class| {
+                registry
+                    .object(class.object())
+                    .map(|record| record.name.clone())
+                    .or_else(|| {
+                        objects
+                            .get(class.object())
+                            .map(|object| ObjectName::new(&object.name))
+                    })
+            });
+            let class = class.unwrap_or_else(|| TypeRole::Thing.object_name());
+            let data = if object.type_id.is_some() {
+                ObjectData::Type(TypeData {
+                    parent: object.parent_of.clone(),
+                })
+            } else if [
+                TypeRole::Function,
+                TypeRole::MethodFunction,
+                TypeRole::MethodFunctionBinary,
+                TypeRole::MethodFunctionSingle,
+                TypeRole::MethodFunctionWithOptions,
+            ]
+            .into_iter()
+            .any(|role| registry.has_type_role(&class, role) || class == role.object_name())
+            {
+                let method = [
+                    TypeRole::MethodFunction,
+                    TypeRole::MethodFunctionBinary,
+                    TypeRole::MethodFunctionSingle,
+                    TypeRole::MethodFunctionWithOptions,
+                ]
+                .into_iter()
+                .any(|role| registry.has_type_role(&class, role) || class == role.object_name());
+                ObjectData::Callable(CallableInfo {
+                    kind: if method {
+                        CallableKind::MethodFunction
+                    } else {
+                        CallableKind::Function
+                    },
+                    typical_value: None,
+                    methods: Vec::new(),
+                    options: Vec::new(),
+                    option_passing: None,
+                    receives_sequence: false,
+                })
+            } else {
+                ObjectData::Plain
+            };
+            let effective_from = object
+                .location
+                .as_ref()
+                .and_then(|location| {
+                    if inherited
+                        .get(&location.uri)
+                        .is_some_and(|limit| location.range.start <= *limit)
+                    {
+                        Some(pos!())
+                    } else {
+                        self.dependency_activation(file, &location.uri)
+                    }
+                })
+                .unwrap_or(pos!());
+            records.push((
+                Record::from_source(
+                    object.id.clone(),
+                    entry.key().clone(),
+                    class,
+                    object.class_of.clone(),
+                    object.package.clone().unwrap_or_else(|| {
+                        ObjectId::session_package(Macaulay2Conventions::USER_PACKAGE)
+                    }),
+                    data,
+                ),
+                effective_from,
+            ));
+        }
+        registry.with_source_context(records)
+    }
+
+    /// Whether two documents can refer to the same declared global binding.
+    /// Repository discovery alone cannot connect same-named globals for rename
+    /// or references. Both documents must see a common shared declaration.
+    pub fn shares_global_binding(&self, name: &str, left: &Url, right: &Url) -> bool {
+        self.definitions_by_name
+            .get(name)
+            .is_some_and(|definitions| {
+                definitions.iter().any(|definition| {
+                    definition.shared
+                        && (left == &definition.uri
+                            || self.is_visible(
+                                WorkspaceViewer::Document(left),
+                                name,
+                                &definition.uri,
+                                definition.range,
+                            ))
+                        && (right == &definition.uri
+                            || self.is_visible(
+                                WorkspaceViewer::Document(right),
+                                name,
+                                &definition.uri,
+                                definition.range,
+                            ))
+                })
+            })
+    }
+
+    /// Reanalyzes closed sources until their imported type identities stabilize.
+    /// Open buffers and initialization snapshots retain their authoritative text
+    /// and are refreshed by their owning sessions instead.
+    pub fn refresh_closed_contexts(&self, registry: &ObjectRegistry, open: &HashSet<Url>) {
+        let sources = self
+            .indexed_file_uris()
+            .into_iter()
+            .filter(|file| !open.contains(file) && !self.is_init_file(file))
+            .filter_map(|file| {
+                let text = fs::read_to_string(file.to_file_path().ok()?).ok()?;
+                Some((file, text))
+            })
+            .collect::<Vec<_>>();
+        let mut previous: HashMap<Url, ObjectRegistry> = HashMap::new();
+        loop {
+            let mut changed = false;
+            for (file, text) in &sources {
+                let context = self.context_registry(file, registry);
+                if previous
+                    .get(file)
+                    .is_some_and(|old| old.same_source_context(&context))
+                {
+                    continue;
+                }
+                self.index_source(file, text, &context);
+                previous.insert(file.clone(), context);
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /// Discovers a repository once, so opening an included file also discovers
+    /// its unopened package entry point and siblings. Open buffers remain authoritative.
+    pub fn repository_files(&self, file: &Url, folders: &[PathBuf]) -> Vec<Url> {
+        let Some(root) = RepositorySources::root(file, folders) else {
+            return Vec::new();
+        };
+        if !self.discovered_repositories.insert(root.clone()) {
+            return Vec::new();
+        }
+        RepositorySources::files(&root)
+    }
+
+    /// Source files newly created below a workspace path, including a package
+    /// entry point that no open fragment explicitly imports.
+    pub fn sources_under(&self, path: &Path) -> Vec<Url> {
+        RepositorySources::files(path)
+    }
+
+    /// Reconstructs package ownership through load edges after all files have
+    /// been indexed. Keeping every importing package avoids selecting a meaning
+    /// arbitrarily when one source file is included by multiple packages.
+    pub fn rebuild_import_contexts(&self) {
+        self.package_of_loaded_file.clear();
+        loop {
+            let mut changed = false;
+            for entry in &self.file_loads_by_file {
+                for load in entry.value() {
+                    let Some(loaded) = self.resolve_load(entry.key(), load) else {
+                        continue;
+                    };
+                    let packages = self.packages_at(entry.key(), load.call);
+                    if packages.is_empty() {
+                        continue;
+                    }
+                    let mut inherited = self.package_of_loaded_file.entry(loaded).or_default();
+                    for package in packages {
+                        changed |= inherited.insert(package);
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /// Last visible source position in each file contributing to the environment.
+    /// Full dependencies use the maximum position; loaders stop at their include.
+    fn import_context_limits(&self, file: &Url) -> HashMap<Url, Position> {
+        let mut limits = self.inherited_context_limits(file);
+        limits.remove(file);
+        self.extend_dependencies(file, pos_max!(), &mut limits);
+        limits
+    }
+
+    /// Prefixes already executed before a package fragment starts.
+    fn inherited_context_limits(&self, file: &Url) -> HashMap<Url, Position> {
+        let mut limits = HashMap::from([(file.clone(), pos_max!())]);
+        if self.packages_at(file, pos!()).is_empty() {
+            return limits;
+        }
+        let mut pending = vec![file.clone()];
+        let mut visited = HashSet::new();
+        while let Some(child) = pending.pop() {
+            if !visited.insert(child.clone()) {
+                continue;
+            }
+            for entry in &self.file_loads_by_file {
+                for load in entry.value() {
+                    if self.resolve_load(entry.key(), load).as_ref() == Some(&child)
+                        && !self.packages_at(entry.key(), load.call).is_empty()
+                    {
+                        self.extend_dependencies(entry.key(), load.call, &mut limits);
+                        pending.push(entry.key().clone());
+                    }
+                }
+            }
+        }
+        limits
+    }
+
+    /// First explicit import activating a dependency in the requesting file.
+    fn dependency_activation(&self, file: &Url, dependency: &Url) -> Option<Position> {
+        let mut imports = self
+            .file_loads_by_file
+            .get(file)
+            .map(|loads| {
+                loads
+                    .iter()
+                    .filter_map(|load| {
+                        self.resolve_load(file, load)
+                            .map(|target| (target, load.literal.end))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(snapshot) = self.hierarchies_by_file.get(file) {
+            for import in &snapshot.package_imports {
+                imports.extend(
+                    self.declared_packages_by_file
+                        .iter()
+                        .filter(|entry| {
+                            entry
+                                .value()
+                                .iter()
+                                .any(|package| package.name == import.package)
+                        })
+                        .map(|entry| (entry.key().clone(), import.effective_from)),
+                );
+            }
+        }
+        imports
+            .into_iter()
+            .filter_map(|(root, position)| {
+                let mut files = HashMap::new();
+                self.extend_dependencies(&root, pos_max!(), &mut files);
+                files.contains_key(dependency).then_some(position)
+            })
+            .min()
+    }
+
+    /// Adds dependencies before a source cutoff, terminating include cycles.
+    fn extend_dependencies(
+        &self,
+        file: &Url,
+        through: Position,
+        limits: &mut HashMap<Url, Position>,
+    ) {
+        if limits
+            .get(file)
+            .is_some_and(|previous| *previous >= through)
+        {
+            return;
+        }
+        limits.insert(file.clone(), through);
+        let loads = self
+            .file_loads_by_file
+            .get(file)
+            .map(|loads| loads.clone())
+            .unwrap_or_default();
+        for load in &loads {
+            if load.call < through {
+                if let Some(child) = self.resolve_load(file, load) {
+                    self.extend_dependencies(&child, pos_max!(), limits);
+                }
+            }
+        }
+        // Package imports are separate from file loads. Their resolved edges
+        // are recorded alongside loads, but do not inherit the caller's scope.
+        if through == pos_max!() {
+            if let Some(children) = self.loads_by_file.get(file) {
+                for child in children.value() {
+                    if !loads
+                        .iter()
+                        .any(|load| self.resolve_load(file, load).as_ref() == Some(child))
+                    {
+                        self.extend_dependencies(child, pos_max!(), limits);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolves an include using the same search paths as ordinary indexing,
+    /// retaining already indexed unsaved and virtual files as valid targets.
+    fn resolve_load(&self, file: &Url, load: &FileLoad) -> Option<Url> {
+        let paths = self
+            .fallback_sources
+            .snapshot()
+            .as_ref()
+            .map(SourceResolver::fallback_load_paths)
+            .unwrap_or_default();
+        load.resolve(file, &paths)
+            .file()
+            .cloned()
+            .or_else(|| load.beside(file).filter(|file| self.is_indexed(file)))
+    }
     /// The index of one package's library sources.
     pub fn of_library_sources() -> Self {
         Self {
@@ -430,7 +808,13 @@ impl WorkspaceIndex {
                 snapshot.package_context = self
                     .package_of_loaded_file
                     .get(entry.key())
-                    .map(|package| package.name().to_string());
+                    .filter(|packages| packages.len() == 1)
+                    .and_then(|packages| {
+                        packages
+                            .iter()
+                            .next()
+                            .map(|package| package.name().to_string())
+                    });
                 (entry.key().clone(), snapshot)
             })
             .collect()
@@ -448,9 +832,18 @@ impl WorkspaceIndex {
             "workspace.index_file",
             serde_json::json!({"uri": uri, "source_bytes": text.len()}),
         );
-        self.remove_file(uri);
-        let Some(snapshot) = DocumentSnapshot::from_text(text.to_string(), knowledge_provider)
-        else {
+        let namespace = self
+            .hierarchies_by_file
+            .get(uri)
+            .filter(|snapshot| snapshot.source_text.as_ref() == text)
+            .map(|snapshot| snapshot.source_namespace);
+        let Some(snapshot) = DocumentSnapshot::from_text_in_namespace(
+            text.to_string(),
+            knowledge_provider,
+            Default::default(),
+            namespace,
+        ) else {
+            self.remove_file(uri);
             self.loads_by_file.insert(uri.clone(), Vec::new());
             return Vec::new();
         };
@@ -491,6 +884,19 @@ impl WorkspaceIndex {
             knowledge_provider,
             fallback.as_ref(),
         ));
+        for import in snapshot.imported_packages() {
+            loads.extend(
+                self.declared_packages_by_file
+                    .iter()
+                    .filter(|entry| {
+                        entry
+                            .value()
+                            .iter()
+                            .any(|declaration| declaration.name == import.package)
+                    })
+                    .map(|entry| entry.key().clone()),
+            );
+        }
         if let Some(core) = fallback
             .as_ref()
             .and_then(|sources| sources.resolve_package_file(Macaulay2Conventions::CORE))
@@ -572,11 +978,19 @@ impl WorkspaceIndex {
             .map(SourceResolver::fallback_load_paths)
             .unwrap_or_default();
         for load in snapshot.file_loads() {
-            let Some(loaded) = load.resolve(uri, &search_paths).file().cloned() else {
+            let Some(loaded) = load
+                .resolve(uri, &search_paths)
+                .file()
+                .cloned()
+                .or_else(|| load.beside(uri).filter(|file| self.is_indexed(file)))
+            else {
                 continue;
             };
             if let Some(package) = self.package_at(uri, load.call) {
-                self.package_of_loaded_file.insert(loaded.clone(), package);
+                self.package_of_loaded_file
+                    .entry(loaded.clone())
+                    .or_default()
+                    .insert(package);
             }
             loaded_files.push(loaded);
         }
@@ -702,15 +1116,27 @@ impl WorkspaceIndex {
     /// of `uri` lands in: the package whose section there contains it in a
     /// file declaring packages, the package loading the file otherwise.
     fn package_at(&self, uri: &Url, position: Position) -> Option<ObjectName> {
+        let packages = self.packages_at(uri, position);
+        (packages.len() == 1)
+            .then(|| packages.into_iter().next())
+            .flatten()
+    }
+
+    /// Packages in whose dictionary this position can execute. The set may
+    /// have multiple members when different entry points include the same file.
+    fn packages_at(&self, uri: &Url, position: Position) -> BTreeSet<ObjectName> {
         match self.declared_packages_by_file.get(uri) {
             Some(declarations) => declarations
                 .iter()
                 .find(|declaration| declaration.contains(position))
-                .map(|declaration| declaration.name.clone()),
+                .map(|declaration| declaration.name.clone())
+                .into_iter()
+                .collect(),
             None => self
                 .package_of_loaded_file
                 .get(uri)
-                .map(|package| package.value().clone()),
+                .map(|package| package.value().clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -727,7 +1153,7 @@ impl WorkspaceIndex {
             || self
                 .package_of_loaded_file
                 .get(uri)
-                .is_some_and(|loaded_into| loaded_into.value() == package)
+                .is_some_and(|loaded_into| loaded_into.value().contains(package))
     }
 
     /// Every export of `name` by an indexed package, with the file declaring
@@ -772,23 +1198,47 @@ impl WorkspaceIndex {
         if self.privacy == PackagePrivacy::Waived {
             return true;
         }
-        let Some(owner) = self.package_at(uri, range.start) else {
+        if !Self::answers_for_itself(viewer, uri)
+            && self
+                .definitions_by_name
+                .get(name)
+                .is_some_and(|definitions| {
+                    definitions.iter().any(|definition| {
+                        &definition.uri == uri && definition.range == range && !definition.shared
+                    })
+                })
+        {
+            return false;
+        }
+        if let WorkspaceViewer::Document(requester) = viewer {
+            if requester != uri
+                && self
+                    .import_context_limits(requester)
+                    .get(uri)
+                    .is_none_or(|limit| range.start > *limit)
+            {
+                return false;
+            }
+        }
+        let owners = self.packages_at(uri, range.start);
+        if owners.is_empty() {
             return true;
-        };
+        }
         // `newPackage` binds the package's own name in `PackageDictionary`,
         // which every session sees.
-        if owner.name() == name {
+        if owners.iter().any(|owner| owner.name() == name) {
             return true;
         }
         let is_member = match viewer {
-            WorkspaceViewer::Document(requester) => self.belongs_to_package(requester, &owner),
+            WorkspaceViewer::Document(requester) => owners
+                .iter()
+                .any(|owner| self.belongs_to_package(requester, owner)),
             WorkspaceViewer::PackageSession => false,
         };
         is_member
-            || self
-                .exports_named(name)
-                .iter()
-                .any(|indexed| indexed.package == owner && indexed.export.definition.name() == name)
+            || self.exports_named(name).iter().any(|indexed| {
+                owners.contains(&indexed.package) && indexed.export.name.name() == name
+            })
     }
 
     /// Whether `viewer`'s own analysis answers for the file `uri`.
@@ -828,7 +1278,11 @@ impl WorkspaceIndex {
                 .unwrap_or_default()
         };
         let mut locations = defined_in(name, None);
-        let exports = self.exports_named(name);
+        let exports = self
+            .exports_named(name)
+            .into_iter()
+            .filter(|indexed| self.is_visible(viewer, name, &indexed.file, indexed.export.range))
+            .collect::<Vec<_>>();
         for indexed in &exports {
             if indexed.export.definition.name() != name {
                 locations.extend(defined_in(
@@ -885,8 +1339,10 @@ impl WorkspaceIndex {
         self.visible_definition(name, viewer)
             .map(|definition| definition.semantic_token)
             .or_else(|| {
-                (!self.exports_named(name).is_empty())
-                    .then(|| M2SemanticToken::new(M2SemanticTokenType::Symbol))
+                (self.exports_named(name).iter().any(|indexed| {
+                    self.is_visible(viewer, name, &indexed.file, indexed.export.range)
+                }))
+                .then(|| M2SemanticToken::new(M2SemanticTokenType::Symbol))
             })
     }
 
@@ -897,7 +1353,10 @@ impl WorkspaceIndex {
             .and_then(|definition| self.package_at(&definition.uri, definition.range.start))
             .or_else(|| {
                 self.exports_named(name)
-                    .first()
+                    .into_iter()
+                    .find(|indexed| {
+                        self.is_visible(viewer, name, &indexed.file, indexed.export.range)
+                    })
                     .map(|export| export.package.clone())
             })
     }
@@ -1249,6 +1708,7 @@ fn top_level_definitions(uri: &Url, snapshot: &DocumentSnapshot) -> Vec<(ObjectN
                     token
                 },
                 is_declaration: binding.state.span == binding.range,
+                shared: !binding.is_local(),
                 code: snapshot.declaration_code(binding).map(str::to_string),
             };
             (binding.name.clone(), definition)
@@ -1350,6 +1810,7 @@ mod tests {
             &builtins,
         );
 
+        index.index_file(&main, "load \"defs.m2\"\n", &builtins);
         let found = index.definitions("myHelper", &main);
         assert_eq!(found.len(), 2, "every reassignment should be indexed");
         assert_eq!(found[0].uri, defs);
@@ -1394,6 +1855,7 @@ mod tests {
             &knowledge,
         );
 
+        index.index_file(&reference, "load \"definitions.m2\"\n", &knowledge);
         assert_eq!(
             index
                 .semantic_token("Greeting", &reference)
@@ -1421,6 +1883,7 @@ mod tests {
             &builtins,
         );
 
+        index.index_file(&script, "needsPackage \"Pkg\"\n", &builtins);
         assert_eq!(index.definitions("pub", &script).len(), 1);
         assert!(index.definitions("priv", &script).is_empty());
         assert!(!index.is_defined("priv", &script));

@@ -40,6 +40,9 @@ impl Macaulay2Conventions {
     /// Package owning ordinary workspace globals.
     pub const USER_PACKAGE: &str = "User";
 
+    /// Mutable runtime context selected by package entry and exit operations.
+    pub const CURRENT_PACKAGE: &str = "currentPackage";
+
     /// Core calls whose first string argument identifies a package.
     pub const PACKAGE_NAME_FUNCTIONS: [&str; 10] = [
         "needsPackage",
