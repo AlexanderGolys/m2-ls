@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.6.1 - 2026-11-06
+
+- Refuse to index a repository root holding more than 100,000 entries,
+  logging the refusal instead of scanning it. `m2-lint` treated the nearest
+  ancestor with a `.git` as the repository, so a `.git` in the home
+  directory made it scan everything below and hang on every input.
+- Report a framed source slice that parses into more than one cell as a
+  parse error at the surplus cell, instead of aborting the process.
+
 ## 2.6.0 - 2026-11-06
 
 - Discover repository source files and resolve package fragments through their
