@@ -14,7 +14,7 @@ makeIdeal = R -> (                       ┐
 doc ///                                  ┐
 Key                                       │ folds as a string
   makeIdeal                               │
-///                                       ┘
+///                                       §variable.documentation|┘§
 ```
 
 Comment ranges are marked as comments, so an editor setting such as "fold all

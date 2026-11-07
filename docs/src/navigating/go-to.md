@@ -5,12 +5,12 @@ name can be assigned many times, and a method function's behavior lives in
 installations scattered across files.
 
 ```m2
-area = method()                 -- ① declaration and definition of `area`
-area Matrix := m -> rank m
-area ZZ := n -> n               -- ③ what `area 3` dispatches to
+area = §function.readonly|method§()                 -- ① declaration and definition of `area`
+area §typeParameter.readonly|Matrix§ := §parameter.declaration|m§ -> §method.readonly|rank§ §parameter|m§
+area §typeParameter.readonly|ZZ§ := §parameter.declaration|n§ -> §parameter|n§               -- ③ what `area 3` dispatches to
 counter = 0                     -- ② declaration of `counter`
-counter = counter + 1           -- ② another definition
-r = area 3
+counter = §variable|counter§ + 1           -- ② another definition
+r = §method|area§ 3
 ```
 
 Go to declaration

@@ -6,12 +6,12 @@ comment, the package named in `needsPackage "Graphs"`, or the file named in
 can underline them and open their target on a click.
 
 ```m2
--- Normalizes the input before [[dispatch]] sees it.
-normalize = x -> x
+-- Normalizes the input before [[§property.documentation|dispatch§]] sees it.
+normalize = §parameter.declaration|x§ -> §parameter|x§
 
-needsPackage "Graphs"
-loadPackage("Normaliz", Reload => true)
-load "lib/helper.m2"
+needsPackage §namespace|"Graphs"§
+loadPackage(§namespace|"Normaliz"§, §enumMember.option.readonly|Reload§ => §variable.readonly|true§)
+load §namespace|"lib/helper.m2"§
 ```
 
 `[[dispatch]]`

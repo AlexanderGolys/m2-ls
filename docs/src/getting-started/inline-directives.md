@@ -25,7 +25,7 @@ commas separate them, and codes and names can be mixed:
 ```m2
 -- m2-ls: disable S04, unused-binding
 -- m2-ls: disable-next-line S06
-R = QQ[x0, x1]
+R = §type.readonly|QQ§[§variable.declaration.algebraic|x0§, §variable.declaration.algebraic|x1§]
 ```
 
 The first comment hides `prefer-coalescence` and `unused-binding` throughout
@@ -48,8 +48,8 @@ bounded disable/enable region. Remove the directive or narrow it to
 
 ```m2
 -- m2-ls: disable-next-line ring-variable-naming
-R = QQ[x0]
-S = QQ[y0]
+R = §type.readonly|QQ§[§variable.declaration.algebraic|x0§]
+S = §type.readonly|QQ§[§variable.declaration.algebraic|y0§]
 ```
 
 Only the `R` line is suppressed. The next line means the next physical line,
@@ -62,7 +62,7 @@ not the line containing the comment.
 
 ```m2
 -- m2-ls: disable-next-line
-R = QQ[x0]
+R = §type.readonly|QQ§[§variable.declaration.algebraic|x0§]
 ```
 
 With no selectors, every diagnostic is hidden in the chosen scope. Similarly,
@@ -140,13 +140,13 @@ run with `M2 -q`. Others belong to a project with an init file of its own:
 
 ```m2
 -- m2-ls: initFile none
-newPackage "Thesis"
+newPackage §namespace|"Thesis"§
 ```
 
 ```m2
 -- m2-ls: initFile ../session-init.m2
-R = QQ[x, y]
-helperFromSessionInit R
+R = §type.readonly|QQ§[§variable.declaration.algebraic|x§, §variable.declaration.algebraic|y§]
+helperFromSessionInit §type|R§
 ```
 
 `none`

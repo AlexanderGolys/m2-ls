@@ -5,8 +5,8 @@ What counts as related depends on what is under the cursor.
 
 ```m2
 total = 0
-scan(L, value -> total = total + value)
-f = value -> if value > 0 then value else -value
+scan(§variable|L§, §parameter.declaration|value§ -> §variable.declaration|total§ = §variable|total§ + §parameter|value§)
+f = §parameter.declaration|value§ -> if §parameter|value§ > 0 then §parameter|value§ else -§parameter|value§
 ```
 
 On a name

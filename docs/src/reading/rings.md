@@ -6,11 +6,11 @@ the way Macaulay2 builds it, so a subscript is never just "something of type
 `S`" — it is a particular variable, or a mistake.
 
 ```m2
-S = QQ[x_0 .. y_2, z, w_(1,1)]
-S_6                         -- S_6 = z
-T = S[t]
-T_1                         -- T_1 = x_0
-T_9
+S = §type.readonly|QQ§[§variable.declaration.algebraic|x_0§ .. §variable.declaration.algebraic|y_2§, §variable.declaration.algebraic|z§, §variable.declaration.algebraic|w_(1,1)§]
+S_§variable.algebraic|6§                         -- S_6 = z
+T = §type|S§[§variable.declaration.algebraic|t§]
+T_§variable.algebraic|1§                         -- T_1 = x_0
+T_§variable.algebraic|9§
 -- ^ error[E14]: index 9 out of bounds 0 .. 8; this ring has 9 variables,
 --   counting those of a polynomial coefficient ring
 ```
@@ -45,14 +45,14 @@ Both mistakes are errors Macaulay2 raises only when the line runs. `m2-ls`
 reports them as you type:
 
 ```m2
-A = QQ[a, b_1]
-A_2
+A = §type.readonly|QQ§[§variable.declaration.algebraic|a§, §variable.declaration.algebraic|b_1§]
+A_§variable.algebraic|2§
 -- ^ error[E14]: index 2 out of bounds 0 .. 1; this ring has 2 variables,
 --   counting those of a polynomial coefficient ring
-"b"_A
+"b"_§type|A§
 -- ^ error[E15]: variable not found in ring: `b`; lookups by name find only
 --   the ring's variables, as its subscripts select them
-b_2_A
+b_§property|2§_§type|A§
 -- ^ error[E15]: indexed variable not found in ring: `b_2`; …
 ```
 
@@ -71,13 +71,13 @@ single token; any other keeps its parts, each colored by what it is.
 : The real field of that precision: one `type`.
 
 `S_1`
-: `S` stays a `type`, the `_` is an operator with the `access` modifier, and
+: `S` stays a `type`, the `_` is an operator with the `memberAccess` modifier, and
   the `1` is colored as the generator it selects.
 
 `L_0`, `L#0`
 : An access into a value: the `0` is a `property`, like a field name.
 
-Themes can fade the `access` operator so the eye skips to the parts that
+Themes can fade the `memberAccess` operator so the eye skips to the parts that
 matter; see [semantic highlighting](semantic-highlighting.md#subscripts).
 
 ## One index, one variable { #indexed }

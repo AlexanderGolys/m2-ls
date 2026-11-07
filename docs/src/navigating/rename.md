@@ -5,14 +5,14 @@ unrelated names with the same spelling alone.
 
 ```m2,pane="Before"
 value = 10
-double = value -> 2 * value
-print(value + double value)
+double = §parameter.declaration|value§ -> 2 * §parameter|value§
+print(§variable.readonly|value§ + §function|double§ §variable.readonly|value§)
 ```
 
 ```m2,pane="After: rename the parameter to n"
 value = 10
-double = n -> 2 * n
-print(value + double value)
+double = §parameter.declaration|n§ -> 2 * §parameter|n§
+print(§variable.readonly|value§ + §function|double§ §variable.readonly|value§)
 ```
 
 The set of edited places is exactly what [references](references.md) finds:

@@ -5,12 +5,12 @@ text after it. The default is deliberately calm: bindings and selected expressio
 off the code.
 
 ```m2
-R = QQ[x, y]                     -- R: PolynomialRing   x: R   y: R
-area = method()                  -- area: MethodFunction
-area Matrix := m -> rank m       --                       -> ZZ
-G = gb ideal(x^2, y)             -- G: GroebnerBasis
-f = symbol g                     -- f: Symbol
-x = if ready then 1 else 2       -- x: ZZ
+R = §type.readonly|QQ§[§variable.declaration.algebraic|x§, §variable.declaration.algebraic|y§]                     -- R: PolynomialRing   x: R   y: R
+area = §function.readonly|method§()                  -- area: MethodFunction
+area §typeParameter.readonly|Matrix§ := §parameter.declaration|m§ -> §method.readonly|rank§ §parameter|m§       --                       -> ZZ
+G = §method.readonly|gb§ §method.readonly|ideal§(§variable.algebraic|x§^2, §variable.algebraic|y§)             -- G: GroebnerBasis
+f = §modifier|symbol§ §enumMember|g§                     -- f: Symbol
+x = if §variable|ready§ then 1 else 2       -- x: ZZ
 ```
 
 Ring generators get the ring they belong to, with return hints enabled, a function shows what it returns

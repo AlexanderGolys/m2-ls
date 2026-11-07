@@ -5,9 +5,9 @@ the current workspace. The report includes live buffers, indexed files they
 load, package objects, and the library objects available to those files.
 
 ```m2
-Meta = new Type of SelfInitializingType
-Entry = new Meta of BasicList
-entry = Entry {}
+Meta = new §type.readonly|Type§ of §type.readonly|SelfInitializingType§
+Entry = new §type|Meta§ of §type.readonly|BasicList§
+entry = §type|Entry§ {}
 ```
 
 These three values illustrate why the relations are separate:

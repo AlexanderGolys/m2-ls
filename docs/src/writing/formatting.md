@@ -9,21 +9,21 @@ For example, formatting keeps `linked === true`; **Simplify Boolean comparison**
 can replace it with `linked` when its type is known to be Boolean.
 
 ```m2,pane="Before"
-normalize = (v,limit) -> (
-if v === null then 0 else if v > limit then limit else v
+normalize = (§parameter.declaration|v§,§parameter.declaration|limit§) -> (
+if §parameter|v§ === §variable.readonly|null§ then 0 else if §parameter|v§ > §parameter|limit§ then §parameter|limit§ else §parameter|v§
 )
-total = sum apply({1,2,3}, i -> 2 * i+1)
+total = §method.readonly|sum§ §function.defaultLibrary.readonly|apply§({1,2,3}, §parameter.declaration|i§ -> 2 * §parameter|i§+1)
 ```
 
 ```m2,pane="After"
-normalize = (v, limit) -> (
-    if v === null then
+normalize = (§parameter.declaration|v§, §parameter.declaration|limit§) -> (
+    if §parameter|v§ === §variable.readonly|null§ then
         0
-    else if v > limit then
-        limit
-    else v
+    else if §parameter|v§ > §parameter|limit§ then
+        §parameter|limit§
+    else §parameter|v§
 )
-total = sum apply({1, 2, 3}, i -> 2*i + 1)
+total = §method.readonly|sum§ §function.defaultLibrary.readonly|apply§({1, 2, 3}, §parameter.declaration|i§ -> 2*§parameter|i§ + 1)
 ```
 
 Format from the editor (`:lua vim.lsp.buf.format()` in Neovim), or from a
@@ -37,39 +37,39 @@ how an `if` that stands on its own line in a block is laid out. The same
 function under each value:
 
 ```m2,pane="compact"
-normalize = (v, limit) -> (
-    if v === null then 0 else if v > limit then limit else v
+normalize = (§parameter.declaration|v§, §parameter.declaration|limit§) -> (
+    if §parameter|v§ === §variable.readonly|null§ then 0 else if §parameter|v§ > §parameter|limit§ then §parameter|limit§ else §parameter|v§
 )
 ```
 
 ```m2,pane="multiline"
-normalize = (v, limit) -> (
-    if v === null then
+normalize = (§parameter.declaration|v§, §parameter.declaration|limit§) -> (
+    if §parameter|v§ === §variable.readonly|null§ then
         0
-    else if v > limit then
-        limit
+    else if §parameter|v§ > §parameter|limit§ then
+        §parameter|limit§
     else
-        v
+        §parameter|v§
 )
 ```
 
 ```m2,pane="multilineCompactElse (default)"
-normalize = (v, limit) -> (
-    if v === null then
+normalize = (§parameter.declaration|v§, §parameter.declaration|limit§) -> (
+    if §parameter|v§ === §variable.readonly|null§ then
         0
-    else if v > limit then
-        limit
-    else v
+    else if §parameter|v§ > §parameter|limit§ then
+        §parameter|limit§
+    else §parameter|v§
 )
 ```
 
 ```m2,pane="leadingKeywords"
-normalize = (v, limit) -> (
-    if v === null
+normalize = (§parameter.declaration|v§, §parameter.declaration|limit§) -> (
+    if §parameter|v§ === §variable.readonly|null§
     then 0
-    else if v > limit
-    then limit
-    else v
+    else if §parameter|v§ > §parameter|limit§
+    then §parameter|limit§
+    else §parameter|v§
 )
 ```
 
@@ -104,13 +104,13 @@ stays on that line under every layout until it outgrows the line width.
   follow what the editor sends with the formatting request.
 
 ```m2,pane="Wrapped at the soft width"
-result = someFunction(firstArgument, secondArgument, thirdArgument) +
-    anotherFunction(fourthArgument, fifthArgument)
+result = §variable|someFunction§(§variable|firstArgument§, §variable|secondArgument§, §variable|thirdArgument§) +
+    §variable|anotherFunction§(§variable|fourthArgument§, §variable|fifthArgument§)
 ```
 
 ```m2,pane="breakAfterSemicolon = true"
-total = sum L;
-scaled = 3*total
+total = §method.readonly|sum§ §variable|L§;
+scaled = 3*§variable|total§
 ```
 
 ## Fine print

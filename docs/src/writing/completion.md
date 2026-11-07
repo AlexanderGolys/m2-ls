@@ -45,7 +45,7 @@ follow; folders reached through a symbolic link count as folders.
 ## Types after `new` { #new }
 
 ```m2
-LocalType = new Type
+LocalType = new §type.readonly|Type§
 instance = new Loc|
 ```
 

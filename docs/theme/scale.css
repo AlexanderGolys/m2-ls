@@ -1,0 +1,11 @@
+/* mdBook sizes everything in rem, 10px by default, with a 750px column and a
+   300px sidebar. Grow the text, the column and the sidebar with the window,
+   from that default at 1280px to 1.5x at 2560px, so wide screens get larger
+   text in a wider column instead of small text in a third of the window. The
+   browser's own zoom still stacks sensibly on top. */
+/* `:root`, not `html`: mdBook sets its 62.5% on `:root`, which outranks `html`. */
+:root {
+    font-size: clamp(62.5%, calc(0.390625vw + 5px), 93.75%);
+    --content-max-width: 75rem;
+    --sidebar-target-width: 30rem; /* the drag handle overrides it */
+}

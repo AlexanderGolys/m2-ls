@@ -6,17 +6,17 @@ library method, and `x` a generator of a polynomial ring — and colors each by
 what it is bound to, not by how it is spelled or where it stands.
 
 ```m2
-R = QQ[x, y]                      -- R type · QQ type · x, y variable+algebraic
-area = method()                   -- area method · method function
-area Matrix := ZZ => m -> rank m  -- Matrix typeParameter · ZZ typeParameter · m parameter
-twice = n -> 2 * n                -- twice function
-scan({1, 2}, print)               -- scan function+defaultLibrary · print function
-G = gb(I, Strategy => Linear)     -- gb method · Strategy enumMember+option
-stdio << "done" << endl           -- stdio variable · endl function
-f = symbol g                      -- symbol modifier · g enumMember
+R = §type.readonly|QQ§[§variable.declaration.algebraic|x§, §variable.declaration.algebraic|y§]                      -- R type · QQ type · x, y variable+algebraic
+area = §function.readonly|method§()                   -- area method · method function
+area §typeParameter.readonly|Matrix§ := §typeParameter.readonly|ZZ§ => §parameter.declaration|m§ -> §method.readonly|rank§ §parameter|m§  -- Matrix typeParameter · ZZ typeParameter · m parameter
+twice = §parameter.declaration|n§ -> 2 * §parameter|n§                -- twice function
+scan({1, 2}, §function.readonly|print§)               -- scan function+defaultLibrary · print function
+G = §method.readonly|gb§(§variable|I§, §enumMember.option.readonly|Strategy§ => §enumMember.readonly|Linear§)     -- gb method · Strategy enumMember+option
+stdio << "done" << §function.readonly|endl§           -- stdio variable · endl function
+f = §modifier|symbol§ §enumMember|g§                      -- symbol modifier · g enumMember
 typo + 1                          -- typo variable
-needsPackage "JSON"               -- "JSON" namespace
-load "lib/helper.m2"              -- "lib/helper.m2" namespace
+needsPackage §namespace|"JSON"§               -- "JSON" namespace
+load §namespace|"lib/helper.m2"§              -- "lib/helper.m2" namespace
 ```
 
 Most tokens use standard LSP types. Embedded code uses custom `delimiter`
@@ -36,8 +36,8 @@ the second column — that is the name your editor and theme see.
 | Function | `function` | anything applied that is not a method function: closures, compiled functions, scripted functors, commands | `twice`, `print`, `apply`, `Ext`, `exit` |
 | Method | `method` | a method function, made by `method()`, which dispatches to its installations | `area`, `det`, `gb`, `source` |
 | Variable | `variable` | every other value | `G`, `stdio`, a local |
-| Parameter | `parameter` | a function parameter, or an input named on a documentation page | `m` in `m -> rank m` |
-| Property | `property` | a key rather than a binding: an option name that is not a protected symbol, a member an access selects | `verbose` in `{verbose => false} >> o -> …`, `key` in `H.key`, `0` in `L_0` |
+| Parameter | `parameter` | a function parameter, or an input named on a documentation page, an option name that is not a protected symbol | `m` in `m -> rank m`, `verbose` in `{verbose => false} >> o -> …` |
+| Property | `property` | a key rather than a binding: a member an access selects, a string hash key | `key` in `H.key`, `0` in `L_0`, `"x"` in `"x" => 1` |
 | Namespace | `namespace` | a package, including package names in strings, and the file a `load`, `needs` or `input` call runs | `Core`, `"JSON"` in `needsPackage "JSON"`, `"lib/helper.m2"` in `load "lib/helper.m2"` |
 | Symbol | `enumMember` | a name used as a `Symbol` rather than for its value | `Strategy`, `Linear`, `g` in `symbol g` |
 | Domain or codomain | `typeParameter` | the types an installation is made on and returns | `Matrix`, `ZZ` in `area Matrix := ZZ => …` |
@@ -91,14 +91,19 @@ makes `area` a method, `twice = n -> …` a function.
 | `documentation` | <i class="fa-solid fa-check"></i> | inside documentation: a `doc` string, a `document` call, a [documentation comment](../beyond/documentation-comments.md) | everything inside `doc ///…///` |
 | `algebraic` | | a ring generator or a known nonnumeric value living over a ring | `x`, an ideal, a module, a matrix |
 | `option` | | an option key | `Strategy` in `Strategy => Linear` |
-| `access` | | an operator selecting a part of its left operand | `_` in `S_1`, `.`, `.?`, binary `#` and `#?` |
+| `memberAccess` | | an operator selecting a part of its left operand | `_` in `S_1`, `.`, `.?`, binary `#` and `#?` |
 | `example` | | code run as a documentation example | the lines under `Example` |
 | `test` | | code inside a `TEST` block | the body of `TEST ///…///` |
 | `strong` | | bold documentation text | `{\bf …}`, `BOLD`, a headline |
 | `emphasis` | | italic documentation text | `{\em …}`, `{\it …}`, `EM` |
 | `monospace` | | monospace documentation text | `{\tt …}`, `TT`, `CODE`, a `Pre` block |
-| `link` | | the address of a link | `\url{…}`, `HREF` |
-| `math` | | TeX mathematics | `$x^2$` |
+| `url` | | the address of a web link | `\url{…}`, `HREF` |
+| `file` | | a path to a file | `load "foo.m2"` |
+| `directory` | | a path to a directory (reserved) | |
+| `wikilink` | | the target of a wikilink | `[[ideal]]` |
+| `tex` | | TeX mathematics | `$x^2$` |
+| `injectedCode` | | code written inside a string | a `TEST` body, an example |
+| `injectedName` | | a string naming an object not necessarily in scope | `needsPackage "Foo"` |
 | `abstract` | <i class="fa-solid fa-check"></i> | standard fallback for `algebraic` and `nonsense`; otherwise reserved | `variable+abstract` in standard-only mode |
 | `index` | | reserved for structural indices in known indexed generator names; currently not emitted | no source spans yet |
 | `nonsense` | | reserved companion to `abstract`; currently not emitted | no source spans yet |
@@ -122,8 +127,8 @@ stable; emitted tokens use these fallbacks:
 | `delimiter`, `punctuation` types | `operator` |
 | All other token types | unchanged |
 | `algebraic`, `nonsense` modifiers | `abstract` |
-| `example`, `strong`, `emphasis`, `monospace`, `link`, `math` modifiers | `documentation` |
-| `option`, `access`, `index`, `test` modifiers | removed |
+| `example`, `strong`, `emphasis`, `monospace`, `url`, `file`, `directory`, `wikilink`, `tex` modifiers | `documentation` |
+| `option`, `memberAccess`, `index`, `test` modifiers | removed |
 | `declaration`, `defaultLibrary`, `readonly`, `documentation`, `abstract` modifiers | unchanged |
 
 Fallbacks combine without duplicating modifiers: a
@@ -139,12 +144,12 @@ Rings are type objects; their elements and the objects built over them are
 values. Highlighting preserves that distinction:
 
 ```m2
-R = QQ[x, y]
-I = ideal(x^2, y)
-S = R/I
-M = S^2
-A = matrix {{x, y}}
-f = x^2 + y
+R = §type.readonly|QQ§[§variable.declaration.algebraic|x§, §variable.declaration.algebraic|y§]
+I = §method.readonly|ideal§(§variable.algebraic|x§^2, §variable.algebraic|y§)
+S = §type|R§/§variable.algebraic|I§
+M = §type|S§^2
+A = §method.readonly|matrix§ {{§variable.algebraic|x§, §variable.algebraic|y§}}
+f = §variable.algebraic|x§^2 + §variable.algebraic|y§
 n = 3
 ```
 
@@ -166,17 +171,17 @@ two apart. A subscript that is one object of the kind of one of its parts is a
 single token; every other access keeps its parts:
 
 ```m2
-R = RR_53                   -- RR_53 type: one field of that precision
-S = R[x, y]
+R = §type|RR_53§                   -- RR_53 type: one field of that precision
+S = §type|R§[§variable.declaration.algebraic|x§, §variable.declaration.algebraic|y§]
 1_S                         -- 1_S number: the number 1, in S
-S_1                         -- S type · _ operator+access · 1 variable+algebraic
-L = {S_0, S_1}
-L_0                         -- L variable · _ operator+access · 0 property
-L#i                         -- # operator+access · i variable
+S_§variable.algebraic|1§                         -- S type · _ operator+access · 1 variable+algebraic
+L = {§type|S§_§variable.algebraic|0§, §type|S§_§variable.algebraic|1§}
+L_§property|0§                         -- L variable · _ operator+access · 0 property
+L#§variable|i§                         -- # operator+access · i variable
 ```
 
 A literal selector is colored by what it selects: a generator in `S_1`, a
-member in `L_0`. The `access` modifier marks the operators that select — `_`,
+member in `L_0`. The `memberAccess` modifier marks the operators that select — `_`,
 `.`, `.?`, binary `#` and `#?` — so a theme can fade them and let the base and
 the selector stand out, as `x.1` reads in many Rust themes. Prefix `#L`, the
 length, is a computation and stays a plain operator. More on how rings are
@@ -196,11 +201,11 @@ Key                             -- keyword+documentation
 Headline
   doubles a number              -- string+documentation+strong
 Description
-  Example
-    double 3                    -- function+documentation+example
+  §keyword.documentation|Example§
+    §variable.documentation.example|double§ 3                    -- function+documentation+example
 ///
 TEST ///
-assert(double 2 == 4)           -- assert method+test, 2 number+test, == operator+test
+assert(§variable.test|double§ 2 == 4)           -- assert method+test, 2 number+test, == operator+test
 ///
 ```
 
@@ -240,7 +245,7 @@ Keywords, strings, numbers, operators and comments are also sent as tokens,
 for editors that rely on the server alone. When the client announces
 `augmentsSyntaxTokens` — it highlights syntax itself, for instance with a
 Tree-sitter grammar — the server leaves those to it and sends only the tokens it
-knows more about: names, roles such as an `access` operator or the literal it
+knows more about: names, roles such as an `memberAccess` operator or the literal it
 selects with, and the modifier keywords `symbol`, `local` and `global`. Strings and comments that contain code or documentation are still
 sent, so the code inside them is colored.
 

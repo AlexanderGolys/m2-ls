@@ -48,9 +48,9 @@ whether user code may install methods on it.
 Local names hover with their defining code, their inferred type and their role:
 
 ```m2
-f = L -> (
-    total := sum L;    -- hover: `total := sum L`, Thing · user-defined binding
-    total
+f = §parameter.declaration|L§ -> (
+    §variable.declaration|total§ := §method.readonly|sum§ §parameter|L§;    -- hover: `total := sum L`, Thing · user-defined binding
+    §variable|total§
     )
 ```
 
@@ -59,9 +59,9 @@ they declare or that inference deduces:
 
 ```m2
 -- Rank of the matrix, or the integer itself.
-area = method()
-area Matrix := ZZ => m -> rank m
-area ZZ := ZZ => n -> n
+area = §function.readonly|method§()
+area §typeParameter.readonly|Matrix§ := §typeParameter.readonly|ZZ§ => §parameter.declaration|m§ -> §method.readonly|rank§ §parameter|m§
+area §typeParameter.readonly|ZZ§ := §typeParameter.readonly|ZZ§ => §parameter.declaration|n§ -> §parameter|n§
 ```
 
 Hovering `area` anywhere shows `area = method()`, then **Methods**

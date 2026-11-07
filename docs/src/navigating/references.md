@@ -6,8 +6,8 @@ the spelling is never included.
 
 ```m2
 value = 10                          -- global `value`
-double = value -> 2 * value         -- a parameter, unrelated to the global
-print(value + double value)         -- both uses of the global
+double = §parameter.declaration|value§ -> 2 * §parameter|value§         -- a parameter, unrelated to the global
+print(§variable.readonly|value§ + §function|double§ §variable.readonly|value§)         -- both uses of the global
 ```
 
 References on the global `value` return lines 1 and 3; on the parameter

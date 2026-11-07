@@ -6,11 +6,11 @@ above a definition, and they show up in [hover](../reading/hover.md) wherever
 the name is used — in this file or any other file of the workspace.
 
 ```m2
--- Computes the Hilbert series of [[R]] modulo [[I]].
+-- Computes the Hilbert series of [[§property.documentation|R§]] modulo [[§property.documentation|I§]].
 --
--- The result is a rational function in `T`; see [[reduceHilbert]]
+-- The result is a rational function in `§property.documentation.example|T§`; see [[§property.documentation|reduceHilbert§]]
 -- for a simplified form.
-hilbertOf = (R, I) -> hilbertSeries(R / I)
+hilbertOf = (§parameter.declaration|R§, §parameter.declaration|I§) -> §method.readonly|hilbertSeries§(§parameter|R§ / §parameter|I§)
 ```
 
 Hovering `hilbertOf` shows the prose, rendered as Markdown below the code.
@@ -29,7 +29,7 @@ comments and comments above ordinary expressions:
 answer := 42            -- trailing comments are never documentation
 
 -- Neither is this one: it sits above an expression, not a definition.
-print answer
+print §variable|answer§
 ```
 
 `---` and `-** … **-` are accepted as explicit documentation markers too; the
@@ -68,15 +68,15 @@ A block comment before `newPackage` documents the package itself:
 
 Tools for building wonderful modules.
 *-
-newPackage("WonderfulModules")
+newPackage(§namespace|"WonderfulModules"§)
 ```
 
 A block comment at the very start of a function body documents that function:
 
 ```m2
-normalizeInput = value -> (
+normalizeInput = §parameter.declaration|value§ -> (
     -* Normalize a value before dispatch. *-
-    value
+    §parameter|value§
     )
 ```
 

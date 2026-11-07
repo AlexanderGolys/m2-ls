@@ -6,18 +6,18 @@ line runs, a non-`Boolean` condition fails deep inside a computation. `m2-ls`
 reports these while you type, and its messages say what to write instead.
 
 ```m2
-R = QQ[x0, x1]
+R = §type.readonly|QQ§[§variable.declaration.algebraic|x0§, §variable.declaration.algebraic|x1§]
 --     ^^ hint[S06]: Ring variable `x0` is a multi-character symbol, not an
 --        indexed variable; use `x_0` so the generators form one indexed family
 
-g = method()
-g ZZ = n -> n
+g = §function.readonly|method§()
+g §type.readonly|ZZ§ = §parameter.declaration|n§ -> §parameter|n§
 -- ^ error[E04]: Installing a method on `g` must use `:=`, not `=`: M2 rejects
 --   this ("no method for storing values of function g"). Use `:=`.
 
-sizeLabel = L -> (
-    n := #L;
-    if n then "nonempty" else "empty"
+sizeLabel = §parameter.declaration|L§ -> (
+    §variable.declaration|n§ := #§parameter|L§;
+    if §variable|n§ then "nonempty" else "empty"
     -- ^ warning[T02]: if condition must have type `Boolean`, but this
     --   expression has type `ZZ`
     )
@@ -127,19 +127,19 @@ The `E` rules around method installation are the ones that save the most
 debugging, because Macaulay2 itself fails late or not at all:
 
 ```m2
-f = x -> x
-f ZZ := n -> n
+f = §parameter.declaration|x§ -> §parameter|x§
+f §typeParameter.readonly|ZZ§ := §parameter.declaration|n§ -> §parameter|n§
 -- E01: Installing a method on `f` has no effect: `f` is not a method function.
 --      Define it with `f = method()` to make method installations take effect.
 
-opts = method(Options => {Limit => 1})
-opts QQ := {} >> o -> x -> x
+opts = §function.readonly|method§(§enumMember.option.readonly|Options§ => {§enumMember.option.readonly|Limit§ => 1})
+opts §typeParameter.readonly|QQ§ := {} >> §parameter.declaration|o§ -> §parameter.declaration|x§ -> §parameter|x§
 -- E11: `opts` passes its options as a table to the installed function, so a
 --      function declaring options with `>>` never receives them and the call
 --      fails. Install `o -> x -> …`.
 
-plain = method()
-plain ZZ := {Limit => 1} >> o -> n -> n
+plain = §function.readonly|method§()
+plain §typeParameter.readonly|ZZ§ := {§enumMember.option.readonly|Limit§ => 1} >> §parameter.declaration|o§ -> §parameter.declaration|n§ -> §parameter|n§
 -- E12: `plain` has no options, so calls cannot pass any and the defaults
 --      declared with `>>` always apply.
 ```
@@ -156,14 +156,14 @@ ordinary local names. Function parameters are exempt: a parameter such as
 also outside this check. Leading underscores on local names are allowed.
 
 ```m2
-convert = T -> value -> new T from value
+convert = §parameter.declaration|T§ -> §parameter.declaration|value§ -> new §parameter|T§ from §parameter|value§
 ```
 
 Option names and unbound symbolic defaults use PascalCase (`S01`), both where
 options are declared and where they are passed to a call:
 
 ```m2
-render = method(Options => {Layout => Compact})
+render = §function.readonly|method§(§enumMember.option.readonly|Options§ => {§property.option.readonly|Layout§ => §variable|Compact§})
 ```
 
 A source-bound option key produces `S09`: its value would be evaluated instead
@@ -171,7 +171,7 @@ of supplying the key as a symbol. A bound default value is allowed:
 
 ```m2
 defaultLimit = 10
-render = method(Options => {Limit => defaultLimit})
+render = §function.readonly|method§(§enumMember.option.readonly|Options§ => {§enumMember.option.readonly|Limit§ => §variable|defaultLimit§})
 ```
 
 Ordinary hash-table entries are not option declarations. `S01` leaves known
@@ -182,9 +182,9 @@ or `toWidget` for `Widget`. Declare the result with `TypicalValue => Widget`
 on the method or a `Widget =>` annotation on each installation:
 
 ```m2
-Widget = new Type of HashTable
-toWidget = method(TypicalValue => Widget)
-toWidget ZZ := n -> new Widget from {"value" => n}
+Widget = new §type.readonly|Type§ of §type.readonly|HashTable§
+toWidget = §function.readonly|method§(§enumMember.option.readonly|TypicalValue§ => §type|Widget§)
+toWidget §typeParameter.readonly|ZZ§ := §parameter.declaration|n§ -> new §type|Widget§ from {§property.option|"value"§ => §parameter|n§}
 ```
 
 ## Floating-point keys { #float-keys }
@@ -195,7 +195,7 @@ the literal is assigned on another line:
 
 ```m2
 key = 1.5
-table#key
+table#§variable|key§
 ```
 
 Use exact values or another stable identifier for keys. A floating-point value
@@ -210,7 +210,7 @@ For one place, write a directive comment in the file:
 ```m2
 -- m2-ls: disable S04 unused-binding
 -- m2-ls: disable-next-line ring-variable-naming
-R = QQ[x0, x1]
+R = §type.readonly|QQ§[§variable.declaration.algebraic|x0§, §variable.declaration.algebraic|x1§]
 ```
 
 `-- m2-ls: disable …`
@@ -243,7 +243,7 @@ and the separate `primaryCode` analysis property.
 one value:
 
 ```m2
-renderLabel = x -> if instance(x, String) then x
+renderLabel = §parameter.declaration|x§ -> if §function.defaultLibrary.readonly|instance§(§parameter|x§, §type.readonly|String§) then §parameter|x§
     else if instance(x, ZZ) then toString x
     else "other"
 ```
@@ -252,10 +252,10 @@ Separate method specializations keep each class's behavior together and let new
 classes extend the operation:
 
 ```m2
-renderLabel = method()
-renderLabel String := String => x -> x
-renderLabel ZZ := String => x -> toString x
-renderLabel Thing := String => x -> "other"
+renderLabel = §function.readonly|method§()
+renderLabel §typeParameter.readonly|String§ := §typeParameter.readonly|String§ => §parameter.declaration|x§ -> §parameter|x§
+renderLabel §typeParameter.readonly|ZZ§ := §typeParameter.readonly|String§ => §parameter.declaration|x§ -> §method.readonly|toString§ §parameter|x§
+renderLabel §typeParameter.readonly|Thing§ := §typeParameter.readonly|String§ => §parameter.declaration|x§ -> "other"
 ```
 
 This warning is advisory. Review inheritance and branch order before changing a
@@ -271,8 +271,8 @@ not cover compound conditions or separate early-return guards.
 membership and a fixed multi-field length:
 
 ```m2
-if not instance(task, VisibleList) or #task != 2 then
-    error "task needs two fields"
+if not §function.defaultLibrary.readonly|instance§(§variable|task§, §type.readonly|VisibleList§) or #§variable|task§ != 2 then
+    §function.defaultLibrary.readonly|error§ "task needs two fields"
 ```
 
 A fixed number of positional entries can indicate a record whose fields would
@@ -295,7 +295,7 @@ explicitly annotate the same codomain. For example, four `String` annotations
 out of five installations qualify; six out of eight do not.
 
 ```m2
-renderLabel = method(TypicalValue => String, Options => {Width => 80})
+renderLabel = §function.readonly|method§(§enumMember.option.readonly|TypicalValue§ => §type.readonly|String§, §enumMember.option.readonly|Options§ => {§property.option|Width§ => 80})
 ```
 
 Keep the declaration's existing options and differing per-method codomain

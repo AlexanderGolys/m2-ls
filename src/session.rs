@@ -19,6 +19,8 @@ use tokio::sync::Notify;
 use tower::Service;
 use tower_lsp::jsonrpc::{Request, Response};
 
+use crate::telemetry::Timing;
+
 /// The process exit code when the client ends the session after requesting
 /// `shutdown`, as the LSP specification requires.
 const EXIT_AFTER_SHUTDOWN: i32 = 0;
@@ -131,7 +133,7 @@ where
             "exit" => self.session_end.end(),
             _ => {}
         }
-        let mut timing = crate::telemetry::Timing::start(
+        let mut timing = Timing::start(
             "rpc",
             serde_json::json!({
                 "method": request.method(), "request_id": request.id(),

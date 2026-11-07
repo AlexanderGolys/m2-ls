@@ -3,15 +3,15 @@
 The document outline lists what the file defines, nested the way the code is:
 
 ```m2
-R = QQ[x_0..x_3]
-area = method()
-area Matrix := m -> rank m
-toString Tally := t -> "tally"
-- String := s -> s
-Point = new Type of List
-f = L -> (
-    g := x -> x + 1;
-    apply(L, g)
+R = §type.readonly|QQ§[§variable.declaration.algebraic|x_0§..§variable.declaration.algebraic|x_3§]
+area = §function.readonly|method§()
+area §typeParameter.readonly|Matrix§ := §parameter.declaration|m§ -> §method.readonly|rank§ §parameter|m§
+toString §typeParameter.readonly|Tally§ := §parameter.declaration|t§ -> "tally"
+- §typeParameter.readonly|String§ := §parameter.declaration|s§ -> §parameter|s§
+Point = new §type.readonly|Type§ of §type.readonly|List§
+f = §parameter.declaration|L§ -> (
+    §function.declaration|g§ := §parameter.declaration|x§ -> §parameter|x§ + 1;
+    §function.defaultLibrary.readonly|apply§(§parameter|L§, §function|g§)
     )
 ```
 

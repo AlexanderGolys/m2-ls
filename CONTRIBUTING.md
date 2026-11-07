@@ -110,6 +110,20 @@ outside tracked source; `/m2-index.jsonl` is ignored for this purpose.
 Keep `README.md` short and user-facing: what the server does, how to install
 and connect it, and the settings it accepts.
 
+The guide in `docs/` is built with `mdbook-tsitter` 4 or later. Its `m2` blocks
+carry the server's semantic tokens as `§type.modifier|text§` marks, which the
+build turns into styled spans (`lsp = true` for `macaulay2` in `docs/book.toml`).
+Write a new block as plain code, then generate its marks with the server
+installed as `m2-ls`:
+
+```bash
+nvim --headless -l tools/lsp-marks/headless.lua block.m2 --server=m2-ls
+```
+
+`tools/lsp-marks` is in the `mdbook-tsitter` repository. The server returns no
+tokens for a cell with a syntax error, so illustrations of unfinished input
+stay unmarked.
+
 ## Test logging
 
 Tests must not write to the usage history or operational log. Library tests do

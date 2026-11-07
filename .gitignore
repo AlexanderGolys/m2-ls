@@ -36,3 +36,4 @@ example-workspace/
 
 # Local spelling configuration
 /codebook.toml
+/nvim_types.lua

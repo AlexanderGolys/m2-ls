@@ -7,16 +7,16 @@ renames, type hints, diagnostics and formatting, without running your code durin
 files, cells, and package tests when M2 is installed.
 
 ```m2
-R = QQ[x0, x1, y]
+R = §type.readonly|QQ§[§variable.declaration.algebraic|x0§, §variable.declaration.algebraic|x1§, §variable.declaration.algebraic|y§]
 --     ^^ Ring variable `x0` is a multi-character symbol, not an indexed
 --        variable; use `x_0` so the generators form one indexed family
 
-area = method()
-area Matrix := m -> rank m       -- area: method · Matrix: domain · rank: method
+area = §function.readonly|method§()
+area §typeParameter.readonly|Matrix§ := §parameter.declaration|m§ -> §method.readonly|rank§ §parameter|m§       -- area: method · Matrix: domain · rank: method
 
-sizeLabel = L -> (
-    n := #L;
-    if n then "nonempty" else "empty"
+sizeLabel = §parameter.declaration|L§ -> (
+    §variable.declaration|n§ := #§parameter|L§;
+    if §variable|n§ then "nonempty" else "empty"
     -- ^ if condition must have type `Boolean`, but this expression has type `ZZ`
     )
 ```

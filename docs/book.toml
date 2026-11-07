@@ -9,7 +9,7 @@ src = "src"
 after = ["links"]
 
 [preprocessor.tsitter.languages]
-macaulay2 = { aliases = ["m2", "macaulay2"] }
+macaulay2 = { aliases = ["m2", "macaulay2"], lsp = true }
 bash = { aliases = ["bash", "sh", "shell"] }
 json = {}
 lua = {}
@@ -21,7 +21,7 @@ markdown = { aliases=["md"] }
 default-theme = "everforest"
 preferred-dark-theme = "everforest"
 theme = "theme"
-additional-css = ["theme/everforest.css"]
+additional-css = ["theme/everforest.css", "theme/scale.css"]
 git-repository-url = "https://github.com/AlexanderGolys/m2-ls"
 git-repository-icon = "fab-github"
 

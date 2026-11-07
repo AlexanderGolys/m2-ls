@@ -6,8 +6,8 @@ are highlighted as namespaces, open on a click, complete as you type them,
 warn when they lead nowhere, and stay correct when you move files around.
 
 ```m2
-load "lib/helper.m2"     -- click to open; go to definition works too
-needs "./config.m2"      -- warned about if the file is not there
+load §namespace|"lib/helper.m2"§     -- click to open; go to definition works too
+needs §namespace|"./config.m2"§      -- warned about if the file is not there
 input "lib/|             -- completes the .m2 files and folders of lib/
 ```
 
@@ -22,10 +22,10 @@ For example, a package entry point can declare its package and load its types
 before its implementation:
 
 ```m2
-newPackage "Markup"
-load "Markup/types.m2"
-load "Markup/render.m2"
-endPackage "Markup"
+newPackage §namespace|"Markup"§
+load §namespace|"Markup/types.m2"§
+load §namespace|"Markup/render.m2"§
+endPackage §namespace|"Markup"§
 ```
 
 `render.m2` sees the package globals declared before its include, including those
@@ -72,11 +72,11 @@ A name that `load` could not run gets an `unloadable-file` warning (E17) on
 its string. The message says why:
 
 ```m2
-load "nofile.m2"        -- No file `nofile.m2` to load, neither in the directory …
-load "./gen.m2"         -- … looked up only in the directory of this file
-load "lib"              -- `lib` is a directory, not a file: name a `.m2` file inside it
-load "secret.m2"        -- `secret.m2` cannot be opened: permission denied
-load ""                 -- An empty file name loads nothing
+load §namespace|"nofile.m2"§        -- No file `nofile.m2` to load, neither in the directory …
+load §namespace|"./gen.m2"§         -- … looked up only in the directory of this file
+load §namespace|"lib"§              -- `lib` is a directory, not a file: name a `.m2` file inside it
+load §namespace|"secret.m2"§        -- `secret.m2` cannot be opened: permission denied
+load §namespace|""§                 -- An empty file name loads nothing
 ```
 
 A file you may not read counts as unloadable, and so does one inside a
@@ -110,13 +110,13 @@ explorer, and every load that ran it is rewritten to run it from its new
 place:
 
 ```m2,pane="Before: main.m2"
-load "lib/helper.m2"
-load ///lib/helper.m2///
+load §namespace|"lib/helper.m2"§
+load §namespace|///lib/helper.m2///§
 ```
 
 ```m2,pane="After moving lib/helper.m2 to lib/util/helper.m2"
-load "lib/util/helper.m2"
-load ///lib/util/helper.m2///
+load §namespace|"lib/util/helper.m2"§
+load §namespace|///lib/util/helper.m2///§
 ```
 
 - **Moved files fix their own loads.** `load "../shared.m2"` inside a file

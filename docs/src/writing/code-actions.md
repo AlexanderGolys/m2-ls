@@ -5,11 +5,11 @@ rewrites that make Macaulay2 code shorter or clearer. Ask for them with the
 cursor on the code (`gra` in Neovim).
 
 ```m2,pane="Before"
-value = if value =!= null then value else fallback
+value = if §variable.readonly|value§ =!= §variable.readonly|null§ then §variable.readonly|value§ else §variable|fallback§
 ```
 
 ```m2,pane="After"
-value = value ?? fallback
+value = §variable.readonly|value§ ?? §variable|fallback§
 ```
 
 Every rewrite is formatted with your
@@ -57,12 +57,12 @@ conversion is a refactor without a diagnostic.
   `else` branch. For example, inside a function:
 
 ```m2,pane="Before"
-if x === null then
-    return y;
+if §variable|x§ === §variable.readonly|null§ then
+    return §variable|y§;
 ```
 
 ```m2,pane="After"
-x ?? return y;
+x ?? return §variable|y§;
 ```
 
 The return guard must test a symbol or an expression wrapped in `try`, since
@@ -151,11 +151,11 @@ metaclass can normalize the argument differently from direct `new` construction.
   survives verbatim.
 
 ```m2,pane="Before"
-label = n -> if n < 0 then "negative" else (if n == 0 then "zero" else "positive")
+label = §parameter.declaration|n§ -> if §parameter|n§ < 0 then "negative" else (if §parameter|n§ == 0 then "zero" else "positive")
 ```
 
 ```m2,pane="After"
-label = n -> if n < 0 then "negative" else if n == 0 then "zero" else "positive"
+label = §parameter.declaration|n§ -> if §parameter|n§ < 0 then "negative" else if §parameter|n§ == 0 then "zero" else "positive"
 ```
 
 ## Declaring library code { #primary-code }
