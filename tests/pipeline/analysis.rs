@@ -639,7 +639,7 @@ async fn protected_assignments_follow_symbol_protection_and_local_scope() {
 }
 
 #[tokio::test]
-async fn primary_code_analyzes_definitions_without_the_prelude() {
+async fn primary_code_analyzes_definitions_with_only_core_loaded() {
     let mut session = DocumentSession::open("ZZ = 7\n").await;
     assert_eq!(diagnostic_lines(&session, "E13"), vec![0]);
 
@@ -649,21 +649,7 @@ async fn primary_code_analyzes_definitions_without_the_prelude() {
     let tokens = semantic_tokens(&mut session).await;
     let readonly = session.semantic_token_modifier("readonly");
     assert_eq!(token_at(&tokens, source, "ZZ", 0).1 & readonly, 0);
-    assert_eq!(hover_type_at(&mut session, 0, 0).await, "ZZ");
-
-    let completions = session
-        .request(
-            "textDocument/completion",
-            json!({
-                "textDocument": {"uri": session.uri()},
-                "position": {"line": 2, "character": 9}
-            }),
-        )
-        .await;
-    let items = completions
-        .as_array()
-        .or_else(|| completions["items"].as_array());
-    assert!(items.is_none_or(|items| !items.iter().any(|item| item["label"] == "allowableThreads")));
+    assert_eq!(hover_type_at(&mut session, 0, 0).await, "Ring");
 
     session.replace("ZZ = 7\n").await;
     assert_eq!(diagnostic_lines(&session, "E13"), vec![0]);
@@ -671,6 +657,62 @@ async fn primary_code_analyzes_definitions_without_the_prelude() {
         .replace("-- m2-ls: primaryCode\nneedsPackage \"Core\"\nZZ = 7\n")
         .await;
     assert!(diagnostic_lines(&session, "E13").is_empty());
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn primary_code_keeps_the_catalog_authoritative_and_unlinted() {
+    let source =
+        "-- m2-ls: primaryCode\nBinaryOperation = new HeaderType of Expression\nZZ = 7\nf=1\nBinaryOperation.synonym = \"x\"\n";
+    let mut session = DocumentSession::open(source).await;
+    assert!(
+        session.diagnostics().is_empty(),
+        "{:?}",
+        session.diagnostics()
+    );
+    let hover = session
+        .request(
+            "textDocument/hover",
+            json!({"textDocument": {"uri": session.uri()}, "position": {"line": 1, "character": 3}}),
+        )
+        .await;
+    let markdown = hover["contents"]["value"].as_str().expect("a hover");
+    assert!(!markdown.contains("user-defined"), "{markdown}");
+    let highlights = session
+        .request(
+            "textDocument/documentHighlight",
+            json!({"textDocument": {"uri": session.uri()}, "position": {"line": 1, "character": 3}}),
+        )
+        .await;
+    assert_eq!(highlights.as_array().map(Vec::len), Some(2), "{highlights}");
+    let actions = session
+        .request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": session.uri()},
+                "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 1}},
+                "context": {"diagnostics": []}
+            }),
+        )
+        .await;
+    assert!(actions.as_array().is_none_or(Vec::is_empty), "{actions}");
+    let edits = session
+        .request(
+            "textDocument/formatting",
+            json!({"textDocument": {"uri": session.uri()}, "options": {"tabSize": 4, "insertSpaces": true}}),
+        )
+        .await;
+    assert!(edits.as_array().is_none_or(Vec::is_empty), "{edits}");
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn primary_code_resolves_core_names_it_does_not_define() {
+    let mut session = DocumentSession::open(
+        "-- m2-ls: primaryCode\nneeds \"code.m2\"\nf = method()\nf Thing := x -> x\n",
+    )
+    .await;
+    assert!(diagnostic_lines(&session, "E22").is_empty());
     session.shutdown().await;
 }
 
@@ -796,7 +838,7 @@ async fn registered_source_roles_drive_semantic_tokens_through_the_server() {
     for (needle, expected_role, description) in [
         ("ZZ", "typeParameter", "method domain"),
         ("Array", "typeParameter", "method codomain"),
-        ("Strategy", "enumMember", "option key"),
+        ("Strategy", "property", "option key"),
         ("name", "property", "quoted member key"),
         ("\"key\"", "property", "lookup key"),
         ("\"JSON\"", "namespace", "package argument"),
@@ -4231,7 +4273,7 @@ async fn documentation_markup_marks_delimiters_links_and_option_keys() {
     let tokens = semantic_tokens(&mut session).await;
     let token = |needle: &str, occurrence: usize| token_at(&tokens, source, needle, occurrence);
     let documentation = session.semantic_token_modifier("documentation");
-    let option = session.semantic_token_modifier("option");
+    let option = session.semantic_token_modifier("optionalParameter");
     let example = session.semantic_token_modifier("example");
     let monospace = session.semantic_token_modifier("monospace");
     let macro_type = session.semantic_token_type("macro");
@@ -4242,7 +4284,7 @@ async fn documentation_markup_marks_delimiters_links_and_option_keys() {
         assert_eq!(
             token("Coarse", occurrence),
             (
-                session.semantic_token_type("parameter"),
+                session.semantic_token_type("property"),
                 option | documentation
             ),
             "the option of an optional-argument key is an option name"
@@ -5123,5 +5165,169 @@ async fn constructor_shorthand_has_one_rule_per_metaclass() {
         })).await;
         assert!(actions.to_string().contains(expected), "{code}: {actions}");
     }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn quoted_names_are_symbols_whatever_they_are_bound_to() {
+    for directive in ["", "-- m2-ls: primaryCode\n"] {
+        let source = format!(
+            "{directive}Superscript = new HeaderType of Expression\nSuperscript#operator = symbol ^\nb = symbol if\nqf = x -> (x + 1)\nc = symbol qf\nd = symbol Superscript\nsin = 3\ne = symbol sin\n"
+        );
+        let mut session = DocumentSession::open(&source).await;
+        let tokens = semantic_tokens(&mut session).await;
+        let symbol = session.semantic_token_type("enumMember");
+        for (name, occurrence) in [
+            ("^", 0),
+            ("if", 0),
+            ("qf", 1),
+            ("Superscript", 2),
+            ("sin", 1),
+        ] {
+            assert_eq!(
+                token_at(&tokens, &source, name, occurrence).0,
+                symbol,
+                "{directive:?} {name}"
+            );
+        }
+        session.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn quoted_names_do_not_highlight_with_the_binding_they_spell() {
+    let source = "x = 1\nx + x\ny = symbol x\nz = symbol x\n";
+    let mut session = DocumentSession::open(source).await;
+    let uri = session.uri().to_string();
+    let highlight = |line: u64, character: u64| json!({"textDocument": {"uri": uri}, "position": {"line": line, "character": character}});
+    let binding = session
+        .request("textDocument/documentHighlight", highlight(0, 0))
+        .await;
+    let lines = |highlights: &serde_json::Value| {
+        highlights
+            .as_array()
+            .map(|all| {
+                all.iter()
+                    .map(|h| h["range"]["start"]["line"].as_u64().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(lines(&binding), vec![0, 1, 1], "{binding}");
+    let quoted = session
+        .request("textDocument/documentHighlight", highlight(2, 11))
+        .await;
+    assert_eq!(lines(&quoted), vec![2, 3], "{quoted}");
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn documentation_links_highlight_each_part_of_their_tag() {
+    let source = r#"newPackage "P"
+export {"f"}
+f = method()
+f ZZ := x -> x
+doc ///
+Key
+  ((symbol +, symbol =), ZZ, ZZ)
+Description
+  Text
+    @TO2 {(f, ZZ), "zz alias"}@ @TO2 ([f, Limit], "opt alias")@ @TO "page title"@ @TO (symbol +, ZZ)@
+///
+"#;
+    let mut session = DocumentSession::open(source).await;
+    let tokens = semantic_tokens(&mut session).await;
+    let symbol = session.semantic_token_type("enumMember");
+    let property = session.semantic_token_type("property");
+    let string = session.semantic_token_type("string");
+    let url = session.semantic_token_modifier("url");
+    // Quoted operator names are symbols, in the key and in a link to it.
+    for occurrence in [0, 1] {
+        assert_eq!(
+            token_at(&tokens, source, "+", occurrence).0,
+            symbol,
+            "+ {occurrence}"
+        );
+    }
+    assert_eq!(token_at(&tokens, source, "=", 2).0, symbol);
+    // The option of a key inside a `TO2` list or sequence is an option.
+    assert_eq!(token_at(&tokens, source, "Limit", 0).0, property);
+    // The text a `TO2` shows, and a page named by a title, read as link text.
+    for text in ["\"zz alias\"", "\"opt alias\"", "\"page title\""] {
+        let (token_type, modifiers) = token_at(&tokens, source, text, 0);
+        assert_eq!(token_type, string, "{text}");
+        assert_ne!(modifiers & url, 0, "{text}");
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn optional_argument_names_in_documentation_are_properties() {
+    let source = r#"newPackage "P"
+export {"f", "Wide"}
+f = method(Options => {Wide => 1})
+f ZZ := o -> x -> x
+doc ///
+Key
+  [f, Wide]
+  [f, Unlisted]
+Headline
+  h
+Inputs
+  Wide => List
+    as before
+  Unlisted => String
+///
+"#;
+    let mut session = DocumentSession::open(source).await;
+    let tokens = semantic_tokens(&mut session).await;
+    let property = session.semantic_token_type("property");
+    for (name, occurrence) in [("Wide", 2), ("Unlisted", 0), ("Wide", 3), ("Unlisted", 1)] {
+        assert_eq!(
+            token_at(&tokens, source, name, occurrence).0,
+            property,
+            "{name} {occurrence}"
+        );
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn option_keys_in_shown_documentation_code_are_properties() {
+    let source = r#"newPackage "P"
+export {"f"}
+f = method(Options => {Gone => 1})
+f ZZ := o -> x -> x
+doc ///
+Key
+  f
+Headline
+  h
+Description
+  CannedExample
+    i1 : f(1, Gone => {"a"})
+    o1 = 2
+  Example
+    f(1, Gone => 3)
+///
+"#;
+    let mut session = DocumentSession::open(source).await;
+    let tokens = semantic_tokens(&mut session).await;
+    let property = session.semantic_token_type("property");
+    for occurrence in [1, 2] {
+        assert_eq!(
+            token_at(&tokens, source, "Gone", occurrence).0,
+            property,
+            "{occurrence}"
+        );
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn unresolved_documentation_references_are_errors_in_any_file() {
+    let source = "f = x -> x\ndoc ///\nKey\n  f\nSeeAlso\n  f\n  missingPage\n///\n";
+    let session = DocumentSession::open(source).await;
+    assert_eq!(diagnostic_lines(&session, "D05"), vec![6]);
     session.shutdown().await;
 }

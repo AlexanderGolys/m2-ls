@@ -36,7 +36,8 @@ use m2_syn::Token;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::ops::Deref;
-use syntax_roles::{PropertyAccess, QuotedName};
+use syntax_roles::PropertyAccess;
+pub(crate) use syntax_roles::QuotedName;
 use tower_lsp::lsp_types::{Position, Range as TextRange, SymbolKind};
 
 use crate::builtin_index::{CallableKind, CallableOption, MethodSignature, OptionPassing, Record};

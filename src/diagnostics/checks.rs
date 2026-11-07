@@ -92,7 +92,8 @@ impl DiagnosticSink {
 
 /// Shared semantic inputs, all derived from the same retained syntax snapshot.
 pub struct DiagnosticInputs<'a> {
-    /// Whether this document is analyzed as library implementation code.
+    /// Whether this document is analyzed as library implementation code, which
+    /// is reported on for syntax errors only.
     pub primary_code: bool,
     /// Semantic facts for the current document snapshot.
     pub analysis: &'a Analysis,
@@ -130,7 +131,6 @@ pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
     let mut sink = DiagnosticSink::default();
     let navigation = SyntaxNavigation::new(source, syntax);
     let context = expressions::ExpressionContext {
-        primary_code,
         analysis,
         source: &navigation,
         knowledge,
@@ -141,7 +141,12 @@ pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
             continue;
         }
         parse::spawn(cell, source, &mut sink);
-        expressions::spawn(cell, &context, &mut sink);
+        if !primary_code {
+            expressions::spawn(cell, &context, &mut sink);
+        }
+    }
+    if primary_code {
+        return sink.diagnostics;
     }
     for installation in analysis.installations() {
         if !source

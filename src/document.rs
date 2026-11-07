@@ -18,6 +18,7 @@ use crate::source_package::{PackageSessionCode, SourcePackages};
 use crate::string_literal::LiteralSource;
 use crate::syntax::{
     AssignmentOperator, AssignmentSyntax, AssignmentTarget, CursorSyntax, ExpressionSyntax,
+    QuotedNames,
 };
 use m2_syn::nodes::{Expr, ExprAssign, ExprOp, ExprOpBin, Symbol};
 use m2_syn::visit::{self, Visit};
@@ -751,9 +752,29 @@ impl DocumentSnapshot {
         self.source_binding_at(name, position)
     }
 
+    /// The names quotes turn into `Symbol` objects, with their ranges, in
+    /// source order.
+    pub fn quoted_names(&self) -> Vec<(&str, TextRange)> {
+        let mut quoted = QuotedNames::default();
+        self.syntax().visit(&mut quoted);
+        quoted
+            .0
+            .into_iter()
+            .filter_map(|symbol| Some((symbol.text(), self.range_for_syntax(symbol)?)))
+            .collect()
+    }
+
     /// The name at `position` with its range and binding: what references,
-    /// highlights and rename start from.
+    /// highlights and rename start from. A quoted name has none, since it
+    /// does not read the binding.
     pub fn target_symbol_at(&self, position: Position) -> Option<TargetSymbol<'_>> {
+        if self
+            .quoted_names()
+            .iter()
+            .any(|(_, range)| range.start <= position && position <= range.end)
+        {
+            return None;
+        }
         let mention = self.symbol_mention_at(position);
         let (name, range) = if let Some(mention) = mention.as_ref() {
             (mention.name(self.text()), mention.range())

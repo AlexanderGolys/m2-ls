@@ -328,9 +328,35 @@ impl HypertextMarkdown {
 
     /// The key `call` links to, when it is a `TO`, `TOH`, or `TO2` link.
     pub(super) fn link_key(call: &ExprOpBinAdj) -> Option<&Expr> {
+        Self::link_parts(call)?.first().copied()
+    }
+
+    /// The parts of a `TO`, `TOH`, or `TO2` link: the key it links to and, for
+    /// `TO2`, the text it shows instead. `TO2` takes them as a sequence,
+    /// `TO2(key, "text")`, or as a list, `TO2 {key, "text"}`.
+    fn link_parts(call: &ExprOpBinAdj) -> Option<Vec<&Expr>> {
         let (function, argument) = markup_call(call)?;
-        matches!(function.rendering(), MarkupRendering::Link)
-            .then(|| Self::arguments(argument).first().copied())
+        if !matches!(function.rendering(), MarkupRendering::Link) {
+            return None;
+        }
+        Some(match Self::arguments(argument)[..] {
+            [list @ Expr::Collection(ExprCollection::List(_))]
+                if function == MarkupFunction::TO2 =>
+            {
+                list.contained_expressions()
+            }
+            ref parts => parts.to_vec(),
+        })
+    }
+
+    /// The text a `TO2` link shows in place of its key's name.
+    fn link_alias(expression: &Expr) -> Option<&Expr> {
+        let Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) = expression else {
+            return None;
+        };
+        let (function, _) = markup_call(call)?;
+        (function == MarkupFunction::TO2)
+            .then(|| Self::link_parts(call)?.get(1).copied())
             .flatten()
     }
 
@@ -433,6 +459,14 @@ impl<'ast, N: SourceNavigation + ?Sized> Visit<'ast> for SemanticMarkup<'_, '_, 
                 self.markup.push(DocumentationMarkup {
                     bytes: self.code.bytes(expression),
                     kind: DocumentationMarkupKind::Styled(style),
+                });
+            }
+        }
+        if let Some(alias) = HypertextMarkdown::link_alias(expression) {
+            if self.code.content_bytes(alias).is_some() {
+                self.markup.push(DocumentationMarkup {
+                    bytes: self.code.bytes(alias),
+                    kind: DocumentationMarkupKind::Styled(TextStyle::Url),
                 });
             }
         }

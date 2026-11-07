@@ -94,9 +94,6 @@ pub trait SemanticTokenKnowledge: TypeKnowledge {
     /// Classify a local object from its inferred static type.
     fn semantic_token_for_static_type(&self, type_name: &str) -> Option<M2SemanticToken>;
 
-    /// Whether the named symbol has the runtime protection attribute.
-    fn is_protected_symbol(&self, name: &str) -> bool;
-
     /// Whether the visible global object is protected against ordinary assignment.
     fn is_protected_global(&self, name: &str) -> bool;
 }
@@ -229,7 +226,7 @@ impl SemanticModifier {
 #[repr(u32)]
 pub enum M2SemanticTokenModifier {
     /// An option key, such as `Strategy` in `Strategy => Linear`.
-    Option = SemanticTokenModifier::new("option"),
+    OptionalParameter = SemanticTokenModifier::new("optionalParameter"),
 
     /// Where a name is bound — `x := 1`, a ring generator in `QQ[x]` — or
     /// what an installation installs on, the `f` of `f ZZ := …`.
@@ -385,18 +382,12 @@ impl M2SemanticToken {
         (self != Self::new(M2SemanticTokenType::Variable)).then_some(self)
     }
 
-    /// The token of an option name written as a symbol: a protected
-    /// symbol such as `Strategy` stays a [`Symbol`](M2SemanticTokenType::Symbol),
-    /// any other name is a [`Parameter`](M2SemanticTokenType::Parameter) of the
-    /// callable it is an option of.
+    /// The token of an option name written as a symbol: a
+    /// [`Property`](M2SemanticTokenType::Property) of the options it is a key
+    /// of, protected or not, so every key of a `k => v` pair reads alike.
     pub fn option_name(name: &str, knowledge: &(impl SemanticTokenKnowledge + ?Sized)) -> Self {
-        let token_type = if knowledge.is_protected_symbol(name) {
-            M2SemanticTokenType::Symbol
-        } else {
-            M2SemanticTokenType::Parameter
-        };
-        Self::new(token_type)
-            .with_modifier(M2SemanticTokenModifier::Option)
+        Self::new(M2SemanticTokenType::Property)
+            .with_modifier(M2SemanticTokenModifier::OptionalParameter)
             .with_binding_protection(knowledge.is_protected_global(name))
     }
 
@@ -489,7 +480,7 @@ pub enum SourceSemanticRole {
     /// `f ZZ := List => x -> …`: Macaulay2's syntax for stating the
     /// installation's typical value.
     CodomainAnnotation,
-    /// A symbol serving as a callable option name.
+    /// A name denoting a symbol that serves as an option name.
     OptionKey,
     /// What an access selects by name or position: the `key` of `H.key`,
     /// the `0` of `L_0` or `L#0`.
@@ -565,14 +556,7 @@ where
         .source_role
         .as_ref()
         .filter(|_| !installs)
-        .and_then(|role| {
-            source_role_semantic_token(
-                role,
-                context.source_token.is_unquoted_symbol,
-                context.source_text,
-                knowledge,
-            )
-        });
+        .and_then(|role| source_role_semantic_token(role, context.source_text, knowledge));
 
     if token.is_none() {
         token = context.binding.map(|binding| {
@@ -688,7 +672,6 @@ pub fn lexical_semantic_token_type(token: &TokenTree) -> Option<M2SemanticTokenT
 /// Token category and modifiers implied by a recorded semantic source role.
 fn source_role_semantic_token(
     role: &SourceSemanticRole,
-    is_unquoted_symbol: bool,
     source_text: &str,
     knowledge: &(impl SemanticTokenKnowledge + ?Sized),
 ) -> Option<M2SemanticToken> {
@@ -707,11 +690,7 @@ fn source_role_semantic_token(
         SourceSemanticRole::CodomainAnnotation | SourceSemanticRole::MethodTypeParameter => {
             M2SemanticToken::new(M2SemanticTokenType::TypeAnnotation)
         }
-        SourceSemanticRole::OptionKey if is_unquoted_symbol => {
-            M2SemanticToken::option_name(source_text, knowledge)
-        }
-        SourceSemanticRole::OptionKey => M2SemanticToken::new(M2SemanticTokenType::Property)
-            .with_modifier(M2SemanticTokenModifier::Option),
+        SourceSemanticRole::OptionKey => M2SemanticToken::option_name(source_text, knowledge),
         SourceSemanticRole::PropertyKey => M2SemanticToken::new(M2SemanticTokenType::Property),
         SourceSemanticRole::AccessOperator => M2SemanticToken::new(M2SemanticTokenType::Operator)
             .with_modifier(M2SemanticTokenModifier::MemberAccess),
@@ -757,12 +736,6 @@ impl ObjectRegistry {
     pub fn get_semantic_token_for_static_type(&self, type_name: &str) -> Option<M2SemanticToken> {
         semantic_token_for_static_type_from_knowledge(self, type_name)
     }
-
-    /// Whether `name` resolves to a protected object whose class is exactly
-    /// Whether the named symbol has the runtime protection attribute.
-    pub fn is_protected_symbol(&self, name: &str) -> bool {
-        is_protected_symbol(self, name)
-    }
 }
 
 impl SemanticTokenKnowledge for ObjectRegistry {
@@ -772,10 +745,6 @@ impl SemanticTokenKnowledge for ObjectRegistry {
 
     fn semantic_token_for_static_type(&self, type_name: &str) -> Option<M2SemanticToken> {
         ObjectRegistry::get_semantic_token_for_static_type(self, type_name)
-    }
-
-    fn is_protected_symbol(&self, name: &str) -> bool {
-        ObjectRegistry::is_protected_symbol(self, name)
     }
 
     fn is_protected_global(&self, name: &str) -> bool {
@@ -792,10 +761,6 @@ impl SemanticTokenKnowledge for ObjectRegistryView<'_> {
         semantic_token_for_static_type_from_knowledge(self, type_name)
     }
 
-    fn is_protected_symbol(&self, name: &str) -> bool {
-        is_protected_symbol(self, name)
-    }
-
     fn is_protected_global(&self, name: &str) -> bool {
         is_protected_global(self, name)
     }
@@ -810,10 +775,6 @@ impl<T: SemanticTokenKnowledge + ?Sized> SemanticTokenKnowledge for &T {
         T::semantic_token_for_static_type(self, type_name)
     }
 
-    fn is_protected_symbol(&self, name: &str) -> bool {
-        T::is_protected_symbol(self, name)
-    }
-
     fn is_protected_global(&self, name: &str) -> bool {
         T::is_protected_global(self, name)
     }
@@ -824,14 +785,6 @@ fn is_protected_global(knowledge: &(impl ObjectKnowledge + ?Sized), name: &str) 
     knowledge
         .get_record(&ObjectName::new(name))
         .is_some_and(|record| record.protected)
-}
-
-/// Whether the named symbol has the runtime protection attribute.
-fn is_protected_symbol(knowledge: &(impl ObjectKnowledge + ?Sized), name: &str) -> bool {
-    let symbol_type = ObjectName::new("Symbol");
-    knowledge
-        .get_record(&ObjectName::new(name))
-        .is_some_and(|record| record.class == symbol_type && record.protected)
 }
 
 /// Classify an indexed binding by its runtime class and protection flag.

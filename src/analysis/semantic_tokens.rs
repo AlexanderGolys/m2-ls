@@ -21,8 +21,11 @@ use super::*;
 use crate::macaulay2::Macaulay2Conventions;
 use crate::object_registry::ObjectKnowledge;
 use crate::semantic_token::{lexical_semantic_token_type, M2SemanticTokenType};
+use crate::source::ByteRange;
 use crate::source::SyntaxSource;
-use crate::syntax::{AssignmentSyntax, AssignmentTarget};
+use crate::syntax::{
+    AssignmentSyntax, AssignmentTarget, BoundSymbols, ExpressionSyntax, LambdaSyntax,
+};
 
 impl Analysis {
     /// Collects the source semantic tokens of every cell.
@@ -35,6 +38,7 @@ impl Analysis {
             analysis: self,
             source,
             knowledge_provider,
+            option_tables: Vec::new(),
         });
         let mut symbols = SymbolTokens {
             analysis: self,
@@ -137,6 +141,9 @@ struct SemanticRoles<'analysis, 'source, 'knowledge, Source: ?Sized, Knowledge: 
     source: &'source Source,
     /// Object and type knowledge queried at each source position.
     knowledge_provider: &'knowledge Knowledge,
+    /// The option-table parameters of `{…} >> o -> body` functions, with
+    /// the bytes of the body they are visible in.
+    option_tables: Vec<(String, ByteRange)>,
 }
 
 impl<'source, Source, Knowledge> SemanticRoles<'_, 'source, '_, Source, Knowledge>
@@ -151,11 +158,70 @@ where
         }
     }
 
-    /// Records property keys without reconstructing navigation nodes.
-    fn register_property(&mut self, node: &impl PropertyAccess) {
+    /// Records property keys without reconstructing navigation nodes. A key
+    /// of an option table, `o.depth`, is an optional parameter.
+    fn register_property(&mut self, node: &impl PropertyAccess, table: &Expr) {
         if let Some(property) = node.property_key() {
-            self.register_role(property, SourceSemanticRole::PropertyKey);
+            let role = if self.is_option_table(table, property) {
+                SourceSemanticRole::OptionKey
+            } else {
+                SourceSemanticRole::PropertyKey
+            };
+            self.register_role(property, role);
         }
+    }
+
+    /// Records `key` as an option key when it is a name denoting a `Symbol`:
+    /// a protected symbol such as `Strategy`, or a name nothing binds, which
+    /// evaluates to its own symbol. A name bound to anything else is a value
+    /// there, not a key, and keeps its own token.
+    fn register_symbol_option_key(&mut self, key: &Expr) {
+        let (Some(name), Some(range)) = (key.symbol_name(), self.source.range_for_syntax(key))
+        else {
+            return;
+        };
+        let knowledge = self.knowledge_provider.at_position(range.start);
+        let denotes_symbol = self.analysis.get_binding_at(name, range.start).is_none()
+            && knowledge
+                .get_record(&ObjectName::new(name))
+                .is_none_or(|record| record.class == TypeRole::Symbol.object_name());
+        if denotes_symbol {
+            self.register_role(key, SourceSemanticRole::OptionKey);
+        }
+    }
+
+    /// Records `key` as an option key when `table` is an option table, in
+    /// `o#depth`, where the key is evaluated and so must denote a symbol.
+    fn register_option_table_key(&mut self, table: &Expr, key: &Expr) {
+        if self.is_option_table(table, key) {
+            self.register_symbol_option_key(key);
+        }
+    }
+
+    /// Records the first parameter of `function`, when it is a lambda, as an
+    /// option table visible in its body.
+    fn register_option_table(&mut self, function: &Expr) {
+        if let Expr::Lambda(lambda) = function {
+            if let (Some(parameter), Some(body)) = (
+                lambda.bound_symbols().first(),
+                self.source.syntax_bytes(lambda.body()),
+            ) {
+                self.option_tables
+                    .push((parameter.text().to_string(), body));
+            }
+        }
+    }
+
+    /// Whether `table` is the option-table parameter of a function whose
+    /// body contains `key`.
+    fn is_option_table(&self, table: &Expr, key: &Expr) -> bool {
+        let (Some(name), Some(position)) = (table.symbol_name(), self.source.syntax_bytes(key))
+        else {
+            return false;
+        };
+        self.option_tables
+            .iter()
+            .any(|(parameter, body)| parameter == name && body.contains(&position.start))
     }
 
     /// Records an accessor's lexical token, without its attached trivia.
@@ -209,13 +275,16 @@ where
     Knowledge: PositionedTypeKnowledge + ?Sized,
 {
     fn visit_expr_option(&mut self, node: &'ast OptionExpression) {
-        self.register_role(node.key.as_ref(), SourceSemanticRole::OptionKey);
+        self.register_symbol_option_key(node.key.as_ref());
         visit::visit_expr_option(self, node);
     }
 
     fn visit_expr_op_bin_regular(&mut self, node: &'ast BinaryExpr) {
-        self.register_property(node);
         let operator = node.operator.spelling();
+        if operator == <Token![>>]>::SPELLING {
+            self.register_option_table(&node.right_operand);
+        }
+        self.register_property(node, &node.left_operand);
         let subscript = operator == <Token![_]>::SPELLING;
         if subscript || operator == <Token![#?]>::SPELLING {
             self.register_access_operator(&node.operator);
@@ -224,8 +293,27 @@ where
         visit::visit_expr_op_bin_regular(self, node);
     }
 
+    fn visit_expr_assign(&mut self, assignment: &'ast ExprAssign) {
+        let installs_with_table = self
+            .source
+            .range_for_syntax(assignment)
+            .is_some_and(|range| {
+                self.analysis.installations().iter().any(|installation| {
+                    installation.span == range && installation.options == MethodOptions::Table
+                })
+            });
+        if installs_with_table {
+            self.register_option_table(assignment.parts().value);
+        }
+        visit::visit_expr_assign(self, assignment);
+    }
+
     fn visit_expr_op_bin_member(&mut self, node: &'ast ExprOpBinMember) {
-        self.register_property(node);
+        let table = match node {
+            ExprOpBinMember::Dot(access) => access.receiver.as_ref(),
+            ExprOpBinMember::Optional(access) => access.receiver.as_ref(),
+        };
+        self.register_property(node, table);
         match node {
             ExprOpBinMember::Dot(access) => self.register_access_operator(&access.operator),
             ExprOpBinMember::Optional(access) => self.register_access_operator(&access.operator),
@@ -234,7 +322,8 @@ where
     }
 
     fn visit_expr_op_bin_index(&mut self, node: &'ast ExprOpBinIndex) {
-        self.register_property(node);
+        self.register_option_table_key(&node.receiver, &node.index);
+        self.register_property(node, &node.receiver);
         self.register_access_operator(&node.operator);
         self.register_selector(node, &node.receiver, &node.index, false);
         visit::visit_expr_op_bin_index(self, node);

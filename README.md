@@ -190,7 +190,7 @@ modifiers, so themes can inherit the standard type's styling.
 | SimpleDoc section keywords, `document` option names, and links (`TO`, `TOH`, `TO2`) | `decorator` | |
 | TeX delimiters and other hypertext constructors | `macro` | |
 | Styled documentation text | `string` | `strong`, `emphasis`, `monospace`, `url`, or `tex` |
-| Option keys, including the `Limit` of `[f, Limit]` in documentation | `parameter`, or `enumMember` for a protected symbol (a string key stays `property`) | `option` |
+| Option keys, including the `Limit` of `[f, Limit]` in documentation | `property` | `optionalParameter` |
 
 Documentation calls, their tags and values, attached documentation comments,
 and embedded code carry the standard `documentation` modifier. Examples,
@@ -253,7 +253,7 @@ highlighting. Files in the discovered Core sources and in
 Removing the property restores normal session analysis. TEST blocks and
 documentation examples continue to use their separate session environments.
 
-The `option` modifier applies to keys only. Values retain their ordinary
+The `optionalParameter` modifier applies to keys only. Values retain their ordinary
 classification; for example, `Strategy => Linear` marks `Strategy` as an
 option key and leaves `Linear` as a symbol. Names without a known binding use
 plain variable tokens, without a separate unresolved modifier.

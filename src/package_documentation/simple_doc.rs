@@ -744,11 +744,19 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             let name = if name_bytes.is_empty() {
                 None
             } else if is_option {
-                self.evaluate_simple_doc_expression(
+                let first_mark = self.documentation.markup.len();
+                let name = self.evaluate_simple_doc_expression(
                     name_bytes,
                     EvaluatedExpression::Value,
                     |code, key| code.link_text(key),
-                )
+                );
+                // The name of an optional argument is a key of the options.
+                for markup in &mut self.documentation.markup[first_mark..] {
+                    if markup.kind == DocumentationMarkupKind::Name {
+                        markup.kind = DocumentationMarkupKind::OptionName;
+                    }
+                }
+                name
             } else {
                 self.documentation.markup.push(DocumentationMarkup {
                     bytes: name_bytes.clone(),

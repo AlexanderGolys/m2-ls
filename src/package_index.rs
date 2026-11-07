@@ -604,6 +604,36 @@ impl SourceResolver {
             .find(|candidate| candidate.is_file())
     }
 
+    /// The local copy of a file the corpus located on its extraction machine:
+    /// the file itself when it exists here, otherwise the file at the same
+    /// place below the Core or package sources of this installation.
+    pub fn resolve_indexed_file(&self, extracted: &Path) -> Option<PathBuf> {
+        if extracted.is_file() {
+            return Some(extracted.to_path_buf());
+        }
+        [
+            (Macaulay2Conventions::CORE_SOURCES, &self.core_path),
+            (Macaulay2Conventions::PACKAGES_DIR, &self.path),
+        ]
+        .into_iter()
+        .find_map(|(sources, search_list)| {
+            let marker = Path::new(sources);
+            let components = extracted.components().collect::<Vec<_>>();
+            let marker_len = marker.components().count();
+            let start = components.windows(marker_len).position(|window| {
+                window
+                    .iter()
+                    .map(|component| component.as_os_str())
+                    .eq(marker.iter())
+            })?;
+            let relative = components[start + marker_len..].iter().collect::<PathBuf>();
+            search_list
+                .iter()
+                .map(|directory| directory.join(&relative))
+                .find(|candidate| candidate.is_file())
+        })
+    }
+
     /// The package whose sources contain `path`: Core for a file on
     /// `corepath`; otherwise the package whose main file `PKG.m2` sits in a
     /// directory of `path` beside its directory `PKG/`, which holds the rest
@@ -1024,6 +1054,27 @@ mod import_trigger_tests {
         assert_eq!(
             resolver.resolve_package_file("Graphs"),
             Some(sources.join("Graphs.m2"))
+        );
+    }
+
+    /// The corpus locates definitions in the extraction machine's source tree;
+    /// the installed Core keeps the same files flat in its own directory.
+    #[test]
+    fn indexed_core_files_resolve_to_the_installed_core() {
+        let fixture = SourceFixture::new();
+        let root = fixture.path();
+        write_tree(root, &["Core/methods.m2"]);
+        let resolver = SourceResolver {
+            core_path: vec![root.join("Core")],
+            ..SourceResolver::default()
+        };
+        assert_eq!(
+            resolver.resolve_indexed_file(Path::new("/elsewhere/M2/Macaulay2/m2/methods.m2")),
+            Some(root.join("Core/methods.m2"))
+        );
+        assert_eq!(
+            resolver.resolve_indexed_file(Path::new("/elsewhere/M2/Macaulay2/m2/missing.m2")),
+            None
         );
     }
 

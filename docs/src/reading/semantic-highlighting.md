@@ -11,7 +11,7 @@ area = §function.readonly|method§()                   -- area method · method
 area §typeParameter.readonly|Matrix§ := §typeParameter.readonly|ZZ§ => §parameter.declaration|m§ -> §method.readonly|rank§ §parameter|m§  -- Matrix typeParameter · ZZ typeParameter · m parameter
 twice = §parameter.declaration|n§ -> 2 * §parameter|n§                -- twice function
 scan({1, 2}, §function.readonly|print§)               -- scan function+defaultLibrary · print function
-G = §method.readonly|gb§(§variable|I§, §enumMember.option.readonly|Strategy§ => §enumMember.readonly|Linear§)     -- gb method · Strategy enumMember+option
+G = §method.readonly|gb§(§variable|I§, §property.optionalParameter.readonly|Strategy§ => §enumMember.readonly|Linear§)     -- gb method · Strategy property+optionalParameter
 stdio << "done" << §function.readonly|endl§           -- stdio variable · endl function
 f = §modifier|symbol§ §enumMember|g§                      -- symbol modifier · g enumMember
 typo + 1                          -- typo variable
@@ -36,8 +36,8 @@ the second column — that is the name your editor and theme see.
 | Function | `function` | anything applied that is not a method function: closures, compiled functions, scripted functors, commands | `twice`, `print`, `apply`, `Ext`, `exit` |
 | Method | `method` | a method function, made by `method()`, which dispatches to its installations | `area`, `det`, `gb`, `source` |
 | Variable | `variable` | every other value | `G`, `stdio`, a local |
-| Parameter | `parameter` | a function parameter, or an input named on a documentation page, an option name that is not a protected symbol | `m` in `m -> rank m`, `verbose` in `{verbose => false} >> o -> …` |
-| Property | `property` | a key rather than a binding: a member an access selects, a string hash key | `key` in `H.key`, `0` in `L_0`, `"x"` in `"x" => 1` |
+| Parameter | `parameter` | a function parameter, or an input named on a documentation page | `m` in `m -> rank m` |
+| Property | `property` | a key rather than a binding: the left side of `=>`, a member an access selects | `verbose` in `{verbose => false} >> o -> …`, `Strategy` in `f(Strategy => 1)`, `key` in `H.key`, `0` in `L_0` |
 | Namespace | `namespace` | a package, including package names in strings, and the file a `load`, `needs` or `input` call runs | `Core`, `"JSON"` in `needsPackage "JSON"`, `"lib/helper.m2"` in `load "lib/helper.m2"` |
 | Symbol | `enumMember` | a name used as a `Symbol` rather than for its value | `Strategy`, `Linear`, `g` in `symbol g` |
 | Domain or codomain | `typeParameter` | the types an installation is made on and returns | `Matrix`, `ZZ` in `area Matrix := ZZ => …` |
@@ -90,7 +90,7 @@ makes `area` a method, `twice = n -> …` a function.
 | `readonly` | <i class="fa-solid fa-check"></i> | a binding protected from reassignment, independently of value mutability | `ZZ`, a protected package export |
 | `documentation` | <i class="fa-solid fa-check"></i> | inside documentation: a `doc` string, a `document` call, a [documentation comment](../beyond/documentation-comments.md) | everything inside `doc ///…///` |
 | `algebraic` | | a ring generator or a known nonnumeric value living over a ring | `x`, an ideal, a module, a matrix |
-| `option` | | an option key | `Strategy` in `Strategy => Linear` |
+| `optionalParameter` | | an option key | `Strategy` in `Strategy => Linear` |
 | `memberAccess` | | an operator selecting a part of its left operand | `_` in `S_1`, `.`, `.?`, binary `#` and `#?` |
 | `example` | | code run as a documentation example | the lines under `Example` |
 | `test` | | code inside a `TEST` block | the body of `TEST ///…///` |
@@ -128,7 +128,7 @@ stable; emitted tokens use these fallbacks:
 | All other token types | unchanged |
 | `algebraic`, `nonsense` modifiers | `abstract` |
 | `example`, `strong`, `emphasis`, `monospace`, `url`, `file`, `directory`, `wikilink`, `tex` modifiers | `documentation` |
-| `option`, `memberAccess`, `index`, `test` modifiers | removed |
+| `optionalParameter`, `memberAccess`, `index`, `test` modifiers | removed |
 | `declaration`, `defaultLibrary`, `readonly`, `documentation`, `abstract` modifiers | unchanged |
 
 Fallbacks combine without duplicating modifiers: a
@@ -271,7 +271,7 @@ An installation head keeps the token its object has elsewhere and adds
   it is a value there, not a call.
 - A local `n := 5` is a variable, never a number — literal types do not leak
   into names.
-- The `option` modifier applies to keys only; values retain their ordinary
+- The `optionalParameter` modifier applies to keys only; values retain their ordinary
   classification.
 
 ## Neovim { #neovim }

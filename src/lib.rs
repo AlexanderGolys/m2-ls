@@ -1626,6 +1626,9 @@ impl LanguageServer for Backend {
         let position = params.range.start;
         Ok(self
             .with_source_at(uri, position, |document, _, _| {
+                if document.properties().primary_code {
+                    return None;
+                }
                 let mut action_settings = settings.diagnostics.clone();
                 action_settings.emit_as.fix_action_only.clear();
                 let mut diagnostics = visible_diagnostics(
@@ -1916,6 +1919,9 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let settings = self.settings.snapshot();
         Ok(self.with_document(&uri, |document| {
+            if document.properties().primary_code {
+                return Vec::new();
+            }
             document_formatting_text_edits(
                 document,
                 params.options.tab_size,

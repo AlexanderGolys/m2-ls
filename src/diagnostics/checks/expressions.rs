@@ -53,8 +53,6 @@ const RECORD_LIST_CLASSES: [&str; 3] = ["List", "BasicList", "VisibleList"];
 
 /// What the expression occasion provides for every cell of one document.
 pub(super) struct ExpressionContext<'a> {
-    /// Whether this document is analyzed as library implementation code.
-    pub primary_code: bool,
     /// Semantic facts for the current document snapshot.
     pub analysis: &'a Analysis,
     /// Source coordinates of the syntax revision being checked.
@@ -816,12 +814,10 @@ impl<'a> ExpressionChecks<'a, '_> {
         parts: &AssignmentParts<'a>,
         knowledge: &ObjectRegistryView<'_>,
     ) {
-        if self.context.primary_code
-            || !matches!(
-                parts.operator,
-                AssignmentOperator::Global | AssignmentOperator::Augmented
-            )
-            || self.installs(assignment)
+        if !matches!(
+            parts.operator,
+            AssignmentOperator::Global | AssignmentOperator::Augmented
+        ) || self.installs(assignment)
         {
             return;
         }

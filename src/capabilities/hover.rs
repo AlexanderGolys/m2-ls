@@ -51,7 +51,10 @@ where
 
     if let Some(mention) = document.symbol_mention_at(position) {
         let name = mention.name(text);
-        let mut hover = if let Some(symbol) = document.mention_symbol(&mention) {
+        let mut hover = if let Some(symbol) = document
+            .mention_symbol(&mention)
+            .filter(|_| !catalog_defines(document, name, knowledge))
+        {
             let documentation = document
                 .documentation_for_binding(symbol)
                 .map(|documentation| documentation.hover_markdown().to_string())
@@ -85,7 +88,10 @@ where
     let hovered = HoveredSyntax::at(document, position)?;
     let node_text = hovered.text(document)?;
 
-    if let Some(symbol) = document.source_symbol_at(node_text, position) {
+    if let Some(symbol) = document
+        .source_symbol_at(node_text, position)
+        .filter(|_| !catalog_defines(document, node_text, knowledge))
+    {
         let local_installation_signature =
             document
                 .installing_assignment_at(position)
@@ -154,6 +160,20 @@ where
         }
     }
     Some(hover)
+}
+
+/// Whether `name` is an object of the catalog that the document, as library
+/// implementation code, defines itself: hover describes the catalog's object
+/// rather than the document's assignment of it.
+fn catalog_defines(
+    document: &DocumentSnapshot,
+    name: &str,
+    knowledge: &(impl LspKnowledge + ?Sized),
+) -> bool {
+    document.properties().primary_code
+        && knowledge
+            .get_record_with_package(&ObjectName::new(name))
+            .is_some_and(|(_, record)| !document.object_registry().is_source_object(&record.id))
 }
 
 /// What the cursor rests on for hover, with the expression around it.

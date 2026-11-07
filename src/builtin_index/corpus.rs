@@ -88,6 +88,25 @@ pub struct RawRecord {
     pub protected: Option<bool>,
     /// The object's documentation, rendered as Markdown.
     pub markdown: Option<String>,
+    /// The span `locate` reports for the object on the extraction machine.
+    pub source_location: Option<RawSourceLocation>,
+}
+
+/// Wire representation of a `locate` span: one-based rows, zero-based columns,
+/// exclusive stop.
+#[forall(#[serde(default)])]
+#[derive(Debug, Deserialize)]
+pub struct RawSourceLocation {
+    /// Absolute filename on the extraction machine.
+    pub filename: String,
+    /// One-based row where the span starts.
+    pub start_row: u32,
+    /// Zero-based column where the span starts.
+    pub start_col: u32,
+    /// One-based row where the span stops.
+    pub stop_row: u32,
+    /// Zero-based column where the span stops, exclusive.
+    pub stop_col: u32,
 }
 
 /// Wire representation of one callable method signature.

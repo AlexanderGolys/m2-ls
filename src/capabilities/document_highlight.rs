@@ -34,6 +34,9 @@ pub fn document_highlights(
     {
         return None;
     }
+    if let Some(highlights) = quoted_name_highlights(document, position) {
+        return Some(highlights);
+    }
     if let Some(highlights) = package_reference_highlights(document, position, builtins) {
         return Some(highlights);
     }
@@ -53,6 +56,28 @@ pub fn document_highlights(
         return Some(highlights);
     }
     keyword_sequence_highlights(document, position)
+}
+
+/// A quoted name denotes the `Symbol` object of its spelling, so the cursor on
+/// one lights up the quotes of the same name rather than any binding of it.
+fn quoted_name_highlights(
+    document: &DocumentSnapshot,
+    position: Position,
+) -> Option<Vec<DocumentHighlight>> {
+    let quoted = document.quoted_names();
+    let (name, _) = quoted
+        .iter()
+        .find(|(_, range)| range.start <= position && position <= range.end)?;
+    Some(
+        quoted
+            .iter()
+            .filter(|(quoted_name, _)| quoted_name == name)
+            .map(|(_, range)| DocumentHighlight {
+                range: *range,
+                kind: Some(DocumentHighlightKind::READ),
+            })
+            .collect(),
+    )
 }
 
 /// Package-name arguments refer to packages even before they are loaded.

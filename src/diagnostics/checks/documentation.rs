@@ -334,8 +334,11 @@ impl<'context> PackageFile<'context> {
     }
 }
 
-/// Report names documentation evaluates in a self-contained package that
-/// neither the package nor the packages it loads define.
+/// Report names documentation evaluates that no definition in reach provides:
+/// not the package's code in this file, not a package it loads, not a name
+/// another file loading this one defines before it. In a self-contained package
+/// the documentation would create the name as a new symbol, which `endPackage`
+/// rejects as unset.
 fn undefined_documentation_key(
     context: &DocumentationContext,
     file: &PackageFile,
@@ -343,13 +346,12 @@ fn undefined_documentation_key(
 ) {
     for referenced in context.documentation.referenced_names() {
         let range = referenced.span.range();
-        let Some(declaration) = file.self_contained_at(range.start) else {
-            continue;
-        };
+        let declaration = file.self_contained_at(range.start);
         let name = &context.source.text()[referenced.span.bytes()];
         let defined = file.code_symbols.contains(name)
-            || declaration.name.name() == name
-            || declaration.export_named(name).is_some()
+            || declaration.is_some_and(|declaration| {
+                declaration.name.name() == name || declaration.export_named(name).is_some()
+            })
             || context
                 .knowledge
                 .object_id_at(&ObjectName::new(name), range.start)
@@ -357,17 +359,22 @@ fn undefined_documentation_key(
         if defined {
             continue;
         }
+        let consequence = match declaration {
+            Some(declaration) => format!(
+                "`{name}` is not defined in package `{}` or in a package it loads; the \
+                 documentation would create it as a new symbol, which `endPackage` rejects \
+                 as unset. Fix the spelling, or define and export `{name}`",
+                declaration.name.name()
+            ),
+            None => format!(
+                "`{name}` is not defined in this file, in the files that load it, or in a \
+                 package it loads; the documentation refers to nothing. Fix the spelling, or \
+                 define `{name}`"
+            ),
+        };
         sink.spawn(
             &catalog::UNDEFINED_DOCUMENTATION_KEY,
-            Finding::new(
-                range,
-                format!(
-                    "`{name}` is not defined in package `{}` or in a package it loads; the \
-                     documentation would create it as a new symbol, which `endPackage` rejects \
-                     as unset. Fix the spelling, or define and export `{name}`",
-                    declaration.name.name()
-                ),
-            ),
+            Finding::new(range, consequence),
         );
     }
 }

@@ -223,6 +223,7 @@ fn goto_symbol_response(
     }
     if matches!(target, NavigationTarget::Definition)
         && library_record
+            .as_ref()
             .and_then(|(_, record)| record.callable())
             .is_some_and(|callable| callable.is_method_function())
     {
@@ -235,6 +236,23 @@ fn goto_symbol_response(
         );
         if !installations.is_empty() {
             return locations_response(installations);
+        }
+    }
+    if matches!(target, NavigationTarget::Definition) {
+        if let Some(location) = library_record
+            .as_ref()
+            .and_then(|(_, record)| record.source_location())
+            .and_then(|located| {
+                let file = library
+                    .source_resolver()
+                    .resolve_indexed_file(&located.file)?;
+                Some(Location::new(
+                    Url::from_file_path(file).ok()?,
+                    located.range,
+                ))
+            })
+        {
+            return Some(GotoDefinitionResponse::Scalar(location));
         }
     }
     // A library name is defined by its package, so it has a location only in
@@ -1148,9 +1166,9 @@ mod tests {
     }
 
     #[test]
-    fn rename_includes_quoted_symbol_reference() {
-        // `symbol M` names the identifier `M` (a plain `symbol` node); renaming the
-        // user-defined `M` must rewrite that occurrence too.
+    fn rename_leaves_quoted_names_alone() {
+        // `symbol M` is the `Symbol` object whatever `M` is bound to, so
+        // renaming the parameter `M` must not rewrite it.
         let text = "f := M -> (symbol M; M + 1)";
         let document = document(text);
         let uri = Url::parse("file:///t.m2").expect("uri");
@@ -1161,8 +1179,7 @@ mod tests {
             .iter()
             .map(|edit| edit.range.start.character)
             .collect::<Vec<_>>();
-        // parameter `M`, the `M` in `symbol M`, and the `M` in `M + 1`.
-        assert_eq!(edits, vec![5, 18, 21]);
+        assert_eq!(edits, vec![5, 21]);
     }
 
     #[test]

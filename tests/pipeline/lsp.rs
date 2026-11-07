@@ -1968,36 +1968,6 @@ async fn opening_installed_sources_does_not_index_their_dependencies() {
     server.shutdown().await;
 }
 
-/// Core locations imply no-prelude analysis without a source directive.
-#[tokio::test]
-async fn opening_core_source_omits_prelude_completions() {
-    let library = LibraryFixture::new();
-    let source = "allowable\n";
-    let workspace = TestWorkspace::new(source);
-    let mut server = LspProcess::spawn().await;
-    server
-        .initialize_with_options(&workspace.root_uri(), library.sources_settings(true))
-        .await;
-    for (uri, expects_prelude) in [
-        (workspace.uri.clone(), true),
-        (library.uri("Core/betti.m2"), false),
-    ] {
-        server.open_document(&uri, source).await;
-        let completion = server
-            .request(
-                "textDocument/completion",
-                document_position(&uri, json!({"line": 0, "character": 9})),
-            )
-            .await;
-        let items = completion.get("items").unwrap_or(&completion);
-        let has_builtin = items
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item["label"] == "allowableThreads"));
-        assert_eq!(has_builtin, expects_prelude, "{uri}: {completion}");
-    }
-    server.shutdown().await;
-}
-
 /// Disabling the optional catalog removes builtin documentation while preserving local analysis.
 #[tokio::test]
 async fn catalog_can_be_disabled_before_loading_builtin_metadata() {

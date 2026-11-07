@@ -27,8 +27,14 @@ has `algebraic`. A method installation keeps its `method` type and adds
   a known `ring` installation, including ideals, modules, and matrices.
   Rings themselves remain `type`. See [algebraic values](semantic-highlighting.md#algebraic).
 
-`option`
-: Marks an option key. Its value retains its own token classification.
+`optionalParameter`
+: Marks an option key, which is a `property`. Only a name denoting a
+  `Symbol` is a key: a protected symbol such as `Strategy`, or a name nothing
+  binds. A string, or a name bound to a function or variable, is a value and
+  keeps its own token. Inside a function that receives an option table,
+  `{…} >> o -> …` or an installation of a method declaring `Options`, the keys
+  read from the table, `o.verbose` and `o#verbose`, carry it too. Its value
+  retains its own token classification.
 
 `memberAccess`
 : Marks part-selection operators: `_`, `.`, `.?`, binary `#`, and `#?`.
@@ -62,7 +68,8 @@ has `algebraic`. A method installation keeps its `method` type and adds
 
 `url`
 : Marks the address in supported documentation link markup, `\url{…}` and
-  `HREF`.
+  `HREF`, the text a `TO2 {key, "text"}` link shows, and the title of a page
+  linked by a string that names no symbol, `TO "page title"`.
 
 `file`
 : Marks a path to a file, such as the argument of `load`.

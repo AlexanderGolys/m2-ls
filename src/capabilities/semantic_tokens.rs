@@ -824,7 +824,7 @@ mod tests {
     use crate::workspace_index::WorkspaceIndex;
     use strum::IntoEnumIterator;
 
-    const OPTION_MODIFIER: u32 = M2SemanticTokenModifier::Option.bit();
+    const OPTION_MODIFIER: u32 = M2SemanticTokenModifier::OptionalParameter.bit();
     const DECLARATION_MODIFIER: u32 = M2SemanticTokenModifier::Declaration.bit();
     const DEFAULT_LIBRARY_MODIFIER: u32 = M2SemanticTokenModifier::DefaultLibrary.bit();
     const READONLY_MODIFIER: u32 = M2SemanticTokenModifier::Readonly.bit();
@@ -1684,38 +1684,6 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     }
 
     #[test]
-    fn semantic_tokens_classify_string_hash_keys_as_properties() {
-        // The string on the left of `=>` is a hash key (property); the value on
-        // the right stays an ordinary string.
-        let text = concat!(
-            "h = new HashTable from {\n",
-            "    \"Quote\" => \"symbol\",\n",
-            "    \"GlobalQuote\" => \"global\"\n",
-            "}\n",
-        );
-        let builtins = ObjectRegistry::default();
-        let document = document(text, &builtins);
-        let tokens = collect_tokens(&document, &builtins, false);
-
-        assert_eq!(
-            tokens
-                .iter()
-                .map(|token| token.token_type)
-                .filter(|token_type| {
-                    *token_type == M2SemanticTokenType::Property as u32
-                        || *token_type == M2SemanticTokenType::String as u32
-                })
-                .collect::<Vec<_>>(),
-            vec![
-                M2SemanticTokenType::Property as u32, // "Quote"
-                M2SemanticTokenType::String as u32,   // "symbol"
-                M2SemanticTokenType::Property as u32, // "GlobalQuote"
-                M2SemanticTokenType::String as u32,   // "global"
-            ]
-        );
-    }
-
-    #[test]
     fn semantic_tokens_classify_lookup_string_keys_as_properties() {
         // A string on the right of `#` / `#?` is a literal key (property). A
         // symbol key (`h#k`) is evaluated, so it stays an ordinary reference.
@@ -1946,23 +1914,75 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     }
 
     #[test]
-    fn option_keys_classify_by_protected_symbol() {
-        // The key of a `k => v` pair is classified by whether it is a protected
-        // symbol: `Strategy` (a protected class-`Symbol` builtin) is a nominal
-        // enum member, while `myKey` (an unprotected user name) is a parameter. The
-        // value `7` is not a symbol, so it is not classified here.
-        let text = "f(x, Strategy => 4, myKey => 7)";
+    fn option_table_keys_in_function_bodies_are_optional_parameters() {
+        let text = concat!(
+            "g = method(Options => {verbose => false})\n",
+            "g ZZ := o -> n -> o.verbose\n",
+            "h = {quiet => 1} >> o -> x -> (o.quiet, o#quiet)\n",
+            "q = r -> r.other\n",
+        );
         let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
+        let optional = M2SemanticTokenModifier::OptionalParameter.bit();
 
-        assert_eq!(
-            token_type_at(&tokens, 0, text.find("Strategy").unwrap() as u32),
-            Some(M2SemanticTokenType::Symbol as u32)
+        for (line, needle, occurrence) in [
+            (0, "verbose", 0),
+            (1, "verbose", 0),
+            (2, "quiet", 0),
+            (2, "quiet", 1),
+            (2, "quiet", 2),
+        ] {
+            let text_line = text.lines().nth(line).unwrap();
+            let column = text_line.match_indices(needle).nth(occurrence).unwrap().0 as u32;
+            let token = token_at(&tokens, line as u32, column).unwrap();
+            assert_eq!(token.token_type, M2SemanticTokenType::Property as u32);
+            assert_eq!(
+                token.token_modifiers_bitset & optional,
+                optional,
+                "{line}:{column}"
+            );
+        }
+        let other = token_at(
+            &tokens,
+            3,
+            text.lines().nth(3).unwrap().find("other").unwrap() as u32,
+        )
+        .unwrap();
+        assert_eq!(other.token_modifiers_bitset & optional, 0);
+    }
+
+    #[test]
+    fn only_keys_denoting_symbols_are_optional_parameters() {
+        // A protected symbol and an unresolved name are symbols, so they are
+        // keys. A name bound to a function, a string, and a local are values
+        // there and keep their own tokens.
+        let text = concat!(
+            "local1 = 3\n",
+            "f(x, Strategy => 4, myKey => 7, degree => 1, \"Degree\" => 2, local1 => 5)",
         );
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
+        let document = document(text, &builtins);
+        let tokens = collect_tokens(&document, &builtins, false);
+        let optional = M2SemanticTokenModifier::OptionalParameter.bit();
+        let line = text.lines().nth(1).unwrap();
+        let at = |key: &str| token_at(&tokens, 1, line.find(key).unwrap() as u32).unwrap();
+
+        for key in ["Strategy", "myKey"] {
+            let token = at(key);
+            assert_eq!(
+                token.token_type,
+                M2SemanticTokenType::Property as u32,
+                "{key}"
+            );
+            assert_eq!(token.token_modifiers_bitset & optional, optional, "{key}");
+        }
+        for key in ["degree", "\"Degree\"", "local1"] {
+            assert_eq!(at(key).token_modifiers_bitset & optional, 0, "{key}");
+        }
         assert_eq!(
-            token_type_at(&tokens, 0, text.find("myKey").unwrap() as u32),
-            Some(M2SemanticTokenType::Parameter as u32)
+            at("\"Degree\"").token_type,
+            M2SemanticTokenType::String as u32
         );
     }
 
@@ -2511,7 +2531,7 @@ Description
         };
         let legend = M2SemanticToken::legend();
         let token = M2SemanticToken::new(M2SemanticTokenType::Function)
-            .with_modifier(M2SemanticTokenModifier::Option)
+            .with_modifier(M2SemanticTokenModifier::OptionalParameter)
             .with_modifier(M2SemanticTokenModifier::DefaultLibrary)
             .with_modifier(M2SemanticTokenModifier::Readonly);
 

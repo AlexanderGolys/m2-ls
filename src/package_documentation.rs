@@ -35,13 +35,13 @@
 mod hypertext;
 mod simple_doc;
 
-use m2_syn::nodes::{Expr, ExprCollection, ExprOpBinAdj, PackedContent, Symbol};
+use m2_syn::nodes::{Expr, ExprCollection, ExprOpBinAdj, ExprQuote, PackedContent, Symbol};
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Lex, Spanned, TokenTree};
 use strum::{Display, EnumString, IntoStaticStr};
 use tower_lsp::lsp_types::Range as TextRange;
 
-use crate::analysis::Analysis;
+use crate::analysis::{Analysis, QuotedName};
 use crate::documentation::{DocumentationBlock, DocumentationTarget};
 use crate::macaulay2::Macaulay2Conventions;
 use crate::meta::BindingRole;
@@ -236,7 +236,9 @@ pub enum TextStyle {
     /// Monospace: `{\tt …}`, code and preformatted hypertext, a `Pre`
     /// block.
     Monospace,
-    /// The address of a web link, `\url{…}`, `HREF`.
+    /// The address of a web link, `\url{…}`, `HREF`, and the text a documentation
+    /// link shows or the title of the page it names: `TO2 {key, "text"}`,
+    /// `TO "page title"`.
     Url,
     /// TeX mathematics, `$…$`.
     Tex,
@@ -897,6 +899,12 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         let source = self.source;
         for (bytes, literal) in code.key_string_candidates {
             if !self.names_symbol(&source.text()[bytes.clone()]) {
+                // A string naming no symbol names a page by its title, and is
+                // read as a link's text.
+                self.documentation.markup.push(DocumentationMarkup {
+                    bytes: literal,
+                    kind: DocumentationMarkupKind::Styled(TextStyle::Url),
+                });
                 continue;
             }
             self.documentation
@@ -1099,6 +1107,7 @@ impl CodeMarkup {
             link_key_bytes: &link_key_bytes,
             marks: &mut marks,
             symbol_starts: Vec::new(),
+            pair_keys: Vec::new(),
         };
         syntax.visit(&mut symbols);
         let symbol_starts = symbols.symbol_starts;
@@ -1172,12 +1181,20 @@ struct SymbolMarks<'a, 'text, N: ?Sized> {
     link_key_bytes: &'a [ByteRange],
     /// Marks collected so far.
     marks: &'a mut CodeMarkup,
+    /// The document bytes of the symbols that are keys of `k => v` pairs,
+    /// which name options.
+    pair_keys: Vec<ByteRange>,
     /// The document bytes where symbols start.
     symbol_starts: Vec<usize>,
 }
 
 impl<'ast, N: SourceNavigation + ?Sized> Visit<'ast> for SymbolMarks<'_, '_, N> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
+        if let Expr::Option(option) = expression {
+            if matches!(option.key.as_ref(), Expr::Symbol(_)) {
+                self.pair_keys.push(self.code.bytes(option.key.as_ref()));
+            }
+        }
         if self.code.content_bytes(expression).is_some()
             && self.link_key_bytes.contains(&self.code.bytes(expression))
         {
@@ -1190,6 +1207,20 @@ impl<'ast, N: SourceNavigation + ?Sized> Visit<'ast> for SymbolMarks<'_, '_, N> 
         visit::visit_expr(self, expression);
     }
 
+    /// A quoted name is the `Symbol` it quotes, whatever it is bound to, as
+    /// the `+` of `symbol +` in a key.
+    fn visit_expr_quote(&mut self, quote: &'ast ExprQuote) {
+        let bytes = self.code.bytes(quote.quoted_name());
+        if bytes.is_empty() {
+            return;
+        }
+        self.symbol_starts.push(bytes.start);
+        self.marks.markup.push(DocumentationMarkup {
+            kind: DocumentationMarkupKind::Syntax(M2SemanticTokenType::Symbol),
+            bytes,
+        });
+    }
+
     fn visit_symbol(&mut self, symbol: &'ast Symbol) {
         let bytes = self.code.bytes(symbol);
         if bytes.is_empty() {
@@ -1197,7 +1228,7 @@ impl<'ast, N: SourceNavigation + ?Sized> Visit<'ast> for SymbolMarks<'_, '_, N> 
         }
         self.symbol_starts.push(bytes.start);
         self.marks.markup.push(DocumentationMarkup {
-            kind: if self.option_names.contains(&bytes) {
+            kind: if self.option_names.contains(&bytes) || self.pair_keys.contains(&bytes) {
                 DocumentationMarkupKind::OptionName
             } else {
                 HypertextMarkdown::constructor_markup(symbol.text())

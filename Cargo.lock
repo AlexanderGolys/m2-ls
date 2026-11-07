@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "m2-ls"
-version = "2.6.1"
+version = "2.6.1-dev.1"
 dependencies = [
  "dashmap",
  "m2-syn",

@@ -8,13 +8,18 @@
 mod corpus;
 
 use std::mem;
+use std::path::PathBuf;
+use tower_lsp::lsp_types::{Position, Range as TextRange};
 
 use serde::Deserialize;
 use std::{collections::HashMap, iter};
 
 use crate::macaulay2::Macaulay2Conventions;
 use crate::object_registry::{ObjectId, ObjectName, OperatorForm, TypeData, TypeId};
-use corpus::{deserialize_records, parse_records, RawOperatorForm, RawOptionSpec, RawRecord};
+use corpus::{
+    deserialize_records, parse_records, RawOperatorForm, RawOptionSpec, RawRecord,
+    RawSourceLocation,
+};
 
 /// The canonical metadata for one builtin M2 object.
 #[derive(Debug, Clone)]
@@ -39,6 +44,31 @@ pub struct Record {
     aliases: Vec<String>,
     /// Rendered documentation or its extracted Markdown coordinates.
     markdown: Option<String>,
+    /// Where the corpus' extraction machine located the object's definition.
+    source_location: Option<IndexedSourceLocation>,
+}
+
+/// A definition span as the extraction machine's `locate` reported it. The
+/// file is a path on that machine, so it names the installed copy only once a
+/// source resolver maps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedSourceLocation {
+    /// The file on the extraction machine.
+    pub file: PathBuf,
+    /// The span in the file.
+    pub range: TextRange,
+}
+
+impl From<RawSourceLocation> for IndexedSourceLocation {
+    fn from(raw: RawSourceLocation) -> Self {
+        Self {
+            file: PathBuf::from(raw.filename),
+            range: TextRange::new(
+                Position::new(raw.start_row.saturating_sub(1), raw.start_col),
+                Position::new(raw.stop_row.saturating_sub(1), raw.stop_col),
+            ),
+        }
+    }
 }
 
 /// The mutually exclusive semantic shape of one indexed M2 object.
@@ -103,6 +133,7 @@ impl Record {
             protected: false,
             aliases: Vec::new(),
             markdown: None,
+            source_location: None,
         }
     }
 
@@ -130,6 +161,11 @@ impl Record {
     /// All canonical and alias names under which this object can be found.
     pub fn lookup_names(&self) -> impl Iterator<Item = ObjectName> + '_ {
         iter::once(self.name.clone()).chain(self.aliases.iter().map(ObjectName::new))
+    }
+
+    /// The definition span the corpus recorded, when `locate` found one.
+    pub fn source_location(&self) -> Option<&IndexedSourceLocation> {
+        self.source_location.as_ref()
     }
 
     /// Rendered Markdown documentation attached to the record, when present.
@@ -537,6 +573,7 @@ impl BuiltinIndex {
                 protected: true,
                 aliases: Vec::new(),
                 markdown: None,
+                source_location: None,
             });
         }
         // User is an implicit runtime package. It has a bare binding, but
@@ -559,6 +596,7 @@ impl BuiltinIndex {
                 protected: true,
                 aliases: Vec::new(),
                 markdown: None,
+                source_location: None,
             });
             class_references.insert(user, ObjectName::new("$Core$Package"));
         }
@@ -601,6 +639,7 @@ impl BuiltinIndex {
                     protected: false,
                     aliases: Vec::new(),
                     markdown: None,
+                    source_location: None,
                 });
                 class_references.insert(id, package_class);
             }
@@ -642,6 +681,7 @@ impl BuiltinIndex {
                     protected: true,
                     aliases: Vec::new(),
                     markdown: None,
+                    source_location: None,
                 });
             }
         }
@@ -731,6 +771,7 @@ impl BuiltinIndex {
             protected: true,
             aliases: Vec::new(),
             markdown: None,
+            source_location: None,
         });
         let type_id = self
             .type_id(&id)
@@ -759,6 +800,7 @@ impl BuiltinIndex {
             protected: true,
             aliases: Vec::new(),
             markdown: None,
+            source_location: None,
         });
         let type_id = self
             .type_id(&id)
@@ -908,6 +950,7 @@ fn base_record(
         protected: raw.protected.unwrap_or(true),
         aliases,
         markdown: raw.markdown.take().filter(|markdown| !markdown.is_empty()),
+        source_location: raw.source_location.take().map(Into::into),
     }
 }
 
@@ -977,6 +1020,28 @@ fn capitalize_form(form: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corpus_source_locations_become_zero_based_ranges() {
+        let index = BuiltinIndex::load(concat!(
+            r#"{"kind":"meta","default_loaded":["Core"]}"#,
+            "\n",
+            r#"{"kind":"symbol","name":"MonomialOrder","package":"$Core$Core","#,
+            r#""source_location":{"filename":"/x/Macaulay2/m2/methods.m2","#,
+            r#""start_row":344,"start_col":8,"stop_row":344,"stop_col":21}}"#,
+        ));
+        let location = index
+            .records()
+            .iter()
+            .find(|record| record.name.name() == "MonomialOrder")
+            .and_then(|record| record.source_location().cloned())
+            .expect("the record carries its location");
+        assert_eq!(location.file, PathBuf::from("/x/Macaulay2/m2/methods.m2"));
+        assert_eq!(
+            location.range,
+            TextRange::new(Position::new(343, 8), Position::new(343, 21))
+        );
+    }
 
     fn index() -> BuiltinIndex {
         BuiltinIndex::load(crate::catalog::test_corpus())

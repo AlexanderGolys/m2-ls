@@ -301,15 +301,19 @@ impl ObjectRegistry {
         registry
     }
 
-    /// An implementation source starts before the session's automatic imports.
+    /// An implementation source starts before the session's automatic imports,
+    /// except Core: its own names, whether Macaulay2 defines them in C++ or in
+    /// Core's sources, are what the implementation code refers to.
     /// Catalog identities remain available for explicit package loads.
     pub fn without_prelude(&self) -> Self {
-        Self {
+        let mut registry = Self {
             catalog: Arc::clone(&self.catalog),
             packages: Vec::new(),
             init_file: InitFileStart::None,
             source_context: Arc::clone(&self.source_context),
-        }
+        };
+        registry.load_package(&ObjectName::new(Macaulay2Conventions::CORE));
+        registry
     }
 
     /// The session started with `init_file` in place of the init file this

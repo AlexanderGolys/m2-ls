@@ -5,6 +5,7 @@ use m2_syn::visit::{self, Visit};
 use m2_syn::{Delimiter, DelimiterValue, Span, Spanned};
 
 use crate::analysis::Dispatch;
+use crate::analysis::QuotedName;
 use crate::source::{ByteRange, SourceNavigation};
 
 /// Expression structure relevant to argument passing and nominal class inference.
@@ -441,7 +442,8 @@ impl<'ast> Visit<'ast> for Applications<'ast> {
 }
 
 /// The symbols within visited syntax that read a binding, in preorder: every
-/// symbol except a member key, the `key` of `x.key`, which names itself.
+/// symbol except a member key, the `key` of `x.key`, which names itself, and a
+/// quoted name, which denotes the `Symbol` object whatever the name is bound to.
 #[derive(Debug, Default)]
 pub struct BindingReferences<'ast>(pub Vec<&'ast Symbol>);
 
@@ -449,6 +451,8 @@ impl<'ast> Visit<'ast> for BindingReferences<'ast> {
     fn visit_symbol(&mut self, symbol: &'ast Symbol) {
         self.0.push(symbol);
     }
+
+    fn visit_expr_quote(&mut self, _quote: &'ast ExprQuote) {}
 
     fn visit_expr_op_bin_member(&mut self, access: &'ast ExprOpBinMember) {
         let (receiver, member) = match access {
@@ -459,6 +463,18 @@ impl<'ast> Visit<'ast> for BindingReferences<'ast> {
         if !matches!(member.as_ref(), Expr::Symbol(_)) {
             self.visit_expr(member);
         }
+    }
+}
+
+/// The names within visited syntax that a quote (`symbol x`, `global x`, …)
+/// turns into the `Symbol` object of that name, in preorder.
+#[derive(Debug, Default)]
+pub struct QuotedNames<'ast>(pub Vec<&'ast Symbol>);
+
+impl<'ast> Visit<'ast> for QuotedNames<'ast> {
+    fn visit_expr_quote(&mut self, quote: &'ast ExprQuote) {
+        self.0.push(quote.quoted_name());
+        visit::visit_expr_quote(self, quote);
     }
 }
 
