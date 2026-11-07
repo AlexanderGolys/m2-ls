@@ -73,11 +73,6 @@ impl SymbolMention {
         &text[self.span.bytes()]
     }
 
-    /// Where the mentioned name is written.
-    pub fn span(&self) -> &DocumentSpan {
-        &self.span
-    }
-
     /// LSP UTF-16 extent of the represented source item.
     pub fn range(&self) -> TextRange {
         self.span.range()

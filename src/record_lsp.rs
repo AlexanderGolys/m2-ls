@@ -11,8 +11,9 @@ use crate::capabilities::hover::layout::{HoverLayout, SectionContent};
 use crate::macaulay2::Macaulay2Conventions;
 use crate::node_metadata::matches_token;
 use crate::node_metadata::SyntaxSnapshot;
+use crate::object_registry::{ObjectId, TypeId};
 use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry, ObjectRegistryView};
-use crate::typesystem::TypeKnowledge;
+use crate::typesystem::{InferredType, TypeKnowledge};
 
 /// The most callables a hover names among those an option belongs to, or
 /// whose option a value is.
@@ -459,6 +460,116 @@ pub fn record_hover_with_package_and_usage(
         .with_section("Signatures", SectionContent::Code, all_signatures)
         .with_documentation(documentation)
         .into_hover()
+}
+
+/// Everything the index knows about `record`, as plain lines: its identity,
+/// callable data, and every installed signature with where its codomain
+/// comes from.
+pub fn record_debug_lines(
+    record: &Record,
+    knowledge: &(impl LspKnowledge + ?Sized),
+) -> Vec<String> {
+    let type_name = |type_id: &TypeId| {
+        knowledge
+            .type_name(type_id)
+            .map_or_else(|| format!("{type_id:?}"), |name| name.name().to_string())
+    };
+    let object_name = |object_id: &ObjectId| {
+        knowledge.object(object_id).map_or_else(
+            || format!("{object_id:?}"),
+            |record| record.name.name().to_string(),
+        )
+    };
+    let mut lines = vec![
+        format!("name: {}", record.name.name()),
+        format!("class: {}", record.class.name()),
+        format!("package: {}", object_name(&record.package)),
+        format!("protected: {}", record.protected),
+        format!("operator: {:?}", record.operator_info()),
+    ];
+    let Some(callable) = record.callable() else {
+        return lines;
+    };
+    lines.push(format!("kind: {:?}", callable.kind));
+    lines.push(format!(
+        "typical value: {}",
+        callable
+            .typical_value
+            .as_ref()
+            .map_or_else(|| "none".to_string(), type_name)
+    ));
+    lines.push(format!("option passing: {:?}", callable.option_passing));
+    lines.push(format!("receives sequence: {}", callable.receives_sequence));
+    lines.push(format!(
+        "options: {}",
+        callable
+            .options
+            .iter()
+            .map(|option| option.name.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    lines.push(format!("signatures ({}):", callable.methods.len()));
+    for method in &callable.methods {
+        let domain = method
+            .domain
+            .iter()
+            .map(&object_name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let codomain = match callable.effective_codomain(method) {
+            Some((codomain, true)) => format!("{} (own)", type_name(codomain)),
+            Some((codomain, false)) => format!("{} (typical value)", type_name(codomain)),
+            None => "unknown".to_string(),
+        };
+        lines.push(format!("  ({domain}) -> {codomain}"));
+    }
+    lines
+}
+
+/// What the call-site analysis concluded about a call of `record`, as plain
+/// lines: the operand types inferred and how the installed signatures were
+/// sorted by them.
+pub fn call_debug_lines(
+    knowledge: &(impl LspKnowledge + ?Sized),
+    argument_types: &[InferredType],
+    facts: &CallSignatureFacts,
+) -> Vec<String> {
+    let domain = |method: &MethodSignature| {
+        method
+            .domain
+            .iter()
+            .map(|object_id| {
+                knowledge.object(object_id).map_or_else(
+                    || format!("{object_id:?}"),
+                    |record| record.name.name().to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut lines = vec![format!("{} argument types:", argument_types.len())];
+    lines.extend(
+        argument_types
+            .iter()
+            .map(|argument| format!("  {argument:?}")),
+    );
+    lines.push(format!(
+        "pinned: {}",
+        facts.pinned.as_ref().map_or_else(
+            || "none".to_string(),
+            |method| format!("({})", domain(method))
+        )
+    ));
+    for (title, methods) in [("possible", &facts.possible), ("excluded", &facts.excluded)] {
+        lines.push(format!("{title} ({}):", methods.len()));
+        lines.extend(
+            methods
+                .iter()
+                .map(|method| format!("  ({})", domain(method))),
+        );
+    }
+    lines
 }
 
 /// Every signature of `record` as Macaulay2 code: the documented ones, with

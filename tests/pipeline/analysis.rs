@@ -3849,7 +3849,8 @@ async fn test_block_code_is_analyzed_as_a_session_that_loaded_the_package() {
         token_at(&tokens, PACKAGE_WITH_TEST, "helper", 1),
         (
             session.semantic_token_type("variable"),
-            session.semantic_token_modifier("test"),
+            session.semantic_token_modifier("test")
+                | session.semantic_token_modifier("injectedCode"),
         ),
         "an unexported global is not"
     );
@@ -4164,7 +4165,7 @@ async fn simple_doc_prose_reads_its_tex_markup_and_the_string_is_documentation()
     for (styled, style) in [
         ("n} to", "monospace"),
         ("the next", "strong"),
-        ("https://", "link"),
+        ("https://", "url"),
         ("adds one", "strong"),
     ] {
         let (token_type, modifiers) = token_at(&tokens, source, styled, 0);
@@ -4241,7 +4242,7 @@ async fn documentation_markup_marks_delimiters_links_and_option_keys() {
         assert_eq!(
             token("Coarse", occurrence),
             (
-                session.semantic_token_type("property"),
+                session.semantic_token_type("parameter"),
                 option | documentation
             ),
             "the option of an optional-argument key is an option name"

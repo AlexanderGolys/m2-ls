@@ -20,7 +20,7 @@ use crate::macaulay2::Macaulay2Conventions;
 use crate::node_metadata::SyntaxSnapshot;
 use crate::object_registry::ObjectName;
 use crate::package_index::PackageLoadingOption;
-use crate::source::{ByteRange, SourceNavigation, SymbolMention};
+use crate::source::{ByteRange, DocumentSpan, SourceNavigation, SymbolMention};
 use crate::string_literal::LiteralSource;
 use crate::syntax::ExpressionSyntax;
 
@@ -80,6 +80,10 @@ pub struct PackageExport {
     /// The name of [`Self::definition`] inside its string, a use of the
     /// package global.
     pub definition_mention: SymbolMention,
+    /// The whole string literal of [`Self::name`], quotes included.
+    pub name_literal: DocumentSpan,
+    /// The whole string literal of [`Self::definition`], quotes included.
+    pub definition_literal: DocumentSpan,
     /// Whether the sessions may assign the symbol.
     pub access: ExportAccess,
 }
@@ -370,6 +374,10 @@ impl<S: SourceNavigation + ?Sized> PackageCallCollector<'_, S> {
                     range: self.source.range_for_syntax(name)?,
                     name_mention: mention(name)?,
                     definition_mention: mention(definition)?,
+                    name_literal: self.source.span_for_bytes(self.source.syntax_bytes(name)?),
+                    definition_literal: self
+                        .source
+                        .span_for_bytes(self.source.syntax_bytes(definition)?),
                     access,
                 })
             })

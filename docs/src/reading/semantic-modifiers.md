@@ -30,10 +30,10 @@ has `algebraic`. A method installation keeps its `method` type and adds
 `option`
 : Marks an option key. Its value retains its own token classification.
 
-`access`
+`memberAccess`
 : Marks part-selection operators: `_`, `.`, `.?`, binary `#`, and `#?`.
   A theme can deemphasize them so the base and selected member stand out.
-  Prefix `#`, which computes a length, has no access modifier.
+  Prefix `#`, which computes a length, has no `memberAccess` modifier.
 
 ## Documentation and embedded code
 
@@ -48,14 +48,33 @@ has `algebraic`. A method installation keeps its `method` type and adds
 `test`
 : Marks code inside a `TEST` block, independently of its token type.
 
+`injectedCode`
+: Marks code written inside a string and analysed as code: the body of a
+  `TEST` block and documentation examples.
+
+`injectedName`
+: Marks a string that names an object which need not be in scope, such as
+  the package in `needsPackage "Foo"`.
+
 `strong`, `emphasis`, `monospace`
 : Mark bold, italic, and code-style documentation text respectively. This
   includes supported markup commands and documentation section roles.
 
-`link`
-: Marks the address in supported documentation link markup.
+`url`
+: Marks the address in supported documentation link markup, `\url{…}` and
+  `HREF`.
 
-`math`
+`file`
+: Marks a path to a file, such as the argument of `load`.
+
+`directory`
+: Marks a path to a directory. Registered in the legend but currently has
+  no emission rule.
+
+`wikilink`
+: Marks the target of a `[[wikilink]]` in a documentation comment.
+
+`tex`
 : Marks TeX mathematics in documentation.
 
 ## Reserved modifiers

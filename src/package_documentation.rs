@@ -236,10 +236,10 @@ pub enum TextStyle {
     /// Monospace: `{\tt …}`, code and preformatted hypertext, a `Pre`
     /// block.
     Monospace,
-    /// The address of a link, `\url{…}`.
-    Link,
+    /// The address of a web link, `\url{…}`, `HREF`.
+    Url,
     /// TeX mathematics, `$…$`.
-    Math,
+    Tex,
 }
 
 /// Something about documentation that `document` or `SimpleDoc` rejects or

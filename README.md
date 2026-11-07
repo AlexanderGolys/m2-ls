@@ -184,13 +184,13 @@ modifiers, so themes can inherit the standard type's styling.
 | Other functions, scripted functors (`id`, `Ext`), commands and manipulators (`exit`, `endl`) | `function` | According to `defaultLibrary` policy |
 | File values (`stdio`) | `variable` | |
 | Ring generators | `variable` | `algebraic` |
-| Access operators (`_` of `S_1`, `.`, `.?`, binary `#`, `#?`) | `operator` | `access` |
+| Access operators (`_` of `S_1`, `.`, `.?`, binary `#`, `#?`) | `operator` | `memberAccess` |
 | Literal selectors (`0` of `L_0` or `L#0`) | `property` | |
 | Installation domains and codomains (`ZZ`, `List` in `f ZZ := List => ...`) | `typeParameter` | |
 | SimpleDoc section keywords, `document` option names, and links (`TO`, `TOH`, `TO2`) | `decorator` | |
 | TeX delimiters and other hypertext constructors | `macro` | |
-| Styled documentation text | `string` | `strong`, `emphasis`, `monospace`, `link`, or `math` |
-| Option keys, including the `Limit` of `[f, Limit]` in documentation | `property`, or `enumMember` for a protected symbol | `option` |
+| Styled documentation text | `string` | `strong`, `emphasis`, `monospace`, `url`, or `tex` |
+| Option keys, including the `Limit` of `[f, Limit]` in documentation | `parameter`, or `enumMember` for a protected symbol (a string key stays `property`) | `option` |
 
 Documentation calls, their tags and values, attached documentation comments,
 and embedded code carry the standard `documentation` modifier. Examples,
@@ -208,7 +208,7 @@ Ring generators include `x` and `y` in `RR[x, y]`, or the whole `x_1` in
 
 A subscript spelling one object of the kind of one of its parts is a single
 token: `1_S` is a `number`, `RR_53` a `type`. Other accesses keep their parts:
-in `S_1` the ring `S` stays a `type`, the `_` is an `access` operator, and the
+in `S_1` the ring `S` stays a `type`, the `_` is a `memberAccess` operator, and the
 `1` is the generator it selects.
 
 The runtime class decides `method` versus `function`, independently of the

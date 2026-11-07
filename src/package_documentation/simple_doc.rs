@@ -916,7 +916,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                         (start..start + opening, DocumentationMarkupKind::TextMarkup),
                         (
                             start + opening..start + close,
-                            DocumentationMarkupKind::Styled(TextStyle::Link),
+                            DocumentationMarkupKind::Styled(TextStyle::Url),
                         ),
                         (
                             start + close..start + close + 1,
@@ -946,7 +946,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 if marks.is_empty() {
                     self.documentation.markup.push(DocumentationMarkup {
                         bytes: start..start + length,
-                        kind: DocumentationMarkupKind::Styled(TextStyle::Math),
+                        kind: DocumentationMarkupKind::Styled(TextStyle::Tex),
                     });
                 }
                 for (bytes, kind) in marks {

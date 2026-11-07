@@ -391,7 +391,7 @@ fn text_style(function: MarkupFunction) -> Option<TextStyle> {
         MarkupRendering::Code | MarkupRendering::Preformatted => Some(TextStyle::Monospace),
         MarkupRendering::Bold | MarkupRendering::Heading => Some(TextStyle::Strong),
         MarkupRendering::Italic => Some(TextStyle::Emphasis),
-        MarkupRendering::Hyperlink => Some(TextStyle::Link),
+        MarkupRendering::Hyperlink => Some(TextStyle::Url),
         _ => None,
     }
 }

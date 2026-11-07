@@ -110,6 +110,8 @@ impl DocumentationBlock {
 pub struct DocumentationSnippet {
     /// Original source interval in UTF-8 byte offsets.
     pub bytes: ByteRange,
+    /// Whether the fragment is the target of a `[[wikilink]]` rather than code.
+    pub is_wikilink: bool,
 }
 
 impl DocumentationSnippet {
@@ -523,21 +525,31 @@ fn collect_markdown_block(
         index
             .example_ranges
             .extend(text.source_ranges(range.clone()));
-        index.snippets.extend(
-            text.source_ranges(range)
-                .into_iter()
-                .map(|bytes| DocumentationSnippet { bytes }),
-        );
+        index
+            .snippets
+            .extend(
+                text.source_ranges(range)
+                    .into_iter()
+                    .map(|bytes| DocumentationSnippet {
+                        bytes,
+                        is_wikilink: false,
+                    }),
+            );
     }
 
     {
         for (_, target_range) in &wiki_links {
             collect_mapped_m2_references(&text, target_range.clone(), source, index);
-            index.snippets.extend(
-                text.source_ranges(target_range.clone())
-                    .into_iter()
-                    .map(|bytes| DocumentationSnippet { bytes }),
-            );
+            index
+                .snippets
+                .extend(
+                    text.source_ranges(target_range.clone())
+                        .into_iter()
+                        .map(|bytes| DocumentationSnippet {
+                            bytes,
+                            is_wikilink: true,
+                        }),
+                );
         }
     }
 
@@ -634,6 +646,7 @@ fn collect_legacy_backtick_snippets(
             }));
         index.snippets.push(DocumentationSnippet {
             bytes: source_start..range.start + close,
+            is_wikilink: true,
         });
     }
 }

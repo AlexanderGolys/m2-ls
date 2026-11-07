@@ -19,6 +19,7 @@ use crate::semantic_token::{
 use crate::settings::{DefaultLibraryMode, DefaultLibrarySetting, SemanticTokenSettings};
 use crate::source::{ByteRange, DocumentSpan, SourceNavigation, SymbolMention, SyntaxSource};
 use crate::source_package::{CodeFragment, ExportAccess};
+use crate::string_literal::LiteralSource;
 use crate::workspace_index::{WorkspaceDefinitionKnowledge, WorkspaceIndex, WorkspaceView};
 use m2_syn::nodes::ExprDebug;
 use m2_syn::visit::{self, Visit};
@@ -183,6 +184,14 @@ impl<'a> SemanticTokenEmitter<'a> {
                 .chain(document.documentation_example_ranges())
                 .cloned()
                 .map(|bytes| (bytes, M2SemanticTokenModifier::Example)),
+        );
+        contexts.extend(
+            documentation
+                .example_ranges()
+                .iter()
+                .chain(document.documentation_example_ranges())
+                .cloned()
+                .map(|bytes| (bytes, M2SemanticTokenModifier::InjectedCode)),
         );
         document.syntax().visit(&mut TestContexts {
             document,
@@ -400,6 +409,16 @@ impl<'ast> Visit<'ast> for TestContexts<'_> {
             if let Some(bytes) = self.document.syntax_bytes(expression) {
                 self.contexts.push((bytes, M2SemanticTokenModifier::Test));
             }
+            if let ExprDebug::Test(test) = expression {
+                if let Some(body) = test
+                    .value
+                    .as_deref()
+                    .and_then(|value| value.literal_content_bytes(self.document.source()))
+                {
+                    self.contexts
+                        .push((body, M2SemanticTokenModifier::InjectedCode));
+                }
+            }
         }
         visit::visit_expr_debug(self, expression);
     }
@@ -432,7 +451,12 @@ fn documentation_snippet_semantic_span(
 ) -> SemanticSpan {
     SemanticSpan {
         source: document.span_for_bytes(snippet.span()),
-        token: M2SemanticToken::new(M2SemanticTokenType::Property),
+        token: if snippet.is_wikilink {
+            M2SemanticToken::new(M2SemanticTokenType::Property)
+                .with_modifier(M2SemanticTokenModifier::Wikilink)
+        } else {
+            M2SemanticToken::new(M2SemanticTokenType::Property)
+        },
     }
 }
 
@@ -596,12 +620,12 @@ where
                 continue;
             };
             spans.push(SemanticSpan {
-                source: export.definition_mention.span().clone(),
+                source: export.definition_literal.clone(),
                 token,
             });
             if export.name != export.definition {
                 spans.push(SemanticSpan {
-                    source: export.name_mention.span().clone(),
+                    source: export.name_literal.clone(),
                     token,
                 });
             }
@@ -650,8 +674,8 @@ where
                             TextStyle::Strong => M2SemanticTokenModifier::Strong,
                             TextStyle::Emphasis => M2SemanticTokenModifier::Emphasis,
                             TextStyle::Monospace => M2SemanticTokenModifier::Monospace,
-                            TextStyle::Link => M2SemanticTokenModifier::Link,
-                            TextStyle::Math => M2SemanticTokenModifier::Math,
+                            TextStyle::Url => M2SemanticTokenModifier::Url,
+                            TextStyle::Tex => M2SemanticTokenModifier::Tex,
                         })
                     }
                     DocumentationMarkupKind::Name => self
@@ -1092,7 +1116,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         assert_eq!(local.token_type, M2SemanticTokenType::Property as u32);
         assert_eq!(
             local.token_modifiers_bitset,
-            M2SemanticTokenModifier::Documentation.bit()
+            M2SemanticTokenModifier::Documentation.bit() | M2SemanticTokenModifier::Wikilink.bit()
         );
 
         let builtin =
@@ -1100,7 +1124,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         assert_eq!(builtin.token_type, M2SemanticTokenType::Property as u32);
         assert_eq!(
             builtin.token_modifiers_bitset,
-            M2SemanticTokenModifier::Documentation.bit()
+            M2SemanticTokenModifier::Documentation.bit() | M2SemanticTokenModifier::Wikilink.bit()
         );
 
         assert_eq!(
@@ -1607,13 +1631,13 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 (1, "marker", M2SemanticTokenType::Symbol),
             ] {
                 let text_line = text.lines().nth(line).unwrap();
-                let column = text_line.find(&format!("\"{name}\"")).unwrap() as u32 + 1;
+                let column = text_line.find(&format!("\"{name}\"")).unwrap() as u32;
                 let token = token_at(&tokens, line as u32, column).unwrap();
                 assert_eq!(
                     token.token_type, role as u32,
                     "{name}, augments_syntax={augments_syntax}"
                 );
-                assert_eq!(token.length, name.len() as u32);
+                assert_eq!(token.length, name.len() as u32 + 2, "quotes included");
                 assert_eq!(token.token_modifiers_bitset & DECLARATION_MODIFIER, 0);
             }
             // Plain mutable variables keep the surrounding string's style;
@@ -1654,9 +1678,9 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             &SemanticTokenSettings::default(),
             true,
         );
-        let token = token_at(&tokens, 1, 9).unwrap();
+        let token = token_at(&tokens, 1, 8).unwrap();
         assert_eq!(token.token_type, M2SemanticTokenType::Function as u32);
-        assert_eq!(token.length, 6);
+        assert_eq!(token.length, 8);
     }
 
     #[test]
@@ -1925,7 +1949,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     fn option_keys_classify_by_protected_symbol() {
         // The key of a `k => v` pair is classified by whether it is a protected
         // symbol: `Strategy` (a protected class-`Symbol` builtin) is a nominal
-        // enum member, while `myKey` (an unprotected user name) is a field. The
+        // enum member, while `myKey` (an unprotected user name) is a parameter. The
         // value `7` is not a symbol, so it is not classified here.
         let text = "f(x, Strategy => 4, myKey => 7)";
         let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
@@ -1938,7 +1962,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         );
         assert_eq!(
             token_type_at(&tokens, 0, text.find("myKey").unwrap() as u32),
-            Some(M2SemanticTokenType::Property as u32)
+            Some(M2SemanticTokenType::Parameter as u32)
         );
     }
 
@@ -2125,7 +2149,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
         let generator = M2SemanticTokenModifier::Algebraic.bit();
-        let access = M2SemanticTokenModifier::Access.bit();
+        let access = M2SemanticTokenModifier::MemberAccess.bit();
 
         for (line, column, length, token_type) in [
             (1, 0, 3, M2SemanticTokenType::Number),
@@ -2340,7 +2364,9 @@ Description
         assert_eq!(token.token_type, M2SemanticTokenType::Number as u32);
         assert_eq!(
             token.token_modifiers_bitset,
-            M2SemanticTokenModifier::Documentation.bit() | M2SemanticTokenModifier::Example.bit()
+            M2SemanticTokenModifier::Documentation.bit()
+                | M2SemanticTokenModifier::Example.bit()
+                | M2SemanticTokenModifier::InjectedCode.bit()
         );
     }
 
@@ -2368,7 +2394,8 @@ Description
         for augments_syntax in [false, true] {
             let tokens = collect_tokens(&document, &builtins, augments_syntax);
             let documentation = M2SemanticTokenModifier::Documentation.bit();
-            let example = M2SemanticTokenModifier::Example.bit();
+            let example = M2SemanticTokenModifier::Example.bit()
+                | M2SemanticTokenModifier::InjectedCode.bit();
             let test = M2SemanticTokenModifier::Test.bit();
             assert_eq!(
                 token_at(&tokens, 0, 0).unwrap().token_modifiers_bitset,
@@ -2397,7 +2424,10 @@ Description
             }
             let token = token_at(&tokens, 13, 8).unwrap();
             assert_eq!(token.token_type, M2SemanticTokenType::Number as u32);
-            assert_eq!(token.token_modifiers_bitset, test);
+            assert_eq!(
+                token.token_modifiers_bitset,
+                test | M2SemanticTokenModifier::InjectedCode.bit()
+            );
             for line in [1, 14] {
                 let token = token_at(&tokens, line, 0).unwrap();
                 assert_eq!(
@@ -2425,7 +2455,7 @@ Description
     #[test]
     fn legend_lists_every_variant_in_declaration_order() {
         let legend = M2SemanticToken::legend();
-        for removed in ["file", "command", "unresolved", "mutable"] {
+        for removed in ["command", "unresolved", "mutable"] {
             assert!(!legend
                 .token_modifiers
                 .iter()
@@ -2462,9 +2492,8 @@ Description
         };
         for modifier in M2SemanticTokenModifier::iter() {
             let expected = match modifier {
-                Example | Strong | Emphasis | Monospace | Link | Math | Documentation => {
-                    Documentation.bit()
-                }
+                Example | Strong | Emphasis | Monospace | Url | File | Directory | Wikilink
+                | Tex | Documentation => Documentation.bit(),
                 Nonsense | Algebraic | Abstract => Abstract.bit(),
                 Declaration | DefaultLibrary | Readonly => modifier.bit(),
                 _ => 0,

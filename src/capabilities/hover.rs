@@ -2,6 +2,10 @@
 
 pub mod layout;
 
+/// When set, a hover over a builtin object ends with everything the index
+/// and the call-site analysis know, for diagnosing wrong types.
+const HOVER_DEBUG_ENV: &str = "M2_LS_HOVER_DEBUG";
+
 /// What follows a signature in hover whose codomain is deduced, not stated.
 const DEDUCED_CODOMAIN_COMMENT: &str = "  -- deduced";
 
@@ -10,13 +14,17 @@ use m2_syn::{Span, Spanned};
 use tower_lsp::lsp_types::*;
 
 use crate::analysis::{
-    Analysis, CallStaticFacts, CodomainOrigin, FunctionInfo, InfixSyntax, MethodInstallation,
+    Analysis, CallSignatureFacts, CallStaticFacts, CodomainOrigin, FunctionInfo, InfixSyntax,
+    MethodInstallation,
 };
 use crate::document::{DocumentSnapshot, SymbolAt};
 use crate::meta::{BindingRole, Metadata};
 use crate::object_registry::ObjectName;
-use crate::record_lsp::{record_hover_with_package_and_usage, signature_usage_from_facts};
-use crate::record_lsp::{LspKnowledge, SignatureUsage};
+use crate::record_lsp::LspKnowledge;
+use crate::record_lsp::{
+    call_debug_lines, record_debug_lines, record_hover_with_package_and_usage,
+    signature_usage_from_facts,
+};
 use crate::semantic_token::M2SemanticTokenType;
 use crate::source::SourceNavigation;
 use crate::workspace_index::{WorkspaceDefinitionKnowledge, WorkspaceDocumentationKnowledge};
@@ -117,14 +125,35 @@ where
     if record.callable().is_some() && document.object_registry().is_source_object(&record.id) {
         return workspace_symbol_hover(node_text, uri, workspace);
     }
-    let signature_usage =
-        call_signature_usage_for_hover(&hovered, node_text, document, analysis, knowledge);
-    Some(record_hover_with_package_and_usage(
+    let evidence = call_evidence_for_hover(&hovered, node_text, document, analysis, knowledge);
+    let signature_usage = evidence.as_ref().and_then(|(_, signature_facts)| {
+        signature_usage_from_facts(knowledge, record, signature_facts)
+    });
+    let mut hover = record_hover_with_package_and_usage(
         record,
         Some(&package),
         knowledge,
         signature_usage.as_ref(),
-    ))
+    );
+    if std::env::var_os(HOVER_DEBUG_ENV).is_some() {
+        let mut lines = record_debug_lines(record, knowledge);
+        if let Some((facts, signature_facts)) = &evidence {
+            lines.push("call:".to_string());
+            lines.extend(call_debug_lines(
+                knowledge,
+                &facts.argument_types,
+                signature_facts,
+            ));
+        }
+        if let HoverContents::Markup(content) = &mut hover.contents {
+            content.value = format!(
+                "```text\n{}\n```\n\n---\n\n{}",
+                lines.join("\n"),
+                content.value
+            );
+        }
+    }
+    Some(hover)
 }
 
 /// What the cursor rests on for hover, with the expression around it.
@@ -281,15 +310,16 @@ where
     )
 }
 
-/// The signature usage at a call site, for hover specialization: the argument
-/// types at the enclosing application/operator, resolved against the loaded scope.
-fn call_signature_usage_for_hover(
+/// The call site's argument facts and how the installed signatures sort by
+/// them, for hover specialization: the argument types at the enclosing
+/// application/operator, resolved against the loaded scope.
+fn call_evidence_for_hover(
     hovered: &HoveredSyntax<'_>,
     node_text: &str,
     document: &DocumentSnapshot,
     analysis: &Analysis,
     knowledge: &(impl LspKnowledge + ?Sized),
-) -> Option<SignatureUsage> {
+) -> Option<(CallStaticFacts, CallSignatureFacts)> {
     let (facts, context): (_, &dyn Spanned) = match *hovered {
         HoveredSyntax::Symbol(SymbolAt {
             expression: Some(symbol),
@@ -322,11 +352,7 @@ fn call_signature_usage_for_hover(
         document.position_for_syntax(context)?,
         knowledge,
     )?;
-    signature_usage_from_facts(
-        knowledge,
-        knowledge.get_record(&callable)?,
-        &signature_facts,
-    )
+    Some((facts, signature_facts))
 }
 
 /// Whether a hover over this node is meaningful: a symbol-like leaf or an
@@ -363,6 +389,7 @@ mod tests {
     use super::*;
     use crate::meta::{BindingRole, Meta};
     use crate::object_registry::ObjectRegistry;
+    use crate::record_lsp::SignatureUsage;
     use crate::test_support::analyze;
     use crate::workspace_index::WorkspaceIndex;
     use tower_lsp::lsp_types::{HoverContents, Range as TextRange, SymbolKind};
@@ -385,6 +412,22 @@ mod tests {
 
     /// The key of `output.value` is the symbol `value`, not the builtin
     /// function `value` nor the parameter of that name, so it has no hover.
+    /// The signature usage the call evidence at `hovered` gives `name`.
+    fn usage_at(
+        hovered: &HoveredSyntax<'_>,
+        name: &str,
+        document: &DocumentSnapshot,
+        knowledge: &ObjectRegistry,
+    ) -> Option<SignatureUsage> {
+        let (_, signature_facts) =
+            call_evidence_for_hover(hovered, name, document, document.analysis(), knowledge)?;
+        signature_usage_from_facts(
+            knowledge,
+            knowledge.get_record(&ObjectName::new(name))?,
+            &signature_facts,
+        )
+    }
+
     #[test]
     fn member_keys_have_no_hover() {
         let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
@@ -596,14 +639,8 @@ mod tests {
         let hovered =
             HoveredSyntax::at(&document, pos!(0, 5)).expect("openOut should be hoverable");
 
-        let usage = call_signature_usage_for_hover(
-            &hovered,
-            "openOut",
-            &document,
-            document.analysis(),
-            &scoped,
-        )
-        .expect("openOut hover should resolve usage signatures");
+        let usage = usage_at(&hovered, "openOut", &document, &scoped)
+            .expect("openOut hover should resolve usage signatures");
         let signature = usage
             .pinned
             .expect("openOut hover should pin the String installation");
@@ -636,9 +673,8 @@ mod tests {
         let hovered =
             HoveredSyntax::at(&document, pos!(2, 7)).expect("operator tokens should be hoverable");
 
-        let usage =
-            call_signature_usage_for_hover(&hovered, "+", &document, document.analysis(), &scoped)
-                .expect("+ hover should resolve usage signatures");
+        let usage = usage_at(&hovered, "+", &document, &scoped)
+            .expect("+ hover should resolve usage signatures");
         let signature = usage
             .pinned
             .expect("+ hover should pin the ZZ, ZZ installation");

@@ -253,7 +253,7 @@ pub enum M2SemanticTokenModifier {
     Algebraic = SemanticTokenModifier::new("algebraic"),
     /// An operator selecting a part of its left operand rather than computing
     /// from both: the `_` of `S_1`, `.` and `.?`, and binary `#` and `#?`.
-    Access = SemanticTokenModifier::new("access"),
+    MemberAccess = SemanticTokenModifier::new("memberAccess"),
     /// Bold documentation text: `{\bf …}`, `BOLD`, a heading.
     Strong = SemanticTokenModifier::new("strong"),
     /// Italic documentation text: `{\em …}`, `{\it …}`, `EM`, `ITALIC`.
@@ -261,10 +261,22 @@ pub enum M2SemanticTokenModifier {
     /// Monospace documentation text: `{\tt …}`, `TT`, `CODE`, `PRE`, a
     /// SimpleDoc `Pre` block.
     Monospace = SemanticTokenModifier::new("monospace"),
-    /// The address of a link: `\url{…}`, `HREF`.
-    Link = SemanticTokenModifier::new("link"),
+    /// The address of a web link: `\url{…}`, `HREF`.
+    Url = SemanticTokenModifier::new("url"),
+    /// A path to a file: the `"foo.m2"` of `load "foo.m2"`.
+    File = SemanticTokenModifier::new("file"),
+    /// A path to a directory; reserved, no automatic emission rule.
+    Directory = SemanticTokenModifier::new("directory"),
+    /// The target of a `[[wikilink]]` in a documentation comment.
+    Wikilink = SemanticTokenModifier::new("wikilink"),
     /// TeX mathematics, `$…$`.
-    Math = SemanticTokenModifier::new("math"),
+    Tex = SemanticTokenModifier::new("tex"),
+    /// Code written inside a string and analysed as code: the body of a
+    /// `TEST` block, a documentation example.
+    InjectedCode = SemanticTokenModifier::new("injectedCode"),
+    /// A string naming an object that need not be in scope, such as the
+    /// package of `needsPackage "Foo"`.
+    InjectedName = SemanticTokenModifier::new("injectedName"),
     /// Code shown or executed as a documentation example.
     Example = SemanticTokenModifier::new("example"),
     /// Code in a `TEST` block.
@@ -292,8 +304,11 @@ impl M2SemanticTokenModifier {
             | Self::Strong
             | Self::Emphasis
             | Self::Monospace
-            | Self::Link
-            | Self::Math => Some(Self::Documentation),
+            | Self::Url
+            | Self::File
+            | Self::Directory
+            | Self::Wikilink
+            | Self::Tex => Some(Self::Documentation),
             Self::Nonsense | Self::Algebraic => Some(Self::Abstract),
             modifier if modifier.is_standard() => Some(modifier),
             _ => None,
@@ -372,13 +387,13 @@ impl M2SemanticToken {
 
     /// The token of an option name written as a symbol: a protected
     /// symbol such as `Strategy` stays a [`Symbol`](M2SemanticTokenType::Symbol),
-    /// any other name is a [`Property`](M2SemanticTokenType::Property) of the
-    /// options it is a key of.
+    /// any other name is a [`Parameter`](M2SemanticTokenType::Parameter) of the
+    /// callable it is an option of.
     pub fn option_name(name: &str, knowledge: &(impl SemanticTokenKnowledge + ?Sized)) -> Self {
         let token_type = if knowledge.is_protected_symbol(name) {
             M2SemanticTokenType::Symbol
         } else {
-            M2SemanticTokenType::Property
+            M2SemanticTokenType::Parameter
         };
         Self::new(token_type)
             .with_modifier(M2SemanticTokenModifier::Option)
@@ -699,11 +714,12 @@ fn source_role_semantic_token(
             .with_modifier(M2SemanticTokenModifier::Option),
         SourceSemanticRole::PropertyKey => M2SemanticToken::new(M2SemanticTokenType::Property),
         SourceSemanticRole::AccessOperator => M2SemanticToken::new(M2SemanticTokenType::Operator)
-            .with_modifier(M2SemanticTokenModifier::Access),
+            .with_modifier(M2SemanticTokenModifier::MemberAccess),
         SourceSemanticRole::QuotedSymbol => M2SemanticToken::new(M2SemanticTokenType::Symbol),
-        SourceSemanticRole::NamespaceArgument | SourceSemanticRole::LoadedFilePath => {
-            M2SemanticToken::new(M2SemanticTokenType::Package)
-        }
+        SourceSemanticRole::NamespaceArgument => M2SemanticToken::new(M2SemanticTokenType::Package)
+            .with_modifier(M2SemanticTokenModifier::InjectedName),
+        SourceSemanticRole::LoadedFilePath => M2SemanticToken::new(M2SemanticTokenType::Package)
+            .with_modifier(M2SemanticTokenModifier::File),
     };
     Some(token)
 }
