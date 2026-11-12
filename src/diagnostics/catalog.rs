@@ -741,12 +741,12 @@ UNAVAILABLE_INIT_FILE {
         severity: WARNING,
     }
 
-    /// Repeated positive class tests on a function parameter in an else-if chain.
-    /// At least two distinct classes must have branches beyond a bare error call.
+    /// Three or more inheritance tests of the same function parameter anywhere
+    /// in its body, including compound conditions and validation guards.
     /// Prefer method specializations so additional classes can add behavior.
     ///
     /// ```m2
-    /// renderLabel = x -> if instance(x, String) then x else if instance(x, ZZ) then toString x else "other"
+    /// renderLabel = x -> if instance(x, String) then x else if instance(x, ZZ) then toString x else if instance(x, List) then toString x else "other"
     /// ```
 MANUAL_TYPE_DISPATCH {
         code: "E19",

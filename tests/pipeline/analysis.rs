@@ -5100,13 +5100,13 @@ async fn explicit_holder_hint_takes_precedence_over_assignment_hint() {
     session.shutdown().await;
 }
 
-/// Class-based branch chains suggest method specializations, without flagging guards.
+/// Three parameter inheritance tests suggest dispatch regardless of their placement.
 #[tokio::test]
 async fn repeated_instance_tests_suggest_method_dispatch() {
     let mut session = DocumentSession::open("").await;
     for (source, expected) in [
         ("f = x -> if instance(x, String) then x else if instance(x, ZZ) then toString x else if instance(x, List) then toString x else null\n", true),
-        ("f = x -> if instance(x, String) then x else (if instance(x, ZZ) then toString x else null)\n", true),
+        ("f = x -> if instance(x, String) then x else (if instance(x, ZZ) then toString x else null)\n", false),
         ("f = x -> if instance(x, String) then x else null\n", false),
         ("f = x -> if not instance(x, String) then error \"text required\"\n", false),
         ("f = (x, y) -> if instance(x, String) then x else if instance(y, ZZ) then y else null\n", false),
@@ -5118,11 +5118,25 @@ async fn repeated_instance_tests_suggest_method_dispatch() {
         ("f = x -> (y := x#0; if instance(y, String) then y else if instance(y, ZZ) then toString y else null)\n", false),
         ("x = 3\nif instance(x, String) then x else if instance(x, ZZ) then toString x else null\n", false),
         ("f = x -> if instance(x#0, String) then x else if instance(x#0, ZZ) then x else null\n", false),
+        ("leaf := x -> (drawing := node(class x, {}, if instance(x, String) then x else try toString x else typeText class x); if instance(x, Ring) or instance(x, RingFamily) then withMetadata(drawing, {\"tex\" => (try texMath x)}) else drawing)\n", true),
+        ("f = x -> (instance(x, String); not instance(x, String); instance(x, String); instance(x, String))\n", true),
+        ("f = x -> (if not instance(x, String) then error \"text\"; if instance(x, ZZ) then error \"integer\"; instance(x, List))\n", true),
+        ("f = (x, T) -> (instance(x, T); instance(x, class T); instance(x, T))\n", true),
+        ("f = x -> (((instance(x, String))); (instance(x, ZZ)))\n", false),
+        ("f = x -> (((instance((x), String))); (instance(x, ZZ)); instance(x, List))\n", true),
+        ("f = (x, y) -> (instance(x, String); instance(y, ZZ); instance(x, List); instance(y, Ring))\n", false),
+        ("f = x -> (instance(x, String); instance(x, ZZ))\ng = x -> instance(x, List)\n", false),
+        ("f = x -> (instance(x, String); g := x -> instance(x, ZZ); instance(x, List))\n", false),
+        ("f = x -> (instance(x, String); g := y -> instance(x, ZZ); instance(x, List))\n", true),
+        ("f = x -> (y := x; instance(y, String); instance(y, ZZ); instance(y, List))\n", false),
+        ("x = 3\ninstance(x, String); instance(x, ZZ); instance(x, List)\n", false),
+        ("f = x -> (instance(x#0, String); instance(x#0, ZZ); instance(x#0, List))\n", false),
+        ("instance = (x, T) -> true\nf = x -> (instance(x, String); instance(x, ZZ); instance(x, List))\n", false),
     ] {
         replace_and_assert_diagnostic(&mut session, source, "E19", expected).await;
         if expected {
             let findings = session.diagnostics().iter().filter(|item| item["code"] == "E19").collect::<Vec<_>>();
-            assert_eq!(findings.len(), 1, "one warning per dispatch chain");
+            assert_eq!(findings.len(), 1, "one warning per parameter");
             assert_eq!(findings[0]["severity"], 2);
         }
     }

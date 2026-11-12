@@ -77,7 +77,7 @@ next.
 | `E16` | `unknown-option` | error | an option name the called function does not accept, which Macaulay2 rejects: `f(1, Verbos => true)`; fix: the closest accepted name |
 | `E17` | `unloadable-file` | warning | a `load`/`needs`/`input` name `load` cannot run: no file where it looks, a directory, a file it may not read, or an empty name: `load "no-such-file.m2"`; see [Workspace files](../navigating/workspace-files.md#unloadable) |
 | `E18` | `unavailable-init-file` | warning | an [`initFile` directive](../getting-started/inline-directives.md#init-file) naming a file that cannot be read: `-- m2-ls: initFile no-such-init.m2`; the file starts without an init file |
-| `E19` | `manual-type-dispatch` | warning | repeated `instance(x, Class)` tests of the same function parameter against distinct named classes with at least two non-error branches in an `if` / `else if` chain; consider method specializations |
+| `E19` | `manual-type-dispatch` | warning | three or more `instance` tests of the same function parameter anywhere in its body; consider method specializations |
 | `E20` | `list-record-shape` | warning | a list-family `instance` check combined with a fixed length above one; consider a hash-table-based record type |
 | `E21` | `float-key` | error | a floating-point key or index, including a key inferred to have floating-point type; approximate equality makes lookup unreliable |
 | `E22` | `unresolved-value` | error | an unbound callable, constructor type, Boolean operand or condition, or indexed receiver; declare or explicitly import the value |
@@ -280,12 +280,14 @@ and the separate `primaryCode` analysis property.
 
 ### Prefer method dispatch for class-specific behavior
 
-`E19` highlights chains that choose behavior by repeatedly checking the class of
-one value:
+`E19` highlights the third `instance` test of the same function parameter
+anywhere in its body. Checks in compound conditions, nested expressions, and
+separate statements all count:
 
 ```m2
 renderLabel = §parameter.declaration|x§ -> if §function.defaultLibrary.readonly|instance§(§parameter|x§, §type.readonly|String§) then §parameter|x§
     else if instance(x, ZZ) then toString x
+    else if instance(x, List) then toString x
     else "other"
 ```
 
@@ -296,15 +298,20 @@ classes extend the operation:
 renderLabel = §function.readonly|method§()
 renderLabel §typeParameter.readonly|String§ := §decorator.readonly|String§ => §parameter.declaration|x§ -> §parameter|x§
 renderLabel §typeParameter.readonly|ZZ§ := §decorator.readonly|String§ => §parameter.declaration|x§ -> §method.readonly|toString§ §parameter|x§
+renderLabel §typeParameter.readonly|List§ := §decorator.readonly|String§ => §parameter.declaration|x§ -> §method.readonly|toString§ §parameter|x§
 renderLabel §typeParameter.readonly|Thing§ := §decorator.readonly|String§ => §parameter.declaration|x§ -> "other"
 ```
 
 This warning is advisory. Review inheritance and branch order before changing a
 chain: methods choose the most specific domain, whereas a chain chooses the first
-matching test. Single validation guards, branches consisting only of `error ...`, computed subjects such as `x#0`, locally derived values, repeated
-tests of the same class, and tests of different subjects do not trigger it. The
-check recognizes direct positive `instance` calls with a direct function parameter and a named class; it does
-not cover compound conditions or separate early-return guards.
+matching test. Repeated tests of the same class, negated tests, and validation
+guards count toward the threshold, as do tests with computed class expressions.
+Only a direct reference to a function parameter as the first argument counts;
+tests of globals, locally derived values, or computed subjects such as `x#0`
+do not. Shadowed `instance` functions are excluded. Each parameter is counted
+independently using its binding, so parameters with the same name in separate
+functions do not combine. A closure testing an enclosing function's parameter
+contributes to that parameter's count. Each parameter receives at most one warning.
 
 ### Prefer named fields for records
 

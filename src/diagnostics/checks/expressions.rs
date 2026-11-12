@@ -8,7 +8,7 @@
 //! does not hold — rewrite sites and the targets of control transfers — are
 //! computed for the cell first and looked up by expression.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ptr;
 
 use m2_syn::nodes::{
@@ -22,8 +22,9 @@ mod constant_values;
 
 use super::DiagnosticSink;
 use crate::analysis::{
-    Analysis, CallOptionIssue, CallableHeadKind, ControlTransferTarget, InferenceSession,
-    InfixSyntax, MethodCodomainEdit, MethodHead, OptionDeclaration, RingVariableError, TypeChecker,
+    Analysis, BindingId, CallOptionIssue, CallableHeadKind, ControlTransferTarget,
+    InferenceSession, InfixSyntax, MethodCodomainEdit, MethodHead, OptionDeclaration,
+    RingVariableError, TypeChecker,
 };
 use crate::diagnostics::rewrites::{RewriteKind, RewriteSite, RewriteSites};
 use crate::diagnostics::{catalog, DiagnosticRule, Finding};
@@ -34,7 +35,7 @@ use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry, Object
 use crate::source::{DocumentSource, SourceNavigation, SyntaxNavigation, SyntaxSource};
 use crate::syntax::{
     AssignmentListSyntax, AssignmentOperator, AssignmentParts, AssignmentSyntax, AssignmentTarget,
-    ClauseSyntax, ControlSyntax, ExpressionSyntax, PackedArguments,
+    ControlSyntax, ExpressionSyntax, PackedArguments,
 };
 use crate::typesystem::{SubtypeEvidence, TypeKnowledge, TypeRole};
 
@@ -47,8 +48,8 @@ const SYMBOL_TYPE: &str = "Symbol";
 /// Inheritance predicate whose repeated calls indicate manual dispatch.
 const INSTANCE: &str = "instance";
 
-/// Failure operation excluded from behavior-dispatch branches.
-const ERROR: &str = "error";
+/// Number of parameter inheritance tests that suggests method dispatch.
+const INSTANCE_DISPATCH_THRESHOLD: usize = 3;
 
 /// Collection classes whose fixed length can encode positional record fields.
 const RECORD_LIST_CLASSES: [&str; 3] = ["List", "BasicList", "VisibleList"];
@@ -106,7 +107,7 @@ pub(super) fn spawn<'a>(
         snapshot: context.source.syntax(),
         rewrites,
         transfers,
-        dispatch_branches: HashSet::new(),
+        parameter_instance_tests: HashMap::new(),
         sink,
     }
     .visit_cell(syntax);
@@ -123,14 +124,15 @@ struct ExpressionChecks<'a, 'context> {
     /// Control transfers of the cell, with the construct receiving each;
     /// absent when the cell's structure is unknown.
     transfers: HashMap<*const ExprControl, Option<ControlTransferTarget<'a>>>,
-    /// Else-if branches already included in a dispatch warning.
-    dispatch_branches: HashSet<*const ExprIf>,
+    /// Inheritance-test counts keyed by the resolved parameter binding.
+    parameter_instance_tests: HashMap<BindingId, usize>,
     /// Findings spawned so far.
     sink: &'context mut DiagnosticSink,
 }
 
 impl<'a> Visit<'a> for ExpressionChecks<'a, '_> {
     fn visit_expr(&mut self, expression: &'a Expr) {
+        self.instance_dispatch(expression);
         if let Some(bytes) = self.context.source.syntax_bytes(expression) {
             if self
                 .context
@@ -197,7 +199,6 @@ impl<'a> ExpressionChecks<'a, '_> {
             self.explicit_install_required(expression, parts);
         }
         if let Expr::If(conditional) = expression {
-            self.instance_dispatch(conditional);
             self.list_record_shape(conditional);
         }
         self.condition_type(expression, &knowledge);
@@ -307,82 +308,56 @@ impl<'a> ExpressionChecks<'a, '_> {
         }
     }
 
-    /// Repeated class tests on a parameter express manual method dispatch.
-    /// At least two distinct classes must have non-error behavior; validation
-    /// guards and tests of computed or locally derived values stay quiet.
-    fn instance_dispatch(&mut self, conditional: &ExprIf) {
-        if self.dispatch_branches.contains(&ptr::from_ref(conditional)) {
+    /// Counts every inheritance test of a resolved function parameter, including
+    /// compound conditions, validation guards, and nested expressions. Binding
+    /// identity keeps shadowed names and separate functions independent. The
+    /// third test carries one warning; later tests do not repeat it. Unchanged
+    /// expressions contribute to the count without republishing old findings.
+    fn instance_dispatch(&mut self, expression: &Expr) {
+        if !matches!(expression, Expr::Op(ExprOp::Bin(ExprOpBin::Adj(_)))) {
             return;
         }
-        let Some((subject, class)) = self.instance_test(&conditional.condition) else {
+        let Some((subject, _)) = self.instance_operands(expression) else {
             return;
         };
-        let mut classes = HashSet::new();
-        if !self.error_only(conditional.then_clause.clause_value()) {
-            classes.insert(class);
-        }
-        let mut branches = Vec::new();
-        let mut current = conditional;
-        while let Some(Expr::If(next)) = current
-            .else_clause
-            .as_ref()
-            .and_then(|clause| clause.clause_value().unparenthesized())
-        {
-            let Some((next_subject, next_class)) = self.instance_test(&next.condition) else {
-                break;
-            };
-            if next_subject != subject {
-                break;
-            }
-            if !self.error_only(next.then_clause.clause_value()) {
-                classes.insert(next_class);
-            }
-            branches.push(ptr::from_ref(next));
-            current = next;
-        }
-        if classes.len() < 2 {
+        let Some(subject) = subject.unparenthesized().and_then(Expr::symbol_name) else {
             return;
-        }
-        self.dispatch_branches.extend(branches);
-        self.spawn(
-            &catalog::MANUAL_TYPE_DISPATCH,
-            &conditional.condition,
-            format!("Repeated class tests on `{subject}` implement manual dispatch; consider a method with one specialization per class."),
-        );
-    }
-
-    /// Whether a branch consists solely of an unshadowed `error` call.
-    fn error_only(&self, expression: &Expr) -> bool {
-        let Some(Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call)))) = expression.unparenthesized() else {
-            return false;
         };
-        if call.left_operand.symbol_name() != Some(ERROR) {
-            return false;
-        }
-        let Some(position) = self.context.source.position_for_syntax(call) else {
-            return false;
+        let Some(position) = self.context.source.position_for_syntax(expression) else {
+            return;
         };
         let knowledge = self.context.knowledge.at(position);
-        self.context
-            .analysis
-            .visible_source_binding_at(ERROR, position, &knowledge)
-            .is_none()
-    }
-
-    /// Parameter and class names of a direct `instance(parameter, Class)` test.
-    fn instance_test<'test>(&self, expression: &'test Expr) -> Option<(&'test str, &'test str)> {
-        let (subject, class) = self.instance_operands(expression)?;
-        let position = self.context.source.position_for_syntax(expression)?;
-        let knowledge = self.context.knowledge.at(position);
-        let subject = subject.unparenthesized()?.symbol_name()?;
-        let binding = self
+        let Some(binding) = self
             .context
             .analysis
-            .visible_source_binding_at(subject, position, &knowledge)?;
+            .visible_source_binding_at(subject, position, &knowledge)
+        else {
+            return;
+        };
         if binding.role != BindingRole::Parameter {
-            return None;
+            return;
         }
-        Some((subject, class.unparenthesized()?.symbol_name()?))
+        let count = self
+            .parameter_instance_tests
+            .entry(binding.binding_id)
+            .or_default();
+        *count += 1;
+        if *count != INSTANCE_DISPATCH_THRESHOLD {
+            return;
+        }
+        if self.context.first_change.is_some_and(|start| {
+            self.context
+                .source
+                .syntax_bytes(expression)
+                .is_none_or(|bytes| bytes.end <= start)
+        }) {
+            return;
+        }
+        self.spawn(
+            &catalog::MANUAL_TYPE_DISPATCH,
+            expression,
+            format!("Repeated class tests on `{subject}` implement manual dispatch; consider a method with one specialization per class."),
+        );
     }
 
     /// Operands of an unshadowed inheritance predicate, without parameter restrictions.
