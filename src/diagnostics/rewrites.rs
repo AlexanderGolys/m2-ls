@@ -26,9 +26,11 @@ use crate::object_registry::ObjectRegistry;
 use crate::source::{ByteRange, SourceNavigation, SyntaxSource};
 use crate::syntax::{AssignmentSyntax, ClauseSyntax, ControlSyntax, ExpressionSyntax};
 
+mod augmented_assignment;
 mod boolean_comparison;
 mod composition;
 mod constructor_call;
+mod null_binding;
 mod unary_call;
 
 use boolean_comparison::BooleanComparison;
@@ -48,6 +50,8 @@ pub enum RewriteKind {
     CoalescingAssignment,
     /// A null test that `??` expresses.
     Coalescence,
+    /// A local bound only to be tested against `null`, which `??` folds away.
+    InlinedNullBinding,
     /// An unused null guard whose branch returns from the function.
     NullReturnGuard,
     /// Mapping a callback consisting of two composed unary function calls.
@@ -68,6 +72,8 @@ pub enum RewriteKind {
     NullBranch,
     /// A `try` repeating its value or falling back to `null`.
     TrySimplification,
+    /// An `x = x op e` that the augmented assignment `x op= e` shortens.
+    AugmentedAssignment,
     /// An `if` whose negated condition simplifies.
     IfCondition,
     /// Nested conditionals that flatten into an `else if` chain.
@@ -90,6 +96,7 @@ impl RewriteKind {
                 | Self::WrapperConstructor
                 | Self::NullBranch
                 | Self::TrySimplification
+                | Self::AugmentedAssignment
                 | Self::IfCondition
                 | Self::ElseIfChain
         )
@@ -101,6 +108,8 @@ impl RewriteKind {
             Self::AmbiguousFloatMemberAccess => &catalog::AMBIGUOUS_FLOAT_MEMBER_ACCESS,
             Self::RedundantControlParentheses => &catalog::REDUNDANT_CONTROL_PARENTHESES,
             Self::CoalescingAssignment | Self::Coalescence => &catalog::PREFER_COALESCENCE,
+            Self::InlinedNullBinding => &catalog::INLINE_NULL_BINDING,
+            Self::AugmentedAssignment => &catalog::PREFER_AUGMENTED_ASSIGNMENT,
             Self::NullBranch => &catalog::UNNECESSARY_NULL_BRANCH,
             Self::NullReturnGuard => &catalog::NULL_RETURN_GUARD,
             Self::MappingComposition => &catalog::MAPPED_COMPOSITION,
@@ -134,6 +143,10 @@ pub struct RewriteSite<'ast> {
     pub owner: Option<ByteRange>,
     /// Source text replacing the expression.
     pub replacement: String,
+    /// Bytes the replacement covers when that is more than the expression: the
+    /// statements an inlining rewrite absorbs before it. The expression is
+    /// where the rewrite is reported and found.
+    pub extent: Option<ByteRange>,
 }
 
 /// Collects the rewrite sites of typed syntax in source order.
@@ -248,6 +261,7 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             expression,
             owner,
             replacement,
+            extent: None,
         });
     }
 
@@ -302,7 +316,8 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             .iter()
             .find(|(slot, _)| ptr::eq(*slot, expression))
         {
-            if let Expr::Holder(_) = expression {
+            // Parentheses around statements are a block, not a grouping.
+            if matches!(expression, Expr::Holder(holder) if holder.muted.is_empty()) {
                 let replacement = expression
                     .unparenthesized()
                     .map(|inner| self.text(inner).to_string());
@@ -314,6 +329,13 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
                 );
             }
         }
+        let replacement = self.augmented_assignment(expression);
+        self.push(
+            RewriteKind::AugmentedAssignment,
+            expression,
+            None,
+            replacement,
+        );
         let coalescence = self.coalescence(expression);
         let coalesces = coalescence.is_some();
         if let Some((kind, replacement)) = coalescence {
@@ -916,6 +938,11 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for RewriteSites<'ast,
         visit::visit_statement(self, statement);
     }
 
+    fn visit_holder(&mut self, node: &'ast Holder) {
+        self.null_bindings(node);
+        visit::visit_holder(self, node);
+    }
+
     fn visit_expr_if(&mut self, node: &'ast ExprIf) {
         self.control_slot(&node.condition, node);
         visit::visit_expr_if(self, node);
@@ -1197,6 +1224,134 @@ mod tests {
         .filter(|site| site.kind.is_coalescence())
         .map(|site| (site.kind, site.replacement))
         .collect()
+    }
+
+    /// An assignment repeating its symbol target as the left operand of an
+    /// operator with an augmented form becomes that augmented assignment.
+    #[test]
+    fn a_target_repeated_as_the_left_operand_becomes_an_augmented_assignment() {
+        let augmented = |text: &str| rewrites(text, RewriteKind::AugmentedAssignment);
+
+        assert_eq!(augmented("prefix = prefix | \"X\"\n"), ["prefix |= \"X\""]);
+        assert_eq!(augmented("n = n + 1\n"), ["n += 1"]);
+        assert_eq!(augmented("n = n - (a or b)\n"), ["n -= (a or b)"]);
+        assert_eq!(augmented("n = n // 2\n"), ["n //= 2"]);
+        assert_eq!(augmented("L = L ++ {1}\n"), ["L ++= {1}"]);
+        assert_eq!(augmented("n = n + n\n"), ["n += n"]);
+        for text in [
+            "n = n < 3\n",
+            "n = n == 3\n",
+            "n = n or b\n",
+            "n = n ? b\n",
+            "n = n + 1 + 2\n",
+            "n = b + n\n",
+            "n = m + 1\n",
+            "n = n#0\n",
+            "n := n + 1\n",
+            "n#0 = n#0 + 1\n",
+        ] {
+            assert_eq!(augmented(text), Vec::<String>::new(), "{text:?}");
+        }
+    }
+
+    /// Parentheses holding statements before their value are a block: removing
+    /// them would drop the statements, so they are never redundant.
+    #[test]
+    fn parentheses_around_statements_are_not_redundant() {
+        let redundant = RewriteKind::RedundantControlParentheses;
+
+        assert_eq!(
+            rewrites(
+                "f = x -> if x then 1 else (c = 2; d = 3; c + d)\n",
+                redundant
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            rewrites("f = x -> if x then 1 else (2)\n", redundant),
+            ["2"],
+            "a plain grouping still is"
+        );
+    }
+
+    /// A local bound only to be tested against `null` folds into the `??`
+    /// using it, whether the conditional assigns or yields; the plain
+    /// coalescence rewrite covers the conditional without the local.
+    #[test]
+    fn a_null_tested_local_folds_into_the_coalescence_using_it() {
+        let inlined = |text: &str| rewrites(text, RewriteKind::InlinedNullBinding);
+
+        assert_eq!(
+            inlined("f = x -> (v := g x; if v =!= null then y = v else y = 0; y)\n"),
+            ["y = g x ?? 0"]
+        );
+        assert_eq!(
+            inlined("f = x -> (v := g x; if v === null then y = 0 else y = v; y)\n"),
+            ["y = g x ?? 0"]
+        );
+        assert_eq!(
+            inlined("f = x -> (v := a or b; if v =!= null then y := v else y := 0; y)\n"),
+            ["y := (a or b) ?? 0"],
+            "a looser subject keeps its parentheses"
+        );
+        assert_eq!(
+            inlined("f = x -> (v := try g x; if v =!= null then y = v else y = 0; y)\n"),
+            ["y = g x ?? 0"],
+            "the `try` is what `??` does with errors already"
+        );
+        assert_eq!(
+            inlined("f = x -> (v := g x; if v =!= null then v else 0)\n"),
+            ["g x ?? 0"],
+            "a block's own value"
+        );
+        assert_eq!(
+            coalescences("f = x -> (v := g x; if v =!= null then y = v else y = 0; y)\n"),
+            [],
+            "the folded conditional carries no coalescence hint of its own"
+        );
+    }
+
+    /// The local stays when anything else uses it, and the conditional stays
+    /// when its branches are not the local and a fallback.
+    #[test]
+    fn a_local_used_elsewhere_or_a_branching_conditional_is_not_folded() {
+        for text in [
+            "f = x -> (v := g x; if v =!= null then y = v else y = 0; v + 1)\n",
+            "f = x -> (v := g x; if v =!= null then y = v else y = v + 1; y)\n",
+            "f = x -> (v := g x; if v =!= null then y = v else z = 0; y)\n",
+            "f = x -> (v := g x; if v =!= null then y = v else y = 0; w := 1; v)\n",
+            "f = x -> (v := g v; if v =!= null then y = v else y = 0; y)\n",
+            "f = x -> (v := g x; w := 1; if v =!= null then y = v else y = 0; y)\n",
+            "f = x -> (v = g x; if v =!= null then y = v else y = 0; y)\n",
+            "f = x -> (v := g x; if v =!= null then y = v; y)\n",
+            "f = x -> (v := g x; if v =!= null then v else 0; 1)\n",
+        ] {
+            assert_eq!(
+                rewrites(text, RewriteKind::InlinedNullBinding),
+                Vec::<String>::new(),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// A chain whose branches do different things is no coalescence, with or
+    /// without a local, and a coalescence already written needs no rewrite.
+    #[test]
+    fn multiway_branches_and_written_coalescences_stay_untouched() {
+        let group_end = "groupEnd = (source, i, place) -> (\n    expected := {closingBracket#(source#i)};\n    j := i + 1;\n    while #expected > 0 do (\n        stop := opaqueEnd(source, j);\n        if stop =!= null then\n            j = stop\n        else if isNameStart source#j then\n            j = pastQuotedBracket(source, j)\n        else (\n            c := source#j;\n            if closingBracket#?c then\n                expected = append(expected, closingBracket#c)\n            else if member(c, bracketSpellings) then\n                expected = drop(expected, -1);\n            j += 1\n        )\n    );\n    j\n)\n";
+        let trailing = "trailingLineComment = text -> (\n    i := 0;\n    comment := null;\n    while i < #text do (\n        stop := opaqueEnd(text, i);\n        comment = if stop =!= null and substring(i, 2, text) == \"--\" then i;\n        i = stop ?? i + 1\n    );\n    if comment =!= null and opaqueEnd(text, comment) == #text then\n        comment\n)\n";
+
+        for text in [group_end, trailing] {
+            assert_eq!(coalescences(text), []);
+            assert_eq!(
+                rewrites(text, RewriteKind::InlinedNullBinding),
+                Vec::<String>::new()
+            );
+            assert_eq!(
+                rewrites(text, RewriteKind::RedundantControlParentheses),
+                Vec::<String>::new()
+            );
+        }
     }
 
     #[test]

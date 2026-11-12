@@ -18,6 +18,8 @@ use m2_syn::nodes::{
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Delimiter, DelimiterValue, Span, Spanned, Token};
 
+mod constant_values;
+
 use super::DiagnosticSink;
 use crate::analysis::{
     Analysis, CallOptionIssue, CallableHeadKind, ControlTransferTarget, InferenceSession,
@@ -172,10 +174,12 @@ impl<'a> ExpressionChecks<'a, '_> {
             self.protected_assignment(node, parts, &knowledge);
         }
         self.ring_variable(expression, &knowledge);
+        self.constant_values(expression, &knowledge);
         self.float_key(expression, &knowledge);
         self.option_key_convention(expression, &knowledge);
         self.rewrite(expression, RewriteKind::RedundantControlParentheses);
         self.coalescence(expression);
+        self.null_binding(expression);
         self.simplification(expression);
         if let Some(call) = call {
             self.ring_variable_naming(call, &knowledge);
@@ -559,6 +563,28 @@ impl<'a> ExpressionChecks<'a, '_> {
                 &catalog::PREFER_COALESCENCE,
                 expression,
                 format!("This conditional can be simplified to `{replacement}`"),
+            );
+        }
+    }
+
+    /// A null-tested local that `??` folds into the statement using it, reported
+    /// over the binding and the conditional together.
+    fn null_binding(&mut self, expression: &Expr) {
+        let extent = self
+            .rewrites
+            .get(&ptr::from_ref(expression))
+            .into_iter()
+            .flatten()
+            .find(|site| site.kind == RewriteKind::InlinedNullBinding)
+            .and_then(|site| Some((site.extent.clone()?, site.replacement.clone())));
+        if let Some((bytes, replacement)) = extent {
+            let range = self.context.source.range_for_bytes(bytes);
+            self.sink.spawn(
+                &catalog::INLINE_NULL_BINDING,
+                Finding::new(
+                    range,
+                    format!("This local only feeds a null test; use `{replacement}`"),
+                ),
             );
         }
     }
@@ -1652,6 +1678,55 @@ mod tests {
         );
     }
 
+    /// What compile-time evaluation proves is reported: matrices that cannot
+    /// combine, a division by a zero written out, and a condition computed
+    /// from literals; names that merely hold constants are settings, and
+    /// inexact or unknown operands prove nothing.
+    #[test]
+    fn determined_values_prove_failures_and_constant_conditions() {
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
+        let codes = |text: &str| {
+            DocumentSnapshot::from_text(text.to_string(), &builtins)
+                .expect("fixture should parse")
+                .diagnostics()
+                .iter()
+                .map(|reported| reported.rule.code)
+                .filter(|code| {
+                    [
+                        catalog::MATRIX_SHAPE_MISMATCH.code,
+                        catalog::DIVISION_BY_ZERO.code,
+                        catalog::CONSTANT_CONDITION.code,
+                    ]
+                    .contains(code)
+                })
+                .collect::<Vec<_>>()
+        };
+        let matrices = "A = matrix {{1, 2, 3}, {4, 5, 6}}\nB = matrix {{1, 2}, {3, 4}}\n";
+        let mismatch = [catalog::MATRIX_SHAPE_MISMATCH.code];
+
+        assert_eq!(codes(&format!("{matrices}A * A\n")), mismatch);
+        assert_eq!(codes(&format!("{matrices}A + B\n")), mismatch);
+        assert_eq!(codes(&format!("{matrices}B * A\n")), []);
+        assert_eq!(codes(&format!("{matrices}transpose A * A\n")), []);
+        assert_eq!(codes(&format!("{matrices}A + A\n")), []);
+        assert_eq!(codes("1/0\n"), [catalog::DIVISION_BY_ZERO.code]);
+        assert_eq!(codes("1.5/0\n"), [catalog::DIVISION_BY_ZERO.code]);
+        assert_eq!(codes("1/0.\n"), [], "an inexact zero divides to infinity");
+        assert_eq!(codes("1.0/0.\n"), []);
+        assert_eq!(codes("x/0\n"), [], "an unknown dividend proves nothing");
+        for text in ["if 2^10 > 1000 then 1 else 2\n", "while 1 > 2 do 3\n"] {
+            assert_eq!(codes(text), [catalog::CONSTANT_CONDITION.code], "{text:?}");
+        }
+        for text in [
+            "if true then 1\n",
+            "n = 4\nif n > 3 then 1\n",
+            "DEBUG = false\nif not DEBUG then 1\n",
+            "if f x then 1\n",
+        ] {
+            assert_eq!(codes(text), [], "{text:?}");
+        }
+    }
+
     /// A simplification must change the code it rewrites. A condition's span
     /// reaches the `then` keyword and so carries the separating space, which
     /// used to make `not name` compare unequal to itself and propose the
@@ -1660,7 +1735,7 @@ mod tests {
     fn simplification_is_not_reported_when_the_rewrite_changes_nothing() {
         let text = concat!(
             "f = () -> (\n",
-            "    if not completed then lineNumber = lineNumber - 1;\n",
+            "    if not completed then lineNumber = previousLine - 1;\n",
             "    g();\n",
             ");\n",
         );

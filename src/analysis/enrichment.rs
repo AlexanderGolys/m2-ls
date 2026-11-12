@@ -520,6 +520,8 @@ where
             self.analysis.enrich_package_declaration(call, self.source);
             self.analysis
                 .bind_anonymous_ring_generators(call, self.source, &knowledge);
+            self.analysis
+                .rebind_ring_generators_on_use(call, self.source);
         }
         visit::visit_expr_op_bin_adj(self, call);
     }

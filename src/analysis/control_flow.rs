@@ -183,19 +183,24 @@ where
         self.owners.pop();
     }
 
-    /// The receiver of `transfer`: its innermost enclosing owner, when that
-    /// owner can receive a transfer of its form.
+    /// The receiver of `transfer`. A `return` leaves its innermost enclosing
+    /// function, passing through any loop steps between them; `break` and
+    /// `continue` go to the innermost owner, when that owner can receive a
+    /// transfer of their form.
     fn target(&self, transfer: &ExprControl) -> Option<ControlTransferTarget<'ast>> {
+        if let ExprControl::Return(_) = transfer {
+            return self.owners.iter().rev().find_map(|owner| match *owner {
+                Owner::Function(function) => Some(ControlTransferTarget::Function(function)),
+                Owner::ListStep(_) | Owner::DoStep(_) => None,
+            });
+        }
         Some(match *self.owners.last()? {
-            Owner::Function(function) => match transfer {
-                ExprControl::Return(_) => ControlTransferTarget::Function(function),
-                ExprControl::Break(_) | ExprControl::Continue(_) => {
-                    let callable = *self.callbacks.get(&ptr::from_ref(function))?;
-                    self.analysis
-                        .is_loop_callback_callable(callable, self.source, self.knowledge)
-                        .then_some(ControlTransferTarget::LoopCallback { function, callable })?
-                }
-            },
+            Owner::Function(function) => {
+                let callable = *self.callbacks.get(&ptr::from_ref(function))?;
+                self.analysis
+                    .is_loop_callback_callable(callable, self.source, self.knowledge)
+                    .then_some(ControlTransferTarget::LoopCallback { function, callable })?
+            }
             Owner::ListStep(statement) => ControlTransferTarget::ListLoop(statement),
             Owner::DoStep(statement) => ControlTransferTarget::DoLoop(statement),
         })

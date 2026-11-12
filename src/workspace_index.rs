@@ -54,6 +54,7 @@ struct DefLocation {
     code: Option<String>,
 }
 
+/// How a top-level definition implements a global function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImplementationKind {
     /// A function bound to a name: `f = x -> …`.

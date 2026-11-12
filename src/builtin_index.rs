@@ -1272,7 +1272,7 @@ mod tests {
                     ),
                     "callable '{}' has a Thing/Any signature codomain (domain={:?})",
                     callable.name,
-                    &method.domain,
+                    method.domain,
                 );
             }
             assert!(

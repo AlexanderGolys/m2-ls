@@ -149,12 +149,11 @@ UNRESOLVED_VALUE {
         severity: ERROR,
     }
 
-    /// A type, function, or local binding does not follow its naming convention.
-    /// Types use PascalCase or uppercase; functions and locals use camelCase.
-    /// Function parameters are exempt because they may stand for types.
+    /// A type or a declared optional argument does not use PascalCase or
+    /// uppercase. Functions and locals are not constrained.
     ///
     /// ```m2
-    /// BadFunction = x -> x
+    /// badType = new Type of HashTable
     /// ```
 NAMING_CONVENTION {
         code: "S08",
@@ -175,8 +174,8 @@ BOUND_OPTION_KEY {
         severity: WARNING,
     }
 
-    /// A conversion method named after a known type should declare that type
-    /// as its shared or per-installation typical value.
+    /// A conversion method named after a known type should declare a typical
+    /// value, shared or per installation, naming that type or a variant of it.
     ///
     /// ```m2
     /// toWidget = method()
@@ -228,6 +227,30 @@ REDUNDANT_CONTROL_PARENTHESES {
 PREFER_COALESCENCE {
         code: "S04",
         name: "prefer-coalescence",
+        severity: HINT,
+    }
+
+    /// A local bound only to be tested against `null`, which `??` folds away
+    /// together with the test: `y = g x ?? 0`.
+    ///
+    /// ```m2
+    /// f = x -> (v := g x; if v =!= null then y = v else y = 0; y)
+    /// ```
+INLINE_NULL_BINDING {
+        code: "S24",
+        name: "inline-null-binding",
+        severity: HINT,
+    }
+
+    /// An assignment repeating its target as the left operand of the value,
+    /// which the augmented assignment writes once.
+    ///
+    /// ```m2
+    /// f = text -> (prefix = "x"; while match(prefix, text) do prefix = prefix | "X"; prefix)
+    /// ```
+PREFER_AUGMENTED_ASSIGNMENT {
+        code: "S25",
+        name: "prefer-augmented-assignment",
         severity: HINT,
     }
 
@@ -368,6 +391,37 @@ WRAPPER_CONSTRUCTOR {
         severity: HINT,
     }
 
+    /// A predicate, a method named `is` and an uppercase letter such as
+    /// `isPrime`, whose results are not always Boolean: its `method()`
+    /// declaration does not set `TypicalValue => Boolean`, or one of its
+    /// installations annotates another result type.
+    ///
+    /// ```m2
+    /// isGood = method()
+    /// ```
+    ///
+    /// ```m2
+    /// isGood = method(TypicalValue => Boolean)
+    /// isGood ZZ := ZZ => n -> n
+    /// ```
+PREDICATE_TYPICAL_VALUE {
+        code: "S22",
+        name: "predicate-typical-value",
+        severity: WARNING,
+    }
+
+    /// A predicate defined as a function closure, which cannot dispatch on its
+    /// arguments or declare a typical value, rather than as a method.
+    ///
+    /// ```m2
+    /// isGood = n -> n > 0
+    /// ```
+PREDICATE_FUNCTION_CLOSURE {
+        code: "S23",
+        name: "predicate-function-closure",
+        severity: HINT,
+    }
+
     /// A multi-character ring variable such as `x0`, which is a separate
     /// symbol rather than the indexed variable `x_0`.
     ///
@@ -381,10 +435,17 @@ RING_VARIABLE_NAMING {
     }
 
     /// A method installed on something that does not dispatch to it: a plain
-    /// function rather than a `method()`, the binary form of `??`, or a `<-`
-    /// method for anything but one non-symbol type. M2 evaluates `x <- v` by
-    /// assigning a symbol `x` directly and otherwise calling the one-type
-    /// method of `class x`, yet `installMethod` accepts every other domain.
+    /// function rather than a `method()`, the binary form of `??`, a `<-`
+    /// method for anything but one non-symbol type, or an operator the
+    /// interpreter evaluates itself for the operand classes. M2 evaluates
+    /// `x <- v` by assigning a symbol `x` directly and otherwise calling the
+    /// one-type method of `class x`, yet `installMethod` accepts every other
+    /// domain. Likewise it computes arithmetic and comparison on native numbers
+    /// (`ZZ`, `QQ`, `RR`, `RRi`, `CC`, `CCi`), `//`, `..` and `..<` on two
+    /// integers, `and`, `or` and `not` on Booleans, and the equality and
+    /// ordering of strings, symbols and nets, before it looks up any method.
+    /// Install the method for a type of your own instead, for example one
+    /// wrapping the value.
     ///
     /// ```m2
     /// f = x -> x
@@ -393,6 +454,10 @@ RING_VARIABLE_NAMING {
     ///
     /// ```m2
     /// installMethod(symbol <-, Symbol, Symbol, (x, y, v) -> v)
+    /// ```
+    ///
+    /// ```m2
+    /// ZZ + QQ := (a, b) -> a
     /// ```
 INSTALL_NO_EFFECT {
         code: "E01",
@@ -517,6 +582,44 @@ PROTECTED_ASSIGNMENT {
         code: "E13",
         name: "protected-assignment",
         severity: ERROR,
+    }
+
+    /// A sum, difference or product of matrices whose dimensions the program
+    /// determines and which do not combine: Macaulay2 rejects them when it
+    /// evaluates the expression.
+    ///
+    /// ```m2
+    /// A = matrix {{1, 2, 3}, {4, 5, 6}}
+    /// A * A
+    /// ```
+MATRIX_SHAPE_MISMATCH {
+        code: "E23",
+        name: "matrix-shape-mismatch",
+        severity: ERROR,
+    }
+
+    /// A division of a number by an exact zero written out, which
+    /// Macaulay2 rejects as a division by zero; `1/0.` is infinity.
+    ///
+    /// ```m2
+    /// 1/0
+    /// ```
+DIVISION_BY_ZERO {
+        code: "E24",
+        name: "division-by-zero",
+        severity: ERROR,
+    }
+
+    /// An `if` or `while` condition that is a computation with one value,
+    /// such as a comparison of numbers, so that one branch never runs.
+    ///
+    /// ```m2
+    /// if 2^10 > 1000 then 1 else 2
+    /// ```
+CONSTANT_CONDITION {
+        code: "S26",
+        name: "constant-condition",
+        severity: HINT,
     }
 
     /// A subscript past the variables of a ring the program writes out,

@@ -132,7 +132,9 @@ async fn semantic_tokens(session: &mut DocumentSession) -> Vec<(u64, u64, u64, u
     let mut line = 0;
     let mut character = 0;
     encoded
-        .chunks_exact(5)
+        .as_chunks::<5>()
+        .0
+        .iter()
         .map(|token| {
             let delta_line = token[0]
                 .as_u64()
@@ -489,7 +491,7 @@ async fn diverging_error_branches_do_not_widen_inferred_types() {
 }
 
 #[tokio::test]
-async fn method_codomains_use_type_annotations_and_all_known_types_are_configurable() {
+async fn method_codomains_are_annotations_and_all_known_types_are_configurable() {
     let source = concat!(
         "p = method(TypicalValue => List)\n",
         "p(ZZ) := Array => x -> [x]\n",
@@ -499,7 +501,7 @@ async fn method_codomains_use_type_annotations_and_all_known_types_are_configura
     let tokens = semantic_tokens(&mut session).await;
     assert_eq!(
         token_at(&tokens, source, "Array", 0).0,
-        session.semantic_token_type("typeParameter")
+        session.semantic_token_type("decorator")
     );
 
     session.show_default_inlay_hint_anchors().await;
@@ -708,7 +710,7 @@ async fn primary_code_keeps_the_catalog_authoritative_and_unlinted() {
 
 #[tokio::test]
 async fn primary_code_resolves_core_names_it_does_not_define() {
-    let mut session = DocumentSession::open(
+    let session = DocumentSession::open(
         "-- m2-ls: primaryCode\nneeds \"code.m2\"\nf = method()\nf Thing := x -> x\n",
     )
     .await;
@@ -837,7 +839,7 @@ async fn registered_source_roles_drive_semantic_tokens_through_the_server() {
 
     for (needle, expected_role, description) in [
         ("ZZ", "typeParameter", "method domain"),
-        ("Array", "typeParameter", "method codomain"),
+        ("Array", "decorator", "method codomain"),
         ("Strategy", "property", "option key"),
         ("name", "property", "quoted member key"),
         ("\"key\"", "property", "lookup key"),
@@ -1002,7 +1004,7 @@ async fn installation_and_syntax_diagnostics_run_through_the_server_pipeline() {
         ("k = 1.5\nh#k\n", "E21", true),
         ("h = hashTable {Key => 1.5}\n", "E21", false),
         ("h#1\n", "E21", false),
-        ("BadName = x -> x\n", "S08", true),
+        ("BadName = x -> x\n", "S08", false),
         ("goodName = x -> x\n", "S08", false),
         ("f = BadName -> BadName\n", "S08", false),
         ("f = goodName -> goodName\n", "S08", false),
@@ -1010,13 +1012,24 @@ async fn installation_and_syntax_diagnostics_run_through_the_server_pipeline() {
         ("f = (T, U) -> (T, U)\n", "S08", false),
         ("f = method()\nf Type := T -> T\n", "S08", false),
         ("f = T -> (T = true; T)\n", "S08", false),
-        ("f = T -> (BadLocal := T; BadLocal)\n", "S08", true),
+        ("f = T -> (Local := T; Local)\n", "S08", false),
+        ("D = 3\n", "S08", false),
+        ("f = method(Options => {badOption => 1})\n", "S08", true),
+        ("f = method(Options => {GoodOption => 1, Other => 2})\n", "S08", false),
+        ("f = {badOption => 1} >> o -> x -> x\n", "S08", true),
+        ("f = {GoodOption => 1} >> o -> x -> x\n", "S08", false),
+        ("f = x -> {badKey => 1}\n", "S08", false),
         ("badType = new Type of HashTable\n", "S08", true),
         ("GoodType = new Type of HashTable\n", "S08", false),
         ("GOODTYPE = new Type of HashTable\n", "S08", false),
         ("Widget = new Type of HashTable\ntoWidget = method()\ntoWidget ZZ := n -> new Widget\n", "S10", true),
         ("Widget = new Type of HashTable\ntoWidget = method(TypicalValue => Widget)\ntoWidget ZZ := n -> new Widget\n", "S10", false),
+        ("isGood = method(TypicalValue => Boolean)\nisGood ZZ := n -> n > 0\n", "S22", false),
+        ("isGood = method(TypicalValue => Boolean)\nisGood ZZ := ZZ => n -> n\n", "S22", true),
+        ("isGood = method(TypicalValue => Boolean)\nisGood ZZ := Boolean => n -> n > 0\n", "S22", false),
         ("Widget = new Type of HashTable\ntoWidget = method()\ntoWidget ZZ := Widget => n -> new Widget\n", "S10", false),
+        ("Widget = new Type of HashTable\ntoWidget = method(TypicalValue => Thing)\ntoWidget ZZ := n -> new Widget\n", "S10", false),
+        ("Widget = new Type of HashTable\ntoWidget = method()\ntoWidget ZZ := String => n -> \"w\"\n", "S10", false),
         ("frobnicate = method()\nfrobnicate ZZ := n -> n\n", "S10", false),
         ("HashTable = new Type of Thing\nhashTable = method()\nhashTable ZZ := n -> n\n", "S10", true),
         ("MyType = new Type of HashTable\nmytype = method()\nmytype ZZ := n -> n\n", "S10", false),
@@ -2161,6 +2174,26 @@ async fn control_transfers_require_their_runtime_body() {
     for (source, expected) in [
         ("f := x -> return x\n", false),
         ("return x\n", true),
+        ("f := x -> while c do (if x then return null)\n", false),
+        ("f := L -> for x in L do if x > 1 then return x\n", false),
+        ("f := L -> for x in L list (while c do return x)\n", false),
+        ("while c do return c\n", true),
+        (
+            "f := L -> (while c do (for x in L do (if x > 0 then (try (while c do (for y in L do (if y > 1 then return y)))))); null)\n",
+            false,
+        ),
+        (
+            "f := L -> for x in L list (try (if x then (while c list return x)))\n",
+            false,
+        ),
+        (
+            "f := () -> (while c do (k := () -> return 1; return 2 + k()))\n",
+            false,
+        ),
+        (
+            "while c do (for x in L do (if x > 0 then (try (while c do (for y in L do (if y > 1 then return y))))))\n",
+            true,
+        ),
         ("if c then break\n", true),
         ("for i from (break i) to 3 list i\n", true),
         ("for i to 3 list if i > 1 then break i\n", false),
@@ -4285,7 +4318,7 @@ async fn documentation_markup_marks_delimiters_links_and_option_keys() {
             token("Coarse", occurrence),
             (
                 session.semantic_token_type("property"),
-                option | documentation
+                option | documentation | session.semantic_token_modifier("documentTag")
             ),
             "the option of an optional-argument key is an option name"
         );
@@ -4385,6 +4418,7 @@ async fn ring_subscripts_evaluate_to_inline_values_and_bound_errors() {
             (4, "T_1 = x_0".to_string()),
             (8, "\"q_1\"_P = q_1".to_string()),
             (9, "S_6 = z".to_string()),
+            (10, "QQ[v] = 1 variable, char 0, dim 1".to_string()),
         ]
     );
 
@@ -4534,6 +4568,186 @@ async fn typed_ring_values_follow_aliases_across_document_revisions() {
     }
     session.replace(&format!("-- α\nR = QQ[y_0]\n{body}")).await;
     assert_eq!(diagnostic_lines(&session, "E14"), vec![3]);
+    session.shutdown().await;
+}
+
+/// Inline values show what algebraic expressions certainly evaluate to: exact
+/// arithmetic and logic with Macaulay2's semantics, the invariants of rings the
+/// program writes out, and the shapes of matrices and ideals; names count only
+/// when assigned once.
+#[tokio::test]
+async fn inline_values_evaluate_exact_arithmetic_and_ring_invariants() {
+    let source = concat!(
+        "n = 5\n",
+        "a = 2^10 + n\n",
+        "b = 7 // 2 * 3\n",
+        "c = (-7) % 3\n",
+        "d = binomial(10, 3)\n",
+        "e = 1 < 2 and not false\n",
+        "f = 4/2 === 2\n",
+        "g = 1/0\n",
+        "m = 2\n",
+        "m = m + 1\n",
+        "h = m * 2\n",
+        "R = QQ[x, y, z]\n",
+        "dimension = dim R\n",
+        "generators = numgens R\n",
+        "characteristic = char (ZZ/101)\n",
+        "M = matrix {{1, 2, 3}, {4, 5, 6}}\n",
+        "rows = numRows M\n",
+        "P = M * transpose M\n",
+        "I = ideal(x^2, y)\n",
+        "count = numgens I\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let values = session
+        .request(
+            "textDocument/inlineValue",
+            json!({
+                "textDocument": {"uri": session.uri()},
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 100, "character": 0}},
+                "context": {"frameId": 0, "stoppedLocation": {
+                    "start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}
+                }}
+            }),
+        )
+        .await;
+    let texts: Vec<String> = response_array(&values)
+        .iter()
+        .map(|value| value["text"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    for expected in [
+        "2^10 + n = 1029",
+        "7 // 2 * 3 = 9",
+        "(-7) % 3 = 2",
+        "binomial(10, 3) = 120",
+        "1 < 2 and not false = true",
+        "4/2 === 2 = false",
+        "QQ[x, y, z] = 3 variables, char 0, dim 3",
+        "dim R = 3",
+        "numgens R = 3",
+        "char (ZZ/101) = 101",
+        "matrix {{1, 2, 3}, {4, 5, 6}} = 2×3 matrix",
+        "numRows M = 2",
+        "M * transpose M = 2×2 matrix",
+        "ideal(x^2, y) = ideal with 2 generators",
+        "numgens I = 2",
+    ] {
+        assert!(
+            texts.contains(&expected.to_owned()),
+            "{expected:?} in {texts:?}"
+        );
+    }
+    for unexpected in ["1/0", "m * 2", "m + 1", "5 = 5", "n = 5"] {
+        assert!(
+            !texts.iter().any(|text| text.starts_with(unexpected)),
+            "{unexpected:?} must not be evaluated: {texts:?}"
+        );
+    }
+    session.shutdown().await;
+}
+
+/// An expression lives in the ring its operands promote to along the
+/// lineage of coefficient and quotiented rings; rings built separately, even
+/// identically (`p` of the later `U` against `T_0`), never mix, and a number joins a ring only if it promotes to
+/// the field the ring is built on.
+#[tokio::test]
+async fn inline_values_name_the_ring_an_expression_lives_in() {
+    let source = concat!(
+        "A = ZZ[x, y]\n",
+        "B = A[y, z]/ideal(y)\n",
+        "C = B[x, z]/ideal(x - z)\n",
+        "T = QQ[p]\n",
+        "U = QQ[p]\n",
+        "V = ZZ[q]\n",
+        "(1 + x - z) * y\n",
+        "p + 1/2\n",
+        "p * 1.5\n",
+        "p + T_0\n",
+        "T_0 + 1/2\n",
+        "q + 1/2\n",
+        "k = 1\n",
+        "T_k * 2\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let values = session
+        .request(
+            "textDocument/inlineValue",
+            json!({
+                "textDocument": {"uri": session.uri()},
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 100, "character": 0}},
+                "context": {"frameId": 0, "stoppedLocation": {
+                    "start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}
+                }}
+            }),
+        )
+        .await;
+    let texts: Vec<String> = response_array(&values)
+        .iter()
+        .map(|value| value["text"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    for expected in [
+        "(1 + x - z) * y in C",
+        "p + 1/2 in U",
+        "T_0 + 1/2 in T",
+        "T_k * 2 in T",
+    ] {
+        assert!(
+            texts.contains(&expected.to_owned()),
+            "{expected:?} in {texts:?}"
+        );
+    }
+    for unrelated in ["p * 1.5", "p + T_0", "q + 1/2"] {
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.starts_with(unrelated) && text.contains(" in ")),
+            "{unrelated:?} mixes rings the interpreter will not mix: {texts:?}"
+        );
+    }
+    session.shutdown().await;
+}
+
+/// `use R` rebinds the names of R's own variables to R's generators, so the
+/// ring a name denotes follows the source order of constructions and `use`s;
+/// the variables of coefficient rings keep the names they have.
+#[tokio::test]
+async fn use_rebinds_the_names_of_a_rings_own_variables() {
+    let mut session = DocumentSession::open(concat!(
+        "R = QQ[x, y]\n",
+        "S = QQ[x]\n",
+        "x\n",
+        "use R\n",
+        "x\n",
+        "y\n",
+        "use S\n",
+        "x\n",
+        "y\n",
+        "A = ZZ[a]\n",
+        "B = A[b]\n",
+        "use A\n",
+        "(a, b)\n",
+        "use B\n",
+        "(a, b)\n",
+    ))
+    .await;
+    for (line, column, expected) in [
+        (2, 0, "S"),
+        (4, 0, "R"),
+        (5, 0, "R"),
+        (7, 0, "S"),
+        (8, 0, "R"),
+        (12, 1, "A"),
+        (12, 4, "B"),
+        (14, 1, "A"),
+        (14, 4, "B"),
+    ] {
+        assert_eq!(
+            hover_type_at(&mut session, line, column).await,
+            expected,
+            "line {line}, column {column}"
+        );
+    }
     session.shutdown().await;
 }
 
@@ -4966,7 +5180,7 @@ async fn regex_tokens_split_text_syntax_and_escapes() {
     let mut character = 0;
     let lines = source.lines().collect::<Vec<_>>();
     let mut patterns = [Vec::new(), Vec::new(), Vec::new()];
-    for token in data.chunks_exact(5) {
+    for token in data.as_chunks::<5>().0 {
         let delta_line = token[0].as_u64().unwrap() as usize;
         line += delta_line;
         character =
@@ -5329,5 +5543,145 @@ async fn unresolved_documentation_references_are_errors_in_any_file() {
     let source = "f = x -> x\ndoc ///\nKey\n  f\nSeeAlso\n  f\n  missingPage\n///\n";
     let session = DocumentSession::open(source).await;
     assert_eq!(diagnostic_lines(&session, "D05"), vec![6]);
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_package_that_loads_files_still_defines_its_own_name_as_a_key() {
+    let source = "newPackage \"P\"\nload \"./other.m2\"\nbeginDocumentation()\ndoc ///\nKey\n  P\nHeadline\n  the package\n///\n";
+    let session = DocumentSession::open(source).await;
+    assert!(diagnostic_lines(&session, "D05").is_empty());
+    let mut session = session;
+    let tokens = semantic_tokens(&mut session).await;
+    let package = session.semantic_token_type("namespace");
+    assert_eq!(token_at(&tokens, source, "P\nHeadline", 0).0, package);
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn documentation_tags_carry_the_document_tag_modifier() {
+    let source = r#"newPackage "P"
+export {"f"}
+f = method(Options => {Wide => 1})
+f ZZ := o -> x -> x
+doc ///
+Key
+  f
+  (f, ZZ)
+  [f, Wide]
+Headline
+  tagged
+Description
+  Text
+    plain f then @TO2 {(f, ZZ), "alias"}@ and @TO "page title"@
+///
+"#;
+    let mut session = DocumentSession::open(source).await;
+    let tokens = semantic_tokens(&mut session).await;
+    let tag = session.semantic_token_modifier("documentTag");
+    for (needle, occurrence, expected) in [
+        ("f\n  (f", 0, true),
+        ("f, ZZ)\n", 0, true),
+        ("Wide]", 0, true),
+        ("(f, ZZ), \"alias", 0, true),
+        ("ZZ), \"alias", 0, true),
+        ("\"page title\"", 0, true),
+        ("\"alias\"", 0, true),
+        ("tagged", 0, false),
+    ] {
+        let (_, modifiers) = token_at(&tokens, source, needle, occurrence);
+        assert_eq!(modifiers & tag != 0, expected, "{needle}");
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn documentation_links_to_own_exports_are_tags_without_protection() {
+    let source = r#"newPackage "P"
+export {"viewBook", "Serve"}
+viewBook = method(Options => {Serve => false})
+doc ///
+Key
+  viewBook
+Description
+  Text
+    @TO viewBook@ and @TO "viewBook"@ and @TO "Core"@ and @TO "Unknownpkg"@ and @TO unknownThing@ and @TO2 {"Macaulay2Doc :: matrix(List)", "A link"}@
+///
+"#;
+    let mut session = DocumentSession::open(source).await;
+    let tokens = semantic_tokens(&mut session).await;
+    let tag = session.semantic_token_modifier("documentTag");
+    let readonly = session.semantic_token_modifier("readonly");
+    for (needle, occurrence) in [
+        ("viewBook\nDescription", 0),
+        ("viewBook@ and", 0),
+        ("\"viewBook\"@", 0),
+        ("\"Core\"", 0),
+        ("\"Unknownpkg\"", 0),
+        ("unknownThing@", 0),
+        ("\"Macaulay2Doc :: matrix(List)\"", 0),
+        ("\"A link\"", 0),
+    ] {
+        let (_, modifiers) = token_at(&tokens, source, needle, occurrence);
+        assert!(modifiers & tag != 0, "tag {needle}");
+        assert_eq!(modifiers & readonly, 0, "readonly {needle}");
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn library_tables_are_a_token_class_of_their_own() {
+    let source = "a = OutputDictionary\nb = typicalValues\nc = ZZ\nd = stdio\n";
+    let mut session = DocumentSession::open(source).await;
+    let tokens = semantic_tokens(&mut session).await;
+    let table = session.semantic_token_type("struct");
+    for name in ["OutputDictionary", "typicalValues"] {
+        assert_eq!(token_at(&tokens, source, name, 0).0, table, "{name}");
+    }
+    for name in ["ZZ", "stdio"] {
+        assert_ne!(token_at(&tokens, source, name, 0).0, table, "{name}");
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn predicates_declare_boolean_methods() {
+    let mut session = DocumentSession::open("x = 1\n").await;
+    for (source, code, expected) in [
+        ("isGood = method()\n", "S22", true),
+        ("isGood = method(TypicalValue => ZZ)\n", "S22", true),
+        ("isGood = method(TypicalValue => Boolean)\n", "S22", false),
+        ("isolated = method()\n", "S22", false),
+        ("isGood = n -> n > 0\n", "S23", true),
+        ("isGood = method(TypicalValue => Boolean)\n", "S23", false),
+        ("isolated = n -> n\n", "S23", false),
+    ] {
+        session.replace(source).await;
+        session.save().await;
+        assert_eq!(
+            session.diagnostic_codes().contains(&code),
+            expected,
+            "{code} for:\n{source}\n{:?}",
+            session.diagnostics()
+        );
+    }
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn types_used_as_table_keys_are_properties() {
+    let source = "Rule = new Type of HashTable\nrules = new MutableHashTable\nrules#Rule = 1\nx = rules#?ZZ\ny = rules#Rule\nn = Rule\n";
+    let mut session = DocumentSession::open(source).await;
+    let tokens = semantic_tokens(&mut session).await;
+    let property = session.semantic_token_type("property");
+    let type_token = session.semantic_token_type("type");
+    for (needle, occurrence) in [("Rule", 1), ("ZZ", 0), ("Rule", 2)] {
+        assert_eq!(
+            token_at(&tokens, source, needle, occurrence).0,
+            property,
+            "{needle} {occurrence}"
+        );
+    }
+    assert_eq!(token_at(&tokens, source, "Rule", 3).0, type_token);
     session.shutdown().await;
 }

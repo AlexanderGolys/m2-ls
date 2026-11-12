@@ -26,6 +26,7 @@ mod semantic_tokens;
 mod syntax_roles;
 mod typechecker;
 
+pub use known_value::{KnownValue, MatrixShape};
 pub use ring::RingVariableError;
 
 use m2_syn::nodes::{
@@ -700,6 +701,7 @@ struct SemanticRegistry {
     ring_generator_specs: Vec<TextRange>,
 }
 
+/// A reference to the output of an earlier cell: `oo`, `ooo`, or `o3`.
 #[derive(Clone, Copy)]
 pub enum OutputReference {
     /// Output reference counted backward from the current source cell.

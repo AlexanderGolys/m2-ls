@@ -13,3 +13,13 @@ pub(super) fn follows_case(name: &str, uppercase: bool) -> bool {
         }
     }) && characters.all(|character| character.is_ascii_alphanumeric())
 }
+
+/// The prefix of the name of a predicate.
+const PREDICATE_PREFIX: &str = "is";
+
+/// Whether a name is that of a predicate: `is` and an uppercase letter, as in
+/// `isPrime`.
+pub(super) fn is_predicate(name: &str) -> bool {
+    name.strip_prefix(PREDICATE_PREFIX)
+        .is_some_and(|rest| rest.starts_with(|first: char| first.is_ascii_uppercase()))
+}

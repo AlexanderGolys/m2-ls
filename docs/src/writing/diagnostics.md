@@ -62,7 +62,7 @@ next.
 | `X04` | `multiple-assignment-targets` | error | a parallel-assignment target that cannot be assigned: `(a, 1) = (2, 3)` |
 | `X05` | `colon-equal-part-assignment` | error | `L#0 := 5`; parts are assigned with `=` |
 | `X06` | `parallel-assignment-arity` | error | `(a, b) = (1, 2, 3)` |
-| `E01` | `install-no-effect` | warning | an installation nothing dispatches to: on a plain function, the binary `??`, or a `<-` method on anything but one non-symbol type |
+| `E01` | `install-no-effect` | warning | an installation nothing dispatches to: on a plain function, the binary `??`, a `<-` method on anything but one non-symbol type, or an operator the interpreter [evaluates itself](#native-operands) for those operands: `ZZ + QQ := …` |
 | `E02` | `operator-not-flexible` | error | an installation on an operator users cannot extend: `ZZ === ZZ := …` |
 | `E03` | `install-arity` | error | `g(ZZ, ZZ) := (a, b, c) -> a` |
 | `E04` | `install-needs-colon-equals` | error | `g ZZ = n -> n`; installations use `:=` |
@@ -81,6 +81,8 @@ next.
 | `E20` | `list-record-shape` | warning | a list-family `instance` check combined with a fixed length above one; consider a hash-table-based record type |
 | `E21` | `float-key` | error | a floating-point key or index, including a key inferred to have floating-point type; approximate equality makes lookup unreliable |
 | `E22` | `unresolved-value` | error | an unbound callable, constructor type, Boolean operand or condition, or indexed receiver; declare or explicitly import the value |
+| `E23` | `matrix-shape-mismatch` | error | a sum, difference or product of matrices written out whose dimensions cannot combine: `A * A` for a 2×3 `A` |
+| `E24` | `division-by-zero` | error | a number divided by an exact zero written out: `1/0`, `1.5/0`; `1/0.` is valid and gives infinity |
 | `T01` | `parallel-assignment-type` | error | `(a, b) = 5` |
 | `T02` | `condition-type` | warning | an `if` or `while` condition known not to be `Boolean` |
 | `T03` | `install-codomain-missing` | hint | an installation other than `new` without a codomain that inference can deduce; fix: insert `ZZ =>` |
@@ -94,9 +96,9 @@ next.
 | `S05` | `unnecessary-null-branch` | hint | an `if` with a removable `null` branch |
 | `S06` | `ring-variable-naming` | hint | a multi-character ring variable such as `x0` instead of `x_0` |
 | `S07` | `shared-method-codomain` | hint | at least five method installations, with more than 75% explicitly annotating the same result type; consider declaring a shared `TypicalValue` |
-| `S08` | `naming-convention` | hint | a type name outside PascalCase or uppercase, or a function or ordinary local name outside camelCase; function parameters are exempt |
+| `S08` | `naming-convention` | hint | a type name or a declared optional argument (`Options => {…}`, `{…} >> f`) outside PascalCase or uppercase |
 | `S09` | `bound-option-key` | warning | an option key whose existing source binding is evaluated instead of supplying the name as a symbol; bound values are allowed |
-| `S10` | `constructor-typical-value` | hint | an installation of a method named after a known type, such as `matrix` or `toMatrix`, without that type as its declared typical value |
+| `S10` | `constructor-typical-value` | hint | an installation of a method named after a known type, such as `matrix` or `toMatrix`, declaring no typical value at all |
 | `S11` | `null-return-guard` | hint | an unused `if x === null then return y` guard expressible as `x ?? return y` |
 | `S12` | `mapped-composition` | hint | `apply(rows, x -> f(g(x)))` expressible as `rows / f @@ g` |
 | `S13` | `redundant-boolean-comparison` | hint | a known Boolean strictly compared with `true` or `false` |
@@ -108,6 +110,11 @@ next.
 | `S19` | `self-initializing-constructor` | hint | `new T from value` expressible as `T value` for a known `SelfInitializingType` |
 | `S20` | `header-constructor` | hint | `new T from values` expressible as `T values` for a known `HeaderType`, with List or Sequence input |
 | `S21` | `wrapper-constructor` | hint | `new T from values` expressible as `T values` for a known `WrapperType`, with List or Sequence input |
+| `S22` | `predicate-typical-value` | warning | a predicate (`is` and an uppercase letter, as in `isPrime`) whose `method()` declaration does not set `TypicalValue => Boolean`, or an installation of one that annotates another result type |
+| `S23` | `predicate-function-closure` | hint | a predicate defined as a function closure rather than as a method |
+| `S24` | `inline-null-binding` | hint | `v := e; if v =!= null then y = v else y = w` expressible as `y = e ?? w`, dropping the local |
+| `S25` | `prefer-augmented-assignment` | hint | `prefix = prefix \| "X"` expressible as `prefix \|= "X"`, for a symbol target and an operator with an augmented form |
+| `S26` | `constant-condition` | hint | an `if` or `while` condition computed from literals alone, as `if 2^10 > 1000`, so one branch never runs |
 | `D01` | `unknown-documentation-section` | error | a SimpleDoc keyword or `document` option that does not exist there |
 | `D02` | `malformed-documentation` | error | documentation SimpleDoc or `document` rejects: a repeated section, a multi-line headline, `Inputs` without `Usage`, … |
 | `D03` | `missing-documentation-key` | error | a documentation page without a `Key` |
@@ -144,16 +151,48 @@ plain §typeParameter.readonly|ZZ§ := {§enumMember.option.readonly|Limit§ => 
 --      declared with `>>` always apply.
 ```
 
+### Operators the interpreter evaluates itself { #native-operands }
+
+`E01` also covers installations that Macaulay2 accepts, lists in `methods`, and
+never calls. Before it looks up any method, the interpreter computes some
+operator calls on native values directly, so a method installed for exactly
+those operand classes is dead:
+
+| Operator | Operand classes the interpreter handles itself |
+| --- | --- |
+| `+ - * /` | any two of `ZZ QQ RR RRi CC CCi` |
+| `^` | the same pairs, except `CC ^ RRi` |
+| `==` | the same pairs, except `CC == RRi`; any real interval on the left; two Booleans, symbols, strings or nets |
+| `?` | most number pairs (`CCi` never on the left), any real interval on the left; strings and nets, symbols, `null` |
+| `//` `..` `..<` | two integers |
+| `and` `or` | two Booleans |
+| unary `-` `+` | a native number |
+| `not`, prefix `??` | a Boolean, `null` |
+
+The binary `??` and `<-` are the other two dead installations, with their own
+messages. Everything else dispatches normally: ring elements of polynomial
+rings, matrices, ideals, lists, your own types, and every other operator
+(`**`, `%`, `|`, `<<`, `_`, …). Installing for `Number` or another ancestor
+works too, since only the exact native pair is answered first. The fix is a
+type of your own, for example a wrapper around the value. The table is checked
+against the real interpreter by the probe in `tests/native_dispatch`.
+
+`S24` is the neighbour of `S04` for the pattern with an intermediate local. It
+reports the binding and the conditional together and is not reported twice by
+`S04`. `??` also falls back when its left side raises an error, which only
+matters if the code sits inside a `try` that relied on that error escaping.
+
 Where a finding points at another place — `f` defined as a plain function on
 an earlier line — the diagnostic carries it as related information, which
 editors show as a clickable note.
 
 ## Naming, options, and constructors { #naming }
 
-`S08` checks PascalCase or uppercase type names and camelCase function and
-ordinary local names. Function parameters are exempt: a parameter such as
-`T` can represent a type. Ring generators and ordinary global values are
-also outside this check. Leading underscores on local names are allowed.
+`S08` checks that type names and declared optional arguments use PascalCase
+or uppercase. Function and local names are free, since rings, modules and
+other mathematical objects keep the names their notation gives them. Function
+parameters, ring generators and ordinary global values are also outside this
+check. Leading underscores are allowed.
 
 ```m2
 convert = §parameter.declaration|T§ -> §parameter.declaration|value§ -> new §parameter|T§ from §parameter|value§
@@ -179,7 +218,9 @@ library symbols and bound values alone.
 
 `S10` recognizes conversion methods named after known types, such as `widget`
 or `toWidget` for `Widget`. Declare the result with `TypicalValue => Widget`
-on the method or a `Widget =>` annotation on each installation:
+on the method or a `Widget =>` annotation on each installation. Any declared
+typical value satisfies the hint, so installations may narrow or differ from
+the method's, for instance to a subclass:
 
 ```m2
 Widget = new §type.readonly|Type§ of §type.readonly|HashTable§
@@ -253,9 +294,9 @@ classes extend the operation:
 
 ```m2
 renderLabel = §function.readonly|method§()
-renderLabel §typeParameter.readonly|String§ := §typeParameter.readonly|String§ => §parameter.declaration|x§ -> §parameter|x§
-renderLabel §typeParameter.readonly|ZZ§ := §typeParameter.readonly|String§ => §parameter.declaration|x§ -> §method.readonly|toString§ §parameter|x§
-renderLabel §typeParameter.readonly|Thing§ := §typeParameter.readonly|String§ => §parameter.declaration|x§ -> "other"
+renderLabel §typeParameter.readonly|String§ := §decorator.readonly|String§ => §parameter.declaration|x§ -> §parameter|x§
+renderLabel §typeParameter.readonly|ZZ§ := §decorator.readonly|String§ => §parameter.declaration|x§ -> §method.readonly|toString§ §parameter|x§
+renderLabel §typeParameter.readonly|Thing§ := §decorator.readonly|String§ => §parameter.declaration|x§ -> "other"
 ```
 
 This warning is advisory. Review inheritance and branch order before changing a

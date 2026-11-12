@@ -17,6 +17,10 @@ pub mod syntax;
 pub mod values;
 use super::*;
 
+pub mod constexpr;
+/// The ring an expression lives in, with the promotion rules that join rings.
+pub mod lineage;
+
 /// The option of a field constructor such as `GF` naming its generator.
 const VARIABLE_OPTION: &str = "Variable";
 
@@ -26,6 +30,9 @@ const GET_SYMBOL_FUNCTION: &str = "getSymbol";
 /// The class of a generator whose ring has no name yet, as `x` of a bare
 /// `QQ[x]`: an element of an anonymous polynomial ring.
 const ANONYMOUS_RING_ELEMENT: &str = "RingElement";
+
+/// The command rebinding the names of a ring's own variables to its generators.
+const USE_COMMAND: &str = "use";
 
 /// The class of `x` once an index of it is written, `x_2 = 4` or `QQ[x_2]`.
 const INDEXED_VARIABLE_TABLE: &str = "IndexedVariableTable";
@@ -1029,6 +1036,40 @@ impl Analysis {
         ranges.sort_by_key(|range| (range.start, range.end));
         ranges.dedup();
         Some(ranges)
+    }
+
+    /// `use R`: Macaulay2 rebinds the global names of R's own variables to R's
+    /// generators, as constructing R did. Nothing else changes: the variables of
+    /// its coefficient rings keep the names they have, and a variable a quotient
+    /// kills is rebound like any other.
+    pub fn rebind_ring_generators_on_use(
+        &mut self,
+        call: &ExprOpBinAdj,
+        source: &(impl SyntaxSource + ?Sized),
+    ) {
+        let (Some(Expr::Symbol(command)), Some(Expr::Symbol(ring))) = (
+            call.left_operand.unparenthesized(),
+            call.right_operand.unparenthesized(),
+        ) else {
+            return;
+        };
+        let position = source.position_for_syntax(command);
+        let redefined = position
+            .is_some_and(|position| self.get_binding_at(command.text(), position).is_some());
+        if command.text() != USE_COMMAND || redefined {
+            return;
+        }
+        let Some(generators) = self
+            .registry
+            .ring_generators
+            .get(&ObjectName::new(ring.text()))
+            .cloned()
+        else {
+            return;
+        };
+        for generator in &generators {
+            self.register_ring_generator(ring.text(), generator, ring, source);
+        }
     }
 
     /// Registers a ring generator declared at `anchor`.

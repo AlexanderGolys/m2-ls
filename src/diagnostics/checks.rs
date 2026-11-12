@@ -13,7 +13,9 @@ mod installation;
 mod location;
 mod method_typical_value;
 mod naming;
+mod native_dispatch;
 mod parse;
+mod predicate_declaration;
 
 use tower_lsp::lsp_types::Url;
 
@@ -151,7 +153,7 @@ pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
     for installation in analysis.installations() {
         if !source
             .bytes_for_range(installation.span)
-            .is_some_and(&selected)
+            .is_some_and(selected)
         {
             continue;
         }
@@ -174,7 +176,7 @@ pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
         .extend(naming.diagnostics.into_iter().filter(|diagnostic| {
             source
                 .bytes_for_range(diagnostic.finding.range)
-                .is_some_and(&selected)
+                .is_some_and(selected)
         }));
     if live {
         return sink.diagnostics;
@@ -264,6 +266,38 @@ mod tests {
             [catalog::INSTALL_NO_EFFECT.code],
             "a keyword is a symbol, so it is assigned before any lookup too"
         );
+    }
+
+    /// The interpreter computes arithmetic and comparison on native values
+    /// itself, so an installation for exactly those operands is never called;
+    /// any other operand class, including ring elements, still dispatches.
+    #[test]
+    fn operator_installations_on_native_operands_have_no_effect() {
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
+        let findings = |installation: &str| {
+            installation_findings(
+                &builtins,
+                &format!("T = new Type of BasicList\n{installation}\n"),
+            )
+        };
+        let ignored = [catalog::INSTALL_NO_EFFECT.code];
+
+        assert_eq!(findings("ZZ + QQ := (a, b) -> a"), ignored);
+        assert_eq!(
+            findings("installMethod(symbol *, RR, CC, (a, b) -> a)"),
+            ignored
+        );
+        assert_eq!(findings("ZZ // ZZ := (a, b) -> a"), ignored);
+        assert_eq!(findings("String == String := (a, b) -> true"), ignored);
+        assert_eq!(findings("RRi ? T := (a, b) -> symbol <"), ignored);
+        assert_eq!(findings("- ZZ := a -> a"), ignored);
+        assert_eq!(findings("not Boolean := a -> a"), ignored);
+        assert_eq!(findings("Boolean and Boolean := (a, b) -> a"), ignored);
+        assert_eq!(findings("ZZ ** QQ := (a, b) -> a"), []);
+        assert_eq!(findings("ZZ + T := (a, b) -> a"), []);
+        assert_eq!(findings("T + T := (a, b) -> a"), []);
+        assert_eq!(findings("Number + Number := (a, b) -> a"), []);
+        assert_eq!(findings("CC ^ RRi := (a, b) -> a"), []);
     }
 
     /// Parallel assignment assigns each target by its own kind: symbols bind,

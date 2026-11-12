@@ -45,6 +45,7 @@
 //! policies instead select the package owning the binding.
 //! `readonly` denotes protection of the binding, not mutability of its value.
 
+use crate::algebraic_kind::AlgebraicKind;
 use crate::builtin_index::Record;
 use crate::meta::{BindingRole, Metadata};
 use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry, ObjectRegistryView};
@@ -125,6 +126,11 @@ pub enum M2SemanticTokenType {
     Property = SemanticTokenType::PROPERTY,
     /// A package.
     Package = SemanticTokenType::NAMESPACE,
+    /// A library object that is a table of the interpreter's own data rather
+    /// than a value: a `Dictionary`, such as `OutputDictionary`, a
+    /// `HashTable` or `MutableHashTable`, such as `typicalValues`, or a
+    /// `NumberedVerticalList`. Sent as `struct`.
+    Table = SemanticTokenType::STRUCT,
     /// A name used as a `Symbol` rather than for a value: a protected symbol
     /// (`Strategy`, an option value such as `Linear`) or a quoted name
     /// (`symbol f`). Sent as `enumMember`, the standard type closest to it.
@@ -144,16 +150,18 @@ pub enum M2SemanticTokenType {
     Method = SemanticTokenType::METHOD,
     /// The modifier keywords `local`, `global`, `symbol` and their kin.
     QuoteModifier = SemanticTokenType::MODIFIER,
-    /// A domain or codomain of an installation: the `ZZ` and `List` of
-    /// `f ZZ := List => …`. Sent as `typeParameter`.
+    /// A domain of an installation: the `ZZ` of `f ZZ := List => …`. Sent as
+    /// `typeParameter`; the codomain is an [`Annotation`](Self::Annotation).
     TypeAnnotation = SemanticTokenType::TYPE_PARAMETER,
     /// Markup around documentation text: a TeX delimiter, the `{\tt` and
     /// `}` of `{\tt x}`, or a hypertext constructor such as `TT` or `PARA`.
     /// The text it styles stays a [`String`](Self::String) carrying the
     /// style's modifier.
     Macro = SemanticTokenType::MACRO,
-    /// A link to another documentation page, such as `TO`, `TOH`, or
-    /// `TO2`. Sent as `decorator`; section labels use `keyword`.
+    /// An annotation attached to what it decorates: the codomain of an
+    /// installation, the `List` of `f ZZ := List => …`, or a link to another
+    /// documentation page, such as `TO`, `TOH`, or `TO2`. Sent as `decorator`;
+    /// section labels use `keyword`.
     Annotation = SemanticTokenType::DECORATOR,
     /// Regular-expression punctuation classified using the protocol regexp category.
     Regexp = SemanticTokenType::REGEXP,
@@ -248,6 +256,23 @@ pub enum M2SemanticTokenModifier {
     /// such as an ideal, a module or a matrix. Rings are types and keep
     /// [`Type`](M2SemanticTokenType::Type).
     Algebraic = SemanticTokenModifier::new("algebraic"),
+    /// A ring, which is also a [`Type`](M2SemanticTokenType::Type): `ZZ`,
+    /// `R = QQ[x]`, a quotient, a field, a sheaf of rings.
+    Ring = SemanticTokenModifier::new("ring"),
+    /// A module: an ideal, a free module, a coherent sheaf, a vector bundle.
+    Module = SemanticTokenModifier::new("module"),
+    /// A morphism: a matrix, a ring map, a map of complexes or sheaves.
+    Morphism = SemanticTokenModifier::new("morphism"),
+    /// A complex: a chain complex, a resolution, a spectral sequence.
+    Complex = SemanticTokenModifier::new("complex"),
+    /// A functor such as `Ext`, `Tor` or `HH`, which is a
+    /// [`Function`](M2SemanticTokenType::Function) when applied.
+    Functor = SemanticTokenModifier::new("functor"),
+    /// An algebraic structure other than the above: a monoid, a poset, a
+    /// matroid, a Lie algebra.
+    Structure = SemanticTokenModifier::new("structure"),
+    /// A geometric space: a variety, a polyhedron, a fan, a simplicial complex.
+    Space = SemanticTokenModifier::new("space"),
     /// An operator selecting a part of its left operand rather than computing
     /// from both: the `_` of `S_1`, `.` and `.?`, and binary `#` and `#?`.
     MemberAccess = SemanticTokenModifier::new("memberAccess"),
@@ -274,6 +299,9 @@ pub enum M2SemanticTokenModifier {
     /// A string naming an object that need not be in scope, such as the
     /// package of `needsPackage "Foo"`.
     InjectedName = SemanticTokenModifier::new("injectedName"),
+    /// A documentation tag: the key a `Key` entry documents or a link names,
+    /// in all its parts — function, signature, option, operator symbol.
+    DocumentTag = SemanticTokenModifier::new("documentTag"),
     /// Code shown or executed as a documentation example.
     Example = SemanticTokenModifier::new("example"),
     /// Code in a `TEST` block.
@@ -287,6 +315,20 @@ pub enum M2SemanticTokenModifier {
     Nonsense = SemanticTokenModifier::new("nonsense"),
 }
 
+impl From<AlgebraicKind> for M2SemanticTokenModifier {
+    fn from(kind: AlgebraicKind) -> Self {
+        match kind {
+            AlgebraicKind::Ring => Self::Ring,
+            AlgebraicKind::Module => Self::Module,
+            AlgebraicKind::Morphism => Self::Morphism,
+            AlgebraicKind::Complex => Self::Complex,
+            AlgebraicKind::Functor => Self::Functor,
+            AlgebraicKind::Structure => Self::Structure,
+            AlgebraicKind::Space => Self::Space,
+        }
+    }
+}
+
 impl M2SemanticTokenModifier {
     /// The modifier's bit in an [`M2SemanticTokenModifiers`] set, which is
     /// also its bit on the wire.
@@ -298,6 +340,7 @@ impl M2SemanticTokenModifier {
     pub const fn standard_fallback(self) -> Option<Self> {
         match self {
             Self::Example
+            | Self::DocumentTag
             | Self::Strong
             | Self::Emphasis
             | Self::Monospace
@@ -306,7 +349,15 @@ impl M2SemanticTokenModifier {
             | Self::Directory
             | Self::Wikilink
             | Self::Tex => Some(Self::Documentation),
-            Self::Nonsense | Self::Algebraic => Some(Self::Abstract),
+            Self::Nonsense
+            | Self::Algebraic
+            | Self::Ring
+            | Self::Module
+            | Self::Morphism
+            | Self::Complex
+            | Self::Functor
+            | Self::Structure
+            | Self::Space => Some(Self::Abstract),
             modifier if modifier.is_standard() => Some(modifier),
             _ => None,
         }
@@ -502,6 +553,8 @@ pub enum SourceSemanticRole {
     QuotedSymbol,
 }
 
+/// One token of the source with what the syntax around it says about its
+/// classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSemanticToken {
     /// Source coordinates associated with this item.
@@ -627,6 +680,10 @@ pub fn local_symbol_semantic_token(
 /// Separators, which are punctuation but no operator.
 const SEPARATORS: [&str; 2] = [<Token![,]>::SPELLING, <Token![;]>::SPELLING];
 
+/// The classes whose library instances are [`Table`](M2SemanticTokenType::Table)s.
+/// `MutableHashTable` is a `HashTable`.
+const TABLE_CLASSES: [&str; 3] = ["Dictionary", "HashTable", "NumberedVerticalList"];
+
 /// Keywords selecting how a quote binds its symbol.
 const QUOTE_MODIFIERS: [&str; 5] = [
     <Token![global]>::SPELLING,
@@ -687,7 +744,10 @@ fn source_role_semantic_token(
         }
         SourceSemanticRole::RingLiteral => M2SemanticToken::new(M2SemanticTokenType::Number),
         SourceSemanticRole::PrecisionField => M2SemanticToken::new(M2SemanticTokenType::Type),
-        SourceSemanticRole::CodomainAnnotation | SourceSemanticRole::MethodTypeParameter => {
+        SourceSemanticRole::CodomainAnnotation => {
+            M2SemanticToken::new(M2SemanticTokenType::Annotation)
+        }
+        SourceSemanticRole::MethodTypeParameter => {
             M2SemanticToken::new(M2SemanticTokenType::TypeAnnotation)
         }
         SourceSemanticRole::OptionKey => M2SemanticToken::option_name(source_text, knowledge),
@@ -795,9 +855,17 @@ pub fn semantic_token_from_knowledge(
 ) -> Option<M2SemanticToken> {
     let record = knowledge.get_record(&ObjectName::new(name))?;
     let mut token = if record_is_type_like(record) {
-        M2SemanticToken::new(M2SemanticTokenType::Type)
+        let token = M2SemanticToken::new(M2SemanticTokenType::Type);
+        match AlgebraicKind::of(knowledge, &ObjectName::new(record.class.as_ref())) {
+            Some(kind) => token.with_modifier(kind.into()),
+            None => token,
+        }
     } else {
         semantic_token_for_static_type_from_knowledge(knowledge, record.class.as_ref())
+            .or_else(|| {
+                is_table_class(knowledge, record.class.as_ref())
+                    .then(|| M2SemanticToken::new(M2SemanticTokenType::Table))
+            })
             .unwrap_or_else(|| M2SemanticToken::new(M2SemanticTokenType::Variable))
     };
     if record.protected {
@@ -815,6 +883,7 @@ pub fn semantic_token_for_static_type_from_knowledge(
 ) -> Option<M2SemanticToken> {
     let type_name = ObjectName::new(type_name);
     let subtype_of = |parent: &str| knowledge.is_subtype(&type_name, &ObjectName::new(parent));
+    let kind = AlgebraicKind::of(knowledge, &type_name).map(M2SemanticTokenModifier::from);
 
     let token_type = if METHOD_FUNCTION_CLASSES.into_iter().any(subtype_of) {
         M2SemanticTokenType::Method
@@ -831,6 +900,8 @@ pub fn semantic_token_for_static_type_from_knowledge(
         M2SemanticTokenType::Variable
     } else if subtype_of("Symbol") && !subtype_of("Keyword") && !subtype_of("Operator") {
         M2SemanticTokenType::Symbol
+    } else if let Some(kind) = kind {
+        return Some(M2SemanticToken::new(M2SemanticTokenType::Variable).with_modifier(kind));
     } else if !subtype_of(NUMBER_CLASS) && lives_over_a_ring(knowledge, &type_name) {
         return Some(
             M2SemanticToken::new(M2SemanticTokenType::Variable)
@@ -841,6 +912,9 @@ pub fn semantic_token_for_static_type_from_knowledge(
     };
 
     let mut token = M2SemanticToken::new(token_type);
+    if let Some(kind) = kind {
+        token = token.with_modifier(kind);
+    }
     token.compiled_callable = if subtype_of("CompiledFunction") {
         Some(CompiledCallableKind::Function)
     } else if subtype_of("CompiledFunctionClosure") {
@@ -849,6 +923,15 @@ pub fn semantic_token_for_static_type_from_knowledge(
         None
     };
     Some(token)
+}
+
+/// Whether `class` is one of the interpreter's table classes, whose library
+/// instances are tables of its own data.
+fn is_table_class(knowledge: &(impl TypeKnowledge + ?Sized), class: &str) -> bool {
+    let class = ObjectName::new(class);
+    TABLE_CLASSES
+        .into_iter()
+        .any(|table| knowledge.is_subtype(&class, &ObjectName::new(table)))
 }
 
 /// Whether `ring` is installed on `class` or one of its ancestors.

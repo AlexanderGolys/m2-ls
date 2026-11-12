@@ -49,6 +49,10 @@ pub enum ControlFlowLayout {
     LeadingKeywords,
 }
 
+/// Formatting settings resolved into the layout parameters the formatter
+/// consults: indentation, line widths, control-flow layout and spacing
+/// preferences. Built from [`FormattingSettings`]; the default follows the
+/// default settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatOptions {
     /// Whitespace unit inserted for each indentation level.
@@ -2336,6 +2340,8 @@ enum OperatorSpacing {
     None,
 }
 
+/// Whether the operator text spells any of the listed token types:
+/// `matches_tokens!(operator, Token![*], Token![/])`.
 macro_rules! matches_tokens {
     ($text:expr, $($token:ty),+ $(,)?) => {
         false $(|| matches_token::<$token>($text))+

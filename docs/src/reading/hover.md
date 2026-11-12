@@ -60,8 +60,8 @@ they declare or that inference deduces:
 ```m2
 -- Rank of the matrix, or the integer itself.
 area = §function.readonly|method§()
-area §typeParameter.readonly|Matrix§ := §typeParameter.readonly|ZZ§ => §parameter.declaration|m§ -> §method.readonly|rank§ §parameter|m§
-area §typeParameter.readonly|ZZ§ := §typeParameter.readonly|ZZ§ => §parameter.declaration|n§ -> §parameter|n§
+area §typeParameter.readonly|Matrix§ := §decorator.readonly|ZZ§ => §parameter.declaration|m§ -> §method.readonly|rank§ §parameter|m§
+area §typeParameter.readonly|ZZ§ := §decorator.readonly|ZZ§ => §parameter.declaration|n§ -> §parameter|n§
 ```
 
 Hovering `area` anywhere shows `area = method()`, then **Methods**

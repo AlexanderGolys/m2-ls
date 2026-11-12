@@ -40,6 +40,15 @@ Each of these fixes the diagnostic it is attached to:
 : `if x === null then 0 else x` becomes `x ?? 0`; an `if` that only assigns a
   fallback, `if t === null then t = v`, becomes `t ??= v`.
 
+**Inline null-tested local with `??`** — `S24`
+: `v := g x; if v =!= null then y = v else y = 0` becomes `y = g x ?? 0`,
+  folding the local into the statement. Offered over the binding and the
+  conditional together, and only when nothing else uses the local.
+
+**Use augmented assignment** — `S25`
+: `prefix = prefix | "X"` becomes `prefix |= "X"`, for a symbol target and an
+  operator that has an augmented form (`+ - * / // % ^ | & ++ ** …`).
+
 **Rewrite as member access** — `X03`
 : `L.1` becomes `L#1`.
 

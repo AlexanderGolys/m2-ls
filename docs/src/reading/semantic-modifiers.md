@@ -20,12 +20,20 @@ has `algebraic`. A method installation keeps its `method` type and adds
 `readonly`
 : Marks a protected binding. This describes reassignment of the name, rather
   than whether the value itself can be mutated. Local shadows and mutable
-  exports do not acquire protection merely by sharing a spelling.
+  exports do not acquire protection merely by sharing a spelling. Inside a
+  package's own source, including the files that declare it, its exports are
+  not protected: the package manager protects them only when it links the
+  package for its users.
 
 `algebraic`
 : Marks ring generators and inferred nonnumeric values whose classes have
   a known `ring` installation, including ideals, modules, and matrices.
   Rings themselves remain `type`. See [algebraic values](semantic-highlighting.md#algebraic).
+
+`ring`, `module`, `morphism`, `complex`, `functor`, `structure`, `space`
+: Mark a whole algebraic or geometric object with its kind, on top of its
+  usual token type: a ring is a `type`, a functor a `function`, the others
+  variables. See [kinds](semantic-highlighting.md#kinds).
 
 `optionalParameter`
 : Marks an option key, which is a `property`. Only a name denoting a
@@ -46,6 +54,13 @@ has `algebraic`. A method installation keeps its `method` type and adds
 `documentation`
 : Marks content belonging to documentation strings, `document` calls, and
   documentation comments.
+
+`documentTag`
+: Marks the parts of a documentation tag: the key a `Key` entry documents or a
+  `TO`, `TOH` or `TO2` link names, as in `(f, ZZ)`, `[f, Opt]` or
+  `(symbol +, ZZ, ZZ)`. Every `TO`, `TOH` or `TO2` target carries it, whether
+  it names an object, a package, or only a page title. The text of a `TO2`
+  link carries it too, as the text of a link to its tag.
 
 `example`
 : Marks code in a documentation example. The example's names still receive

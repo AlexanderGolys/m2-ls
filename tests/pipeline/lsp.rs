@@ -1177,7 +1177,9 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     let mut line = 0;
     let mut character = 0;
     let token_type = response_array(&semantic_tokens["data"])
-        .chunks_exact(5)
+        .as_chunks::<5>()
+        .0
+        .iter()
         .find_map(|token| {
             let delta_line = token[0].as_u64()?;
             let delta_character = token[1].as_u64()?;
@@ -1570,7 +1572,9 @@ async fn standard_only_semantic_tokens_apply_live_with_a_refresh() {
     );
 
     assert!(response_array(&tokens["data"])
-        .chunks_exact(5)
+        .as_chunks::<5>()
+        .0
+        .iter()
         .any(|token| token[4].as_u64().unwrap() & algebraic_modifier != 0));
     let readonly_modifier = 1u64
         << response_array(&legend["tokenModifiers"])
@@ -1601,7 +1605,9 @@ async fn standard_only_semantic_tokens_apply_live_with_a_refresh() {
     );
 
     assert!(response_array(&tokens["data"])
-        .chunks_exact(5)
+        .as_chunks::<5>()
+        .0
+        .iter()
         .all(|token| token[4].as_u64().unwrap() & algebraic_modifier == 0));
     assert_ne!(
         response_array(&tokens["data"])[4].as_u64().unwrap() & readonly_modifier,

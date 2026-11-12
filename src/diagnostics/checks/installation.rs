@@ -4,7 +4,8 @@
 use m2_syn::Token;
 use tower_lsp::lsp_types::SymbolKind;
 
-use super::{DiagnosticSink, InstallationContext};
+use super::native_dispatch::NativeEvaluation;
+use super::{naming, DiagnosticSink, InstallationContext};
 use crate::analysis::{
     CallableHeadKind, CodomainOrigin, Dispatch, InstalledValue, MethodHead,
     MethodInstallationSyntax, MethodOptions, Operator,
@@ -20,10 +21,44 @@ pub(super) fn spawn(context: &InstallationContext, sink: &mut DiagnosticSink) {
     install_arity(context, sink);
     install_option_form(context, sink);
     constructor_typical_value(context, sink);
+    predicate_result(context, sink);
 }
 
-/// Hints when a conversion named for a known type does not declare that type
-/// as the result of its installation or its method function.
+/// Warns when an installation of a predicate annotates a result other than
+/// Boolean: a predicate keeps its typical value on every installation.
+fn predicate_result(context: &InstallationContext, sink: &mut DiagnosticSink) {
+    let installation = context.installation;
+    let MethodHead::Function(name) = &installation.method.head else {
+        return;
+    };
+    let boolean = TypeRole::Boolean.object_name();
+    let Some(codomain) = installation
+        .method
+        .codomain
+        .as_ref()
+        .filter(|codomain| **codomain != boolean)
+    else {
+        return;
+    };
+    if !naming::is_predicate(name.name())
+        || installation.codomain_origin != Some(CodomainOrigin::Annotation)
+    {
+        return;
+    }
+    sink.spawn(
+        &catalog::PREDICATE_TYPICAL_VALUE,
+        Finding::new(
+            installation.span,
+            format!(
+                "`{name}` is a predicate, but this installation annotates `{codomain}`; a \
+                 predicate returns `{boolean}` on every installation"
+            ),
+        ),
+    );
+}
+
+/// Hints when a conversion named for a known type declares no typical value,
+/// neither for its installation nor for its method function.
 fn constructor_typical_value(context: &InstallationContext, sink: &mut DiagnosticSink) {
     let installation = context.installation;
     let MethodHead::Function(name) = &installation.method.head else {
@@ -55,15 +90,12 @@ fn constructor_typical_value(context: &InstallationContext, sink: &mut Diagnosti
     if !source_type && !indexed_type {
         return;
     }
+    // Any declared typical value is a decision: a method often keeps a general
+    // one and narrows it per installation to a subclass, or the reverse.
     if matches!(
         installation.codomain_origin,
         Some(CodomainOrigin::Annotation | CodomainOrigin::TypicalValue)
-    ) && installation
-        .method
-        .codomain
-        .as_ref()
-        .is_some_and(|codomain| codomain.name() == target)
-    {
+    ) {
         return;
     }
     sink.spawn(&catalog::CONSTRUCTOR_TYPICAL_VALUE, Finding::new(installation.span, format!("`{name}` names the type `{target}`; declare `{target}` as the method or installation's typical value")));
@@ -122,7 +154,33 @@ fn install_no_effect(context: &InstallationContext, sink: &mut DiagnosticSink) {
                 },
             );
         }
-        MethodHead::Operator(_) => {}
+        MethodHead::Operator(operator) => {
+            let spelling = operator.token.name();
+            let Some(evaluation) =
+                NativeEvaluation::of_installation(spelling, &installation.method.domain)
+            else {
+                return;
+            };
+            let domain = installation
+                .method
+                .domain
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            sink.spawn(
+                &catalog::INSTALL_NO_EFFECT,
+                Finding::new(
+                    installation.span,
+                    format!(
+                        "Installing `{spelling}` for ({domain}) has no effect: {}. M2 records the \
+                         method, but never calls it. Install it for a type of your own instead, \
+                         for example one wrapping the value.",
+                        evaluation.reason(spelling)
+                    ),
+                ),
+            );
+        }
     }
 }
 

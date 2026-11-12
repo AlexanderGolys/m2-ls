@@ -55,6 +55,7 @@ fn rewrite_title(site: &RewriteSite<'_>) -> &'static str {
         RewriteKind::RedundantControlParentheses => "Remove redundant parentheses",
         RewriteKind::CoalescingAssignment => "Use `??=` coalescing assignment",
         RewriteKind::Coalescence => "Use `??` coalescence",
+        RewriteKind::InlinedNullBinding => "Inline null-tested local with `??`",
         RewriteKind::MappingComposition => "Simplify mapped composition",
         RewriteKind::BooleanComparison => "Simplify Boolean comparison",
         RewriteKind::PartialApplicationLambda => "Replace lambda with partial application",
@@ -65,6 +66,7 @@ fn rewrite_title(site: &RewriteSite<'_>) -> &'static str {
         RewriteKind::NullReturnGuard => "Simplify null-return guard",
         RewriteKind::NullBranch => "Simplify unnecessary null branch",
         RewriteKind::TrySimplification => "Simplify try",
+        RewriteKind::AugmentedAssignment => "Use augmented assignment",
         RewriteKind::IfCondition => "Simplify if condition",
         RewriteKind::ElseIfChain => "Flatten nested if into else-if chain",
     }
@@ -78,6 +80,7 @@ fn requires_diagnostic(kind: RewriteKind) -> bool {
         RewriteKind::AmbiguousFloatMemberAccess
             | RewriteKind::CoalescingAssignment
             | RewriteKind::Coalescence
+            | RewriteKind::InlinedNullBinding
     )
 }
 
@@ -153,7 +156,10 @@ impl<'a> CodeActionContext<'a, '_> {
     /// exactly its expression, or a plain refactor where the hint is absent
     /// or suppressed.
     fn rewrite(&self, site: &RewriteSite<'_>) -> Option<CodeAction> {
-        let range = self.document.range_for_syntax(site.expression)?;
+        let range = match &site.extent {
+            Some(extent) => self.document.range_for_bytes(extent.clone()),
+            None => self.document.range_for_syntax(site.expression)?,
+        };
         let diagnostic = self.diagnostic_covering(site.kind.rule(), range);
         if diagnostic.is_none() && requires_diagnostic(site.kind) {
             return None;
@@ -219,6 +225,7 @@ impl<'a> CodeActionContext<'a, '_> {
         let coalescence = self.enclosing.iter().rev().find_map(|expression| {
             self.site_of(expression, RewriteKind::Coalescence)
                 .or_else(|| self.site_of(expression, RewriteKind::CoalescingAssignment))
+                .or_else(|| self.site_of(expression, RewriteKind::InlinedNullBinding))
         });
         let else_if_chain = self
             .enclosing
@@ -240,6 +247,7 @@ impl<'a> CodeActionContext<'a, '_> {
             innermost(RewriteKind::NullReturnGuard, is_if),
             innermost(RewriteKind::NullBranch, is_if),
             innermost(RewriteKind::TrySimplification, is_try),
+            self.innermost_site(RewriteKind::AugmentedAssignment),
             innermost(RewriteKind::IfCondition, is_if),
             else_if_chain,
         ]

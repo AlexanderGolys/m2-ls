@@ -8,7 +8,7 @@ what it is bound to, not by how it is spelled or where it stands.
 ```m2
 R = §type.readonly|QQ§[§variable.declaration.algebraic|x§, §variable.declaration.algebraic|y§]                      -- R type · QQ type · x, y variable+algebraic
 area = §function.readonly|method§()                   -- area method · method function
-area §typeParameter.readonly|Matrix§ := §typeParameter.readonly|ZZ§ => §parameter.declaration|m§ -> §method.readonly|rank§ §parameter|m§  -- Matrix typeParameter · ZZ typeParameter · m parameter
+area §typeParameter.readonly|Matrix§ := §decorator.readonly|ZZ§ => §parameter.declaration|m§ -> §method.readonly|rank§ §parameter|m§  -- Matrix typeParameter · ZZ decorator · m parameter
 twice = §parameter.declaration|n§ -> 2 * §parameter|n§                -- twice function
 scan({1, 2}, §function.readonly|print§)               -- scan function+defaultLibrary · print function
 G = §method.readonly|gb§(§variable|I§, §property.optionalParameter.readonly|Strategy§ => §enumMember.readonly|Linear§)     -- gb method · Strategy property+optionalParameter
@@ -40,8 +40,9 @@ the second column — that is the name your editor and theme see.
 | Property | `property` | a key rather than a binding: the left side of `=>`, a member an access selects | `verbose` in `{verbose => false} >> o -> …`, `Strategy` in `f(Strategy => 1)`, `key` in `H.key`, `0` in `L_0` |
 | Namespace | `namespace` | a package, including package names in strings, and the file a `load`, `needs` or `input` call runs | `Core`, `"JSON"` in `needsPackage "JSON"`, `"lib/helper.m2"` in `load "lib/helper.m2"` |
 | Symbol | `enumMember` | a name used as a `Symbol` rather than for its value | `Strategy`, `Linear`, `g` in `symbol g` |
-| Domain or codomain | `typeParameter` | the types an installation is made on and returns | `Matrix`, `ZZ` in `area Matrix := ZZ => …` |
-| Annotation | `decorator` | a documentation link | `TO`, `TOH`, `TO2` |
+| Table | `struct` | a library object that is a table of the interpreter's own data: a `Dictionary`, `HashTable`, `MutableHashTable` or `NumberedVerticalList` | `OutputDictionary`, `typicalValues` |
+| Domain | `typeParameter` | the types an installation is made on | `Matrix` in `area Matrix := ZZ => …` |
+| Annotation | `decorator` | the codomain an installation annotates, and the `TO`, `TOH` and `TO2` constructors of documentation links | `ZZ` in `area Matrix := ZZ => …`, `TO` in `@TO f@` |
 | Markup | `macro` | markup around documentation text | `{\tt`, `}`, `PARA`, `TT` |
 | Modifier keyword | `modifier` | the quoting keywords | `symbol`, `local`, `global`, `threadVariable` |
 | Keyword | `keyword` | language keywords, SimpleDoc section keywords, and document option names | `if`, `then`, `for`, `TEST`, `Key`, `Description` |
@@ -90,6 +91,7 @@ makes `area` a method, `twice = n -> …` a function.
 | `readonly` | <i class="fa-solid fa-check"></i> | a binding protected from reassignment, independently of value mutability | `ZZ`, a protected package export |
 | `documentation` | <i class="fa-solid fa-check"></i> | inside documentation: a `doc` string, a `document` call, a [documentation comment](../beyond/documentation-comments.md) | everything inside `doc ///…///` |
 | `algebraic` | | a ring generator or a known nonnumeric value living over a ring | `x`, an ideal, a module, a matrix |
+| `ring`, `module`, `morphism`, `complex`, `functor`, `structure`, `space` | | an object of that [algebraic kind](#kinds) | `R = QQ[x]`, an ideal, a matrix, `HH`, a variety |
 | `optionalParameter` | | an option key | `Strategy` in `Strategy => Linear` |
 | `memberAccess` | | an operator selecting a part of its left operand | `_` in `S_1`, `.`, `.?`, binary `#` and `#?` |
 | `example` | | code run as a documentation example | the lines under `Example` |
@@ -104,7 +106,7 @@ makes `area` a method, `twice = n -> …` a function.
 | `tex` | | TeX mathematics | `$x^2$` |
 | `injectedCode` | | code written inside a string | a `TEST` body, an example |
 | `injectedName` | | a string naming an object not necessarily in scope | `needsPackage "Foo"` |
-| `abstract` | <i class="fa-solid fa-check"></i> | standard fallback for `algebraic` and `nonsense`; otherwise reserved | `variable+abstract` in standard-only mode |
+| `abstract` | <i class="fa-solid fa-check"></i> | standard fallback for `algebraic`, the kind modifiers and `nonsense`; otherwise reserved | `variable+abstract` in standard-only mode |
 | `index` | | reserved for structural indices in known indexed generator names; currently not emitted | no source spans yet |
 | `nonsense` | | reserved companion to `abstract`; currently not emitted | no source spans yet |
 
@@ -126,7 +128,7 @@ stable; emitted tokens use these fallbacks:
 | `escapeSequence` type | `string` |
 | `delimiter`, `punctuation` types | `operator` |
 | All other token types | unchanged |
-| `algebraic`, `nonsense` modifiers | `abstract` |
+| `algebraic`, the seven kind modifiers, `nonsense` | `abstract` |
 | `example`, `strong`, `emphasis`, `monospace`, `url`, `file`, `directory`, `wikilink`, `tex` modifiers | `documentation` |
 | `optionalParameter`, `memberAccess`, `index`, `test` modifiers | removed |
 | `declaration`, `defaultLibrary`, `readonly`, `documentation`, `abstract` modifiers | unchanged |
@@ -146,23 +148,46 @@ values. Highlighting preserves that distinction:
 ```m2
 R = §type.readonly|QQ§[§variable.declaration.algebraic|x§, §variable.declaration.algebraic|y§]
 I = §method.readonly|ideal§(§variable.algebraic|x§^2, §variable.algebraic|y§)
-S = §type|R§/§variable.algebraic|I§
+S = §type|R§/§variable.module|I§
 M = §type|S§^2
 A = §method.readonly|matrix§ {{§variable.algebraic|x§, §variable.algebraic|y§}}
 f = §variable.algebraic|x§^2 + §variable.algebraic|y§
 n = 3
 ```
 
-Here `R` and `S` receive `type`. The inferred ideal `I`, module `M`,
-matrix `A`, polynomial `f`, and generators `x` and `y` receive
-`variable+algebraic`. Their binding introductions also carry `declaration`.
+Here `R` and `S` receive `type+ring`. The inferred ideal `I` and module `M`
+receive `variable+module`, the matrix `A` `variable+morphism`, and the
+polynomial `f` and generators `x` and `y` `variable+algebraic`. Their binding introductions also carry `declaration`.
 The numeric binding `n` remains a plain variable.
 
-For known inferred classes, `algebraic` means that the catalog records an
+For known inferred classes, `algebraic` means that, of no kind below, the catalog records an
 installation of `ring` on that class or an ancestor. Numbers are excluded,
 and type classification takes precedence. This supports package-defined
 objects too, provided their type and `ring` installations are known.
 Incomplete inference can leave a value as an ordinary variable.
+
+## Kinds of algebraic object { #kinds }
+
+Beyond `algebraic`, which marks elements, an object that is a whole algebraic
+or geometric structure carries the modifier of its kind. There are seven, kept
+few on purpose: coherent sheaves count as modules, sheaves of algebras as
+rings, an ideal as a module.
+
+| Modifier | Kind | Examples |
+| --- | --- | --- |
+| `ring` | rings, fields, quotients, sheaves of rings | `ZZ`, `R = QQ[x]`, `R/I` |
+| `module` | modules, ideals, coherent sheaves, vector spaces, bundles | `ideal(x, y)`, `R^2` |
+| `morphism` | maps between the above | `matrix {{x}}`, a ring map |
+| `complex` | complexes, resolutions, spectral sequences | a `Complex` |
+| `functor` | functors | `HH`, `Ext`, `Tor` |
+| `structure` | other algebraic structures | a monoid, a Lie algebra |
+| `space` | geometric spaces | a variety, a polyhedron, a fan |
+
+The kind is that of the most specific root class an object descends from, so a
+class a package defines is recognised as soon as its parent is. The kind rides
+on the usual token type: a ring stays a `type`, a functor a `function`, the
+rest are variables. Under `standardOnly` every kind becomes `abstract`, like
+`algebraic`.
 
 ## Subscripts { #subscripts }
 

@@ -37,6 +37,7 @@ use tower_lsp::{
 
 #[macro_use]
 mod util;
+mod algebraic_kind;
 mod analysis;
 mod builtin_index;
 mod capabilities;

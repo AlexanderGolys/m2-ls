@@ -66,6 +66,15 @@ struct InlineValueCollector<'ast, 'query, K: ?Sized> {
     values: Vec<InlineValue>,
 }
 
+impl<K: TypeKnowledge + ?Sized> InlineValueCollector<'_, '_, K> {
+    /// Whether `expression` computes its value, rather than writing or naming
+    /// it: `2^10` and `numgens R` show what they evaluate to, `1024` and `n`
+    /// do not repeat themselves.
+    fn is_computation(expression: &Expr) -> bool {
+        !matches!(expression, Expr::Literal(_) | Expr::Symbol(_))
+    }
+}
+
 impl<'ast, K: TypeKnowledge + ?Sized> Visit<'ast> for InlineValueCollector<'ast, '_, K> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
         let Some(range) = self.document.range_for_syntax(expression) else {
@@ -78,17 +87,30 @@ impl<'ast, K: TypeKnowledge + ?Sized> Visit<'ast> for InlineValueCollector<'ast,
             && self.range.start <= range.start
             && range.end <= self.range.end
         {
-            if let Some(Ok(selected)) = self.session.ring_values(0).selected(expression) {
-                if let Some(text) = self
-                    .document
+            let ring_values = self.session.ring_values(0);
+            let shown = match ring_values.selected(expression) {
+                Some(Ok(selected)) => Some(format!("= {}", selected.variable)),
+                _ => ring_values
+                    .constant(expression)
+                    .filter(|_| Self::is_computation(expression))
+                    .map(|value| format!("= {value}"))
+                    .or_else(|| {
+                        let ring = ring_values.ring_of(expression)?;
+                        (Self::is_computation(expression) && !ring.is_native())
+                            .then(|| format!("in {ring}"))
+                    }),
+            };
+            if let (Some(shown), Some(text)) = (
+                shown,
+                self.document
                     .syntax_bytes(expression)
-                    .and_then(|bytes| self.document.text().get(bytes))
-                {
-                    self.values.push(InlineValue::Text(InlineValueText {
-                        range,
-                        text: format!("{text} = {}", selected.variable),
-                    }));
-                }
+                    .and_then(|bytes| self.document.text().get(bytes)),
+            ) {
+                self.values.push(InlineValue::Text(InlineValueText {
+                    range,
+                    text: format!("{text} {shown}"),
+                }));
+                return;
             }
         }
         visit::visit_expr(self, expression);

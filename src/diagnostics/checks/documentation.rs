@@ -349,9 +349,12 @@ fn undefined_documentation_key(
         let declaration = file.self_contained_at(range.start);
         let name = &context.source.text()[referenced.span.bytes()];
         let defined = file.code_symbols.contains(name)
-            || declaration.is_some_and(|declaration| {
-                declaration.name.name() == name || declaration.export_named(name).is_some()
-            })
+            || context
+                .packages
+                .declarations()
+                .iter()
+                .any(|package| package.name.name() == name)
+            || declaration.is_some_and(|declaration| declaration.export_named(name).is_some())
             || context
                 .knowledge
                 .object_id_at(&ObjectName::new(name), range.start)

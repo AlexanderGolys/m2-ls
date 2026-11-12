@@ -190,6 +190,27 @@ where
         }
     }
 
+    /// Records `key`, written after `#` or `#?`, as a property key when it
+    /// names a type: a table keyed by types, as in `rules#MdLink`, selects by
+    /// that name like any other property.
+    fn register_type_key(&mut self, key: &Expr) {
+        let (Some(name), Some(range)) = (key.symbol_name(), self.source.range_for_syntax(key))
+        else {
+            return;
+        };
+        let names_type = match self.analysis.get_binding_at(name, range.start) {
+            Some(binding) => binding.state.presentation_kind == SymbolKind::CLASS,
+            None => self
+                .knowledge_provider
+                .at_position(range.start)
+                .get_record(&ObjectName::new(name))
+                .is_some_and(|record| record.type_info().is_some()),
+        };
+        if names_type {
+            self.register_role(key, SourceSemanticRole::PropertyKey);
+        }
+    }
+
     /// Records `key` as an option key when `table` is an option table, in
     /// `o#depth`, where the key is evaluated and so must denote a symbol.
     fn register_option_table_key(&mut self, table: &Expr, key: &Expr) {
@@ -286,6 +307,9 @@ where
         }
         self.register_property(node, &node.left_operand);
         let subscript = operator == <Token![_]>::SPELLING;
+        if operator == <Token![#?]>::SPELLING {
+            self.register_type_key(&node.right_operand);
+        }
         if subscript || operator == <Token![#?]>::SPELLING {
             self.register_access_operator(&node.operator);
             self.register_selector(node, &node.left_operand, &node.right_operand, subscript);
@@ -323,6 +347,7 @@ where
 
     fn visit_expr_op_bin_index(&mut self, node: &'ast ExprOpBinIndex) {
         self.register_option_table_key(&node.receiver, &node.index);
+        self.register_type_key(&node.index);
         self.register_property(node, &node.receiver);
         self.register_access_operator(&node.operator);
         self.register_selector(node, &node.receiver, &node.index, false);

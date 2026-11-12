@@ -39,6 +39,44 @@ Where the program determines the variable, the server answers
 Editors that request inline values show them beside the expression; Neovim
 does not request them on its own.
 
+## Computed values { #computed-values }
+
+Inline values also show what an expression certainly evaluates to, computed
+without running Macaulay2. Only what is cheap and certain is evaluated:
+
+```m2
+n = 5
+2^10 + n                     -- = 1029
+7 // 2 * 3                   -- = 9
+(-7) % 3                     -- = 2 (the remainder is never negative)
+binomial(10, 3)              -- = 120
+4/2 === 2                    -- = false (4/2 is a QQ value)
+R = QQ[x, y, z]              -- QQ[x, y, z] = 3 variables, char 0, dim 3
+dim R                        -- = 3
+char (ZZ/101)                -- = 101
+M = matrix {{1, 2, 3}, {4, 5, 6}}
+M * transpose M              -- = 2×2 matrix
+ideal(x^2, y)                -- = ideal with 2 generators
+```
+
+- **Exact numbers and logic.** `ZZ` and `QQ` arithmetic, comparisons, `and`,
+  `or`, `not`, and `binomial`, `gcd`, `lcm`, `abs`, `max` and `min`. The
+  interpreter computes these natively and ignores installed methods, so the
+  result cannot depend on the rest of the program. Division by zero, a
+  result beyond 128 bits and an exponent above 4096 are not evaluated.
+- **Names.** A name is followed to its value only when the program assigns
+  it exactly once, so the value cannot depend on control flow. `m = 2` and
+  `m = m + 1` leave `m` unknown.
+- **Rings.** `numgens`, `dim` and `char` of `ZZ`, `QQ`, `ZZ/p`, `GF q` and
+  polynomial rings over them (a polynomial ring adds its variables to the
+  dimension of its coefficient ring). A quotient by an ideal, `RR` and `CC`
+  stay unknown.
+- **Matrices and ideals.** A matrix written out has its dimensions, `numRows`,
+  `numColumns`, `transpose`, sums and products follow; an ideal written out
+  has its generator count.
+
+A bare literal or name shows nothing, since it would only repeat itself.
+
 ## Mistakes caught { #diagnostics }
 
 Both mistakes are errors Macaulay2 raises only when the line runs. `m2-ls`
@@ -86,6 +124,51 @@ Each index of an indexed family is its own variable. With the cursor on `z_1`
 after `R = QQ[z_0 .. z_2]`, [document highlights](document-highlight.md) and
 [references](../navigating/references.md) find every `z_1` and the range
 `z_0 .. z_2` that declares it — never `z_0` or `z_2`.
+
+## Which ring a name denotes { #use }
+
+Constructing a ring binds the names of its variables, and a later ring with the
+same names takes them over. `use R` rebinds the names of `R`'s own variables to
+`R`'s generators again, exactly as constructing it did; the variables of its
+coefficient rings keep the names they have. `m2-ls` follows both in source
+order, so after
+
+```m2
+R = QQ[x, y]
+S = QQ[x]
+x         -- an element of S
+use R
+x         -- an element of R
+```
+
+the type of `x` changes where `use R` runs. Each ring keeps all its own names
+whatever the global names currently denote, which is why `"x"_R` still finds
+`R`'s generator after `S` took the name `x`.
+
+## Which ring an expression lives in { #lineage }
+
+Every ring construction makes a new ring: `QQ[x] === QQ[x]` is false, and so
+is `A/I === A/I`. Elements of two constructions never mix, even when the
+constructions are written the same. What does mix is a ring with the rings it
+is built over, its coefficient rings and the ring it is a quotient of. For
+
+```m2
+A = ZZ[x, y]
+B = A[y, z]/ideal(y)
+C = B[x, z]/ideal(x - z)
+(1 + x - z) * y
+```
+
+the last line lives in `C`, and the inline value says so: `(1 + x - z) * y in C`.
+
+A number joins a ring when it promotes to the field the ring is built on, so
+`ZZ[x]` rejects `1/2`, `QQ[x]` accepts it but rejects `1.5`, and `RR[x]`
+accepts both but not `ii`. Two distinct rings, `RR[x]` and `CC[x]` included,
+never mix. Wherever the analysis cannot tell which ring a name denotes, because
+the name is assigned twice or the ring is built in a loop, it shows nothing.
+Inside the quotient clause of `B[x, z]/ideal(x - z)` the generators already
+belong to `C`, though in the interpreter they still generate the ring before
+the quotient.
 
 ## Fine print
 

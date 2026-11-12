@@ -354,6 +354,11 @@ impl HypertextMarkdown {
         let Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) = expression else {
             return None;
         };
+        Self::link_text(call)
+    }
+
+    /// The text `call` shows in place of its key's name, when it is a `TO2` link.
+    pub(super) fn link_text(call: &ExprOpBinAdj) -> Option<&Expr> {
         let (function, _) = markup_call(call)?;
         (function == MarkupFunction::TO2)
             .then(|| Self::link_parts(call)?.get(1).copied())

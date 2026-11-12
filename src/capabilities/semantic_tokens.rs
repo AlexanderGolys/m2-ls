@@ -18,7 +18,7 @@ use crate::semantic_token::{
 };
 use crate::settings::{DefaultLibraryMode, DefaultLibrarySetting, SemanticTokenSettings};
 use crate::source::{ByteRange, DocumentSpan, SourceNavigation, SymbolMention, SyntaxSource};
-use crate::source_package::{CodeFragment, ExportAccess};
+use crate::source_package::CodeFragment;
 use crate::string_literal::LiteralSource;
 use crate::workspace_index::{WorkspaceDefinitionKnowledge, WorkspaceIndex, WorkspaceView};
 use m2_syn::nodes::ExprDebug;
@@ -595,8 +595,8 @@ where
     /// The names export strings list, as the objects their definitions
     /// name, including declarations that follow the export list and
     /// exported synonyms. A name defined nowhere is the symbol the export
-    /// creates. Protected exports carry `readonly`; `exportMutable` names
-    /// keep their ordinary token type without a protection modifier.
+    /// creates. The package's own source never protects them: the package
+    /// manager does that when it links the package.
     fn export_spans(&self) -> Vec<SemanticSpan> {
         let mut spans = Vec::new();
         for (package, export) in self
@@ -611,10 +611,7 @@ where
                 .unwrap_or_else(|| M2SemanticToken::new(M2SemanticTokenType::Symbol));
             let Some(token) = self
                 .apply_library_policy(named, Some(package.name.name()))
-                .with_binding_protection(
-                    !self.document.properties().primary_code
-                        && export.access == ExportAccess::Protected,
-                )
+                .with_binding_protection(false)
                 .within_string()
             else {
                 continue;
@@ -633,6 +630,15 @@ where
         spans
     }
 
+    /// The token of a name `mention` written in a documentation string. A
+    /// name naming nothing known, or a plain variable, stays part of the
+    /// string, unless it is a documentation tag, which is always marked.
+    fn named_in_string(&self, mention: &SymbolMention, is_tag: bool) -> Option<M2SemanticToken> {
+        self.mention_token(mention)
+            .and_then(M2SemanticToken::within_string)
+            .or_else(|| is_tag.then(|| M2SemanticToken::new(M2SemanticTokenType::String)))
+    }
+
     /// The marked spans of the document's documentation strings: section
     /// keywords, and the tokens of the code they embed, its names as what
     /// they name. A name naming nothing known stays part of the string.
@@ -643,6 +649,7 @@ where
             .iter()
             .filter_map(|markup| {
                 let source = self.document.span_for_bytes(markup.bytes.clone());
+                let is_tag = self.document.package_documentation().is_tag(markup);
                 let token = match markup.kind {
                     DocumentationMarkupKind::SectionKeyword => {
                         M2SemanticToken::new(M2SemanticTokenType::Keyword)
@@ -678,19 +685,19 @@ where
                             TextStyle::Tex => M2SemanticTokenModifier::Tex,
                         })
                     }
-                    DocumentationMarkupKind::Name => self
-                        .mention_token(&SymbolMention::new(source.clone()))?
-                        .within_string()?,
-                    DocumentationMarkupKind::QuotedName { start, end } => self
-                        .mention_token(&SymbolMention::new(
-                            self.document.span_for_bytes(start..end),
-                        ))?
-                        .within_string()?,
+                    DocumentationMarkupKind::Name => {
+                        self.named_in_string(&SymbolMention::new(source.clone()), is_tag)?
+                    }
+                    DocumentationMarkupKind::QuotedName { start, end } => self.named_in_string(
+                        &SymbolMention::new(self.document.span_for_bytes(start..end)),
+                        is_tag,
+                    )?,
                     DocumentationMarkupKind::ItemName => {
                         M2SemanticToken::new(M2SemanticTokenType::Parameter)
                     }
                     DocumentationMarkupKind::Syntax(token_type) => M2SemanticToken::new(token_type),
                 };
+                let token = token.with_modifier_state(M2SemanticTokenModifier::DocumentTag, is_tag);
                 Some(SemanticSpan { source, token })
             })
             .collect()
@@ -752,19 +759,16 @@ where
         if self.document.properties().primary_code {
             return false;
         }
-        self.document
+        let declares_export = self
+            .document
             .packages()
             .declarations()
             .iter()
             .flat_map(|package| &package.exports)
-            .find(|export| export.name.name() == name)
-            .map_or_else(
-                || {
-                    self.workspace_index.is_protected_export(name)
-                        || self.builtins.at(position).is_protected_global(name)
-                },
-                |export| export.access == ExportAccess::Protected,
-            )
+            .any(|export| export.name.name() == name);
+        !declares_export
+            && (self.workspace_index.is_protected_export(name)
+                || self.builtins.at(position).is_protected_global(name))
     }
 
     /// Combines source, workspace, and catalog facts to classify this semantic token.
@@ -1583,8 +1587,8 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         assert!(!is_readonly(4, 20), "a use of that parameter");
         assert!(!is_readonly(5, 0), "an unprotected library global");
         assert!(is_readonly(6, 0), "a protected library global");
-        assert!(is_readonly(8, 0), "a protected export's definition");
-        assert!(is_readonly(10, 0), "a protected export's reference");
+        assert!(!is_readonly(8, 0), "a package's own export definition");
+        assert!(!is_readonly(10, 0), "a package's own export reference");
         assert!(
             !is_readonly(9, 14),
             "a parameter shadowing a protected export"
@@ -2046,9 +2050,31 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         assert!(tokens.iter().all(|token| token.length > 0));
     }
 
-    /// A value is algebraic when `ring` is installed on its class: ideals,
-    /// modules, matrices and ring elements are, numbers and lists are not,
-    /// and a ring stays a type without the modifier.
+    /// A library functor is a function of the `functor` kind, and the other
+    /// kinds that library objects can have are marked the same way.
+    #[test]
+    fn library_objects_carry_their_algebraic_kind() {
+        let text = "HH\nZZ\nMatrix\n";
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
+        let document = document(text, &builtins);
+        let tokens = collect_tokens(&document, &builtins, false);
+        let kind = |line| {
+            let token = token_at(&tokens, line, 0).expect("highlighted");
+            (token.token_type, token.token_modifiers_bitset)
+        };
+        let (token_type, modifiers) = kind(0);
+        assert_eq!(token_type, M2SemanticTokenType::Function as u32);
+        assert_ne!(modifiers & M2SemanticTokenModifier::Functor.bit(), 0);
+        let (token_type, modifiers) = kind(1);
+        assert_eq!(token_type, M2SemanticTokenType::Type as u32);
+        assert_ne!(modifiers & M2SemanticTokenModifier::Ring.bit(), 0);
+        let (_, modifiers) = kind(2);
+        assert_eq!(modifiers & M2SemanticTokenModifier::Morphism.bit(), 0);
+    }
+
+    /// A value of an algebraic kind carries it: a ring is a type that is also a
+    /// `ring`, an ideal or module a `module`, a matrix a `morphism`. Elements,
+    /// which only live over a ring, are `algebraic`; numbers and lists are not.
     #[test]
     fn values_living_over_a_ring_are_algebraic_and_rings_stay_types() {
         let text = concat!(
@@ -2066,14 +2092,17 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
         let algebraic = M2SemanticTokenModifier::Algebraic.bit();
+        let ring = M2SemanticTokenModifier::Ring.bit();
+        let module = M2SemanticTokenModifier::Module.bit();
+        let morphism = M2SemanticTokenModifier::Morphism.bit();
 
         for (line, token_type, modifiers) in [
-            (0, M2SemanticTokenType::Type, 0),
-            (1, M2SemanticTokenType::Variable, algebraic),
-            (2, M2SemanticTokenType::Type, 0),
-            (3, M2SemanticTokenType::Variable, algebraic),
+            (0, M2SemanticTokenType::Type, ring),
+            (1, M2SemanticTokenType::Variable, module),
+            (2, M2SemanticTokenType::Type, ring),
+            (3, M2SemanticTokenType::Variable, module),
             (4, M2SemanticTokenType::Variable, algebraic),
-            (5, M2SemanticTokenType::Variable, algebraic),
+            (5, M2SemanticTokenType::Variable, morphism),
             (6, M2SemanticTokenType::Variable, algebraic),
             (7, M2SemanticTokenType::Variable, 0),
             (8, M2SemanticTokenType::Variable, 0),
@@ -2180,7 +2209,12 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             assert_eq!(token.token_type, token_type as u32, "{line}:{column}");
         }
         for (line, column, token_type, modifiers) in [
-            (1, 6, M2SemanticTokenType::Type, 0),
+            (
+                1,
+                6,
+                M2SemanticTokenType::Type,
+                M2SemanticTokenModifier::Ring.bit(),
+            ),
             (1, 7, M2SemanticTokenType::Operator, access),
             (1, 8, M2SemanticTokenType::Variable, generator),
             (4, 1, M2SemanticTokenType::Operator, access),
@@ -2219,9 +2253,16 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 );
                 let value = token_at(&tokens, 0, text.find("value").unwrap() as u32).unwrap();
                 assert_eq!(value.token_type, M2SemanticTokenType::String as u32);
+                let tag_modifier =
+                    if matches!(option, DocumentOption::Key | DocumentOption::SeeAlso) {
+                        M2SemanticTokenModifier::DocumentTag.bit()
+                    } else {
+                        0
+                    };
                 assert_eq!(
                     value.token_modifiers_bitset,
-                    M2SemanticTokenModifier::Documentation.bit()
+                    M2SemanticTokenModifier::Documentation.bit() | tag_modifier,
+                    "{option}"
                 );
             }
         }
@@ -2512,9 +2553,10 @@ Description
         };
         for modifier in M2SemanticTokenModifier::iter() {
             let expected = match modifier {
-                Example | Strong | Emphasis | Monospace | Url | File | Directory | Wikilink
-                | Tex | Documentation => Documentation.bit(),
-                Nonsense | Algebraic | Abstract => Abstract.bit(),
+                Example | DocumentTag | Strong | Emphasis | Monospace | Url | File | Directory
+                | Wikilink | Tex | Documentation => Documentation.bit(),
+                Nonsense | Algebraic | Ring | Module | Morphism | Complex | Functor | Structure
+                | Space | Abstract => Abstract.bit(),
                 Declaration | DefaultLibrary | Readonly => modifier.bit(),
                 _ => 0,
             };
@@ -2662,8 +2704,8 @@ p(ZZ) := Array => x -> [x]
 
         assert_eq!(
             token_type_at(&tokens, 1, 9),
-            Some(M2SemanticTokenType::TypeAnnotation as u32),
-            "the explicit Array codomain uses the same type annotation as the domain"
+            Some(M2SemanticTokenType::Annotation as u32),
+            "the explicit Array codomain is an annotation, not a type parameter"
         );
         assert_eq!(
             token_type_at(&tokens, 1, 2),

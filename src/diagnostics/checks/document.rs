@@ -3,7 +3,9 @@
 
 use std::collections::HashSet;
 
-use m2_syn::visit::Visit;
+use m2_syn::nodes::{Expr, ExprCollection, ExprOpBinRegular, ExprOption, Symbol};
+use m2_syn::visit::{self, Visit};
+use m2_syn::Token;
 use tower_lsp::lsp_types::SymbolKind;
 
 use super::{DiagnosticSink, DocumentContext};
@@ -11,37 +13,102 @@ use crate::diagnostics::{catalog, Finding};
 use crate::meta::BindingRole;
 use crate::node_metadata::ParsedCell;
 use crate::source::SourceNavigation;
-use crate::syntax::BindingReferences;
+use crate::syntax::{BindingReferences, ExpressionSyntax};
+
+/// The option of `method` holding the options a method function accepts.
+const OPTIONS_KEY: &str = "Options";
 
 /// Spawns every diagnostic that needs the whole document.
 pub(super) fn spawn(context: &DocumentContext, sink: &mut DiagnosticSink) {
     unused_binding(context, sink);
     super::method_typical_value::MethodTypicalValue::spawn(context, sink);
+    super::predicate_declaration::PredicateDeclaration::spawn(context, sink);
 }
 
-/// Checks names on source declarations, excluding function parameters, ring
-/// generators, and globals that are neither functions nor types. A parameter
-/// can stand for a type, so its name need not follow ordinary local casing.
+/// Checks the names of types and of optional arguments. A type is PascalCase
+/// or uppercase, as is an option declared by `Options => {…}` or `{…} >> f`.
+/// Functions and locals are free: rings, modules and other mathematical
+/// objects keep the names their notation gives them.
 pub(super) fn naming_conventions(context: &DocumentContext, sink: &mut DiagnosticSink) {
     for binding in context.analysis.bindings() {
         if binding.role == BindingRole::Parameter || binding.state.is_ring_generator {
             continue;
         }
-        let kind = binding.state.presentation_kind;
-        let (uppercase, description) = if kind == SymbolKind::CLASS {
-            (true, "Type names should use PascalCase or uppercase")
-        } else if kind == SymbolKind::FUNCTION || binding.binding.is_local() {
-            (false, "Function and local names should use camelCase")
-        } else {
-            continue;
-        };
         let name = binding.name.name();
-        if !super::naming::follows_case(name, uppercase) {
+        if binding.state.presentation_kind == SymbolKind::CLASS
+            && !super::naming::follows_case(name, true)
+        {
             sink.spawn(
                 &catalog::NAMING_CONVENTION,
-                Finding::new(binding.range, format!("{description}: `{name}`")),
+                Finding::new(
+                    binding.range,
+                    format!("Type names should use PascalCase or uppercase: `{name}`"),
+                ),
             );
         }
+    }
+    let mut declarations = OptionDeclarations::default();
+    for cell in context.syntax.cells().iter().filter_map(ParsedCell::syntax) {
+        declarations.visit_cell(cell);
+    }
+    for key in declarations.keys {
+        let name = key.text();
+        let Some(range) = context.source.range_for_syntax(key) else {
+            continue;
+        };
+        if !super::naming::follows_case(name, true) {
+            sink.spawn(
+                &catalog::NAMING_CONVENTION,
+                Finding::new(
+                    range,
+                    format!("Optional argument names should use PascalCase: `{name}`"),
+                ),
+            );
+        }
+    }
+}
+
+/// The names of the optional arguments the visited syntax declares: the keys
+/// of the list in `Options => {…}` and in the `{…} >> f` of a function.
+#[derive(Default)]
+struct OptionDeclarations<'ast> {
+    /// The declared names, in source order.
+    keys: Vec<&'ast Symbol>,
+}
+
+impl<'ast> OptionDeclarations<'ast> {
+    /// Records the keys of the `key => value` entries of the list `declared`.
+    fn declare(&mut self, declared: &'ast Expr) {
+        let Some(Expr::Collection(ExprCollection::List(_))) = declared.unparenthesized() else {
+            return;
+        };
+        for entry in declared
+            .unparenthesized()
+            .into_iter()
+            .flat_map(Expr::contained_expressions)
+        {
+            if let Expr::Option(option) = entry {
+                if let Expr::Symbol(key) = option.key.as_ref() {
+                    self.keys.push(key);
+                }
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for OptionDeclarations<'ast> {
+    fn visit_expr_option(&mut self, option: &'ast ExprOption) {
+        if option.key.symbol_name() == Some(OPTIONS_KEY) {
+            self.declare(&option.value);
+        }
+        visit::visit_expr_option(self, option);
+    }
+
+    fn visit_expr_op_bin_regular(&mut self, operation: &'ast ExprOpBinRegular) {
+        if operation.operator.spelling() == <Token![>>]>::SPELLING {
+            self.declare(&operation.left_operand);
+        }
+        visit::visit_expr_op_bin_regular(self, operation);
     }
 }
 

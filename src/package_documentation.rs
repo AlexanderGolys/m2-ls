@@ -86,6 +86,9 @@ pub struct PackageDocumentation {
     key_strings: Vec<DocumentSpan>,
     /// Source spans classified as documentation markup.
     markup: Vec<DocumentationMarkup>,
+    /// The source of each documentation tag: a key a page documents or a link
+    /// names, which the markup inside it is a part of.
+    tags: Vec<ByteRange>,
     /// Source intervals belonging to package documentation.
     documentation_ranges: Vec<ByteRange>,
     /// Source intervals treated as executable documentation examples.
@@ -397,6 +400,13 @@ impl PackageDocumentation {
     /// The keyword and code spans of documentation strings.
     pub fn markup(&self) -> &[DocumentationMarkup] {
         &self.markup
+    }
+
+    /// Whether `markup` is part of a documentation tag.
+    pub fn is_tag(&self, markup: &DocumentationMarkup) -> bool {
+        self.tags
+            .iter()
+            .any(|tag| tag.start <= markup.bytes.start && markup.bytes.end <= tag.end)
     }
 
     /// What `document` and `SimpleDoc` reject or warn about.
@@ -888,6 +898,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 .map(|body| (body, code.bytes(key)))
                 .into_iter()
                 .collect(),
+            tags: vec![code.bytes(key)],
         };
         self.record_code_markup(marks);
     }
@@ -896,6 +907,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// in key positions name keys when they hold a symbol's name.
     fn record_code_markup(&mut self, code: CodeMarkup) {
         self.documentation.markup.extend(code.markup);
+        self.documentation.tags.extend(code.tags);
         let source = self.source;
         for (bytes, literal) in code.key_string_candidates {
             if !self.names_symbol(&source.text()[bytes.clone()]) {
@@ -1073,6 +1085,8 @@ struct CodeMarkup {
     /// The document bytes of the content of each string in a key position:
     /// the key itself, or the key a `TO`, `TOH`, or `TO2` link links to.
     key_string_candidates: Vec<(ByteRange, ByteRange)>,
+    /// The document bytes of the documentation tags the code writes.
+    tags: Vec<ByteRange>,
 }
 
 impl CodeMarkup {
@@ -1085,6 +1099,13 @@ impl CodeMarkup {
     ) -> Self {
         let mut applications = Applications::default();
         syntax.visit(&mut applications);
+        let link_texts = applications
+            .0
+            .iter()
+            .filter_map(|call| HypertextMarkdown::link_text(call))
+            .filter(|text| code.content_bytes(text).is_some())
+            .map(|text| code.bytes(text))
+            .collect::<Vec<_>>();
         let link_keys = applications
             .0
             .into_iter()
@@ -1100,7 +1121,18 @@ impl CodeMarkup {
             .iter()
             .map(|key| code.bytes(*key))
             .collect::<Vec<_>>();
-        let mut marks = Self::default();
+        // The text of `TO2` is the text of a link to its tag, so it is part of it.
+        let mut marks = Self {
+            tags: link_key_bytes.iter().chain(&link_texts).cloned().collect(),
+            markup: link_texts
+                .into_iter()
+                .map(|bytes| DocumentationMarkup {
+                    bytes,
+                    kind: DocumentationMarkupKind::Syntax(M2SemanticTokenType::String),
+                })
+                .collect(),
+            ..Self::default()
+        };
         let mut symbols = SymbolMarks {
             code,
             option_names: &option_names,

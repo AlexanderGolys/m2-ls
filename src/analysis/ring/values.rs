@@ -50,12 +50,27 @@ where
     }
 
     /// Current source position of retained typed syntax.
-    fn position(&self, syntax: &dyn Spanned) -> Option<Position> {
+    pub(super) fn position(&self, syntax: &dyn Spanned) -> Option<Position> {
         Some(self.source.range_for_syntax(syntax)?.start)
     }
 
+    /// Current source range of retained typed syntax.
+    pub(super) fn range(&self, syntax: &dyn Spanned) -> Option<TextRange> {
+        self.source.range_for_syntax(syntax)
+    }
+
+    /// The binding of the global `name` visible at `position`.
+    pub(super) fn global_binding(&self, name: &str, position: Position) -> Option<BindingView<'_>> {
+        self.checker.get_binding_from_scope(name, 0, position)
+    }
+
+    /// The source text of typed syntax.
+    pub(super) fn text(&self, syntax: &(impl Spanned + ?Sized)) -> Option<&str> {
+        self.source.text_for_syntax(syntax)
+    }
+
     /// Binding visible at this exact syntax position and its enclosing scope.
-    fn binding(&self, symbol: &Symbol) -> Option<BindingView<'_>> {
+    pub(super) fn binding(&self, symbol: &Symbol) -> Option<BindingView<'_>> {
         let position = self.position(symbol)?;
         self.checker.get_binding_from_scope(
             symbol.text(),
@@ -211,7 +226,10 @@ where
     }
 
     /// A polynomial constructor's typed variable specification, checked against its head type.
-    fn constructor_variables(&self, application: &'ast ExprOpBinAdj) -> Option<&'ast Expr> {
+    pub(super) fn constructor_variables(
+        &self,
+        application: &'ast ExprOpBinAdj,
+    ) -> Option<&'ast Expr> {
         let variables = RingSyntax::constructor_variables(application)?;
         let position = self.position(application)?;
         let knowledge = self.checker.knowledge_at(position);
@@ -408,7 +426,7 @@ where
     }
 
     /// Resolve a semantic binding value through retained typed expressions.
-    fn expression_at(&self, range: TextRange) -> Option<&'ast Expr> {
+    pub(super) fn expression_at(&self, range: TextRange) -> Option<&'ast Expr> {
         let expressions = self.expressions.get_or_init(|| {
             let mut visitor = ExpressionRanges {
                 source: self.source,

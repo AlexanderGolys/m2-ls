@@ -8,6 +8,7 @@
 //! a new release; otherwise the cached copy is used offline. The cache holds a
 //! single file named by the checksum its content must match.
 
+use std::cmp::Reverse;
 use std::env;
 use std::fmt::{self, Display};
 use std::fs;
@@ -603,7 +604,7 @@ impl CatalogCache {
                 catalogs.push((modified, entry.path(), digest));
             }
         }
-        catalogs.sort_by(|left, right| right.0.cmp(&left.0));
+        catalogs.sort_by_key(|(modified, _, _)| Reverse(*modified));
         let mut catalogs = catalogs.into_iter().map(|(_, path, digest)| (path, digest));
         let newest = catalogs.next();
         catalogs.try_for_each(|(path, _)| Self::remove(&path))?;
