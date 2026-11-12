@@ -1,5 +1,41 @@
 # Changelog
 
+## 2.6.2 - 2026-11-12
+
+- Show computed values as inline values: exact `ZZ`/`QQ` arithmetic,
+  comparisons and logic, `numgens`/`dim`/`char` of polynomial rings over
+  `ZZ`, `QQ`, `ZZ/p` and `GF q`, the shapes of matrices written out and the
+  generator counts of ideals. Only names assigned exactly once are followed.
+- Track which ring an expression lives in through coefficient rings and
+  quotients, show it inline (`… in C`), and follow `use R` rebinding the names
+  of `R`'s variables in source order.
+- Add E23 `matrix-shape-mismatch` and E24 `division-by-zero` errors, the S22
+  `predicate-typical-value` warning, and S23 `predicate-function-closure`,
+  S24 `inline-null-binding`, S25 `prefer-augmented-assignment` and S26
+  `constant-condition` hints; S24 and S25 come with rewrites.
+- Report as E01 the installations the interpreter never calls because it
+  evaluates the operator itself for those native operands, as `ZZ + QQ := …`.
+- Accept `return` inside loop bodies, `if` and `try` at any depth within a
+  function; E08 no longer reports it as outside a function body.
+- Limit S08 to type names and declared optional arguments, and accept any
+  declared typical value for S10.
+- Add the `ring`, `module`, `morphism`, `complex`, `functor`, `structure` and
+  `space` kind modifiers and the `documentTag` modifier. Codomain annotations
+  are `decorator`s and interpreter tables are `struct`s. Rename the `access`
+  and `math` modifiers to `memberAccess` and `tex`, split `link` into `url`,
+  `file`, `directory` and `wikilink`, and add `injectedCode` and
+  `injectedName`. Unprotected option names are parameters.
+- Leave a package's exports unprotected inside its own source.
+- Load Core for library implementation files, which report syntax errors only
+  and get no code actions or formatting. Hover describes the catalog object
+  for names the library assigns itself, and go-to-definition falls back to the
+  installed source location for objects no assignment defines.
+- Stop counting quoted names as references to the binding they spell in
+  highlights and renames.
+- Highlight documentation keys, `TO2` link text and example option names more
+  precisely, and report unresolved documentation references as D05 errors in
+  any file.
+
 ## 2.6.1 - 2026-11-06
 
 - Refuse to index a repository root holding more than 100,000 entries,
