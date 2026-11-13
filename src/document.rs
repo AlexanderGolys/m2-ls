@@ -11,7 +11,7 @@ use crate::file_load::FileLoad;
 use crate::init_file::InitFileDirective;
 use crate::node_metadata::SyntaxSnapshot;
 use crate::object_registry::{ObjectName, ObjectRegistry};
-use crate::package_documentation::PackageDocumentation;
+use crate::package_documentation::{DocumentationTextTag, PackageDocumentation};
 use crate::package_index::{collect_imported_packages_in_tree, PackageImport, SourceResolver};
 use crate::source::{ByteRange, DocumentSource, SourceNavigation, SymbolMention, SyntaxSource};
 use crate::source_package::{PackageSessionCode, SourcePackages};
@@ -677,6 +677,18 @@ impl DocumentSnapshot {
     /// The package documentation the document writes.
     pub fn package_documentation(&self) -> &PackageDocumentation {
         &self.package_documentation
+    }
+
+    /// A quoted page title under the cursor that does not resolve to a source or indexed symbol.
+    /// Single-word overview titles navigate as pages, while quoted symbol names keep code navigation.
+    pub fn documentation_text_tag_at(&self, position: Position) -> Option<&DocumentationTextTag> {
+        let tag = self.package_documentation.text_tag_at(position)?;
+        (self.source_symbol_at(&tag.title, position).is_none()
+            && self
+                .object_registry()
+                .object_id_at(&ObjectName::new(&tag.title), position)
+                .is_none())
+        .then_some(tag)
     }
 
     /// The code the document runs in package sessions — its TEST blocks and

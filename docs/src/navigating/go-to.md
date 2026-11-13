@@ -58,6 +58,11 @@ implementation on `det` lists its installations across the loaded packages.
 Inside a library file, the package's private names resolve too. A package's
 files are read the first time a jump needs them.
 
+Definition lookup searches through the package's source files for a binding.
+For example, `findSynonyms` resolves to its declaration in `document.m2`;
+the call in `syns := findSynonyms s` does not define it. Catalog locations
+serve as file hints and are checked against the installed source.
+
 > [!NOTE]
 > Functions compiled into the interpreter, such as `apply`, have no Macaulay2
 > source. Their jumps return nothing rather than a guessed location.
@@ -68,3 +73,10 @@ files are read the first time a jump needs them.
   signatures and types keep working from the downloaded and cached catalog.
 - [`sources.enabled = false`](../getting-started/configuration.md#sources)
   keeps navigation inside your own files.
+
+Quoted documentation page titles support **Go to definition** and **Go to
+declaration**: a link to `"Guide to rings"` jumps to its matching `Key` entry.
+The title may be used by `TO`, `TOH`, `TO2`, `SeeAlso`, or `Subnodes`, in SimpleDoc
+or hypertext lists. Titles resolve within the current package when known;
+`"PackageName :: Guide to rings"` selects a package explicitly. Symbol keys
+continue to navigate to their code definitions.

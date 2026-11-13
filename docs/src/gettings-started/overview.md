@@ -40,7 +40,7 @@ tracking some compile-time computable characteristic, like a bound on dimension.
 
 [Folding](../reading/folding.md)
 : Collapses multiline expressions, function bodies, comments, and strings using
-  their source structure.
+  their source structure. SimpleDoc nodes and nested sections fold independently.
 
 
 [Declaration, definition, implementation, and type definition](../navigating/go-to.md)
@@ -50,7 +50,8 @@ tracking some compile-time computable characteristic, like a bound on dimension.
 
 [References](../navigating/references.md)
 : Finds uses of the selected binding, respecting local scopes and shadowing.
-  Globals are searched across the indexed workspace.
+  Globals and quoted documentation page titles are searched across the indexed
+  workspace. Page titles also support definition and declaration jumps.
 
 [Rename](../navigating/rename.md)
 : Renames a user binding and its references together, including documentation
@@ -85,7 +86,9 @@ tracking some compile-time computable characteristic, like a bound on dimension.
 [Diagnostics](../writing/diagnostics.md)
 : Reports syntax, runtime, type, style, and package-documentation problems as you
   edit, including floating-point keys, option names, constructor result types,
-  and declaration naming. Function parameters are exempt from naming checks.
+  and declaration naming. It also checks package export documentation across
+  loaded files and suggests simpler counted loops. Function parameters are
+  exempt from naming checks.
   Every rule has a stable code and configurable suppression.
 
 [Code actions](../writing/code-actions.md)
@@ -93,7 +96,9 @@ tracking some compile-time computable characteristic, like a bound on dimension.
   directives are available as explicit actions; automatic fix-all omits them.
   Simplifications include early-return null guards, mapped compositions, and
   redundant strict Boolean comparisons, forwarding callbacks, and partial
-  applications. Each rewrite has its own configurable lint code.
+  applications, unary compositions, and conditional assignment chains. Each
+  rewrite has its own configurable lint code. SimpleDoc placeholder actions
+  create documentation sections suited to a declaration or method signature.
 
 [Formatting](../writing/formatting.md)
 : Formats the whole document with configurable spacing, wrapping, indentation,

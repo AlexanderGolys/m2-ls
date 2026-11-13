@@ -24,7 +24,11 @@ Globals
 
 Documentation
 : `[[name]]` links in [documentation comments](../beyond/documentation-comments.md)
-  are references too.
+  are references too. Quoted documentation page titles are also indexed:
+  `TO`, `TOH`, `TO2`, `SeeAlso`, and `Subnodes` targets refer to matching `Key`
+  entries across workspace files, in both SimpleDoc and hypertext documentation.
+  Link display labels and ordinary prose strings are excluded. The include
+  declaration flag controls whether `Key` entries are listed.
 
 Indexed ring generators
 : Each index is its own variable. After `R = RR[x, y_1, z_0 .. z_2]`,

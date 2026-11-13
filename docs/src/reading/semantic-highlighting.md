@@ -274,9 +274,11 @@ were available.
 Keywords, strings, numbers, operators and comments are also sent as tokens,
 for editors that rely on the server alone. When the client announces
 `augmentsSyntaxTokens` — it highlights syntax itself, for instance with a
-Tree-sitter grammar — the server leaves those to it and sends only the tokens it
-knows more about: names, roles such as an `memberAccess` operator or the literal it
-selects with, and the modifier keywords `symbol`, `local` and `global`. Strings and comments that contain code or documentation are still
+Tree-sitter grammar — the server defers ordinary keywords, numbers, operators,
+and comments to it. It sends names, roles such as a `memberAccess` operator or the literal it
+selects with, and the modifier keywords `symbol`, `local` and `global`.
+Ordinary strings still receive `string` tokens, including their delimiters.
+Strings and comments that contain code or documentation are still
 sent, so the code inside them is colored.
 
 ## Precedence { #precedence }

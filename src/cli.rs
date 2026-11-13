@@ -287,8 +287,8 @@ impl Tool {
         .ok_or("could not parse source")?;
         let directed = session_registry(Some(&document));
         document.restart_session(&directed);
+        let index = WorkspaceIndex::default();
         if !document.properties().primary_code {
-            let index = WorkspaceIndex::default();
             let mut loaded = index.index_snapshot(&uri, &document, &registry);
             let path = uri.to_file_path().ok();
             let root = path
@@ -316,7 +316,13 @@ impl Tool {
             );
             document.restart_session(&index.context_registry(&uri, &directed));
         }
-        let diagnostics = visible_diagnostics(&document, &uri, &settings.diagnostics, &sources);
+        let diagnostics = visible_diagnostics(
+            &document,
+            &uri,
+            &settings.diagnostics,
+            &sources,
+            Some(&index),
+        );
         crate::usage_log::diagnostics(&uri, document.text(), &diagnostics);
         let mut failed = false;
         for diagnostic in diagnostics {

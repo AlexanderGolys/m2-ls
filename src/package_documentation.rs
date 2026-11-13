@@ -84,6 +84,8 @@ pub struct PackageDocumentation {
     /// Strings naming a documentation key by a symbol's name, such as `"f"`
     /// in `TO "f"`: names, but not ones the documentation evaluates.
     key_strings: Vec<DocumentSpan>,
+    /// Quoted page titles used as keys or links, distinct from symbol names.
+    text_tags: Vec<DocumentationTextTag>,
     /// Source spans classified as documentation markup.
     markup: Vec<DocumentationMarkup>,
     /// The source of each documentation tag: a key a page documents or a link
@@ -91,6 +93,8 @@ pub struct PackageDocumentation {
     tags: Vec<ByteRange>,
     /// Source intervals belonging to package documentation.
     documentation_ranges: Vec<ByteRange>,
+    /// Multiline SimpleDoc sections, from their keyword through their last content line.
+    section_ranges: Vec<TextRange>,
     /// Source intervals treated as executable documentation examples.
     example_ranges: Vec<ByteRange>,
     /// Malformed or inconsistent documentation entries found during extraction.
@@ -124,6 +128,17 @@ pub struct DocumentationKey {
     pub range: TextRange,
     /// What the key names.
     pub subject: DocumentedSubject,
+}
+
+/// A quoted documentation page title at a definition or a link target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentationTextTag {
+    /// Title as written inside the string literal.
+    pub title: String,
+    /// Source range of the complete quoted title, excluding surrounding markup.
+    pub range: TextRange,
+    /// Whether this occurrence is a page's Key rather than a reference.
+    pub is_definition: bool,
 }
 
 /// What a documentation key names.
@@ -358,6 +373,17 @@ impl PackageDocumentation {
             node.examples
                 .dedup_by_key(|fragment| fragment.bytes.clone());
         }
+        for tag in &mut documentation.text_tags {
+            tag.is_definition = documentation
+                .nodes
+                .iter()
+                .flat_map(|node| &node.keys)
+                .any(|key| key.range == tag.range);
+        }
+        documentation
+            .text_tags
+            .sort_by_key(|tag| (tag.range.start, tag.range.end));
+        documentation.text_tags.dedup();
         documentation.example_sessions = documentation
             .nodes
             .iter()
@@ -375,6 +401,12 @@ impl PackageDocumentation {
     /// Source regions occupied by documentation calls.
     pub fn documentation_ranges(&self) -> &[ByteRange] {
         &self.documentation_ranges
+    }
+
+    /// Foldable SimpleDoc sections, including nested nodes, descriptions, and examples.
+    /// Trailing blank lines and the containing string's delimiter are excluded.
+    pub fn section_ranges(&self) -> &[TextRange] {
+        &self.section_ranges
     }
 
     /// Regions shown or executed as examples, including canned examples.
@@ -395,6 +427,21 @@ impl PackageDocumentation {
     /// The names the documentation evaluates in the package, in source order.
     pub fn referenced_names(&self) -> &[ReferencedName] {
         &self.referenced_names
+    }
+
+    /// Quoted overview titles and their definition or reference locations.
+    pub fn text_tags(&self) -> &[DocumentationTextTag] {
+        &self.text_tags
+    }
+
+    /// The quoted page title under the cursor, including either quote character.
+    pub fn text_tag_at(
+        &self,
+        position: tower_lsp::lsp_types::Position,
+    ) -> Option<&DocumentationTextTag> {
+        self.text_tags
+            .iter()
+            .find(|tag| tag.range.start <= position && position < tag.range.end)
     }
 
     /// The keyword and code spans of documentation strings.
@@ -910,6 +957,11 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         self.documentation.tags.extend(code.tags);
         let source = self.source;
         for (bytes, literal) in code.key_string_candidates {
+            self.documentation.text_tags.push(DocumentationTextTag {
+                title: source.text()[bytes.clone()].to_string(),
+                range: source.range_for_bytes(literal.clone()),
+                is_definition: false,
+            });
             if !self.names_symbol(&source.text()[bytes.clone()]) {
                 // A string naming no symbol names a page by its title, and is
                 // read as a link's text.

@@ -1,6 +1,8 @@
 //! Indexed source text and the repository's single position-conversion API.
 
+use m2_syn::Span;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tower_lsp::lsp_types::Position;
 use tower_lsp::lsp_types::Range as TextRange;
@@ -107,7 +109,7 @@ pub struct DocumentSource {
     /// Cached line boundaries used for byte and UTF-16 conversions.
     line_index: LineIndex,
     /// Parser source identities mapped to their current document offsets.
-    syntax_offsets: HashMap<m2_syn::File, usize>,
+    syntax_offsets: HashMap<Span, usize>,
 }
 
 impl DocumentSource {
@@ -125,9 +127,9 @@ impl DocumentSource {
     pub fn register_syntax(&mut self, syntax: &SyntaxSnapshot) {
         self.syntax_offsets.clear();
         for cell in syntax.cells() {
-            for file in cell.files() {
+            for site in cell.source_sites() {
                 self.syntax_offsets
-                    .insert(file, cell.document_range().start);
+                    .insert(site, cell.document_range().start);
             }
         }
     }
@@ -152,7 +154,11 @@ pub trait SourceNavigation {
     fn syntax_bytes(&self, syntax: &(impl m2_syn::Spanned + ?Sized)) -> Option<ByteRange> {
         let span = syntax.try_span()?;
         let range = span.range()?;
-        let offset = self.source().syntax_offsets.get(&span.file()).copied()?;
+        let offset = self
+            .source()
+            .syntax_offsets
+            .get(&Span::unlocated(Arc::clone(span.source())))
+            .copied()?;
         Some(offset + range.start..offset + range.end)
     }
 
@@ -362,16 +368,23 @@ pub struct SyntaxNavigation<'a, S: ?Sized> {
     /// The syntax revision whose cell-local spans are mapped.
     snapshot: &'a SyntaxSnapshot,
     /// Cell-local source identities mapped to revision-specific offsets.
-    offsets: HashMap<m2_syn::File, usize>,
+    offsets: HashMap<Span, usize>,
 }
 
 impl<'a, S: SourceNavigation + ?Sized> SyntaxNavigation<'a, S> {
     /// Associates a source navigator with the cell offsets of this syntax revision.
     pub fn new(original: &'a S, snapshot: &'a SyntaxSnapshot) -> Self {
+        #[allow(
+            clippy::mutable_key_type,
+            reason = "Native span equality and hashing use immutable source allocation identity; the source's lazy line cache is not part of the key."
+        )]
         let offsets = snapshot
             .cells()
             .iter()
-            .flat_map(|cell| cell.files().map(|file| (file, cell.document_range().start)))
+            .flat_map(|cell| {
+                cell.source_sites()
+                    .map(|site| (site, cell.document_range().start))
+            })
             .collect();
         Self {
             original,
@@ -394,7 +407,10 @@ impl<S: SourceNavigation + ?Sized> SourceNavigation for SyntaxNavigation<'_, S> 
     fn syntax_bytes(&self, syntax: &(impl m2_syn::Spanned + ?Sized)) -> Option<ByteRange> {
         let span = syntax.try_span()?;
         let range = span.range()?;
-        let offset = self.offsets.get(&span.file()).copied()?;
+        let offset = self
+            .offsets
+            .get(&Span::unlocated(Arc::clone(span.source())))
+            .copied()?;
         Some(offset + range.start..offset + range.end)
     }
 }
@@ -402,6 +418,27 @@ impl<S: SourceNavigation + ?Sized> SourceNavigation for SyntaxNavigation<'_, S> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recycled compact file labels must not merge distinct parser source snapshots.
+    #[test]
+    fn source_coordinates_distinguish_snapshots_with_the_same_file_label() {
+        use m2_syn::{File, Source};
+        let label = File::from_raw(7);
+        let first = Source::with_file(label, "retainedName");
+        let second = Source::with_file(label, "x");
+        let first_span = Span::ranged(Arc::clone(&first), 0..first.text().len());
+        let second_span = Span::ranged(Arc::clone(&second), 0..second.text().len());
+        let mut document = DocumentSource::new("retainedName\nx".into());
+        document.syntax_offsets.insert(Span::unlocated(first), 0);
+        document
+            .syntax_offsets
+            .insert(Span::unlocated(second), "retainedName\n".len());
+        assert_eq!(first_span.file(), second_span.file());
+        assert_eq!(document.text_for_syntax(&first_span), Some("retainedName"));
+        assert_eq!(document.text_for_syntax(&second_span), Some("x"));
+        assert_eq!(document.syntax_bytes(&first_span), Some(0..12));
+        assert_eq!(document.syntax_bytes(&second_span), Some(13..14));
+    }
 
     #[test]
     fn typed_coordinates_require_registered_provenance() {
@@ -437,7 +474,9 @@ mod tests {
             for error in cell.lexer_diagnostics() {
                 diagnostics += 1;
                 assert_eq!(
-                    source.syntax_offsets.get(&error.span().file()),
+                    source
+                        .syntax_offsets
+                        .get(&Span::unlocated(Arc::clone(error.span().source()))),
                     Some(&cell.document_range().start)
                 );
             }

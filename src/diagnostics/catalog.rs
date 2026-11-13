@@ -216,6 +216,9 @@ REDUNDANT_CONTROL_PARENTHESES {
 
     /// A null test that `??` expresses directly: here `x ?? 0`, and
     /// `typeInfo ??= class value` for an `if` that only assigns the fallback.
+    /// An unused `if stop =!= null then i = stop` becomes `i = stop ?? i`.
+    /// Complete fallback chains assigning `i` become values of one enclosing
+    /// assignment, retaining preceding branch statements and their scopes.
     ///
     /// ```m2
     /// f = x -> if x === null then 0 else x
@@ -284,6 +287,43 @@ NULL_RETURN_GUARD {
 MAPPED_COMPOSITION {
         code: "S12",
         name: "mapped-composition",
+        severity: HINT,
+    }
+
+    /// A lambda forwarding its sole parameter through two named unary functions.
+    ///
+    /// ```m2
+    /// x -> foo bar x
+    /// ```
+COMPOSED_LAMBDA {
+        code: "S28",
+        name: "composed-lambda",
+        severity: HINT,
+    }
+
+    /// A local integer counter immediately followed by a `while` loop that
+    /// advances it by one. A `for` loop expresses the iteration directly.
+    /// The index must be unused outside the loop, with no other writes,
+    /// `continue`, or closures that could expose it beyond the loop's scope.
+    ///
+    /// ```m2
+    /// scanText = text -> (i := 0; while i < #text do (print text#i; i += 1))
+    /// ```
+PREFER_FOR_LOOP {
+        code: "S29",
+        name: "prefer-for-loop",
+        severity: HINT,
+    }
+
+    /// A numeric `for` loop explicitly starts at zero, its default lower bound.
+    /// Omit the `from 0` clause, retaining the upper bound and loop condition.
+    ///
+    /// ```m2
+    /// for i from 0 to 9 do print i
+    /// ```
+REDUNDANT_FOR_START {
+        code: "S30",
+        name: "redundant-for-start",
         severity: HINT,
     }
 
@@ -766,6 +806,19 @@ LIST_RECORD_SHAPE {
         severity: WARNING,
     }
 
+    /// An installation explicitly annotates the same result type already
+    /// declared by its method's `TypicalValue`. Remove the annotation to inherit it.
+    ///
+    /// ```m2
+    /// specNet = method(Dispatch => Thing, TypicalValue => SpecNet)
+    /// specNet SpecNet := SpecNet => identity
+    /// ```
+REDUNDANT_METHOD_CODOMAIN {
+        code: "S27",
+        name: "redundant-method-codomain",
+        severity: HINT,
+    }
+
     /// More than three quarters of a local method's installations explicitly
     /// annotate one result type, with at least five effective installations.
     /// Prefer one `TypicalValue` in the constructor and retain differing overrides.
@@ -913,8 +966,8 @@ DUPLICATE_DOCUMENTATION {
         severity: ERROR,
     }
 
-    /// An exported symbol without documentation in a package whose
-    /// documentation is in the same file; `installPackage` warns about each.
+    /// An exported symbol without a direct documentation key in its package,
+    /// including documentation in loaded files. Applies before documentation begins.
     /// List deliberately undocumented symbols in `undocumented {…}`.
     ///
     /// ```m2

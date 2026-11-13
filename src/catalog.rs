@@ -1,7 +1,8 @@
 //! Downloaded builtin metadata and documentation, kept outside the executable.
 //!
 //! The catalog is generated and published by the M2Book package: every M2Book
-//! release carries it as a release asset, next to a SHA-256 checksum asset.
+//! release carries it as its one `.jsonl` asset, under any name, and is
+//! verified against the SHA-256 digest GitHub records for that asset.
 //! The server follows the compatible M2Book release line by default;
 //! `M2_LS_CATALOG_VERSION` can restrict it with a Cargo-style version requirement.
 //! A catalog is downloaded on first use (or by `m2-ls --download-catalog`) and again only when M2Book publishes
@@ -20,30 +21,24 @@ use std::time::{Duration, SystemTime};
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use ureq::ResponseExt;
 
 use crate::builtin_index::BuiltinIndex;
 use crate::settings::CatalogSettings;
 
-/// M2Book release page used to discover the latest catalog version.
-const RELEASES_URL: &str = "https://github.com/AlexanderGolys/M2Book/releases";
 /// Environment variable selecting a Cargo-style M2Book release requirement.
 const CATALOG_VERSION_ENV: &str = "M2_LS_CATALOG_VERSION";
-/// API listing published releases for constrained version selection.
+/// API describing M2Book's published releases and their assets.
 const RELEASES_API: &str = "https://api.github.com/repos/AlexanderGolys/M2Book/releases";
 /// Maximum release metadata page size supported by GitHub.
 const RELEASES_PER_PAGE: usize = 100;
-/// Maximum accepted release-list response size.
+/// Maximum accepted release metadata response size.
 const MAX_RELEASE_METADATA_BYTES: u64 = 8 * 1024 * 1024;
-/// Path prefix identifying a redirected release-tag page.
-const RELEASE_TAG_PATH: &str = "/releases/tag/";
-/// Release asset containing builtin metadata and documentation.
-const CATALOG_ASSET: &str = "m2-index.jsonl";
-/// Release asset containing the catalog's expected SHA-256 checksum.
-const CHECKSUM_ASSET: &str = "m2-index.jsonl.sha256";
+/// Algorithm prefix of the asset digests GitHub reports.
+const ASSET_DIGEST_PREFIX: &str = "sha256:";
 /// Prefix of checksum-addressed catalog cache filenames.
 const CATALOG_FILE_PREFIX: &str = "m2-index-";
-/// Suffix of cached JSONL catalog filenames.
+/// Suffix of JSONL catalog files: the one release asset carrying it, and
+/// every cached copy.
 const CATALOG_FILE_SUFFIX: &str = ".jsonl";
 /// Environment variable selecting a local catalog instead of the download cache.
 const CATALOG_ENV: &str = "M2_LS_CATALOG";
@@ -51,8 +46,6 @@ const CATALOG_ENV: &str = "M2_LS_CATALOG";
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// Maximum catalog response size accepted before aborting a download.
 const MAX_CATALOG_BYTES: u64 = 256 * 1024 * 1024;
-/// Maximum checksum response size accepted before aborting a download.
-const MAX_CHECKSUM_BYTES: u64 = 1024;
 /// Number of hexadecimal digits required for a SHA-256 checksum.
 const SHA256_HEX_LENGTH: usize = 64;
 
@@ -238,24 +231,25 @@ impl CatalogDigest {
         Self(format!("{:x}", Sha256::digest(catalog)))
     }
 
-    /// Read a digest in `sha256sum` output format: the digest, then optionally
-    /// the file name.
-    fn parse(checksum: &str) -> Option<Self> {
-        checksum
-            .split_whitespace()
-            .next()
-            .filter(|digest| {
-                digest.len() == SHA256_HEX_LENGTH
-                    && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-            .map(|digest| Self(digest.to_ascii_lowercase()))
+    /// Read a digest written as 64 hexadecimal digits, in either case.
+    fn from_hex(digest: &str) -> Option<Self> {
+        (digest.len() == SHA256_HEX_LENGTH && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| Self(digest.to_ascii_lowercase()))
+    }
+
+    /// Read a digest as GitHub reports it for a release asset: `sha256:` and
+    /// the hexadecimal digest.
+    fn of_asset_digest(digest: &str) -> Option<Self> {
+        digest
+            .strip_prefix(ASSET_DIGEST_PREFIX)
+            .and_then(Self::from_hex)
     }
 
     /// The digest a cache file name promises, if it names a cached catalog.
     fn of_file_name(name: &str) -> Option<Self> {
         name.strip_prefix(CATALOG_FILE_PREFIX)?
             .strip_suffix(CATALOG_FILE_SUFFIX)
-            .and_then(Self::parse)
+            .and_then(Self::from_hex)
     }
 
     /// Cache filename derived from the catalog checksum.
@@ -275,12 +269,14 @@ impl Display for CatalogDigest {
     }
 }
 
-/// One published M2Book catalog: the release that carries it and the digest
-/// published with it.
+/// One published M2Book catalog: the release that carries it, where to
+/// download it, and the digest GitHub reports for it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CatalogRelease {
-    /// Release tag identifying the catalog assets.
+    /// Release tag of the M2Book release carrying the catalog.
     tag: String,
+    /// Download URL of the catalog asset.
+    url: String,
     /// Expected checksum used to verify catalog contents.
     digest: CatalogDigest,
 }
@@ -291,43 +287,87 @@ impl CatalogRelease {
         &self.tag
     }
 
-    /// The digest the release publishes for its catalog.
+    /// The digest GitHub reports for the catalog asset.
     pub fn digest(&self) -> &CatalogDigest {
         &self.digest
     }
 }
 
-/// Published release metadata used for SemVer selection.
+/// A file attached to a published release, as the GitHub API describes it.
+#[derive(Debug, Deserialize)]
+struct ReleaseAsset {
+    /// File name of the asset.
+    name: String,
+    /// Where the asset is downloaded from.
+    browser_download_url: String,
+    /// `sha256:` and the asset's digest; absent only for assets uploaded
+    /// before GitHub began recording digests.
+    digest: Option<String>,
+}
+
+/// Published release metadata: its tag, whether it is a draft, and its
+/// assets.
 #[derive(Debug, Deserialize)]
 struct PublishedRelease {
-    /// Tag from which both catalog assets will be downloaded.
+    /// Tag naming the release and its version.
     tag_name: String,
     /// Unpublished releases cannot provide a selected catalog.
     draft: bool,
+    /// Files attached to the release.
+    #[serde(default)]
+    assets: Vec<ReleaseAsset>,
 }
 
 impl PublishedRelease {
+    /// The semantic version of the tag, with or without a leading `v`.
+    fn version(&self) -> Option<Version> {
+        Version::parse(self.tag_name.strip_prefix('v').unwrap_or(&self.tag_name)).ok()
+    }
+
     /// Highest published semantic version satisfying the requirement.
-    fn select(
-        releases: impl IntoIterator<Item = Self>,
-        requirement: &VersionReq,
-    ) -> Option<(Version, String)> {
+    fn select(releases: impl IntoIterator<Item = Self>, requirement: &VersionReq) -> Option<Self> {
         releases
             .into_iter()
             .filter(|release| !release.draft)
-            .filter_map(|release| {
-                let version = Version::parse(
-                    release
-                        .tag_name
-                        .strip_prefix('v')
-                        .unwrap_or(&release.tag_name),
-                )
-                .ok()?;
-                requirement
-                    .matches(&version)
-                    .then_some((version, release.tag_name))
-            })
+            .filter_map(|release| Some((release.version()?, release)))
+            .filter(|(version, _)| requirement.matches(version))
             .max_by(|left, right| left.0.cmp(&right.0))
+            .map(|(_, release)| release)
+    }
+
+    /// The catalog this release publishes: its only `.jsonl` asset, whatever
+    /// its name, verified by the digest GitHub reports for it. Other assets,
+    /// such as a checksum file, are ignored.
+    fn catalog(self) -> io::Result<CatalogRelease> {
+        let tag = self.tag_name;
+        let mut catalogs = self
+            .assets
+            .into_iter()
+            .filter(|asset| asset.name.ends_with(CATALOG_FILE_SUFFIX));
+        let (Some(asset), None) = (catalogs.next(), catalogs.next()) else {
+            return Err(IOError::new(
+                ErrorKind::NotFound,
+                format!("M2Book {tag} must carry exactly one {CATALOG_FILE_SUFFIX} catalog asset"),
+            ));
+        };
+        let digest = asset
+            .digest
+            .as_deref()
+            .and_then(CatalogDigest::of_asset_digest)
+            .ok_or_else(|| {
+                IOError::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "GitHub reports no SHA-256 digest for {} of M2Book {tag}",
+                        asset.name
+                    ),
+                )
+            })?;
+        Ok(CatalogRelease {
+            tag,
+            url: asset.browser_download_url,
+            digest,
+        })
     }
 }
 
@@ -347,106 +387,64 @@ impl M2BookReleases {
         Self { agent }
     }
 
-    /// The latest release with its published digest. The tag is read from
-    /// where GitHub redirects the latest-release page, so both assets come
-    /// from the same release.
-    fn latest(&self) -> io::Result<CatalogRelease> {
-        let response = self
-            .agent
-            .head(format!("{RELEASES_URL}/latest"))
-            .call()
-            .map_err(IOError::other)?;
-        let tag = Self::tag_of_release_page(response.get_uri().path())?;
-        self.release(tag)
-    }
-
-    /// Resolve the highest published version satisfying a Cargo-style requirement.
+    /// The catalog of the highest published release satisfying a Cargo-style
+    /// requirement; `*` is the release GitHub marks as latest.
     fn matching(&self, requirement: &VersionReq) -> io::Result<CatalogRelease> {
         if *requirement == VersionReq::STAR {
-            return self.latest();
+            return self
+                .metadata::<PublishedRelease>(&format!("{RELEASES_API}/latest"))?
+                .catalog();
         }
-        let mut selected: Option<(Version, String)> = None;
+        let mut selected: Option<PublishedRelease> = None;
         for page in 1.. {
-            let bytes = self
-                .agent
-                .get(format!(
-                    "{RELEASES_API}?per_page={RELEASES_PER_PAGE}&page={page}"
-                ))
-                .header(
-                    "User-Agent",
-                    concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")),
-                )
-                .call()
-                .map_err(IOError::other)?
-                .body_mut()
-                .with_config()
-                .limit(MAX_RELEASE_METADATA_BYTES)
-                .read_to_vec()
-                .map_err(IOError::other)?;
-            let releases: Vec<PublishedRelease> =
-                serde_json::from_slice(&bytes).map_err(IOError::other)?;
+            let releases: Vec<PublishedRelease> = self.metadata(&format!(
+                "{RELEASES_API}?per_page={RELEASES_PER_PAGE}&page={page}"
+            ))?;
             let last_page = releases.len() < RELEASES_PER_PAGE;
-            if let Some(candidate) = PublishedRelease::select(releases, requirement) {
-                if selected
-                    .as_ref()
-                    .is_none_or(|previous| candidate.0 > previous.0)
-                {
-                    selected = Some(candidate);
-                }
-            }
+            selected = PublishedRelease::select(selected.into_iter().chain(releases), requirement);
             if last_page {
                 break;
             }
         }
-        let (_, tag) = selected.ok_or_else(|| {
-            IOError::new(
-                ErrorKind::NotFound,
-                format!("no published M2Book release matches {requirement}"),
-            )
-        })?;
-        self.release(tag)
-    }
-
-    /// Read the checksum asset of a selected release.
-    fn release(&self, tag: String) -> io::Result<CatalogRelease> {
-        let checksum = self.asset(&tag, CHECKSUM_ASSET, MAX_CHECKSUM_BYTES)?;
-        let digest =
-            CatalogDigest::parse(&String::from_utf8_lossy(&checksum)).ok_or_else(|| {
-                IOError::new(
-                    ErrorKind::InvalidData,
-                    format!("{CHECKSUM_ASSET} of M2Book {tag} does not contain a SHA-256 digest"),
-                )
-            })?;
-        Ok(CatalogRelease { tag, digest })
-    }
-
-    /// Extracts and validates the release tag from the redirected release-page path.
-    fn tag_of_release_page(path: &str) -> io::Result<String> {
-        path.rsplit_once(RELEASE_TAG_PATH)
-            .map(|(_, tag)| tag.to_owned())
-            .filter(|tag| !tag.is_empty() && !tag.contains('/'))
+        selected
             .ok_or_else(|| {
                 IOError::new(
                     ErrorKind::NotFound,
-                    format!("M2Book has no published release at {RELEASES_URL}"),
+                    format!("no published M2Book release matches {requirement}"),
                 )
-            })
+            })?
+            .catalog()
     }
 
-    /// Downloads the release catalog and verifies it against the expected checksum.
-    fn catalog(&self, release: &CatalogRelease) -> io::Result<Vec<u8>> {
-        self.asset(&release.tag, CATALOG_ASSET, MAX_CATALOG_BYTES)
-    }
-
-    /// Downloads a named release asset while enforcing the supplied byte limit.
-    fn asset(&self, tag: &str, asset: &str, limit: u64) -> io::Result<Vec<u8>> {
-        self.agent
-            .get(format!("{RELEASES_URL}/download/{tag}/{asset}"))
+    /// Reads release metadata from the GitHub API.
+    fn metadata<Metadata: for<'de> Deserialize<'de>>(&self, url: &str) -> io::Result<Metadata> {
+        let bytes = self
+            .agent
+            .get(url)
+            .header(
+                "User-Agent",
+                concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")),
+            )
             .call()
             .map_err(IOError::other)?
             .body_mut()
             .with_config()
-            .limit(limit)
+            .limit(MAX_RELEASE_METADATA_BYTES)
+            .read_to_vec()
+            .map_err(IOError::other)?;
+        serde_json::from_slice(&bytes).map_err(IOError::other)
+    }
+
+    /// Downloads the release catalog, at most the catalog size limit; the
+    /// cache verifies it against the release digest before storing it.
+    fn catalog(&self, release: &CatalogRelease) -> io::Result<Vec<u8>> {
+        self.agent
+            .get(&release.url)
+            .call()
+            .map_err(IOError::other)?
+            .body_mut()
+            .with_config()
+            .limit(MAX_CATALOG_BYTES)
             .read_to_vec()
             .map_err(IOError::other)
     }
@@ -693,7 +691,24 @@ mod tests {
     fn release_of(tag: &str, catalog: &[u8]) -> CatalogRelease {
         CatalogRelease {
             tag: tag.to_owned(),
+            url: format!("https://example.invalid/{tag}/catalog.jsonl"),
             digest: CatalogDigest::of(catalog),
+        }
+    }
+
+    fn asset(name: &str, digest: Option<&str>) -> ReleaseAsset {
+        ReleaseAsset {
+            name: name.to_owned(),
+            browser_download_url: format!("https://example.invalid/{name}"),
+            digest: digest.map(str::to_owned),
+        }
+    }
+
+    fn published(tag: &str, draft: bool, assets: Vec<ReleaseAsset>) -> PublishedRelease {
+        PublishedRelease {
+            tag_name: tag.to_owned(),
+            draft,
+            assets,
         }
     }
 
@@ -708,17 +723,11 @@ mod tests {
     fn constraints_select_the_highest_published_matching_version() {
         let select = |requirement: &str| {
             let releases = ["v0.1.1", "0.1.3", "v0.2.0", "v0.1.4-beta.1", "not-semver"]
-                .map(|tag| PublishedRelease {
-                    tag_name: tag.to_owned(),
-                    draft: false,
-                })
+                .map(|tag| published(tag, false, Vec::new()))
                 .into_iter()
-                .chain([PublishedRelease {
-                    tag_name: "v0.1.9".to_owned(),
-                    draft: true,
-                }]);
+                .chain([published("v0.1.9", true, Vec::new())]);
             PublishedRelease::select(releases, &VersionReq::parse(requirement).unwrap())
-                .map(|(_, tag)| tag)
+                .map(|release| release.tag_name)
         };
         assert_eq!(select(">=0.1.1, <0.2"), Some("0.1.3".to_owned()));
         assert_eq!(select("=0.1.1"), Some("v0.1.1".to_owned()));
@@ -759,26 +768,56 @@ mod tests {
     }
 
     #[test]
-    fn release_tag_comes_from_the_latest_release_redirect() {
-        assert_eq!(
-            M2BookReleases::tag_of_release_page("/AlexanderGolys/M2Book/releases/tag/v0.2.0")
-                .unwrap(),
-            "v0.2.0"
-        );
-        let error =
-            M2BookReleases::tag_of_release_page("/AlexanderGolys/M2Book/releases").unwrap_err();
-        assert_eq!(io::Error::kind(&error), io::ErrorKind::NotFound);
+    fn the_catalog_is_the_one_jsonl_asset_under_any_name() {
+        let digest = "AB".repeat(32);
+        let github_digest = format!("sha256:{digest}");
+        let release = published(
+            "v0.1.3",
+            false,
+            vec![
+                asset("m2-index.jsonl.sha256", Some(&github_digest)),
+                asset("builtins.jsonl", Some(&github_digest)),
+            ],
+        )
+        .catalog()
+        .unwrap();
+        assert_eq!(release.tag(), "v0.1.3");
+        assert_eq!(release.url, "https://example.invalid/builtins.jsonl");
+        assert_eq!(release.digest().to_string(), digest.to_ascii_lowercase());
+
+        for assets in [
+            Vec::new(),
+            vec![asset("notes.txt", Some(&github_digest))],
+            vec![
+                asset("a.jsonl", Some(&github_digest)),
+                asset("b.jsonl", Some(&github_digest)),
+            ],
+        ] {
+            let error = published("v1", false, assets).catalog().unwrap_err();
+            assert_eq!(io::Error::kind(&error), io::ErrorKind::NotFound);
+        }
+        for digest in [None, Some("md5:abc"), Some("sha256:not-hex")] {
+            let error = published("v1", false, vec![asset("index.jsonl", digest)])
+                .catalog()
+                .unwrap_err();
+            assert_eq!(io::Error::kind(&error), io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]
-    fn checksum_asset_accepts_sha256sum_output_only() {
-        let digest = "AB".repeat(32);
+    fn release_metadata_reads_the_github_api_shape() {
+        let release: PublishedRelease = serde_json::from_str(
+            r#"{"tag_name": "v0.1.2", "draft": false, "assets": [{"name": "m2-index.jsonl",
+                "browser_download_url": "https://example.invalid/m2-index.jsonl",
+                "digest": "sha256:fb64052a95943d7b90bd0af7234f2a8372ce68028e4d9c6f3ef443086d8fa882",
+                "size": 58040028}]}"#,
+        )
+        .unwrap();
+        assert_eq!(release.version(), Some(Version::new(0, 1, 2)));
         assert_eq!(
-            CatalogDigest::parse(&format!("{digest}  m2-index.jsonl\n")),
-            Some(CatalogDigest(digest.to_ascii_lowercase()))
+            release.catalog().unwrap().digest().to_string(),
+            "fb64052a95943d7b90bd0af7234f2a8372ce68028e4d9c6f3ef443086d8fa882"
         );
-        assert_eq!(CatalogDigest::parse("not-a-digest m2-index.jsonl"), None);
-        assert_eq!(CatalogDigest::parse(""), None);
     }
 
     #[test]

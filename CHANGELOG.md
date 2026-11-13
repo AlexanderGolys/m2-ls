@@ -1,5 +1,41 @@
 # Changelog
 
+## 2.7.0 - 2026-11-13
+
+- Prevent semantic-token requests from panicking on invalid byte spans or
+  UTF-8 boundaries. Map retained parser sources by allocation identity so
+  recycled file labels cannot mix coordinates from different snapshots.
+- Add SimpleDoc placeholder actions for functions, method installations,
+  types, options, and packages, with sections matching each item's role.
+- Add S27 `redundant-method-codomain`, S28 `composed-lambda`, S29
+  `prefer-for-loop`, and S30 `redundant-for-start`. Remove repeated codomain
+  annotations, replace unary forwarding lambdas with composition, and omit
+  `from 0` through quick fixes; counted `while` loops receive an advisory hint.
+- Extend S04 coalescence fixes to conditional assignment chains and unused
+  non-null updates, preserving branch statements, comments, and local scopes.
+- Count E19 parameter class tests throughout function bodies, including
+  validation guards and compound conditions; report the third test per binding.
+- Check D07 documentation coverage for every package export, including package
+  fragments and documentation loaded from other files. Require a direct key
+  for the public name, or an explicit `undocumented` exemption.
+- Navigate to quoted documentation page titles and find their references across
+  workspace files, respecting package-qualified titles. Fold SimpleDoc nodes
+  and nested sections independently.
+- Use a separate `docs` token for documentation prose and add `libraryConst`
+  and `libraryConfigParam` modifiers. Keep embedded code's own styles and emit
+  string tokens when augmenting syntax highlighting. Standard-only mode maps
+  prose to strings and removes the custom library modifiers.
+- Keep documentation examples analyzed for highlighting and navigation without
+  publishing their lint diagnostics. Ordinary source and TEST blocks retain
+  diagnostics.
+- Resolve library definitions to actual source bindings rather than catalog
+  references, including definitions late in a package's load sequence.
+- Discover the catalog as the compatible M2Book release's single `.jsonl`
+  asset, regardless of its name, and verify GitHub's recorded SHA-256 digest.
+  Preserve panic diagnostics on stderr as well as in operational logs.
+- Update the user guide for the new actions, diagnostics, documentation
+  navigation, folding, and semantic token classifications.
+
 ## 2.6.2 - 2026-11-12
 
 - Show computed values as inline values: exact `ZZ`/`QQ` arithmetic,

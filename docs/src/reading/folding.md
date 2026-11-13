@@ -20,3 +20,10 @@ Key                                       │ folds as a string
 Comment ranges are marked as comments, so an editor setting such as "fold all
 comments" collapses exactly those. A long documentation string folds away as a
 unit, which makes the code of a package file easy to scan.
+
+SimpleDoc documentation also folds by section. Collapse an entire `Node`, or
+fold `Key`, `Usage`, `Inputs`, `Outputs`, and other sections independently.
+Nested sections such as `Description` → `Text` or `Example`, `Synopsis`, and
+`Consequences` → `Item` have their own folds. Each fold keeps its keyword visible
+and ends at its last nonblank content line, before the next section or closing
+string delimiter. Empty sections do not produce folds.

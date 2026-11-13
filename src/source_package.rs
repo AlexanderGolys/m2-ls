@@ -49,6 +49,8 @@ pub struct SourcePackages {
     declarations: Vec<PackageDeclaration>,
     /// TEST blocks paired with the package session in which they execute.
     tests: Vec<PackageSessionCode>,
+    /// Exports outside a local declaration, whose package may be supplied by a loader.
+    fragment_exports: Vec<PackageExport>,
 }
 
 /// One `newPackage` section of a source file.
@@ -260,12 +262,15 @@ impl SourcePackages {
         let mut packages = Self {
             declarations,
             tests: Vec::new(),
+            fragment_exports: Vec::new(),
         };
         for call in calls {
             match call {
                 PackageCall::Export { start, exports } => {
                     if let Some(declaration) = packages.declaration_at_mut(start) {
                         declaration.exports.extend(exports);
+                    } else {
+                        packages.fragment_exports.extend(exports);
                     }
                 }
                 PackageCall::Test { start, body } => {
@@ -280,6 +285,12 @@ impl SourcePackages {
             }
         }
         packages
+    }
+
+    /// Exports whose owning package must be determined from the file's loaders.
+    /// These do not become public package items in a standalone script.
+    pub fn fragment_exports(&self) -> &[PackageExport] {
+        &self.fragment_exports
     }
 
     /// Every package the file declares, in source order.

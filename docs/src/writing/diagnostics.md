@@ -96,7 +96,7 @@ next.
 | `S01` | `option-key-convention` | hint | an option name or unbound symbol value that does not use PascalCase in an option declaration or a call |
 | `S02` | `unused-binding` | warning | a local that is never read; names starting with `_` are exempt |
 | `S03` | `redundant-control-parentheses` | hint | parentheses the keyword already delimits: `if (n > 0) then` |
-| `S04` | `prefer-coalescence` | hint | a null test `??` says directly: `if x === null then 0 else x` |
+| `S04` | `prefer-coalescence` | hint | a null test `??` says directly, including conditional chains assigning the same variable |
 | `S05` | `unnecessary-null-branch` | hint | an `if` with a removable `null` branch |
 | `S06` | `ring-variable-naming` | hint | a multi-character ring variable such as `x0` instead of `x_0` |
 | `S07` | `shared-method-codomain` | hint | at least five method installations, with more than 75% explicitly annotating the same result type; consider declaring a shared `TypicalValue` |
@@ -119,15 +119,50 @@ next.
 | `S24` | `inline-null-binding` | hint | `v := e; if v =!= null then y = v else y = w` expressible as `y = e ?? w`, dropping the local |
 | `S25` | `prefer-augmented-assignment` | hint | `prefix = prefix \| "X"` expressible as `prefix \|= "X"`, for a symbol target and an operator with an augmented form |
 | `S26` | `constant-condition` | hint | an `if` or `while` condition computed from literals alone, as `if 2^10 > 1000`, so one branch never runs |
+| `S27` | `redundant-method-codomain` | hint | an installation annotation repeats its method declaration’s `TypicalValue`; fix: remove the annotation and inherit the default |
+| `S28` | `composed-lambda` | hint | `x -> foo bar x` expressible as `foo @@ bar`, with named unary functions |
+| `S29` | `prefer-for-loop` | hint | a local counter initialized before a `while`, incremented once per iteration, and unused outside the loop |
+| `S30` | `redundant-for-start` | hint | an explicit `from 0` clause, the default start of a numeric `for` loop |
 | `D01` | `unknown-documentation-section` | error | a SimpleDoc keyword or `document` option that does not exist there |
 | `D02` | `malformed-documentation` | error | documentation SimpleDoc or `document` rejects: a repeated section, a multi-line headline, `Inputs` without `Usage`, … |
 | `D03` | `missing-documentation-key` | error | a documentation page without a `Key` |
 | `D04` | `long-headline` | warning | a headline over 100 characters |
 | `D05` | `undefined-documentation-key` | error | a key, `@TO@` link or `SeeAlso` entry nothing defines — `endPackage` would reject it |
 | `D06` | `duplicate-documentation` | error | a key documented twice, or both documented and listed in `undocumented` |
-| `D07` | `undocumented-export` | warning | an exported symbol without documentation in a package documented in the same file |
+| `D07` | `undocumented-export` | warning | a public export without a direct documentation key in its package, including loaded files |
 | `D08` | `documentation-outside-package` | error | documentation after `endPackage`, where no package can hold it |
 | `D09` | `documentation-before-begin` | error | `doc` before `beginDocumentation()`, which is what loads it |
+
+`S29` suggests a `for` loop for a counter such as:
+
+```m2
+scanText = text -> (
+    i := 0;
+    while i < #text do (print text#i; i += 1)
+)
+```
+
+Use `for i to #text - 1 do print text#i`, omitting the explicit initializer
+and increment. `for` starts at zero by default and its `to` bound is inclusive;
+`i <= #text` therefore becomes `for i to #text do`. A nonzero start retains a
+`from` clause. The hint accepts literal integer bounds and collection lengths,
+and skips loops that directly write to the collection whose length supplies the bound.
+This is an advisory hint without an automatic fix. It accepts `i += 1` and
+`i = i + 1` as final increments, and skips loops
+that otherwise change the counter, use it outside the loop, execute `continue`,
+or create closures that could expose the counter beyond its new scope.
+
+`S30` flags an explicit `from 0` in a numeric `for` loop. Its **Omit `from 0`**
+quick fix turns `for i from 0 to #text - 1 do …` into
+`for i to #text - 1 do …`, preserving header comments, bounds, and conditions.
+
+`D07` checks every `export` and `exportMutable` item, including exports in
+package fragments, even before you call `beginDocumentation()`. A direct `Key`
+for the public name in `document` or SimpleDoc satisfies the check; a method key
+such as `(f, ZZ)` or an option key such as `[f, Limit]` does not document `f`
+itself. Documentation in files loaded by the package counts, while pages in
+unrelated files or other packages do not. Use `undocumented {name}` in the
+package or its loaded documentation to exempt an intentionally undocumented item.
 
 Unused bindings are also tagged *unnecessary*, which most editors render by
 fading the name rather than underlining it.
@@ -369,3 +404,9 @@ Package fragments use their declared package's include order, rather than an
 arbitrary caller's globals. See [package context](../navigating/workspace-files.md#package-context).
 An unresolved use is an error even though the runtime can initially represent
 an unknown name as a Symbol.
+
+`S27` removes a repeated installation annotation. For example, after
+`specNet = method(Dispatch => Thing, TypicalValue => SpecNet)`, the installation
+`specNet SpecNet := SpecNet => identity` can be simplified to
+`specNet SpecNet := identity`. Differing annotations remain as overrides.
+The removal fix preserves the implementation and retains annotations containing comments.

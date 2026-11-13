@@ -11,6 +11,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task;
 use tower_lsp::lsp_types::{Location, Url};
 
+use crate::builtin_index::IndexedSourceLocation;
 use crate::document::DocumentSnapshot;
 use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::package_index::SourceResolver;
@@ -22,8 +23,9 @@ const LOAD_SEQUENCE: &str = "loadsequence";
 const MAX_CACHED_PACKAGES: usize = 8;
 /// Bound on unresolved package names retained to suppress repeated lookups.
 const MAX_MISSING_PACKAGES: usize = 128;
-/// Maximum source-file count indexed for one library package.
-const MAX_PACKAGE_FILES: usize = 64;
+/// Maximum source-file count indexed for one library package, allowing the
+/// complete Core load sequence to be searched within the source-byte budget.
+const MAX_PACKAGE_FILES: usize = 128;
 /// Maximum cumulative source bytes indexed for one library package.
 const MAX_PACKAGE_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -77,6 +79,11 @@ pub struct LibrarySources<'library> {
 }
 
 impl LibraryIndex {
+    /// Maximum indexing rounds for one navigation request. Each round visits
+    /// one file per requested package, allowing its full file budget while
+    /// terminating even when requests span more packages than the cache holds.
+    pub const MAX_INDEXING_STEPS: usize = MAX_PACKAGE_FILES;
+
     /// Creates an empty lazy library index using the supplied resolver and builtin registry.
     pub fn new(source_resolver: SourceResolver, registry: ObjectRegistry) -> Self {
         Self {
@@ -296,6 +303,42 @@ impl PackageSources {
 }
 
 impl LibrarySources<'_> {
+    /// Finds actual bindings in the file suggested by a catalog location.
+    ///
+    /// Catalog coordinates can denote a reference or belong to a different
+    /// source version. Parse the installed file and return only its bindings
+    /// of `name`, after the queued package search has finished. This also
+    /// supports definition files absent from the package's load sequence.
+    pub fn recorded_definitions(
+        &self,
+        name: &str,
+        recorded: &IndexedSourceLocation,
+    ) -> Vec<Location> {
+        if !self.wanted_packages.borrow().is_empty() {
+            return Vec::new();
+        }
+        let Some(file) = self.source_resolver().resolve_indexed_file(&recorded.file) else {
+            return Vec::new();
+        };
+        let Ok(uri) = Url::from_file_path(&file) else {
+            return Vec::new();
+        };
+        if !fs::metadata(&file).is_ok_and(|metadata| metadata.len() <= MAX_PACKAGE_SOURCE_BYTES) {
+            return Vec::new();
+        }
+        let Some(snapshot) = fs::read_to_string(file).ok().and_then(|text| {
+            DocumentSnapshot::from_text_for_navigation(text, &self.library.registry)
+        }) else {
+            return Vec::new();
+        };
+        snapshot
+            .analysis()
+            .binding_states()
+            .filter(|binding| binding.state.scope_idx == 0 && binding.name.name() == name)
+            .map(|binding| Location::new(uri.clone(), binding.state.span))
+            .collect()
+    }
+
     /// Package and file lookup configuration used by this index.
     pub fn source_resolver(&self) -> &SourceResolver {
         self.library.source_resolver()

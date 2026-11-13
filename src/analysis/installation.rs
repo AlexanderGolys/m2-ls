@@ -805,6 +805,41 @@ impl Analysis {
         }
     }
 
+    /// Finds an explicit installation annotation that repeats its method's
+    /// declared typical value. The returned range includes the annotation arrow
+    /// and following whitespace, leaving the installed expression intact.
+    /// Annotations containing comments are retained to avoid deleting commentary.
+    pub fn redundant_method_codomain(
+        &self,
+        assignment: &ExprAssign,
+        source: &(impl SyntaxSource + ?Sized),
+    ) -> Option<TextRange> {
+        let installation = self.installation_for(assignment, source)?;
+        let MethodHead::Function(name) = &installation.method.head else {
+            return None;
+        };
+        let function = self.function_at(name.name(), installation.span.start)?;
+        if !function.is_method_function() {
+            return None;
+        }
+        let parts = assignment.parts();
+        let annotation = codomain_annotation(&parts)?;
+        let annotated = ObjectName::new(annotation.symbol_name()?);
+        if function.typical_value.as_ref() != Some(&annotated) {
+            return None;
+        }
+        let value = match parts.value {
+            Expr::Option(option) => option.value.as_ref(),
+            value => value,
+        };
+        let start = source.syntax_bytes(annotation)?.start;
+        let end = source.syntax_bytes(value)?.start;
+        if source.source().text().get(start..end)?.contains("--") {
+            return None;
+        }
+        Some(source.range_for_bytes(start..end))
+    }
+
     /// Deduces an installed method's result class from its implementation and declared annotation.
     pub fn method_codomain_deduction(
         &self,

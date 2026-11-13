@@ -2,7 +2,7 @@
 
 use m2_syn::{
     frame_recovering, lex_str_recovering, nodes::Cell, CellStream, CellTokenStream, CommentTrivia,
-    File, LexError, LexErrorKind, NativeParseError, NativeParser, Parser, Spanned, Token, Trivia,
+    LexError, LexErrorKind, NativeParseError, NativeParser, Parser, Span, Spanned, Token, Trivia,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -26,8 +26,8 @@ struct CellData {
     source: Arc<str>,
     /// Independently owned generated cell, without a source-file wrapper.
     syntax: Option<Cell>,
-    /// Source identity shared by the cell syntax, trivia, and lexical diagnostics.
-    file: Option<File>,
+    /// Unlocated source snapshot shared by the cell syntax or its fatal diagnostic.
+    source_site: Option<Span>,
     /// Comments retained alongside the cell parse.
     trivia: Vec<Trivia>,
     /// Recoverable and fatal lexical errors for this cell.
@@ -94,17 +94,14 @@ impl ParsedCell {
             .collect()
     }
 
-    /// Source identity used to relocate the retained cell's spans.
-    pub fn file(&self) -> Option<File> {
-        self.data.file
-    }
-
-    /// Source identities used by syntax, diagnostics, and recovered trivia.
-    pub fn files(&self) -> impl Iterator<Item = File> + '_ {
-        self.file().into_iter().chain(
+    /// Unlocated source snapshots used by the cell's syntax and recovered trivia.
+    /// Snapshot identity stays unique even when the parser recycles compact file labels.
+    pub fn source_sites(&self) -> impl Iterator<Item = Span> + '_ {
+        self.data.source_site.clone().into_iter().chain(
             self.trivia()
                 .iter()
-                .filter_map(|trivia| trivia.try_span().map(|span| span.file())),
+                .filter_map(|trivia| trivia.try_span())
+                .map(|span| Span::unlocated(Arc::clone(span.source()))),
         )
     }
 
@@ -117,14 +114,17 @@ impl ParsedCell {
         let mut data = CellData {
             source: Arc::from(source),
             syntax: None,
-            file: None,
+            source_site: None,
             trivia: Vec::new(),
             lexer_diagnostics: Vec::new(),
             parse_error: None,
         };
         match lex_str_recovering(source) {
             Ok(recovered) => {
-                data.file = recovered.value.try_span().map(|span| span.file());
+                data.source_site = recovered
+                    .value
+                    .try_span()
+                    .map(|span| Span::unlocated(Arc::clone(span.source())));
                 let comments = CommentTrivia::of(&recovered.value);
                 data.trivia = comments
                     .outer()
@@ -132,9 +132,12 @@ impl ParsedCell {
                     .chain(comments.inner())
                     .cloned()
                     .collect();
-                data.file = data
-                    .file
-                    .or_else(|| data.trivia.first()?.try_span().map(|span| span.file()));
+                data.source_site = data.source_site.or_else(|| {
+                    data.trivia
+                        .first()?
+                        .try_span()
+                        .map(|span| Span::unlocated(Arc::clone(span.source())))
+                });
                 data.lexer_diagnostics = recovered.diagnostics;
                 let framed = frame_recovering(recovered.value);
                 let cells =
@@ -151,7 +154,8 @@ impl ParsedCell {
                             });
                         }
                         if let Some(cell) = &data.syntax {
-                            data.file = Some(cell.span().file());
+                            data.source_site =
+                                Some(Span::unlocated(Arc::clone(cell.span().source())));
                         }
                     }
                     Err(error) => data.parse_error = Some(error),
@@ -169,7 +173,7 @@ impl ParsedCell {
                             .collect();
                     }
                 }
-                data.file = Some(error.span().file());
+                data.source_site = Some(Span::unlocated(Arc::clone(error.span().source())));
                 data.lexer_diagnostics.push(error);
             }
         }

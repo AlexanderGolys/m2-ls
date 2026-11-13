@@ -26,6 +26,7 @@ use crate::object_registry::ObjectRegistry;
 use crate::source::{ByteRange, SourceNavigation, SyntaxSource};
 use crate::syntax::{AssignmentSyntax, ClauseSyntax, ControlSyntax, ExpressionSyntax};
 
+mod assigned_branches;
 mod augmented_assignment;
 mod boolean_comparison;
 mod composition;
@@ -34,7 +35,7 @@ mod null_binding;
 mod unary_call;
 
 use boolean_comparison::BooleanComparison;
-use composition::MappingComposition;
+use composition::{LambdaComposition, MappingComposition};
 use constructor_call::ConstructorCall;
 use unary_call::UnarySymbolCall;
 
@@ -56,6 +57,8 @@ pub enum RewriteKind {
     NullReturnGuard,
     /// Mapping a callback consisting of two composed unary function calls.
     MappingComposition,
+    /// A lambda forwarding its parameter through two unary function calls.
+    LambdaComposition,
     /// A Boolean expression strictly compared with `true` or `false`.
     BooleanComparison,
     /// A callback doing nothing but forwarding its parameter to a named function.
@@ -88,6 +91,7 @@ impl RewriteKind {
             self,
             Self::NullReturnGuard
                 | Self::MappingComposition
+                | Self::LambdaComposition
                 | Self::BooleanComparison
                 | Self::ForwardingLambda
                 | Self::PartialApplicationLambda
@@ -113,6 +117,7 @@ impl RewriteKind {
             Self::NullBranch => &catalog::UNNECESSARY_NULL_BRANCH,
             Self::NullReturnGuard => &catalog::NULL_RETURN_GUARD,
             Self::MappingComposition => &catalog::MAPPED_COMPOSITION,
+            Self::LambdaComposition => &catalog::COMPOSED_LAMBDA,
             Self::BooleanComparison => &catalog::REDUNDANT_BOOLEAN_COMPARISON,
             Self::ForwardingLambda => &catalog::FORWARDING_LAMBDA,
             Self::PartialApplicationLambda => &catalog::PARTIAL_APPLICATION_LAMBDA,
@@ -207,7 +212,7 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
                         .is_some_and(|comparison| {
                             comparison.is_applicable(analysis, source, knowledge)
                         }),
-                    RewriteKind::SelfInitializingConstructor => {
+                    RewriteKind::SelfInitializingConstructor | RewriteKind::LambdaComposition => {
                         let range = source.syntax_bytes(site.expression)?;
                         let drops_comment = source
                             .syntax()
@@ -226,8 +231,10 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
                         if drops_comment {
                             return None;
                         }
-                        site.kind = ConstructorCall::of(site.expression)?
-                            .kind(analysis, source, knowledge)?;
+                        if site.kind == RewriteKind::SelfInitializingConstructor {
+                            site.kind = ConstructorCall::of(site.expression)?
+                                .kind(analysis, source, knowledge)?;
+                        }
                         true
                     }
                     _ => true,
@@ -281,6 +288,13 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
         );
         let replacement = self.forwarding_lambda(expression);
         self.push(RewriteKind::ForwardingLambda, expression, None, replacement);
+        let replacement = self.lambda_composition(expression);
+        self.push(
+            RewriteKind::LambdaComposition,
+            expression,
+            None,
+            replacement,
+        );
         let replacement = self.partial_application_lambda(expression);
         self.push(
             RewriteKind::PartialApplicationLambda,
@@ -429,6 +443,29 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             && function != lambda.argument.text()
             && UnarySymbolCall::has_function_name(call.function))
         .then(|| self.text(call.function).trim().to_string())
+    }
+
+    /// Composition notation for a lambda passing its parameter through two
+    /// named unary functions. Parentheses protect the composition when the
+    /// lambda is an operand of an enclosing call or operator.
+    fn lambda_composition(&self, expression: &Expr) -> Option<String> {
+        let composition = LambdaComposition::of(expression)?;
+        if !composition.has_function_names() {
+            return None;
+        }
+        let replacement = format!(
+            "{} @@ {}",
+            self.text(composition.outer).trim(),
+            self.text(composition.inner).trim()
+        );
+        let needs_parentheses = self
+            .parent
+            .is_some_and(|parent| matches!(parent, Expr::Op(_)));
+        Some(if needs_parentheses {
+            format!("({replacement})")
+        } else {
+            replacement
+        })
     }
 
     /// Partial application for `y -> f(x, y)`, with a fixed symbol argument.
@@ -584,7 +621,11 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
         )
     }
 
-    /// The `??` form of an `if` that assigns a fallback when its subject is null.
+    /// The `??` form of an `if` assigning either a fallback when its subject is
+    /// null or its subject when non-null. An omitted branch can be replaced by
+    /// the target's previous value only when the conditional's result is unused.
+    /// A complete fallback chain can instead yield the value assigned on each
+    /// path, retaining statements before terminal assignments inside their blocks.
     fn coalescing_assignment(
         &self,
         conditional: &ExprIf,
@@ -599,6 +640,20 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             // `if x === null then x = v` yields `null` where `x ??= v` yields `x`,
             // so the two agree only when nothing uses the `if`'s own value.
             let (target, operator, fallback) = symbol_assignment(then_value)?;
+            if null_branch == NullBranch::Else {
+                return (discarded
+                    && operator == <Token![=]>::SPELLING
+                    && self.same_expression(fallback, subject))
+                .then(|| {
+                    (
+                        RewriteKind::Coalescence,
+                        format!(
+                            "{target} = {} ?? {target}",
+                            self.coalescence_subject(subject)
+                        ),
+                    )
+                });
+            }
             return (null_branch == NullBranch::Then
                 && discarded
                 && operator == <Token![=]>::SPELLING
@@ -615,13 +670,25 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             NullBranch::Then => (then_value, else_value),
             NullBranch::Else => (else_value, then_value),
         };
-        let (target, operator, fallback) = symbol_assignment(fallback_branch)?;
         let (repeated_target, repeated_operator, repeated_subject) =
             symbol_assignment(subject_branch)?;
-        if repeated_target != target
-            || repeated_operator != operator
-            || !self.same_expression(repeated_subject, subject)
-        {
+        if !self.same_expression(repeated_subject, subject) {
+            return None;
+        }
+        let Some((target, operator, fallback)) = symbol_assignment(fallback_branch) else {
+            if repeated_operator != <Token![=]>::SPELLING {
+                return None;
+            }
+            let fallback = self.assigned_branch_value(fallback_branch, repeated_target)?;
+            return Some((
+                RewriteKind::Coalescence,
+                format!(
+                    "{repeated_target} = {} ?? ({fallback})",
+                    self.coalescence_subject(subject)
+                ),
+            ));
+        };
+        if repeated_target != target || repeated_operator != operator {
             return None;
         }
         if operator == <Token![=]>::SPELLING && target == self.text(subject) {

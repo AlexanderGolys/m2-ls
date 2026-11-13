@@ -238,21 +238,18 @@ fn goto_symbol_response(
             return locations_response(installations);
         }
     }
+    // Catalog locations may identify the first read of a symbol, including
+    // a call on an assignment's right-hand side. Only source bindings and
+    // method installations establish a definition target.
     if matches!(target, NavigationTarget::Definition) {
-        if let Some(location) = library_record
+        if let Some(recorded) = library_record
             .as_ref()
             .and_then(|(_, record)| record.source_location())
-            .and_then(|located| {
-                let file = library
-                    .source_resolver()
-                    .resolve_indexed_file(&located.file)?;
-                Some(Location::new(
-                    Url::from_file_path(file).ok()?,
-                    located.range,
-                ))
-            })
         {
-            return Some(GotoDefinitionResponse::Scalar(location));
+            let definitions = library.recorded_definitions(node_text, recorded);
+            if !definitions.is_empty() {
+                return locations_response(definitions);
+            }
         }
     }
     // A library name is defined by its package, so it has a location only in

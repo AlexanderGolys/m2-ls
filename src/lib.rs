@@ -430,22 +430,23 @@ impl Backend {
 
     /// Run a navigation request at `position` against the library sources
     /// indexed so far; while it wanted packages that were not indexed yet,
-    /// index them off the session task and run it again.
+    /// index them off the session task and run it again. Allow enough rounds
+    /// for the library index's per-package file budget, so a definition near
+    /// the end of Core's load sequence remains reachable.
     async fn navigate<R>(
         &self,
         uri: &Url,
         position: Position,
         request: impl Fn(&DocumentSnapshot, &ObjectRegistry, WorkspaceView, &LibrarySources) -> R,
     ) -> Option<R> {
-        const MAX_INDEXING_STEPS: usize = 8;
-        for step in 0..=MAX_INDEXING_STEPS {
+        for step in 0..=LibraryIndex::MAX_INDEXING_STEPS {
             let library_index = self.library.snapshot();
             let library = library_index.sources();
             let response = self.with_source_at(uri, position, |document, knowledge, workspace| {
                 request(document, knowledge, workspace, &library)
             });
             let wanted_packages = library.into_wanted_packages();
-            if wanted_packages.is_empty() || step == MAX_INDEXING_STEPS {
+            if wanted_packages.is_empty() || step == LibraryIndex::MAX_INDEXING_STEPS {
                 return response;
             }
             library_index.index_packages(wanted_packages).await;
@@ -716,6 +717,7 @@ impl Backend {
             init_file.uri(),
             &settings.diagnostics,
             library.source_resolver(),
+            Some(&self.workspace_index),
         )
         .into_iter()
         .filter(|diagnostic| {
@@ -786,6 +788,7 @@ impl Backend {
             &settings.diagnostics,
             library.source_resolver(),
             version,
+            &self.workspace_index,
         )
         .await;
     }
@@ -853,6 +856,7 @@ impl Backend {
                             document.key(),
                             &settings.diagnostics,
                             library.source_resolver(),
+                            Some(&self.workspace_index),
                         ),
                     )
                 })
@@ -1021,9 +1025,25 @@ impl Backend {
         refreshed
     }
 
-    /// Publishes diagnostics after a source context changes, skipping a document
-    /// whose current operation already published its own diagnostics.
-    async fn publish_context_diagnostics(&self, files: Vec<Url>, exclude: Option<&Url>) {
+    /// Publishes diagnostics after a source context changes. Exporting documents
+    /// are also refreshed because documentation coverage can change independently
+    /// of their semantic registry. Skips the document already published by its operation.
+    async fn publish_context_diagnostics(&self, mut files: Vec<Url>, exclude: Option<&Url>) {
+        files.extend(
+            self.documents
+                .iter()
+                .filter(|document| {
+                    !document.packages().fragment_exports().is_empty()
+                        || document
+                            .packages()
+                            .declarations()
+                            .iter()
+                            .any(|package| !package.exports.is_empty())
+                })
+                .map(|document| document.key().clone()),
+        );
+        files.sort();
+        files.dedup();
         for uri in files {
             if Some(&uri) != exclude {
                 if let Some(document) = self.documents.get(&uri) {
@@ -1087,13 +1107,15 @@ impl Backend {
     }
 }
 
-/// Preserve panic diagnostics alongside request and stage timings.
+/// Preserve panic diagnostics on stderr as well as alongside request and stage timings.
 fn install_panic_logging() {
-    panic::set_hook(Box::new(|panic_info| {
+    let previous_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |panic_info| {
         telemetry::event(serde_json::json!({
             "operation": "panic", "message": panic_info.to_string(),
             "backtrace": Backtrace::force_capture().to_string(),
         }));
+        previous_hook(panic_info);
     }));
     telemetry::event(
         serde_json::json!({"operation": "startup", "version": env!("CARGO_PKG_VERSION")}),
@@ -1637,6 +1659,7 @@ impl LanguageServer for Backend {
                     uri,
                     &action_settings,
                     self.library.snapshot().source_resolver(),
+                    Some(&self.workspace_index),
                 );
                 for diagnostic in params
                     .context
@@ -1725,6 +1748,18 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
+
+        if let Some(document) = self.documents.get(uri) {
+            if let Some(tag) = document.documentation_text_tag_at(position) {
+                return Ok(Some(self.workspace_index.documentation_text_locations(
+                    uri,
+                    position,
+                    &tag.title,
+                    false,
+                    include_declaration,
+                )));
+            }
+        }
 
         // Resolve the target and the current file's references, then drop the
         // document guard before scanning other files (avoids holding a DashMap
@@ -1935,7 +1970,10 @@ impl LanguageServer for Backend {
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
         let uri = params.text_document.uri;
         Ok(self.with_document(&uri, |document| {
-            folding_ranges(crate::source::SyntaxSource::syntax(document))
+            folding_ranges(
+                crate::source::SyntaxSource::syntax(document),
+                document.package_documentation(),
+            )
         }))
     }
 
@@ -1957,6 +1995,16 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
+        if let Some(document) = self.documents.get(uri) {
+            if let Some(tag) = document.documentation_text_tag_at(position) {
+                let locations = self
+                    .workspace_index
+                    .documentation_text_locations(uri, position, &tag.title, true, true);
+                return Ok(
+                    (!locations.is_empty()).then_some(GotoDefinitionResponse::Array(locations))
+                );
+            }
+        }
         Ok(self
             .navigate(uri, position, |document, knowledge, workspace, library| {
                 goto_definition_response(
@@ -1978,6 +2026,16 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDeclarationResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
+        if let Some(document) = self.documents.get(uri) {
+            if let Some(tag) = document.documentation_text_tag_at(position) {
+                let locations = self
+                    .workspace_index
+                    .documentation_text_locations(uri, position, &tag.title, true, true);
+                return Ok(
+                    (!locations.is_empty()).then_some(GotoDefinitionResponse::Array(locations))
+                );
+            }
+        }
         Ok(self
             .navigate(uri, position, |document, knowledge, workspace, library| {
                 goto_declaration_response(

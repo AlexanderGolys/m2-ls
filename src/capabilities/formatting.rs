@@ -25,6 +25,7 @@ use tower_lsp::lsp_types::{
 
 use crate::document::DocumentSnapshot;
 use crate::node_metadata::{matches_token, SyntaxSnapshot};
+use crate::package_documentation::PackageDocumentation;
 
 mod layout;
 use crate::settings::FormattingSettings;
@@ -157,9 +158,13 @@ pub fn document_formatting_text_edits(
     }]
 }
 
-/// Foldable code, literal, and comment regions derived from the document syntax.
-pub fn folding_ranges(syntax: &SyntaxSnapshot) -> Vec<FoldingRange> {
-    folding_ranges_for_syntax(syntax)
+/// Foldable code, literals, comments, and nested SimpleDoc sections.
+/// Documentation folds retain their keyword line and exclude trailing blanks.
+pub fn folding_ranges(
+    syntax: &SyntaxSnapshot,
+    documentation: &PackageDocumentation,
+) -> Vec<FoldingRange> {
+    let mut ranges = folding_ranges_for_syntax(syntax)
         .into_iter()
         .map(|range| FoldingRange {
             start_line: range.start_line,
@@ -169,7 +174,23 @@ pub fn folding_ranges(syntax: &SyntaxSnapshot) -> Vec<FoldingRange> {
             kind: (range.kind == FormatFoldKind::Comment).then_some(FoldingRangeKind::Comment),
             collapsed_text: None,
         })
-        .collect()
+        .collect::<Vec<_>>();
+    ranges.extend(
+        documentation
+            .section_ranges()
+            .iter()
+            .map(|range| FoldingRange {
+                start_line: range.start.line,
+                start_character: None,
+                end_line: range.end.line,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: None,
+            }),
+    );
+    ranges.sort_by_key(|range| (range.start_line, range.end_line));
+    ranges.dedup_by_key(|range| (range.start_line, range.end_line));
+    ranges
 }
 
 /// A whitespace replacement expressed in the current layout's byte offsets.
@@ -2937,7 +2958,10 @@ mod tests {
     #[test]
     fn marks_comment_folds_for_lsp_clients() {
         let text = "-- first\n-- second\n";
-        let ranges = folding_ranges(&SyntaxSnapshot::parse(text, None));
+        let ranges = folding_ranges(
+            &SyntaxSnapshot::parse(text, None),
+            &PackageDocumentation::default(),
+        );
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].kind, Some(FoldingRangeKind::Comment));

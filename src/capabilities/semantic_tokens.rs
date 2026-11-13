@@ -123,7 +123,9 @@ impl SessionTokenClassifier<'_> {
             .flat_map(|token| {
                 if token.source_role == Some(SourceSemanticRole::RegularExpression) {
                     let bytes = token.span.bytes();
-                    let text = &self.session.snapshot.text()[bytes.clone()];
+                    let Some(text) = self.session.snapshot.text().get(bytes.clone()) else {
+                        return Vec::new();
+                    };
                     RegexTokens::new(text, bytes)
                         .runs()
                         .into_iter()
@@ -229,8 +231,10 @@ impl<'a> SemanticTokenEmitter<'a> {
             return false;
         };
         let source_bytes = source_token.span.bytes();
+        let Some(text) = self.document.text().get(source_bytes.clone()) else {
+            return false;
+        };
         if source_token.source_role == Some(SourceSemanticRole::RegularExpression) {
-            let text = &self.document.text()[source_bytes.clone()];
             for (bytes, kind) in RegexTokens::new(text, source_bytes).runs() {
                 self.push(SemanticSpan {
                     source: self.document.span_for_bytes(bytes),
@@ -350,8 +354,12 @@ impl<'a> SemanticTokenEmitter<'a> {
     }
 
     /// Appends a nonempty semantic span after splitting it into valid line-local protocol tokens.
+    /// Invalid byte ranges, including endpoints inside UTF-8 characters, are skipped.
     fn push(&mut self, span: SemanticSpan) -> bool {
         let bytes = span.bytes();
+        if self.document.text().get(bytes.clone()).is_none() {
+            return false;
+        }
         let mut boundaries = vec![bytes.start, bytes.end];
         for (context, _) in &self.contexts {
             boundaries.extend(
@@ -382,11 +390,18 @@ impl<'a> SemanticTokenEmitter<'a> {
         emitted
     }
 
-    /// Emit `token` over `ranges`, single-line ranges in document order.
+    /// Emit `token` over nonempty single-line ranges in document order.
+    /// Skip malformed or out-of-order ranges instead of underflowing delta coordinates.
     fn push_ranges(&mut self, ranges: Vec<TextRange>, token: M2SemanticToken) -> bool {
         let mut emitted = false;
         let (token_type, token_modifiers_bitset) = token.encode(self.settings);
         for range in ranges {
+            if range.start < self.previous
+                || range.start.line != range.end.line
+                || range.start.character >= range.end.character
+            {
+                continue;
+            }
             let delta_line = range.start.line - self.previous.line;
             let delta_start = if delta_line == 0 {
                 range.start.character - self.previous.character
@@ -590,7 +605,8 @@ where
     /// The token of what the name `mention` writes names: the binding it
     /// resolves to, an indexed object, or a workspace definition.
     fn mention_token(&self, mention: &SymbolMention) -> Option<M2SemanticToken> {
-        let name = mention.name(self.document.text());
+        let (start, end) = mention.byte_span();
+        let name = self.document.text().get(start..end)?;
         let knowledge = self.builtins.at(mention.range().start);
         let binding = self.document.mention_symbol(mention);
         let names_local = binding.as_ref().is_some_and(|binding| binding.is_local());
@@ -681,7 +697,7 @@ where
                         M2SemanticToken::new(M2SemanticTokenType::Annotation)
                     }
                     DocumentationMarkupKind::OptionName => {
-                        let name = &self.document.text()[markup.bytes.clone()];
+                        let name = self.document.text().get(markup.bytes.clone())?;
                         let binding = self
                             .document
                             .mention_symbol(&SymbolMention::new(source.clone()));
@@ -731,13 +747,14 @@ where
     }
 
     /// The token `source_token` of the classifier's document is emitted as.
+    /// Tokens whose byte ranges do not select valid document text are skipped.
     fn semantic_span(
         &self,
         source_token: &SourceSemanticToken,
         augments_syntax_tokens: bool,
     ) -> Option<SemanticSpan> {
         let position = source_token.span.range().start;
-        let source_text = &self.document.text()[source_token.span.bytes()];
+        let source_text = self.document.text().get(source_token.span.bytes())?;
         let binding = source_token
             .is_symbol
             .then(|| {
@@ -836,7 +853,7 @@ where
         binding: Option<(BindingView<'_>, bool)>,
         emit_syntax: bool,
     ) -> Option<M2SemanticToken> {
-        let source_text = &self.document.text()[source_token.span.bytes()];
+        let source_text = self.document.text().get(source_token.span.bytes())?;
         let position = source_token.span.range().start;
         let knowledge = self.builtins.at(position);
         let token = classify_source_semantic_token(
@@ -895,6 +912,65 @@ mod tests {
 
     fn document(text: &str, builtins: &ObjectRegistry) -> DocumentSnapshot {
         DocumentSnapshot::from_text(text.to_string(), builtins).expect("fixture should parse")
+    }
+
+    /// Invalid spans must not panic in either classifier or embedded-token paths.
+    #[test]
+    fn invalid_semantic_spans_are_skipped() {
+        let builtins = ObjectRegistry::default();
+        let document = document("x = \"é\"\n", &builtins);
+        let workspace = WorkspaceIndex::default();
+        let settings = SemanticTokenSettings::default();
+        let uri = Url::parse("file:///invalid-spans.m2").expect("valid fixture URI");
+        let classifier = SemanticTokenClassifier {
+            document: &document,
+            builtins: &builtins,
+            workspace_index: &workspace,
+            settings: &settings,
+            uri: &uri,
+        };
+        let mut emitter = SemanticTokenEmitter::new(&document, &settings);
+        let original = &document.analysis().source_semantic_tokens()[0];
+        let reversed = (2..3).end..(2..3).start;
+        for bytes in [0..document.text().len() + 1, 100..101, 6..7, reversed] {
+            let mut token = original.clone();
+            token.span = document.span_for_bytes(bytes);
+            for augments_syntax in [false, true] {
+                assert!(classifier.semantic_span(&token, augments_syntax).is_none());
+                assert!(classifier
+                    .classify(&token, None, !augments_syntax)
+                    .is_none());
+                token.syntax_token_type = Some(M2SemanticTokenType::String);
+                token.source_role = Some(SourceSemanticRole::RegularExpression);
+                assert!(!emitter.emit_embedded_tokens(&token, &[], &[], augments_syntax));
+            }
+            assert!(!emitter.push(SemanticSpan {
+                source: token.span,
+                token: M2SemanticToken::new(M2SemanticTokenType::Variable),
+            }));
+        }
+        assert!(emitter.finish().is_empty());
+        assert!(classifier.semantic_span(original, false).is_some());
+    }
+
+    /// Malformed or stale coordinates cannot underflow protocol token deltas.
+    #[test]
+    fn invalid_semantic_coordinates_are_skipped() {
+        let builtins = ObjectRegistry::default();
+        let document = document("x = 1\nx\n", &builtins);
+        let settings = SemanticTokenSettings::default();
+        let mut emitter = SemanticTokenEmitter::new(&document, &settings);
+        let token = M2SemanticToken::new(M2SemanticTokenType::Variable);
+        assert!(emitter.push_ranges(vec![TextRange::new(pos!(1, 0), pos!(1, 1))], token));
+        for range in [
+            TextRange::new(pos!(0, 0), pos!(0, 1)),
+            TextRange::new(pos!(1, 2), pos!(1, 1)),
+            TextRange::new(pos!(1, 1), pos!(1, 1)),
+            TextRange::new(pos!(1, 1), pos!(2, 0)),
+        ] {
+            assert!(!emitter.push_ranges(vec![range], token));
+        }
+        assert_eq!(emitter.finish().len(), 1);
     }
 
     /// `symbol` and `list` are spelled the same as the grammar's *named* node
@@ -1706,7 +1782,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             let counter_column = text.lines().nth(2).unwrap().find("counter").unwrap() as u32;
             assert_eq!(
                 token_type_at(&tokens, 2, counter_column),
-                (!augments_syntax).then_some(M2SemanticTokenType::String as u32)
+                Some(M2SemanticTokenType::String as u32)
             );
             let hook_column = text.lines().nth(2).unwrap().find("hook").unwrap() as u32;
             let hook = token_at(&tokens, 2, hook_column).unwrap();

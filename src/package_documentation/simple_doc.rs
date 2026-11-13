@@ -357,6 +357,14 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             let keyword_bytes = section.keyword_line.text.clone();
             match self.keyword(&section) {
                 Some(keyword) if context.accepts(keyword) => {
+                    if let Some(last) = section.nonblank().last() {
+                        let range = self
+                            .source
+                            .range_for_bytes(keyword_bytes.start..last.text.end);
+                        if range.start.line < range.end.line {
+                            self.documentation.section_ranges.push(range);
+                        }
+                    }
                     self.documentation.markup.push(DocumentationMarkup {
                         bytes: keyword_bytes,
                         kind: DocumentationMarkupKind::SectionKeyword,

@@ -61,6 +61,34 @@ const FMT: &str = env!("CARGO_BIN_EXE_m2-fmt");
 const LINT: &str = env!("CARGO_BIN_EXE_m2-lint");
 const SERVER: &str = env!("CARGO_BIN_EXE_m2-ls");
 
+/// The standalone linter shares package-wide coverage with the editor and counts
+/// documentation in included files even without a local documentation section.
+#[test]
+fn lint_checks_exports_against_loaded_documentation() {
+    let workspace = Workspace::new();
+    fs::write(workspace.0.join("P.m2"), "newPackage \"P\"\nexport {\"covered\", \"missing\"}\ncovered = 1\nmissing = 2\nload \"docs.m2\"\nendPackage \"P\"\n").unwrap();
+    fs::write(workspace.0.join("docs.m2"), "document {Key => covered}\n").unwrap();
+    let output = workspace.run(LINT, &["--deny-warnings", "P.m2"], "");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let findings = text
+        .lines()
+        .filter(|line| line.contains("D07"))
+        .collect::<Vec<_>>();
+    assert_eq!(findings.len(), 1, "{output:?}");
+    assert!(findings[0].contains("`missing`"), "{output:?}");
+    assert!(!output.status.success());
+    fs::write(
+        workspace.0.join("docs.m2"),
+        "document {Key => covered}\nundocumented {missing}\n",
+    )
+    .unwrap();
+    let output = workspace.run(LINT, &["P.m2"], "");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("D07"),
+        "{output:?}"
+    );
+}
+
 #[test]
 fn server_can_prepare_a_catalog_without_starting_a_session() {
     let workspace = Workspace::new();

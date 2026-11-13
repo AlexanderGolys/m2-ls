@@ -1,11 +1,11 @@
-//! Typed recognition and semantic checks for mapping a composed callback.
+//! Typed recognition of composed lambdas and semantic checks for mapping them.
 
 use m2_syn::nodes::{Expr, ExprLambda, ExprOp, ExprOpBin, ExprOpBinAdj};
 
 use crate::analysis::Analysis;
 use crate::object_registry::ObjectRegistry;
 use crate::source::SyntaxSource;
-use crate::syntax::{BoundSymbols, ExpressionSyntax, LambdaSyntax};
+use crate::syntax::ExpressionSyntax;
 use crate::typesystem::{TypeKnowledge, TypeRole};
 
 use super::unary_call::UnarySymbolCall;
@@ -44,31 +44,12 @@ impl<'ast> MappingComposition<'ast> {
         let [Some(collection), Some(callback)] = arguments.as_slice() else {
             return None;
         };
-        let Expr::Lambda(callback) = UnarySymbolCall::grouped_value(callback)? else {
-            return None;
-        };
-        // A variadic parameter can receive a Sequence as one value; a fixed
-        // `(x) -> ...` parameter unpacks it and has different call semantics.
-        if !matches!(callback, ExprLambda::Variadic(_)) {
-            return None;
-        }
-        let parameters = callback.bound_symbols();
-        let [parameter] = parameters.as_slice() else {
-            return None;
-        };
-        let outer = UnarySymbolCall::of(callback.body())?;
-        let inner = UnarySymbolCall::of(outer.argument)?;
-        if inner.argument.symbol_name()? != parameter.text()
-            || outer.function.symbol_name()? == parameter.text()
-            || inner.function.symbol_name()? == parameter.text()
-        {
-            return None;
-        }
+        let composition = LambdaComposition::of(UnarySymbolCall::grouped_value(callback)?)?;
         Some(Self {
             call,
             collection,
-            outer: outer.function,
-            inner: inner.function,
+            outer: composition.outer,
+            inner: composition.inner,
         })
     }
 
@@ -98,5 +79,47 @@ impl<'ast> MappingComposition<'ast> {
             && [self.outer, self.inner]
                 .into_iter()
                 .all(UnarySymbolCall::has_function_name)
+    }
+}
+
+/// Two unary calls forwarding a variadic lambda's sole parameter.
+/// Named callees avoid hoisting computed expressions out of the callback.
+#[derive(Debug, Clone, Copy)]
+pub struct LambdaComposition<'ast> {
+    /// Function applied to the inner call's result.
+    pub outer: &'ast Expr,
+    /// Function receiving the forwarded parameter.
+    pub inner: &'ast Expr,
+}
+
+impl<'ast> LambdaComposition<'ast> {
+    /// Recognizes `x -> outer(inner x)` with statement-free grouping.
+    /// Fixed parameter lists unpack sequences differently and are excluded,
+    /// as are extra arguments and callees referring to the removed parameter.
+    pub fn of(expression: &'ast Expr) -> Option<Self> {
+        let Expr::Lambda(ExprLambda::Variadic(lambda)) = expression else {
+            return None;
+        };
+        let outer = UnarySymbolCall::of(&lambda.body)?;
+        let inner = UnarySymbolCall::of(outer.argument)?;
+        let parameter = lambda.argument.text();
+        if inner.argument.symbol_name()? != parameter
+            || outer.function.symbol_name()? == parameter
+            || inner.function.symbol_name()? == parameter
+        {
+            return None;
+        }
+        Some(Self {
+            outer: outer.function,
+            inner: inner.function,
+        })
+    }
+
+    /// Whether both callees follow the lowercase function naming convention.
+    /// PascalCase names may denote constructors rather than functions.
+    pub fn has_function_names(self) -> bool {
+        [self.outer, self.inner]
+            .into_iter()
+            .all(UnarySymbolCall::has_function_name)
     }
 }

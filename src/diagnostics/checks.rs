@@ -6,6 +6,7 @@
 //! check inspects what its occasion provides and spawns the diagnostics it
 //! finds into the [`DiagnosticSink`], under whichever rules apply.
 
+mod counted_loop;
 mod document;
 mod documentation;
 mod expressions;
@@ -170,10 +171,11 @@ pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
         syntax,
         source,
     };
-    let mut naming = DiagnosticSink::default();
-    document::naming_conventions(&context, &mut naming);
+    let mut positioned = DiagnosticSink::default();
+    document::naming_conventions(&context, &mut positioned);
+    counted_loop::CountedLoops::spawn(&context, &mut positioned);
     sink.diagnostics
-        .extend(naming.diagnostics.into_iter().filter(|diagnostic| {
+        .extend(positioned.diagnostics.into_iter().filter(|diagnostic| {
             source
                 .bytes_for_range(diagnostic.finding.range)
                 .is_some_and(selected)

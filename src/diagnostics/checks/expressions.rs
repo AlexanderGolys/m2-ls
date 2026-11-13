@@ -13,7 +13,7 @@ use std::ptr;
 
 use m2_syn::nodes::{
     AssignmentArgument, AssignmentList, AssignmentListContent, Expr, ExprAssign, ExprCollection,
-    ExprControl, ExprIf, ExprLambda, ExprLiteral, ExprOp, ExprOpBin, ExprOpBinAdj, Symbol,
+    ExprControl, ExprFor, ExprIf, ExprLambda, ExprLiteral, ExprOp, ExprOpBin, ExprOpBinAdj, Symbol,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Delimiter, DelimiterValue, Span, Spanned, Token};
@@ -181,6 +181,7 @@ impl<'a> ExpressionChecks<'a, '_> {
         self.option_key_convention(expression, &knowledge);
         self.rewrite(expression, RewriteKind::RedundantControlParentheses);
         self.coalescence(expression);
+        self.default_for_start(expression);
         self.null_binding(expression);
         self.simplification(expression);
         if let Some(call) = call {
@@ -529,6 +530,48 @@ impl<'a> ExpressionChecks<'a, '_> {
             _ => return,
         };
         self.spawn(rule, expression, message);
+    }
+
+    /// Flags a literal `from 0`, since numeric `for` loops start at zero by
+    /// default. The recorded edit removes only the keyword and integer spelling,
+    /// retaining comments between them and the remainder of the loop header.
+    fn default_for_start(&mut self, expression: &Expr) {
+        let Expr::For(ExprFor::Range(loop_)) = expression else {
+            return;
+        };
+        let Some(bound) = &loop_.lower_bound else {
+            return;
+        };
+        let Expr::Literal(ExprLiteral::Integer(integer)) = bound.value.as_ref() else {
+            return;
+        };
+        if integer.text().parse::<u64>() != Ok(0) {
+            return;
+        }
+        let source = self.context.source;
+        let (Some(keyword), Some(value)) = (
+            source.syntax_bytes(&bound.from_token),
+            source.syntax_bytes(integer),
+        ) else {
+            return;
+        };
+        let end = value.start + integer.text().len();
+        let range = source.range_for_bytes(keyword.start..end);
+        let mut start = keyword.start;
+        let text = source.text();
+        while start > 0 && matches!(text.as_bytes()[start - 1], b' ' | b'\t') {
+            start -= 1;
+        }
+        let trivia = &text[keyword.start + <Token![from]>::SPELLING.len()..value.start];
+        let replacement = if trivia.trim().is_empty() { "" } else { trivia };
+        self.sink.spawn(
+            &catalog::REDUNDANT_FOR_START,
+            Finding::new(range, "`for` starts at zero by default; omit `from 0`").with_fix(
+                "Omit `from 0`",
+                source.range_for_bytes(start..end),
+                replacement,
+            ),
+        );
     }
 
     /// A conditional that `??` or `??=` expresses.
@@ -1200,6 +1243,20 @@ impl<'a> ExpressionChecks<'a, '_> {
     /// A method installation whose codomain inference can supply, or whose
     /// annotated codomain contradicts the inferred result type.
     fn install_codomain(&mut self, assignment: &ExprAssign, knowledge: &ObjectRegistryView<'_>) {
+        if let Some(range) = self
+            .context
+            .analysis
+            .redundant_method_codomain(assignment, self.context.source)
+        {
+            self.sink.spawn(
+                &catalog::REDUNDANT_METHOD_CODOMAIN,
+                Finding::new(
+                    range,
+                    "This annotation repeats the method's TypicalValue and can be removed.",
+                )
+                .with_fix("Remove redundant codomain annotation", range, ""),
+            );
+        }
         let Some(deduction) = self.context.analysis.method_codomain_deduction(
             assignment,
             self.context.source,

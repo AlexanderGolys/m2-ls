@@ -94,8 +94,10 @@ default-loaded package baseline) is mandatory for a usable catalog; the server
 continues with source analysis when no valid catalog can be loaded. The catalog
 is never embedded in the executable or included in the crate archive.
 
-The catalog is published as the `m2-index.jsonl` asset of each M2Book release,
-next to its `m2-index.jsonl.sha256` checksum. The server follows the latest compatible `0.1.*`
+The catalog is published as the one `.jsonl` asset of each M2Book release, under
+any name: `gh release create v0.1.3 m2-index.jsonl` publishes it. The server
+verifies the download against the SHA-256 digest GitHub records for that asset,
+so no checksum file is needed. It follows the latest compatible `0.1.*`
 release by default (`M2_LS_CATALOG_VERSION` accepts Cargo-style constraints)
 and refuses a download that does not match the wire format, so release an
 incompatible format change together with the server that reads it.

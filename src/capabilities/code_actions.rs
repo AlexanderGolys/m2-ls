@@ -157,6 +157,7 @@ fn rewrite_title(site: &RewriteSite<'_>) -> &'static str {
         RewriteKind::Coalescence => "Use `??` coalescence",
         RewriteKind::InlinedNullBinding => "Inline null-tested local with `??`",
         RewriteKind::MappingComposition => "Simplify mapped composition",
+        RewriteKind::LambdaComposition => "Replace lambda with composition",
         RewriteKind::BooleanComparison => "Simplify Boolean comparison",
         RewriteKind::PartialApplicationLambda => "Replace lambda with partial application",
         RewriteKind::SelfInitializingConstructor => "Use self-initializing constructor call",
@@ -536,6 +537,7 @@ impl<'a> CodeActionContext<'a, '_> {
             parentheses,
             self.innermost_site(RewriteKind::BooleanComparison),
             self.innermost_site(RewriteKind::ForwardingLambda),
+            self.innermost_site(RewriteKind::LambdaComposition),
             self.innermost_site(RewriteKind::PartialApplicationLambda),
             self.innermost_site(RewriteKind::SelfInitializingConstructor),
             self.innermost_site(RewriteKind::HeaderConstructor),
@@ -933,6 +935,7 @@ mod tests {
             &uri,
             &DiagnosticSettings::default(),
             &SourceResolver::default(),
+            None,
         );
         let action = fix_all_action(&document, &uri, &diagnostics, &FormatOptions::default())
             .expect("file-wide fixes should be offered");
@@ -957,6 +960,7 @@ mod tests {
             &uri,
             &DiagnosticSettings::default(),
             &SourceResolver::default(),
+            None,
         );
         assert!(
             fix_all_action(&rewritten, &uri, &diagnostics, &FormatOptions::default()).is_none()
@@ -974,6 +978,7 @@ mod tests {
             &uri,
             &DiagnosticSettings::default(),
             &SourceResolver::default(),
+            None,
         );
         let action =
             fix_all_action(&document, &uri, &diagnostics, &FormatOptions::default()).unwrap();
@@ -999,6 +1004,7 @@ mod tests {
             &uri,
             &DiagnosticSettings::default(),
             &SourceResolver::default(),
+            None,
         );
         assert!(available_code_actions(
             &document,
@@ -1078,6 +1084,7 @@ mod tests {
                         &uri,
                         &DiagnosticSettings::default(),
                         &SourceResolver::default(),
+                        None,
                     );
                     let expression_start = rewritten_expression_start(&document);
                     let actions = available_code_actions(

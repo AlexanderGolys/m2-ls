@@ -2,7 +2,7 @@
 
 use serde_json::{json, Value};
 
-use crate::support::{position, response_array, DocumentSession};
+use crate::support::{document_position, position, response_array, DocumentSession};
 
 fn diagnostic_lines(session: &DocumentSession, code: &str) -> Vec<u64> {
     session
@@ -121,6 +121,7 @@ async fn inlay_hints(session: &mut DocumentSession) -> Vec<Value> {
         .expect("expected inlay hints")
 }
 
+/// Decodes a complete semantic-token response into absolute positions and classifications.
 async fn semantic_tokens(session: &mut DocumentSession) -> Vec<(u64, u64, u64, u64)> {
     let response = session
         .request(
@@ -158,6 +159,28 @@ async fn semantic_tokens(session: &mut DocumentSession) -> Vec<(u64, u64, u64, u
             )
         })
         .collect()
+}
+
+/// Shortening, emptying, and restoring Unicode documents must leave full-token requests usable.
+#[tokio::test]
+async fn semantic_tokens_survive_document_replacements() {
+    let original = "longName = \"é😀\"\nsecondName = longName\nsecondName\n";
+    let mut session = DocumentSession::open(original).await;
+    let expected = semantic_tokens(&mut session).await;
+    assert!(!expected.is_empty());
+    for replacement in ["x\n", "", "\"é😀\"\n", "x = (\n", original] {
+        session.replace(replacement).await;
+        let tokens = semantic_tokens(&mut session).await;
+        if replacement.is_empty() {
+            assert!(tokens.is_empty());
+        } else {
+            assert!(!tokens.is_empty(), "{replacement:?}");
+        }
+        if replacement == original {
+            assert_eq!(tokens, expected);
+        }
+    }
+    session.shutdown().await;
 }
 
 fn token_at(
@@ -1968,7 +1991,7 @@ async fn boolean_comparisons_offer_simplification_hints_and_quick_fixes() {
     session.shutdown().await;
 }
 
-/// Unary forwarding and fixed-first-argument callbacks have separate diagnostics
+/// Unary forwarding, composition, and fixed-first-argument callbacks have separate diagnostics
 /// and edits, including parenthesized calls. Statements and parameter-dependent
 /// callees or fixed arguments keep their callback wrappers.
 #[tokio::test]
@@ -2016,6 +2039,30 @@ async fn forwarding_callbacks_have_separate_rules_and_quick_fixes() {
             "Replace lambda with partial application",
             "f_x",
         ),
+        (
+            "x -> foo bar x",
+            "S28",
+            "Replace lambda with composition",
+            "foo@@bar",
+        ),
+        (
+            "x -> foo(bar(x))",
+            "S28",
+            "Replace lambda with composition",
+            "foo@@bar",
+        ),
+        (
+            "x -> ((foo (bar((x)))))",
+            "S28",
+            "Replace lambda with composition",
+            "foo@@bar",
+        ),
+        (
+            "accept (x -> foo bar x)",
+            "S28",
+            "Replace lambda with composition",
+            "foo@@bar",
+        ),
     ];
     let mut session = DocumentSession::open("").await;
     for (expression, code, title, replacement) in cases {
@@ -2037,11 +2084,16 @@ async fn forwarding_callbacks_have_separate_rules_and_quick_fixes() {
                 assert_eq!(hints[0]["severity"], 4);
                 assert_eq!(
                     hints[0]["message"],
-                    format!("This expression can be simplified to `{replacement}`")
+                    format!(
+                        "This expression can be simplified to `{}`",
+                        replacement.replace("@@", " @@ ")
+                    )
                 );
             }
             let uri = session.uri().to_string();
-            let position = json!({"line": usize::from(suppressed), "character": 9});
+            let line = usize::from(suppressed);
+            let character = source.lines().nth(line).unwrap().find("->").unwrap();
+            let position = json!({"line": line, "character": character});
             let response = session
                 .request(
                     "textDocument/codeAction",
@@ -2068,6 +2120,19 @@ async fn forwarding_callbacks_have_separate_rules_and_quick_fixes() {
         }
     }
     for expression in [
+        "x -> foo bar other",
+        "x -> x bar x",
+        "x -> foo x x",
+        "x -> foo(bar(x, x))",
+        "x -> foo(bar x, x)",
+        "x -> (getFunction x)(bar x)",
+        "x -> Constructor bar x",
+        "x -> foo Constructor x",
+        "(x) -> foo bar x",
+        "(x, y) -> foo bar x",
+        "x -> (print x; foo bar x)",
+        "x -> foo(bar(print x; x))",
+        "x -> (foo -- keep this comment\n bar x)",
         "c -> inlineOf other",
         "c -> c c",
         "c -> (print c; inlineOf c)",
@@ -2091,7 +2156,9 @@ async fn forwarding_callbacks_have_separate_rules_and_quick_fixes() {
             session
                 .diagnostics()
                 .iter()
-                .all(|diagnostic| diagnostic["code"] != "S14" && diagnostic["code"] != "S18"),
+                .all(|diagnostic| diagnostic["code"] != "S14"
+                    && diagnostic["code"] != "S18"
+                    && diagnostic["code"] != "S28"),
             "unexpected forwarding rewrite for `{expression}`"
         );
     }
@@ -4863,8 +4930,7 @@ async fn string_tokens_distinguish_patterns_packages_and_ordinary_text() {
         "\"lines\"",
         "\"local\"",
     ] {
-        // This client augments syntax highlighting, so ordinary strings may
-        // be omitted from semantic tokens and colored by the editor instead.
+        // Ordinary strings remain semantic tokens alongside syntax highlighting.
         let position = position(source, needle, 0);
         let token_type = tokens
             .iter()
@@ -4873,8 +4939,9 @@ async fn string_tokens_distinguish_patterns_packages_and_ordinary_text() {
                     && *character == position["character"].as_u64().unwrap()
             })
             .map(|(_, _, token_type, _)| *token_type);
-        assert!(
-            token_type.is_none() || token_type == Some(session.semantic_token_type("string")),
+        assert_eq!(
+            token_type,
+            Some(session.semantic_token_type("string")),
             "{needle}: {token_type:?}"
         );
     }
@@ -5720,6 +5787,105 @@ async fn types_used_as_table_keys_are_properties() {
     session.shutdown().await;
 }
 
+/// Repeated typical values are hints with an edit preserving the implementation.
+#[tokio::test]
+async fn redundant_method_codomains_offer_removal() {
+    let mut session = DocumentSession::open("").await;
+    for implementation in ["identity", "x -> x", "(x -> x)"] {
+        let source = format!("specNet = method(Dispatch => Thing, TypicalValue => SpecNet)\nspecNet SpecNet := SpecNet => {implementation}\n");
+        session.replace(&source).await;
+        let diagnostic = session
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic["code"] == "S27")
+            .expect("repeated typical value should be a hint")
+            .clone();
+        assert_eq!(diagnostic["severity"], 4);
+        let uri = session.uri().to_string();
+        let response = session
+            .request(
+                "textDocument/codeAction",
+                json!({
+                    "textDocument": {"uri": uri},
+                    "range": diagnostic["range"],
+                    "context": {"diagnostics": [diagnostic]}
+                }),
+            )
+            .await;
+        let action = response_array(&response)
+            .iter()
+            .find(|action| action["title"] == "Remove redundant codomain annotation")
+            .expect("redundant annotation should have a removal fix");
+        let edit = &action["edit"]["changes"][&uri][0];
+        assert_eq!(edit["newText"], "");
+        assert_eq!(
+            edit["range"],
+            json!({
+                "start": {"line": 1, "character": 19},
+                "end": {"line": 1, "character": 30}
+            })
+        );
+        session.replace(&source.replace("SpecNet => ", "")).await;
+        assert!(!session.diagnostic_codes().contains(&"S27"));
+    }
+    for source in [
+        "f = method(TypicalValue => List)\nf ZZ := Array => x -> [x]\n",
+        "f = method()\nf ZZ := List => x -> {x}\n",
+        "f = method(TypicalValue => List)\nf ZZ := x -> {x}\n",
+        "f = method(TypicalValue => List)\nf ZZ := List => -- keep this comment\n x -> {x}\n",
+    ] {
+        replace_and_assert_diagnostic(&mut session, source, "S27", false).await;
+    }
+    session.shutdown().await;
+}
+
+/// Every domain receives the redundant-annotation hint, and Fix All removes
+/// all repeated codomains while preserving the installed function bodies.
+#[tokio::test]
+async fn redundant_method_codomains_are_fixed_across_all_domains() {
+    let source = concat!(
+        "specNet = method(Dispatch => Thing, TypicalValue => SpecNet)\n",
+        "specNet Nothing := SpecNet => value -> word(\"null\", Nothing)\n",
+        "specNet Boolean := SpecNet => value -> word(toString value, Boolean)\n",
+        "specNet String := SpecNet => value -> word(value, String)\n",
+        "specNet Package := SpecNet => value -> word(toString value, Package)\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    assert_eq!(diagnostic_lines(&session, "S27"), vec![1, 2, 3, 4]);
+    let uri = session.uri().to_string();
+    let diagnostics = session.diagnostics().to_vec();
+    let response = session
+        .request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": uri},
+                "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 0}},
+                "context": {"diagnostics": diagnostics}
+            }),
+        )
+        .await;
+    let action = response_array(&response)
+        .iter()
+        .find(|action| action["kind"] == "source.fixAll")
+        .expect("file-wide fix should include every redundant codomain");
+    let edits = action["edit"]["changes"][&uri].as_array().unwrap();
+    assert_eq!(edits.len(), 4);
+    let mut lines = source.lines().map(str::to_string).collect::<Vec<_>>();
+    for edit in edits.iter().rev() {
+        let range = &edit["range"];
+        let line = range["start"]["line"].as_u64().unwrap() as usize;
+        assert_eq!(range["end"]["line"], line);
+        let start = range["start"]["character"].as_u64().unwrap() as usize;
+        let end = range["end"]["character"].as_u64().unwrap() as usize;
+        lines[line].replace_range(start..end, edit["newText"].as_str().unwrap());
+    }
+    let fixed = lines.join("\n") + "\n";
+    assert_eq!(fixed, source.replace("SpecNet => ", ""));
+    session.replace(&fixed).await;
+    assert!(!session.diagnostic_codes().contains(&"S27"));
+    session.shutdown().await;
+}
+
 /// Documentation refactors preserve SimpleDoc's template and insert before each declaration.
 #[tokio::test]
 async fn simple_doc_placeholders_cover_declarations_and_options() {
@@ -5923,6 +6089,219 @@ async fn documentation_prose_and_embedded_code_have_distinct_tokens() {
             modifiers & session.semantic_token_modifier("documentation"),
             0,
             "{text}"
+        );
+    }
+    session.shutdown().await;
+}
+
+/// SimpleDoc sections fold independently, including nested sections and multiple nodes.
+#[tokio::test]
+async fn documentation_sections_have_nested_folding_ranges() {
+    let source = concat!(
+        "doc ///\n",
+        "Node\n",
+        "  Key\n    firstPage\n",
+        "  Description\n",
+        "    Text\n      First paragraph.\n      Second line.\n",
+        "\n",
+        "    Example\n      x = 1\n      x + 1\n",
+        "  Caveat\n",
+        "Node\n",
+        "  Key\n    secondPage\n",
+        "  Usage\n    f x\n",
+        "///\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let response = session
+        .request(
+            "textDocument/foldingRange",
+            json!({"textDocument": {"uri": session.uri()}}),
+        )
+        .await;
+    let sections = response_array(&response)
+        .iter()
+        .filter(|range| range["kind"] == "region")
+        .map(|range| {
+            (
+                range["startLine"].as_u64().unwrap(),
+                range["endLine"].as_u64().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sections,
+        vec![
+            (1, 12),
+            (2, 3),
+            (4, 11),
+            (5, 7),
+            (9, 11),
+            (13, 17),
+            (14, 15),
+            (16, 17)
+        ]
+    );
+    assert!(
+        response_array(&response)
+            .iter()
+            .any(|range| range["startLine"] == 0 && range["endLine"] == 18),
+        "the whole string still folds: {response}"
+    );
+    session.shutdown().await;
+}
+
+/// Overview title references span SimpleDoc and hypertext without treating link labels as keys.
+#[tokio::test]
+async fn quoted_documentation_titles_support_navigation_and_references() {
+    let source = concat!(
+        "doc ///\nKey\n  \"Guide to rings\"\n  \"Guide alias\"\nDescription\n  Text\n",
+        "    @TO \"Guide to rings\"@ @TOH \"Guide to rings\"@ @TO2 {\"Guide to rings\", \"label\"}@\n",
+        "SeeAlso\n  \"Guide to rings\"\nSubnodes\n  \"Guide to rings\"\n///\n",
+    );
+    let related = "document {Key => \"Other page\", TO \"Guide to rings\", TO2(\"Guide to rings\", \"label\"), SeeAlso => {\"Guide to rings\"}, TO2(\"Other page\", \"Guide to rings\")}\n";
+    let mut session = DocumentSession::open_with_related(source, related).await;
+    let uri = session.uri().to_string();
+    for method in ["textDocument/definition", "textDocument/declaration"] {
+        let response = session
+            .request(
+                method,
+                document_position(&uri, position(source, "\"Guide to rings\"", 1)),
+            )
+            .await;
+        let locations = response_array(&response);
+        assert_eq!(locations.len(), 1, "{response}");
+        assert_eq!(locations[0]["uri"], uri);
+        assert_eq!(
+            locations[0]["range"]["start"],
+            position(source, "\"Guide to rings\"", 0)
+        );
+    }
+    for (include, count) in [(false, 8), (true, 9)] {
+        let response = session.request("textDocument/references", json!({
+            "textDocument": {"uri": uri}, "position": position(source, "\"Guide to rings\"", 1),
+            "context": {"includeDeclaration": include}
+        })).await;
+        assert_eq!(response_array(&response).len(), count, "{response}");
+    }
+    let changed = source.replacen("\"Guide to rings\"", "\"Renamed guide\"", 1);
+    session.replace(&changed).await;
+    let response = session
+        .request(
+            "textDocument/definition",
+            document_position(&uri, position(&changed, "\"Guide to rings\"", 0)),
+        )
+        .await;
+    assert!(
+        response.is_null(),
+        "the old definition must leave the index: {response}"
+    );
+    session.shutdown().await;
+}
+
+/// Equal overview titles in different packages remain separate, with explicit qualification supported.
+#[tokio::test]
+async fn documentation_title_navigation_respects_package_qualification() {
+    let source = "newPackage \"P\"\ndoc ///\nKey\n  \"Shared guide\"\nDescription\n  Text\n    @TO \"Shared guide\"@ @TO \"Q :: Shared guide\"@\n///\n";
+    let related = "newPackage \"Q\"\ndoc ///\nKey\n  \"Shared guide\"\nDescription\n  Text\n    @TO \"Shared guide\"@\n///\n";
+    let mut session = DocumentSession::open_with_related(source, related).await;
+    let uri = session.uri().to_string();
+    for (title, occurrence, own) in [
+        ("\"Shared guide\"", 1, true),
+        ("\"Q :: Shared guide\"", 0, false),
+    ] {
+        let response = session
+            .request(
+                "textDocument/definition",
+                document_position(&uri, position(source, title, occurrence)),
+            )
+            .await;
+        let locations = response_array(&response);
+        assert_eq!(locations.len(), 1, "{response}");
+        assert_eq!(locations[0]["uri"] == uri, own, "{response}");
+        let refs = session.request("textDocument/references", json!({"textDocument": {"uri": uri}, "position": position(source, title, occurrence), "context": {"includeDeclaration": false}})).await;
+        assert_eq!(
+            response_array(&refs).len(),
+            if own { 1 } else { 2 },
+            "{refs}"
+        );
+    }
+    session.shutdown().await;
+}
+
+/// A single-word quoted title remains a page when no symbol supplies that name.
+#[tokio::test]
+async fn single_word_overview_titles_navigate_to_their_key() {
+    let source =
+        "doc ///\nKey\n  \"Introduction\"\nDescription\n  Text\n    @TO \"Introduction\"@\n///\n";
+    let mut session = DocumentSession::open(source).await;
+    let uri = session.uri().to_string();
+    let response = session
+        .request(
+            "textDocument/definition",
+            document_position(&uri, position(source, "\"Introduction\"", 1)),
+        )
+        .await;
+    assert_eq!(
+        response_array(&response)[0]["range"]["start"],
+        position(source, "\"Introduction\"", 0)
+    );
+    session.shutdown().await;
+}
+
+/// Retained semantic spans follow source relocation through shortening and UTF-8 edits.
+#[tokio::test]
+async fn semantic_tokens_survive_shortening_documents_with_retained_cells() {
+    let mut session =
+        DocumentSession::open("prefix = 12345\nretainedName = 1\nretainedName\n").await;
+    for source in [
+        "prefix = 1\nretainedName = 1\nretainedName\n",
+        "-- λ\nprefix = 1\nretainedName = 1\nretainedName\n",
+        "retainedName = 1\nretainedName\n",
+        "retainedName = 1\nretainedName",
+        "x\n",
+    ] {
+        session.replace(source).await;
+        let tokens = semantic_tokens(&mut session).await;
+        assert!(!tokens.is_empty(), "{source}");
+        let symbol = if source == "x\n" { "x" } else { "retainedName" };
+        assert_eq!(
+            token_at(&tokens, source, symbol, 0).0,
+            session.semantic_token_type("variable")
+        );
+    }
+    session.shutdown().await;
+}
+
+/// Emoji identifiers use UTF-16 ranges while retaining their full UTF-8 spelling.
+#[tokio::test]
+async fn emoji_identifier_tokens_and_navigation_use_utf16_ranges() {
+    let source = "😀😀=11\nanswer = 😀😀 + 1\n𝒜 = 😀😀\n";
+    let mut session = DocumentSession::open(source).await;
+    let uri = session.uri().to_string();
+    let response = session
+        .request(
+            "textDocument/semanticTokens/full",
+            json!({"textDocument": {"uri": uri}}),
+        )
+        .await;
+    assert_eq!(response["data"][2], 4, "two emoji occupy four UTF-16 units");
+    let definition = session
+        .request(
+            "textDocument/definition",
+            document_position(&uri, json!({"line":1, "character":9})),
+        )
+        .await;
+    assert_eq!(
+        definition["range"],
+        json!({"start":{"line":0,"character":0},"end":{"line":0,"character":4}})
+    );
+    let references = session.request("textDocument/references", json!({"textDocument": {"uri": uri}, "position": {"line":0,"character":2}, "context": {"includeDeclaration":true}})).await;
+    assert_eq!(response_array(&references).len(), 3);
+    for location in response_array(&references) {
+        assert_eq!(
+            location["range"]["end"]["character"].as_u64().unwrap()
+                - location["range"]["start"]["character"].as_u64().unwrap(),
+            4
         );
     }
     session.shutdown().await;

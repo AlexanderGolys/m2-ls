@@ -7,10 +7,10 @@
 //! evaluates that the package never defines, exports left undocumented, and
 //! documentation where Macaulay2 cannot read it.
 //!
-//! A package may keep code or documentation in files it loads, which this
-//! document cannot see. The checks that need every definition or every page
-//! of a package therefore run only in a package section that loads no other
-//! file.
+//! A package may keep code or documentation in files it loads. Definition checks
+//! requiring the whole package run only for self-contained sections. Export
+//! coverage is first checked locally, then replaced during publication by the
+//! workspace's package-wide coverage when an index is available.
 
 use std::collections::{HashMap, HashSet};
 
@@ -32,7 +32,7 @@ use crate::package_documentation::{
 use crate::package_index::collect_imported_packages_in_tree;
 use crate::source::SourceNavigation;
 use crate::source_package::PackageDeclaration;
-use crate::syntax::{Applications, BindingReferences, ExpressionSyntax};
+use crate::syntax::BindingReferences;
 
 /// The package that defines `doc` and the other SimpleDoc functions, which
 /// `beginDocumentation()` loads last.
@@ -48,7 +48,7 @@ pub(super) fn spawn(context: &DocumentationContext, sink: &mut DiagnosticSink) {
     documentation_outside_package(context, sink);
     documentation_before_begin(context, sink);
     undefined_documentation_key(context, &file, sink);
-    undocumented_export(context, &file, sink);
+    undocumented_export(context, sink);
 }
 
 /// Word a fault `document` or `SimpleDoc` reports while reading a page.
@@ -268,8 +268,6 @@ struct PackageFile<'context> {
     /// The symbols the file's code mentions outside of documentation, each of
     /// which Macaulay2 creates in the package the code is in.
     code_symbols: HashSet<&'context str>,
-    /// Where each `beginDocumentation()` call ends, loading SimpleDoc.
-    begin_documentation: Vec<Position>,
 }
 
 impl<'context> PackageFile<'context> {
@@ -293,10 +291,8 @@ impl<'context> PackageFile<'context> {
                 .any(|node| node.range.start <= position && position <= node.range.end)
         };
         let mut references = BindingReferences::default();
-        let mut applications = Applications::default();
         for cell in context.syntax.cells().iter().filter_map(ParsedCell::syntax) {
             references.visit_cell(cell);
-            applications.visit_cell(cell);
         }
         let code_symbols = references
             .0
@@ -309,19 +305,9 @@ impl<'context> PackageFile<'context> {
             })
             .map(|symbol| symbol.text())
             .collect();
-        let begin_documentation = applications
-            .0
-            .into_iter()
-            .filter(|call| {
-                call.left_operand.symbol_name() == Some(Macaulay2Conventions::BEGIN_DOCUMENTATION)
-            })
-            .filter_map(|call| context.source.range_for_syntax(call))
-            .map(|range| range.end)
-            .collect();
         Self {
             self_contained,
             code_symbols,
-            begin_documentation,
         }
     }
 
@@ -393,51 +379,30 @@ fn undefined_documentation_key(
     }
 }
 
-/// Report exports of a self-contained package with documentation that no page
-/// documents and `undocumented` does not exempt.
-fn undocumented_export(
-    context: &DocumentationContext,
-    file: &PackageFile,
-    sink: &mut DiagnosticSink,
-) {
-    let documented = context
-        .documentation
-        .nodes()
-        .iter()
-        .flat_map(|node| node.keys.iter())
-        .chain(context.documentation.undocumented())
-        .filter_map(|key| match &key.subject {
-            DocumentedSubject::Name(name) => Some(name.name()),
-            DocumentedSubject::Method { .. }
-            | DocumentedSubject::OptionalArgument { .. }
-            | DocumentedSubject::Expression(_) => None,
-        })
-        .collect::<HashSet<_>>();
-    for declaration in &file.self_contained {
-        let has_documentation = file
-            .begin_documentation
+/// Reports each export lacking a direct documentation key or explicit exemption
+/// in its package section. Workspace publication replaces these local findings
+/// with findings that also account for documentation in loaded files.
+fn undocumented_export(context: &DocumentationContext, sink: &mut DiagnosticSink) {
+    for declaration in context.packages.declarations() {
+        let documented = context
+            .documentation
+            .nodes()
             .iter()
-            .any(|position| declaration.contains(*position));
-        if !has_documentation {
-            continue;
-        }
-        for export in declaration
-            .exports
-            .iter()
-            .filter(|export| !documented.contains(export.name.name()))
-        {
-            sink.spawn(
-                &catalog::UNDOCUMENTED_EXPORT,
-                Finding::new(
-                    export.range,
-                    format!(
-                        "`{}` is exported but not documented, which `installPackage` warns \
-                         about; document it with `Key` `{}`, or list it in `undocumented {{…}}`",
-                        export.name.name(),
-                        export.name.name()
-                    ),
-                ),
-            );
+            .flat_map(|node| node.keys.iter())
+            .chain(context.documentation.undocumented())
+            .filter(|key| declaration.contains(key.range.start))
+            .filter_map(|key| match &key.subject {
+                DocumentedSubject::Name(name) => Some(name),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        for export in &declaration.exports {
+            if !documented.contains(&export.name) {
+                sink.diagnostics
+                    .push(crate::diagnostics::M2Diagnostic::undocumented_export(
+                        export,
+                    ));
+            }
         }
     }
 }

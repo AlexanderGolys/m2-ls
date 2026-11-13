@@ -180,11 +180,12 @@ impl M2SemanticTokenType {
     /// Whether to emit this syntax token when the client advertises
     /// `semanticTokens.augmentsSyntaxTokens`, meaning it layers semantic tokens
     /// over syntax highlighting. Quote modifiers (`local`, `global`, `symbol`,
-    /// etc.) still receive the LSP `modifier` classification; ordinary syntax
-    /// tokens defer to the editor's highlighter. This flag does not tell the
+    /// etc.) still receive the LSP `modifier` classification, and strings
+    /// retain their semantic classification. Other ordinary syntax tokens
+    /// defer to the editor's highlighter. This flag does not tell the
     /// server whether a particular syntax grammar is installed.
     pub const fn emit_alongside_syntax_highlighting(self) -> bool {
-        matches!(self, Self::QuoteModifier)
+        matches!(self, Self::QuoteModifier | Self::String)
     }
 }
 

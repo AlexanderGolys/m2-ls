@@ -16,12 +16,13 @@ use tower_lsp::lsp_types::{Location, Position, Range as TextRange, Url};
 use crate::analysis::AssignmentFactKind;
 use crate::builtin_index::{CallableInfo, CallableKind, ObjectData, Record};
 use crate::capabilities::document_symbols::{collect_workspace_symbols, WorkspaceSourceSymbol};
+use crate::diagnostics::M2Diagnostic;
 use crate::document::DocumentSnapshot;
 use crate::file_load::FileLoad;
 use crate::macaulay2::Macaulay2Conventions;
 use crate::object_hierarchy::HierarchySnapshot;
 use crate::object_registry::{ObjectId, ObjectName, ObjectRegistry, TypeData};
-use crate::package_documentation::DocumentedSubject;
+use crate::package_documentation::{DocumentationKey, DocumentationTextTag, DocumentedSubject};
 use crate::package_index::SourceResolver;
 use crate::semantic_token::{
     local_symbol_semantic_token, M2SemanticToken, M2SemanticTokenModifier, M2SemanticTokenType,
@@ -267,6 +268,13 @@ pub struct WorkspaceIndex {
     /// The documentation pages of every indexed file, by the name they
     /// document.
     pages_by_name: DashMap<ObjectName, Vec<IndexedPage>>,
+    /// Quoted documentation page titles and links retained for each source file.
+    text_tags_by_file: DashMap<Url, Vec<DocumentationTextTag>>,
+    /// Direct documentation keys and explicit exemptions, retained with positions
+    /// so coverage can be restricted to the package owning each key.
+    documentation_keys_by_file: DashMap<Url, Vec<DocumentationKey>>,
+    /// Export declarations from package fragments, owned by their loading packages.
+    fragment_exports_by_file: DashMap<Url, Vec<PackageExport>>,
     /// The names each indexed file contributes to the tables above, for
     /// removing them again.
     names_by_file: DashMap<Url, Vec<ObjectName>>,
@@ -307,6 +315,70 @@ pub enum WorkspaceView<'index> {
 }
 
 impl WorkspaceIndex {
+    /// Reports undocumented public exports in `uri`, counting direct keys and
+    /// `undocumented` exemptions only from files executing in the same package.
+    /// Method and optional-argument keys do not document their head symbol.
+    pub fn undocumented_exports(&self, uri: &Url) -> Vec<M2Diagnostic> {
+        let exports = self
+            .declared_packages_by_file
+            .get(uri)
+            .map(|declarations| {
+                declarations
+                    .iter()
+                    .flat_map(|declaration| {
+                        declaration
+                            .exports
+                            .iter()
+                            .map(|export| (export.clone(), declaration.name.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let fragment_exports = self
+            .fragment_exports_by_file
+            .get(uri)
+            .map(|exports| {
+                exports
+                    .iter()
+                    .flat_map(|export| {
+                        self.packages_at(uri, export.range.start)
+                            .into_iter()
+                            .map(|package| (export.clone(), package))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let documented = self
+            .documentation_keys_by_file
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .flat_map(|key| {
+                        let DocumentedSubject::Name(name) = &key.subject else {
+                            return Vec::new();
+                        };
+                        self.packages_at(entry.key(), key.range.start)
+                            .into_iter()
+                            .map(|package| (name.clone(), package))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>();
+        let mut reported = BTreeSet::new();
+        exports
+            .into_iter()
+            .chain(fragment_exports)
+            .filter(|(export, package)| {
+                !documented.contains(&(export.name.clone(), package.clone()))
+            })
+            .filter(|(export, _)| reported.insert((export.name.clone(), export.range.start)))
+            .map(|(export, _)| M2Diagnostic::undocumented_export(&export))
+            .collect()
+    }
+
     /// Source records supplied by the file's possible loading contexts. Only
     /// global definitions are shared: `:=` file locals never enter this table.
     /// Conflicting definitions remain navigation candidates rather than becoming
@@ -870,6 +942,23 @@ impl WorkspaceIndex {
         knowledge_provider: &ObjectRegistry,
     ) -> Vec<Url> {
         self.remove_file(uri);
+        self.fragment_exports_by_file
+            .insert(uri.clone(), snapshot.packages().fragment_exports().to_vec());
+        let documentation = snapshot.package_documentation();
+        self.documentation_keys_by_file.insert(
+            uri.clone(),
+            documentation
+                .nodes()
+                .iter()
+                .flat_map(|node| node.keys.iter())
+                .chain(documentation.undocumented())
+                .cloned()
+                .collect(),
+        );
+        self.text_tags_by_file.insert(
+            uri.clone(),
+            snapshot.package_documentation().text_tags().to_vec(),
+        );
         self.hierarchies_by_file
             .insert(uri.clone(), HierarchySnapshot::new(snapshot, uri));
         let initialization = snapshot
@@ -1018,6 +1107,56 @@ impl WorkspaceIndex {
         self.package_of_loaded_file.remove(uri);
     }
 
+    /// Locations of an overview title across workspace documentation.
+    /// A qualified `Package :: title` selects that package; an unqualified title
+    /// uses the requesting file's package when it has one. Definitions alone
+    /// serve navigation, while reference queries may include the Key occurrences.
+    pub fn documentation_text_locations(
+        &self,
+        uri: &Url,
+        position: Position,
+        title: &str,
+        definitions_only: bool,
+        include_declaration: bool,
+    ) -> Vec<Location> {
+        let (package, title) = title
+            .split_once("::")
+            .map(|(package, title)| (Some(ObjectName::new(package.trim())), title.trim()))
+            .unwrap_or_else(|| (self.package_at(uri, position), title));
+        let mut locations = Vec::new();
+        for entry in &self.text_tags_by_file {
+            for tag in entry.value() {
+                let (owner, candidate) = tag
+                    .title
+                    .split_once("::")
+                    .map(|(owner, title)| (Some(ObjectName::new(owner.trim())), title.trim()))
+                    .unwrap_or_else(|| {
+                        (
+                            self.package_at(entry.key(), tag.range.start),
+                            tag.title.as_str(),
+                        )
+                    });
+                if candidate == title
+                    && package
+                        .as_ref()
+                        .is_none_or(|package| owner.as_ref() == Some(package))
+                    && if definitions_only {
+                        tag.is_definition
+                    } else {
+                        include_declaration || !tag.is_definition
+                    }
+                {
+                    locations.push(Location::new(entry.key().clone(), tag.range));
+                }
+            }
+        }
+        locations.sort_by(|left, right| {
+            (left.uri.as_str(), left.range.start).cmp(&(right.uri.as_str(), right.range.start))
+        });
+        locations.dedup();
+        locations
+    }
+
     /// The indexed files at or under `path`.
     pub fn files_under(&self, path: &Path) -> Vec<Url> {
         self.loads_by_file
@@ -1054,6 +1193,9 @@ impl WorkspaceIndex {
     /// Drop the facts recorded for `uri`, keeping the package a loading file
     /// placed it in, as when it is about to be indexed again.
     pub fn remove_file(&self, uri: &Url) {
+        self.fragment_exports_by_file.remove(uri);
+        self.documentation_keys_by_file.remove(uri);
+        self.text_tags_by_file.remove(uri);
         self.hierarchies_by_file.remove(uri);
         self.loads_by_file.remove(uri);
         self.file_loads_by_file.remove(uri);

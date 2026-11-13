@@ -44,6 +44,8 @@ use tower_lsp::Client;
 use crate::document::DocumentSnapshot;
 use crate::package_index::SourceResolver;
 use crate::settings::DiagnosticSettings;
+use crate::source_package::PackageExport;
+use crate::workspace_index::WorkspaceIndex;
 
 /// The stable code a diagnostic is published under, such as `S02`. Only the
 /// [`catalog`] creates codes, so every code names a registered diagnostic.
@@ -208,6 +210,21 @@ pub struct M2Diagnostic {
 }
 
 impl M2Diagnostic {
+    /// Warns at the export string of a public symbol without a documentation key.
+    pub fn undocumented_export(export: &PackageExport) -> Self {
+        let name = export.name.name();
+        Self {
+            rule: &catalog::UNDOCUMENTED_EXPORT,
+            finding: Finding::new(
+                export.range,
+                format!(
+                    "`{name}` is exported but not documented; document it with `Key` `{name}`, \
+                 or list it in `undocumented {{…}}`"
+                ),
+            ),
+        }
+    }
+
     /// The finding as published to clients for the document at `uri`, under
     /// its rule's code, name, severity, and tags.
     ///
@@ -242,18 +259,28 @@ impl M2Diagnostic {
 }
 
 /// The findings of the document at `uri` that the user's settings allow,
-/// converted for publication: its analysis findings, then those of its
+/// converted for publication, using package-wide export coverage when `workspace`
+/// is available: its analysis findings, then those of its
 /// location, with the files it names looked up in `sources`.
 pub fn visible_diagnostics(
     document: &DocumentSnapshot,
     uri: &Url,
     settings: &DiagnosticSettings,
     sources: &SourceResolver,
+    workspace: Option<&WorkspaceIndex>,
 ) -> Vec<Diagnostic> {
-    let located = collect_located(document, uri, sources);
+    let mut located = collect_located(document, uri, sources);
+    if !document.properties().primary_code {
+        if let Some(workspace) = workspace {
+            located.extend(workspace.undocumented_exports(uri));
+        }
+    }
     document
         .diagnostics()
         .iter()
+        .filter(|diagnostic| {
+            workspace.is_none() || diagnostic.rule.code != catalog::UNDOCUMENTED_EXPORT.code
+        })
         .chain(&located)
         .filter(|diagnostic| settings.publishes(diagnostic.rule.code))
         .filter(|diagnostic| !document.diagnostic_suppressions().suppresses(diagnostic))
@@ -276,8 +303,9 @@ pub async fn publish_diagnostics(
     settings: &DiagnosticSettings,
     sources: &SourceResolver,
     version: Option<i32>,
+    workspace: &WorkspaceIndex,
 ) {
-    let diagnostics = visible_diagnostics(document, &uri, settings, sources);
+    let diagnostics = visible_diagnostics(document, &uri, settings, sources, Some(workspace));
     crate::usage_log::diagnostics(&uri, document.text(), &diagnostics);
     client.publish_diagnostics(uri, diagnostics, version).await;
 }

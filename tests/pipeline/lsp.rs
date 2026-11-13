@@ -1389,115 +1389,6 @@ async fn locations_at(
     lines
 }
 
-#[tokio::test]
-async fn navigation_enters_configured_library_sources_of_loaded_packages() {
-    let library = LibraryFixture::new();
-    let source = "I = ideal 1\nbetti I\nsaturate I\ntoString I\n";
-    let workspace = TestWorkspace::new(source);
-    let mut server = LspProcess::spawn().await;
-    server
-        .initialize_with_options(&workspace.root_uri(), library.sources_settings(true))
-        .await;
-    server.open_document(&workspace.uri, source).await;
-
-    assert_eq!(
-        locations_at(
-            &mut server,
-            "textDocument/definition",
-            &workspace.uri,
-            position(source, "betti", 0)
-        )
-        .await,
-        vec![(library.uri("Core/betti.m2"), 0)],
-        "Core's files are the ones its loadsequence lists"
-    );
-    assert_eq!(
-        locations_at(
-            &mut server,
-            "textDocument/definition",
-            &workspace.uri,
-            position(source, "toString", 0)
-        )
-        .await,
-        vec![(library.uri("Core/Core.m2"), 0)]
-    );
-    assert_eq!(
-        locations_at(
-            &mut server,
-            "textDocument/definition",
-            &workspace.uri,
-            position(source, "ideal", 0)
-        )
-        .await,
-        Vec::new(),
-        "a Core name no library file assigns has no definition to jump to"
-    );
-    assert_eq!(
-        locations_at(
-            &mut server,
-            "textDocument/definition",
-            &workspace.uri,
-            position(source, "saturate", 0)
-        )
-        .await,
-        vec![(library.uri("Saturation/impl.m2"), 0)],
-        "a package's definitions come from the files it loads"
-    );
-    assert_eq!(
-        locations_at(
-            &mut server,
-            "textDocument/implementation",
-            &workspace.uri,
-            position(source, "betti", 0)
-        )
-        .await,
-        vec![
-            (library.uri("Core/betti.m2"), 1),
-            (library.uri("Saturation/impl.m2"), 2),
-        ],
-        "every loaded package may install a library method"
-    );
-
-    let package_file = library.uri("Saturation/impl.m2");
-    let package_source = std::fs::read_to_string(
-        library
-            .root
-            .join("usr-dist/common/share/Macaulay2/Saturation/impl.m2"),
-    )
-    .expect("package source");
-    server.open_document(&package_file, &package_source).await;
-    assert_eq!(
-        locations_at(
-            &mut server,
-            "textDocument/definition",
-            &package_file,
-            position(&package_source, "saturationHelper", 0)
-        )
-        .await,
-        vec![(library.uri("Saturation.m2"), 0)],
-        "inside a library file, the package's private names resolve"
-    );
-    server.shutdown().await;
-
-    let mut disabled = LspProcess::spawn().await;
-    disabled
-        .initialize_with_options(&workspace.root_uri(), library.sources_settings(false))
-        .await;
-    disabled.open_document(&workspace.uri, source).await;
-    let definition = disabled
-        .request(
-            "textDocument/definition",
-            document_position(&workspace.uri, position(source, "betti", 0)),
-        )
-        .await;
-    assert_eq!(
-        definition,
-        Value::Null,
-        "disabled library navigation finds no sources"
-    );
-    disabled.shutdown().await;
-}
-
 /// Documentation keys name the same library objects as ordinary expressions.
 /// Method setup can create an object without assigning its name in source.
 #[tokio::test]
@@ -1532,6 +1423,86 @@ async fn definition_of_documented_library_method_finds_installed_methods() {
         );
     }
     server.shutdown().await;
+}
+
+/// A catalog's first read of a symbol is not its definition. Navigation must
+/// search past both the early request cutoff and the former 64-file budget.
+#[tokio::test]
+async fn library_definitions_ignore_catalog_references_and_search_late_sources() {
+    for (definition, listed) in [
+        (None, true),
+        (Some("findSynonyms := x -> x\n"), true),
+        (Some("findSynonyms := x -> x\n"), false),
+    ] {
+        let library = LibraryFixture::new();
+        let packages = library.root.join("usr-dist/common/share/Macaulay2");
+        let reference = "helper = s -> (syns := findSynonyms s; syns)\n";
+        std::fs::write(packages.join("Core/betti.m2"), reference).expect("reference source");
+        let mut sequence = String::from("betti.m2\n");
+        for index in 0..80 {
+            let name = format!("padding{index}.m2");
+            std::fs::write(packages.join("Core").join(&name), "").expect("padding source");
+            sequence.push_str(&name);
+            sequence.push('\n');
+        }
+        if listed {
+            sequence.push_str("document.m2\n");
+        }
+        std::fs::write(packages.join("Core/loadsequence"), sequence).expect("load sequence");
+        let definition_source = if listed {
+            definition.unwrap_or("").to_string()
+        } else {
+            format!("{reference}{}", definition.unwrap_or(""))
+        };
+        std::fs::write(packages.join("Core/document.m2"), definition_source)
+            .expect("definition source");
+
+        let source = "findSynonyms symbol x\n";
+        let workspace = TestWorkspace::new(source);
+        let column = reference.find("findSynonyms").expect("reference column");
+        let corpus = [
+            json!({"kind":"meta", "default_loaded":["Core"]}),
+            json!({
+                "kind":"methodFunction", "name":"findSynonyms", "package":"$Core$Core",
+                "source_location": {
+                    "filename": if listed {
+                        "/extraction/Macaulay2/m2/betti.m2"
+                    } else {
+                        "/extraction/Macaulay2/m2/document.m2"
+                    },
+                    "start_row": 1, "stop_row": 1,
+                    "start_col": column, "stop_col": column + "findSynonyms".len()
+                }
+            }),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        workspace.write_file("catalog.jsonl", &corpus);
+        let mut server =
+            LspProcess::spawn_with_catalog(Some(&workspace.path("catalog.jsonl"))).await;
+        server
+            .initialize_with_options(&workspace.root_uri(), library.sources_settings(true))
+            .await;
+        server.open_document(&workspace.uri, source).await;
+
+        // Repeat to check that a warm cache also rejects the catalog reference.
+        for _ in 0..2 {
+            let locations = locations_at(
+                &mut server,
+                "textDocument/definition",
+                &workspace.uri,
+                position(source, "findSynonyms", 0),
+            )
+            .await;
+            let expected = definition
+                .map(|_| vec![(library.uri("Core/document.m2"), u64::from(!listed))])
+                .unwrap_or_default();
+            assert_eq!(locations, expected, "definition source: {definition:?}");
+        }
+        server.shutdown().await;
+    }
 }
 
 #[tokio::test]

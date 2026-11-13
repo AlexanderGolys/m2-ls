@@ -39,6 +39,20 @@ Each of these fixes the diagnostic it is attached to:
 **Use `??` coalescence**, **Use `??=` coalescing assignment** — `S04`
 : `if x === null then 0 else x` becomes `x ?? 0`; an `if` that only assigns a
   fallback, `if t === null then t = v`, becomes `t ??= v`.
+  A conditional update, `if stop =!= null then i = stop`, becomes
+  `i = stop ?? i`. The forms without an `else` are offered only when the
+  conditional's result is unused, preserving its missing-branch behavior.
+  When every fallback path assigns the same existing variable, the assignment
+  moves outside the chain: `if stop =!= null then i = stop else if ready then
+  i = next else i = i + 1` becomes `i = stop ?? (if ready then next else i + 1)`.
+  Statements before a branch's final assignment stay in that branch's block,
+  so collecting a match or updating a table still happens only on that path.
+  A branch declaring its own local target or lacking a final value keeps the
+  original conditional.
+
+**Omit `from 0`** — `S30`
+: Removes a numeric `for` loop's explicit zero start: `for i from 0 to n do …`
+  becomes `for i to n do …`. Comments in the removed clause are preserved.
 
 **Inline null-tested local with `??`** — `S24`
 : `v := g x; if v =!= null then y = v else y = 0` becomes `y = g x ?? 0`,
@@ -113,6 +127,14 @@ condition. Comparisons using `==` or `!=` are left unchanged.
   Parentheses around the call or its argument are allowed. The callback must
   forward its sole parameter directly to a named lowercase function, with
   no extra arguments or statements.
+
+**Replace lambda with composition** — `S28`
+: `x -> foo bar x` → `foo @@ bar`; `x -> foo(bar(x))` has the same rewrite.
+  Both calls must be unary and use lowercase function names independent of
+  the parameter. Parentheses are preserved where an enclosing call or operator
+  needs them. Fixed parameter lists, extra statements or arguments, computed
+  callees, and comments that would be removed keep their lambda wrappers.
+  Disable `composed-lambda` to hide the hint while retaining the refactor.
 
 **Replace lambda with partial application** — `S18`
 : `y -> f(x, y)` → `f_x`. The callback passes its sole parameter as the second
@@ -192,11 +214,16 @@ Every `m2-ls` diagnostic under the cursor also offers two actions that write a
 **Disable S04 in this file**
 : Inserts `-- m2-ls: disable S04` at the top of the file.
 
+**Remove redundant codomain annotation** — `S27`
+
+Removes an installation’s `Type =>` annotation when it repeats the method’s
+explicit `TypicalValue`, allowing the installation to inherit that value.
+
 ## SimpleDoc documentation placeholders
 
 Place the cursor on a declaration and choose **Generate SimpleDoc documentation
 for …** to insert a `doc /// … ///` placeholder immediately above it.
-The action fills the documentation key and add explanatory text for sections
+The action fills the documentation key and adds explanatory text for sections
 that need your input.
 
 The full templates translate Macaulay2's
