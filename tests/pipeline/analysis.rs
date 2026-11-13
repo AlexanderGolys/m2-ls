@@ -718,6 +718,33 @@ async fn primary_code_resolves_core_names_it_does_not_define() {
     session.shutdown().await;
 }
 
+/// Library export modifiers follow indexed binding protection and exclude local aliases.
+#[tokio::test]
+async fn indexed_library_modifiers_follow_binding_protection() {
+    let source = "ZZ\nallowableThreads\nalias = ZZ\nalias\nf = ZZ -> ZZ\n";
+    let mut session = DocumentSession::open(source).await;
+    let tokens = semantic_tokens(&mut session).await;
+    let constant = session.semantic_token_modifier("libraryConst");
+    let config = session.semantic_token_modifier("libraryConfigParam");
+    let library = constant | config;
+    assert_eq!(token_at(&tokens, source, "ZZ", 0).1 & library, constant);
+    assert_eq!(
+        token_at(&tokens, source, "allowableThreads", 0).1 & library,
+        config
+    );
+    assert_eq!(token_at(&tokens, source, "ZZ", 1).1 & library, constant);
+    for occurrence in 0..2 {
+        assert_eq!(
+            token_at(&tokens, source, "alias", occurrence).1 & library,
+            0
+        );
+    }
+    for occurrence in 2..4 {
+        assert_eq!(token_at(&tokens, source, "ZZ", occurrence).1 & library, 0);
+    }
+    session.shutdown().await;
+}
+
 #[tokio::test]
 async fn compiled_function_aliases_keep_compiled_but_not_binding_protection() {
     let source = "f = scan\nf\nscan\nscan = f\nscan\n";
@@ -1265,9 +1292,10 @@ async fn method_codomain_diagnostics_offer_annotation_quick_fixes() {
             }),
         )
         .await;
-    // Nothing fixes the mismatch; only silencing it is offered.
+    // No quick fix repairs the mismatch; documentation is an independent refactor.
     let offered = response_array(&actions)
         .iter()
+        .filter(|action| action["kind"] == "quickfix")
         .map(|action| {
             (
                 action["title"].as_str().unwrap_or_default().to_string(),
@@ -4136,13 +4164,10 @@ async fn documentation_strings_highlight_their_code_as_what_it_names() {
         token_type("arg, n", 0),
         session.semantic_token_type("parameter")
     );
-    let unrelated_parameter = position(source, "n)\nInputs", 0);
-    assert!(
-        !tokens.iter().any(|(line, character, ..)| {
-            Some(*line) == unrelated_parameter["line"].as_u64()
-                && Some(*character) == unrelated_parameter["character"].as_u64()
-        }),
-        "a name only some function binds stays text"
+    assert_eq!(
+        token_type("n)\nInputs", 0),
+        session.semantic_token_type("variable"),
+        "unresolved code names retain a variable token"
     );
     assert_eq!(
         token_type("arg:", 0),
@@ -4246,7 +4271,7 @@ async fn simple_doc_prose_reads_its_tex_markup_and_the_string_is_documentation()
         let (token_type, modifiers) = token_at(&tokens, source, styled, 0);
         assert_eq!(
             token_type,
-            session.semantic_token_type("string"),
+            session.semantic_token_type("docs"),
             "styled text stays text"
         );
         assert_ne!(
@@ -4257,19 +4282,14 @@ async fn simple_doc_prose_reads_its_tex_markup_and_the_string_is_documentation()
     }
     assert_eq!(
         token_at(&tokens, source, "Text", 0),
-        (
-            session.semantic_token_type("keyword"),
-            session.semantic_token_modifier("documentation")
-        ),
+        (session.semantic_token_type("keyword"), 0),
         "a part of a section is a section keyword like any other"
     );
-    let documentation = session.semantic_token_modifier("documentation");
     let (string_type, modifiers) = token_at(&tokens, source, "///\nKey", 0);
-    assert_eq!(string_type, session.semantic_token_type("string"));
-    assert_ne!(
-        modifiers & documentation,
-        0,
-        "the doc string is documentation"
+    assert_eq!(string_type, session.semantic_token_type("docs"));
+    assert_eq!(
+        modifiers & session.semantic_token_modifier("documentation"),
+        0
     );
     assert_eq!(
         token_at(&tokens, source, "2\n///", 0).0,
@@ -4305,12 +4325,12 @@ async fn documentation_markup_marks_delimiters_links_and_option_keys() {
     let mut session = DocumentSession::open(source).await;
     let tokens = semantic_tokens(&mut session).await;
     let token = |needle: &str, occurrence: usize| token_at(&tokens, source, needle, occurrence);
-    let documentation = session.semantic_token_modifier("documentation");
+    let documentation = 0;
     let option = session.semantic_token_modifier("optionalParameter");
     let example = session.semantic_token_modifier("example");
     let monospace = session.semantic_token_modifier("monospace");
     let macro_type = session.semantic_token_type("macro");
-    let string = session.semantic_token_type("string");
+    let string = session.semantic_token_type("docs");
     let decorator = session.semantic_token_type("decorator");
 
     for occurrence in [2, 3] {
@@ -5467,7 +5487,7 @@ Description
     let tokens = semantic_tokens(&mut session).await;
     let symbol = session.semantic_token_type("enumMember");
     let property = session.semantic_token_type("property");
-    let string = session.semantic_token_type("string");
+    let string = session.semantic_token_type("docs");
     let url = session.semantic_token_modifier("url");
     // Quoted operator names are symbols, in the key and in a link to it.
     for occurrence in [0, 1] {
@@ -5697,5 +5717,213 @@ async fn types_used_as_table_keys_are_properties() {
         );
     }
     assert_eq!(token_at(&tokens, source, "Rule", 3).0, type_token);
+    session.shutdown().await;
+}
+
+/// Documentation refactors preserve SimpleDoc's template and insert before each declaration.
+#[tokio::test]
+async fn simple_doc_placeholders_cover_declarations_and_options() {
+    for (source, keys) in [
+        ("T = new Type of Thing\n", vec!["T"]),
+        ("f = x -> x\n", vec!["f"]),
+        (
+            "f = method(Options => {Verbose => false})\n",
+            vec!["f", "[f, Verbose]"],
+        ),
+        (
+            "f = {Verbose => false} >> o -> x -> x\n",
+            vec!["f", "[f, Verbose]"],
+        ),
+        ("f ZZ := ZZ => x -> x\n", vec!["(f, ZZ)"]),
+        ("newPackage \"DocFixture\"\n", vec!["DocFixture"]),
+    ] {
+        let mut session = DocumentSession::open(source).await;
+        let uri = session.uri().to_string();
+        let actions = session.request("textDocument/codeAction", json!({
+            "textDocument": {"uri": uri},
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": []}
+        })).await;
+        for key in keys {
+            let title = format!("Generate SimpleDoc documentation for {key}");
+            let action = response_array(&actions)
+                .iter()
+                .find(|action| action["title"] == title)
+                .unwrap_or_else(|| panic!("missing {title}: {actions}"));
+            let edit = &action["edit"]["changes"][&uri][0];
+            let text = edit["newText"].as_str().unwrap();
+            assert!(
+                text.starts_with(&format!("doc ///\nNode\n  Key\n    {key}\n")),
+                "{text}"
+            );
+            assert!(text.contains("Explain what this item does"));
+            assert!(text.contains("  Caveat\n"));
+            assert_eq!(text.contains("  Acknowledgement\n"), key == "DocFixture");
+            assert_eq!(text.contains("  Subnodes\n"), key == "DocFixture");
+            assert!(!text.contains("CannedExample"));
+            assert!(!text.contains("ExampleFiles"));
+            assert!(!text.contains("  SeeAlso\n"));
+            let sections = text
+                .lines()
+                .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
+                .collect::<Vec<_>>();
+            let mut expected = vec!["  Key", "  Headline"];
+            let callable = key.starts_with('[')
+                || key == "(f, ZZ)"
+                || key == "f" && !source.starts_with("f = method");
+            if callable {
+                expected.extend(["  Usage", "  Inputs"]);
+                if !key.starts_with('[') {
+                    expected.push("  Outputs");
+                }
+                expected.push("  Consequences");
+            }
+            expected.push("  Description");
+            if key == "DocFixture" {
+                expected.extend(["  Acknowledgement", "  Contributors", "  References"]);
+            }
+            expected.push("  Caveat");
+            if key == "DocFixture" {
+                expected.push("  Subnodes");
+            }
+            assert_eq!(sections, expected, "{key}: {text}");
+            assert!(text.contains("    Example\n"));
+            assert!(text.contains("    Text\n      Explain the example"));
+
+            if key == "(f, ZZ)" {
+                assert!(text.contains("  Usage\n    f(x)\n"), "{text}");
+                assert!(text.contains("    x:ZZ\n"), "{text}");
+                assert!(text.contains("    result:ZZ\n"), "{text}");
+            }
+            if key.starts_with('[') {
+                assert!(!text.contains("  Outputs\n"));
+            }
+            if key == "T" || source.starts_with("f = method") && key == "f" {
+                assert!(!text.contains("  Inputs\n"));
+                assert!(!text.contains("  Outputs\n"));
+            }
+            assert!(
+                !response_array(&actions).iter().any(|action| action["title"]
+                    .as_str()
+                    .is_some_and(|title| title.contains("minimal SimpleDoc")))
+            );
+            assert_eq!(edit["range"]["start"], json!({"line": 0, "character": 0}));
+            assert_eq!(edit["range"]["start"], edit["range"]["end"]);
+        }
+        session.shutdown().await;
+    }
+}
+
+/// Markup constructors do not become unresolved keys when the catalog lacks Text exports.
+#[tokio::test]
+async fn documentation_markup_constructors_are_not_undefined_keys() {
+    let source = concat!(
+        "f = x -> x\n",
+        "doc ///\n",
+        "Key\n  f\n",
+        "Description\n  Text\n",
+        "    @TO f@ @TOH f@ @TO2 {f, \"label\"}@\n",
+        "    @TT \"code\"@ @BOLD \"bold\"@\n",
+        "    @TO missingTarget@\n",
+        "Subnodes\n  TO f\n",
+        "///\n",
+        "document {Key => f, PARA {TO f, TOH f, TO2(f, \"label\"), TT \"code\"}}\n",
+    );
+    let session = DocumentSession::open(source).await;
+    let findings = session
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| diagnostic["code"] == "D05")
+        .collect::<Vec<_>>();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("`missingTarget`"));
+    session.shutdown().await;
+}
+
+/// Documentation examples remain navigable code without publishing their lint diagnostics.
+#[tokio::test]
+async fn documentation_examples_do_not_publish_diagnostics() {
+    let source = concat!(
+        "f = x -> x\n",
+        "doc ///\nKey\n  f\nDescription\n  Example\n",
+        "    exampleResult = unknownExampleName\n",
+        "    if 1 then exampleResult else null\n",
+        "///\n",
+        "document {Key => f, EXAMPLE {\"hypertextResult = unknownHypertextName\"}}\n",
+        "TEST ///\nZZ = 7\n///\n",
+        "QQ = 7\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let messages = session
+        .diagnostics()
+        .iter()
+        .filter_map(|diagnostic| diagnostic["message"].as_str())
+        .collect::<Vec<_>>();
+    for name in ["unknownExampleName", "unknownHypertextName"] {
+        assert!(
+            messages.iter().all(|message| !message.contains(name)),
+            "{messages:?}"
+        );
+    }
+    for name in ["`ZZ`", "`QQ`"] {
+        assert!(
+            messages.iter().any(|message| message.contains(name)),
+            "{messages:?}"
+        );
+    }
+    assert!(session.diagnostics().iter().all(|diagnostic| {
+        let line = diagnostic["range"]["start"]["line"].as_u64().unwrap();
+        !(6..=7).contains(&line)
+    }));
+    let tokens = semantic_tokens(&mut session).await;
+    assert_eq!(
+        token_at(&tokens, source, "exampleResult", 0).0,
+        session.semantic_token_type("variable")
+    );
+    session.shutdown().await;
+}
+
+/// Documentation prose has its own type while embedded syntax retains complete code tokens.
+#[tokio::test]
+async fn documentation_prose_and_embedded_code_have_distinct_tokens() {
+    let source = concat!(
+        "f = x -> x\n",
+        "doc ///\nKey\n  f\nUsage\n  f(x + spare, {1, 2})\n",
+        "Inputs\n  x:ZZ\nOutputs\n  :ZZ\nDescription\n  Text\n    ordinary prose\n",
+        "  Example\n    localValue = (\n      2 + 3\n    )\n    f(localValue, \"literal\")\n///\n",
+    );
+    let mut session = DocumentSession::open(source).await;
+    let tokens = semantic_tokens(&mut session).await;
+    let docs = session.semantic_token_type("docs");
+    assert_eq!(token_at(&tokens, source, "    ordinary prose", 0).0, docs);
+    assert_eq!(
+        token_at(&tokens, source, "spare", 0).0,
+        session.semantic_token_type("variable")
+    );
+    assert_eq!(
+        token_at(&tokens, source, ":", 0).0,
+        session.semantic_token_type("punctuation")
+    );
+    for (text, occurrence, kind) in [
+        ("(", 0, "delimiter"),
+        ("{", 0, "delimiter"),
+        (",", 0, "punctuation"),
+        ("+", 0, "operator"),
+        ("(", 1, "delimiter"),
+        (")", 1, "delimiter"),
+        ("localValue", 0, "variable"),
+        ("\"literal\"", 0, "string"),
+    ] {
+        let (ty, modifiers) = token_at(&tokens, source, text, occurrence);
+        assert_eq!(ty, session.semantic_token_type(kind), "{text} {occurrence}");
+        assert_eq!(
+            modifiers & session.semantic_token_modifier("documentation"),
+            0,
+            "{text}"
+        );
+    }
     session.shutdown().await;
 }

@@ -417,6 +417,7 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
     assert_eq!(
         action_titles(&ordered_actions),
         [
+            "Generate SimpleDoc documentation for orderedActions",
             "Simplify unnecessary null branch",
             "Simplify if condition",
             "Disable S05 on this line",

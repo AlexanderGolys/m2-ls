@@ -17,6 +17,14 @@ has `algebraic`. A method installation keeps its `method` type and adds
   consult the [policy reference](../getting-started/configuration.md#semantic-tokens)
   for accepted values and alias behavior.
 
+`libraryConst`, `libraryConfigParam`
+: Mark indexed library bindings exported as protected or mutable, respectively.
+  For example, `ZZ` carries `libraryConst`, while `allowableThreads` carries
+  `libraryConfigParam`. Protection describes reassignment of the binding,
+  independently of whether its value can be mutated. Local aliases and shadows
+  carry neither modifier. Both are independent of `defaultLibrary` and are
+  removed in standard-only mode.
+
 `readonly`
 : Marks a protected binding. This describes reassignment of the name, rather
   than whether the value itself can be mutated. Local shadows and mutable
@@ -52,8 +60,9 @@ has `algebraic`. A method installation keeps its `method` type and adds
 ## Documentation and embedded code
 
 `documentation`
-: Marks content belonging to documentation strings, `document` calls, and
-  documentation comments.
+: The standard-only fallback for custom documentation style modifiers.
+  Prose uses the `docs` token type; embedded code does not inherit a blanket
+  documentation modifier, so its own token styles remain visible.
 
 `documentTag`
 : Marks the parts of a documentation tag: the key a `Key` entry documents or a

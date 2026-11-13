@@ -27,7 +27,7 @@ use crate::node_metadata::ParsedCell;
 use crate::object_registry::ObjectName;
 use crate::package_documentation::{
     DocumentOption, DocumentTag, DocumentationFault, DocumentationFaultKind, DocumentationKey,
-    DocumentedSubject, SimpleDocKeyword,
+    DocumentationMarkupKind, DocumentedSubject, SimpleDocKeyword,
 };
 use crate::package_index::collect_imported_packages_in_tree;
 use crate::source::SourceNavigation;
@@ -345,6 +345,17 @@ fn undefined_documentation_key(
     sink: &mut DiagnosticSink,
 ) {
     for referenced in context.documentation.referenced_names() {
+        // Markup constructors are documentation syntax, rather than target keys.
+        // Preserve their references for navigation while checking the keys they consume.
+        if context.documentation.markup().iter().any(|markup| {
+            markup.bytes == referenced.span.bytes()
+                && matches!(
+                    markup.kind,
+                    DocumentationMarkupKind::LinkConstructor | DocumentationMarkupKind::TextMarkup
+                )
+        }) {
+            continue;
+        }
         let range = referenced.span.range();
         let declaration = file.self_contained_at(range.start);
         let name = &context.source.text()[referenced.span.bytes()];

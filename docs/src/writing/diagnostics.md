@@ -1,5 +1,9 @@
 # Diagnostics
 
+Documentation examples (`Example`, `CannedExample`, and hypertext `EXAMPLE` code)
+do not publish lint diagnostics. They remain analyzed for highlighting and
+navigation. Ordinary source and `TEST` blocks still report diagnostics.
+
 Macaulay2 accepts a lot of code that does not do what it says. A misspelled
 name becomes a symbol, a method installed with `=` is rejected only when that
 line runs, a non-`Boolean` condition fails deep inside a computation. `m2-ls`

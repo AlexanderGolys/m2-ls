@@ -1182,12 +1182,7 @@ impl CodeMarkup {
                 .or_else(|| {
                     matches!(token, TokenTree::Punct(_)).then_some(M2SemanticTokenType::Punctuation)
                 })
-                .filter(|token_type| {
-                    !matches!(
-                        token_type,
-                        M2SemanticTokenType::Comment | M2SemanticTokenType::String
-                    )
-                })
+                .filter(|token_type| !matches!(token_type, M2SemanticTokenType::Comment))
             else {
                 continue;
             };

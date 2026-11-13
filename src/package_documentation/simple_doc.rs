@@ -29,6 +29,7 @@
 //! and `CannedExample`s are code SimpleDoc only shows; their tokens are marked
 //! like those of the code it evaluates.
 
+use crate::semantic_token::M2SemanticTokenType;
 use std::ops::Range;
 
 use m2_syn::nodes::ExprOpBinAdj;
@@ -600,8 +601,8 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                         &self.reassemble(part.content),
                     ));
                 }
-                for fragment in &fragments {
-                    self.mark_shown_code(fragment.bytes.clone());
+                if let (Some(first), Some(last)) = (fragments.first(), fragments.last()) {
+                    self.mark_shown_code(first.bytes.start..last.bytes.end);
                 }
                 page.examples.extend(fragments);
             }
@@ -736,6 +737,15 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 continue;
             };
             let name_bytes = item_line.trimmed(0..separator_start);
+            self.documentation.markup.push(DocumentationMarkup {
+                bytes: line.text.start + separator_start
+                    ..line.text.start + separator_start + separator.len(),
+                kind: DocumentationMarkupKind::Syntax(if separator == ":" {
+                    M2SemanticTokenType::Punctuation
+                } else {
+                    M2SemanticTokenType::Operator
+                }),
+            });
             let rest_start = separator_start + separator.len();
             let (type_end, abbreviation) = item_line.short_description(rest_start);
             let type_bytes = item_line.trimmed(rest_start..type_end);

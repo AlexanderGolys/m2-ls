@@ -46,6 +46,7 @@ the second column — that is the name your editor and theme see.
 | Markup | `macro` | markup around documentation text | `{\tt`, `}`, `PARA`, `TT` |
 | Modifier keyword | `modifier` | the quoting keywords | `symbol`, `local`, `global`, `threadVariable` |
 | Keyword | `keyword` | language keywords, SimpleDoc section keywords, and document option names | `if`, `then`, `for`, `TEST`, `Key`, `Description` |
+| Documentation prose | `docs` | documentation text, independently styled from source strings | explanatory paragraphs and styled text |
 | String | `string` | string literals | `"done"`, `///…///` |
 | Regular expression | `regexp` | special syntax within literal patterns of `match`, `regex`, `replace`, `select`, and `separate`; delimiters and plain text stay `string` | `+` in `replace(///a+///, "b", text)` |
 | Escape sequence | `escapeSequence` | escaped characters in patterns, retaining their source spelling | `\d`, `\.`, `\\d` in quoted strings |
@@ -88,8 +89,10 @@ makes `area` a method, `twice = n -> …` a function.
 | --- | :---: | --- | --- |
 | `declaration` | <i class="fa-solid fa-check"></i> | where a name is bound, or what an installation installs on | `R =`, `n :=`, `x` in `QQ[x]`, `area` in `area Matrix :=` |
 | `defaultLibrary` | <i class="fa-solid fa-check"></i> | a value selected by `semanticTokens.defaultLibrary` | by default, compiled functions such as `apply` and `scan` |
+| `libraryConst` | | an indexed library binding exported as protected | `ZZ` |
+| `libraryConfigParam` | | an indexed library binding exported as mutable | `allowableThreads` |
 | `readonly` | <i class="fa-solid fa-check"></i> | a binding protected from reassignment, independently of value mutability | `ZZ`, a protected package export |
-| `documentation` | <i class="fa-solid fa-check"></i> | inside documentation: a `doc` string, a `document` call, a [documentation comment](../beyond/documentation-comments.md) | everything inside `doc ///…///` |
+| `documentation` | <i class="fa-solid fa-check"></i> | standard-only fallback for documentation style modifiers; not inherited by embedded code | compatibility output for styled prose |
 | `algebraic` | | a ring generator or a known nonnumeric value living over a ring | `x`, an ideal, a module, a matrix |
 | `ring`, `module`, `morphism`, `complex`, `functor`, `structure`, `space` | | an object of that [algebraic kind](#kinds) | `R = QQ[x]`, an ideal, a matrix, `HH`, a variety |
 | `optionalParameter` | | an option key | `Strategy` in `Strategy => Linear` |
@@ -114,7 +117,9 @@ The complete list of `defaultLibrary` policies and their alias behavior is in
 [Configuration](../getting-started/configuration.md#semantic-tokens). The
 compiled policies describe the value; package policies describe the binding's
 origin. `readonly` independently describes symbol protection. Local aliases and
-shadows remain assignable, and `exportMutable` names remain unmarked.
+shadows remain assignable. Indexed protected exports carry `libraryConst`; indexed
+mutable exports carry `libraryConfigParam`. These modifiers describe the library
+binding, never local aliases or shadows, and do not depend on `defaultLibrary`.
 
 ## Standard-only compatibility { #standard-only }
 
@@ -125,16 +130,16 @@ stable; emitted tokens use these fallbacks:
 
 | Full vocabulary | Standard-only output |
 | --- | --- |
-| `escapeSequence` type | `string` |
+| `escapeSequence`, `docs` types | `string` |
 | `delimiter`, `punctuation` types | `operator` |
 | All other token types | unchanged |
 | `algebraic`, the seven kind modifiers, `nonsense` | `abstract` |
 | `example`, `strong`, `emphasis`, `monospace`, `url`, `file`, `directory`, `wikilink`, `tex` modifiers | `documentation` |
-| `optionalParameter`, `memberAccess`, `index`, `test` modifiers | removed |
+| `optionalParameter`, `memberAccess`, `index`, `test`, `libraryConst`, `libraryConfigParam` modifiers | removed |
 | `declaration`, `defaultLibrary`, `readonly`, `documentation`, `abstract` modifiers | unchanged |
 
 Fallbacks combine without duplicating modifiers: a
-`string+documentation+monospace` token becomes `string+documentation`.
+`docs+monospace` token becomes `string+documentation`.
 An ideal classified as `variable+algebraic` becomes `variable+abstract`.
 Compatibility mode sacrifices visual distinctions; it does not change name
 resolution or type inference.
@@ -221,13 +226,13 @@ export {"double"}               -- "double" colored as the function it exports
 exportMutable {"verbosity"}     -- "verbosity" variable, without readonly
 beginDocumentation()
 doc ///
-Key                             -- keyword+documentation
-  double                        -- function+documentation
+Key                             -- keyword
+  double                        -- function
 Headline
-  doubles a number              -- string+documentation+strong
+  doubles a number              -- docs+strong
 Description
-  §keyword.documentation|Example§
-    §variable.documentation.example|double§ 3                    -- function+documentation+example
+  §keyword|Example§
+    §variable.example|double§ 3                    -- function+example
 ///
 TEST ///
 assert(§variable.test|double§ 2 == 4)           -- assert method+test, 2 number+test, == operator+test
@@ -236,19 +241,19 @@ assert(§variable.test|double§ 2 == 4)           -- assert method+test, 2 numbe
 
 The code of `TEST` blocks and documentation examples is analyzed as real code,
 so its names resolve against the package exactly as they would when the tests
-run. A plain variable named inside a string keeps the string's color instead of
-dropping to the default text color.
+run. Code names retain their semantic categories, including `variable` for
+unresolved names. Documentation prose uses `docs`, separate from string literals.
 
 SimpleDoc section names such as `Key`, `Description`, and `Example`
-receive `keyword+documentation`. Hypertext link constructors such as `TO`
-receive `decorator+documentation`; formatting constructors such as `TT`
-receive `macro+documentation`. Both `@` delimiters of an inline expression
+receive `keyword`. Hypertext link constructors such as `TO`
+receive `decorator`; formatting constructors such as `TT`
+receive `macro`. Both `@` delimiters of an inline expression
 and the delimiters of TeX formatting receive markup tokens.
 
 Quoted documentation references and styled strings include their quotation
 marks in the highlight. For example, `TO "Matrix"` resolves the name
 `Matrix`, but colors the entire `"Matrix"` literal as a type; `TT "code"`
-marks the entire literal as `string+monospace`. TeX formatting such as
+marks the entire literal as `docs+monospace`. TeX formatting such as
 `{\tt code}` keeps its markup delimiters separate from its styled content.
 
 Embedded code includes its group boundaries as `delimiter` and its commas
@@ -344,3 +349,8 @@ escapes, so `"\\d"` highlights `\\d` as one escape sequence.
 
 Only literal pattern arguments are refined. Replacement strings, input text,
 and calls through a locally shadowed function keep their ordinary classification.
+
+Documentation prose uses the custom `docs` token type. Embedded names, operators,
+brackets, and literals retain their code classifications without a blanket
+`documentation` modifier. In standard-only mode, `docs` falls back to `string`.
+For Neovim, style `@lsp.type.docs.macaulay2` independently from `@string`.

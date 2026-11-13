@@ -435,6 +435,9 @@ impl DocumentSnapshot {
             let session_diagnostics = snapshot
                 .package_sessions()
                 .iter()
+                // Examples remain analyzed for editor features, but only TEST
+                // sessions contribute diagnostics to the containing document.
+                .filter(|session| snapshot.packages.tests().contains(&session.code))
                 .flat_map(|session| session.snapshot.diagnostics.iter().cloned())
                 .collect::<Vec<_>>();
             snapshot.diagnostics.extend(session_diagnostics);

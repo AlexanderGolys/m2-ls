@@ -155,7 +155,7 @@ pub enum M2SemanticTokenType {
     TypeAnnotation = SemanticTokenType::TYPE_PARAMETER,
     /// Markup around documentation text: a TeX delimiter, the `{\tt` and
     /// `}` of `{\tt x}`, or a hypertext constructor such as `TT` or `PARA`.
-    /// The text it styles stays a [`String`](Self::String) carrying the
+    /// The text it styles stays [`Docs`](Self::Docs) carrying the
     /// style's modifier.
     Macro = SemanticTokenType::MACRO,
     /// An annotation attached to what it decorates: the codomain of an
@@ -172,6 +172,8 @@ pub enum M2SemanticTokenType {
     Delimiter = SemanticTokenType::new("delimiter"),
     /// Embedded code separators, such as commas and semicolons.
     Punctuation = SemanticTokenType::new("punctuation"),
+    /// Documentation prose, styled independently from source string literals.
+    Docs = SemanticTokenType::new("docs"),
 }
 
 impl M2SemanticTokenType {
@@ -247,9 +249,8 @@ pub enum M2SemanticTokenModifier {
     /// A binding protected from reassignment, independently of value mutability.
     Readonly = SemanticTokenModifier::READONLY,
 
-    /// Documentation: a documentation call with its tags and values, the
-    /// string a `doc` call reads as SimpleDoc, an attached documentation
-    /// comment, and the code they embed.
+    /// Standard compatibility fallback for custom documentation style modifiers.
+    /// Documentation code does not inherit this modifier automatically.
     Documentation = SemanticTokenModifier::DOCUMENTATION,
     /// An algebraic object that is not itself a type: a generator such as
     /// the `x` of `QQ[x]`, or a value whose class `ring` is installed on,
@@ -313,6 +314,10 @@ pub enum M2SemanticTokenModifier {
     Index = SemanticTokenModifier::new("index"),
     /// Reserved companion to abstract mathematical content; no automatic emission rule.
     Nonsense = SemanticTokenModifier::new("nonsense"),
+    /// An indexed library binding exported as protected, regardless of value mutability.
+    LibraryConst = SemanticTokenModifier::new("libraryConst"),
+    /// An indexed library binding exported as mutable and available for configuration.
+    LibraryConfigParam = SemanticTokenModifier::new("libraryConfigParam"),
 }
 
 impl From<AlgebraicKind> for M2SemanticTokenModifier {
@@ -495,7 +500,9 @@ impl M2SemanticToken {
                 M2SemanticTokenModifiers::with,
             );
         let token_type = match self.token_type {
-            M2SemanticTokenType::EscapeSequence => M2SemanticTokenType::String,
+            M2SemanticTokenType::EscapeSequence | M2SemanticTokenType::Docs => {
+                M2SemanticTokenType::String
+            }
             M2SemanticTokenType::Delimiter | M2SemanticTokenType::Punctuation => {
                 M2SemanticTokenType::Operator
             }

@@ -32,6 +32,106 @@ const RAW_STRING_MIN_ESCAPES: usize = 3;
 /// The delimiter of a raw string literal, on both sides.
 const RAW_STRING_DELIMITER: &str = "///";
 
+/// Declaration category selecting the applicable documentation sections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+enum DocumentationItemKind {
+    /// A package entry page with credits and a table of contents.
+    Package,
+    /// An overview of a source-defined type.
+    Type,
+    /// A method function overview whose installations have their own signatures.
+    Method,
+    /// A function with one source-defined argument list.
+    Function,
+    /// One installed method signature.
+    Installation,
+    /// A callable's optional argument.
+    Option,
+    /// Another source binding documented as an overview.
+    Value,
+}
+
+/// Source facts and presentation fields for one SimpleDoc documentation node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DocumentationTemplate {
+    /// SimpleDoc expression identifying the documented object.
+    key: String,
+    /// Position of the declaration above which the node is inserted.
+    start: Position,
+    /// Known usage expression; absent for package and type overview pages.
+    usage: Option<String>,
+    /// Argument names and their known types, in call order.
+    inputs: Vec<(String, Option<String>)>,
+    /// Known callable result type.
+    output: Option<String>,
+    /// Declaration category governing which sections are appropriate.
+    kind: DocumentationItemKind,
+}
+
+impl DocumentationTemplate {
+    /// Creates an overview node before a declaration.
+    fn new(key: String, start: Position) -> Self {
+        Self {
+            key,
+            start,
+            usage: None,
+            inputs: Vec::new(),
+            output: None,
+            kind: DocumentationItemKind::Value,
+        }
+    }
+
+    /// Translates the function, optional-argument, package, and overview templates
+    /// from Macaulay2Doc into SimpleDoc, retaining their section order.
+    fn render(&self) -> String {
+        let mut text = format!("doc ///\nNode\n  Key\n    {}\n  Headline\n    Describe this item's purpose in one short sentence.\n", self.key);
+        if let Some(usage) = &self.usage {
+            text.push_str(&format!("  Usage\n    {usage}\n"));
+            if !self.inputs.is_empty() {
+                text.push_str("  Inputs\n");
+                for (name, ty) in &self.inputs {
+                    let annotation = ty.as_ref().map(|ty| format!(":{ty}")).unwrap_or_default();
+                    text.push_str(&format!(
+                        "    {name}{annotation}\n      Describe this input and its constraints.\n"
+                    ));
+                }
+            }
+            if self.kind != DocumentationItemKind::Option {
+                text.push_str("  Outputs\n");
+                let annotation = self
+                    .output
+                    .as_ref()
+                    .map(|ty| format!(":{ty}"))
+                    .unwrap_or_default();
+                text.push_str(&format!(
+                    "    result{annotation}\n      Describe the returned value.\n"
+                ));
+            }
+        }
+        if self.usage.is_some() {
+            text.push_str("  Consequences\n    Item\n      Describe side effects, or remove this section if there are none.\n");
+        }
+        text.push_str(
+            "  Description\n    Text\n      Explain what this item does and when to use it.\n",
+        );
+        text.push_str("    Example\n      -- Add runnable Macaulay2 code demonstrating a typical use.\n    Text\n      Explain the example and its result, or remove this paragraph.\n");
+        if self.kind == DocumentationItemKind::Package {
+            text.push_str("  Acknowledgement\n    Credit support or assistance relevant to the package.\n  Contributors\n    List the package contributors.\n  References\n    List relevant publications or references.\n");
+        }
+        text.push_str(
+            "  Caveat\n    Describe limitations or special cases, or remove this section.\n",
+        );
+        if self.kind == DocumentationItemKind::Package {
+            text.push_str(
+                "  Subnodes\n    -- Add documentation keys for the package's main entry points.\n",
+            );
+        }
+        text.push_str("///");
+        text
+    }
+}
+
 /// Document and request data shared by code-action producers.
 struct CodeActionContext<'a, 'request> {
     /// Immutable document snapshot being queried.
@@ -112,6 +212,203 @@ impl<'a> CodeActionContext<'a, '_> {
             ),
             diagnostics,
         })
+    }
+
+    /// Documentation placeholders for declarations enclosing the cursor and their options.
+    fn documentation_placeholders(&self) -> Vec<CodeAction> {
+        let mut targets = Vec::new();
+        for installation in self.document.analysis().installations() {
+            if !installation.span.contains_position(self.position) {
+                continue;
+            }
+            let method = &installation.method;
+            let head = match &method.head {
+                crate::analysis::MethodHead::Function(name) => name.name().to_string(),
+                crate::analysis::MethodHead::Operator(operator) => {
+                    format!("symbol {}", operator.token.name())
+                }
+            };
+            let mut parts = vec![head];
+            parts.extend(method.domain.iter().map(|name| name.name().to_string()));
+            let mut template = DocumentationTemplate::new(
+                format!("({})", parts.join(", ")),
+                installation.span.start,
+            );
+            let names = self.documentation_parameters(installation.span);
+            template.inputs = method
+                .domain
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| {
+                    (
+                        names
+                            .get(index)
+                            .cloned()
+                            .unwrap_or_else(|| format!("arg{}", index + 1)),
+                        Some(ty.name().to_string()),
+                    )
+                })
+                .collect();
+            template.usage = Some(format!(
+                "{}({})",
+                method.head.name().name(),
+                template
+                    .inputs
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            template.kind = DocumentationItemKind::Installation;
+            template.output = method.codomain.as_ref().map(|ty| ty.name().to_string());
+            targets.push(template);
+        }
+        if targets.is_empty() {
+            for binding in self.document.analysis().binding_states() {
+                if !binding
+                    .state
+                    .definition_range
+                    .contains_position(self.position)
+                    || self.document.declaration_code(binding).is_none()
+                {
+                    continue;
+                }
+                let start = binding.state.definition_range.start;
+                let name = binding.name.name();
+                let mut template = DocumentationTemplate::new(name.to_string(), start);
+                if binding.state.presentation_kind == SymbolKind::CLASS {
+                    template.kind = DocumentationItemKind::Type;
+                }
+                if let Some(function) = self.document.analysis().function_for_binding(binding) {
+                    template.kind = if function.is_method_function() {
+                        DocumentationItemKind::Method
+                    } else {
+                        DocumentationItemKind::Function
+                    };
+                    template.inputs = self
+                        .documentation_parameters(binding.state.definition_range)
+                        .into_iter()
+                        .map(|name| (name, None))
+                        .collect();
+                    template.usage = Some(format!(
+                        "{name}({})",
+                        template
+                            .inputs
+                            .iter()
+                            .map(|(name, _)| name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                    template.output = function
+                        .typical_value
+                        .as_ref()
+                        .map(|ty| ty.name().to_string());
+                    for option in function.declared_options.iter().flatten() {
+                        let mut option_template = DocumentationTemplate::new(
+                            format!("[{name}, {}]", option.name.name()),
+                            start,
+                        );
+                        option_template.kind = DocumentationItemKind::Option;
+                        option_template.usage =
+                            Some(format!("{name}(..., {} => value)", option.name.name()));
+                        option_template.inputs.push((
+                            "value".into(),
+                            option
+                                .accepted_types
+                                .first()
+                                .map(|ty| ty.name().to_string()),
+                        ));
+                        targets.push(option_template);
+                    }
+                }
+                if template.kind == DocumentationItemKind::Method {
+                    template.usage = None;
+                    template.inputs.clear();
+                    template.output = None;
+                }
+                targets.push(template);
+            }
+        }
+        for package in self.document.packages().declarations() {
+            if package.section.start.line == self.position.line {
+                let mut template = DocumentationTemplate::new(
+                    package.name.name().to_string(),
+                    package.section.start,
+                );
+                template.kind = DocumentationItemKind::Package;
+                targets.push(template);
+            }
+        }
+        targets.sort_by(|left, right| {
+            (
+                &left.key,
+                left.start,
+                left.kind != DocumentationItemKind::Package,
+            )
+                .cmp(&(
+                    &right.key,
+                    right.start,
+                    right.kind != DocumentationItemKind::Package,
+                ))
+        });
+        targets.dedup_by(|left, right| left.key == right.key && left.start == right.start);
+        targets
+            .into_iter()
+            .filter_map(|template| {
+                let start = template.start;
+                let key = &template.key;
+                let line = self.document.text().lines().nth(start.line as usize)?;
+                let indent: String = line
+                    .chars()
+                    .take_while(|character| matches!(character, ' ' | '\t'))
+                    .collect();
+                // A line insertion must not split an earlier statement on the same line.
+                let prefix = self.document.byte_for_position(start)?;
+                let line_start = self
+                    .document
+                    .byte_for_position(Position::new(start.line, 0))?;
+                if !self.document.text()[line_start..prefix].trim().is_empty() {
+                    return None;
+                }
+                let text = template.render();
+                let newline = if self.document.text().contains("\r\n") {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
+                let replacement = text
+                    .lines()
+                    .map(|line| format!("{indent}{line}{newline}"))
+                    .collect::<String>();
+                let position = Position::new(start.line, 0);
+                Some(
+                    CodeActionSpec {
+                        title: format!("Generate SimpleDoc documentation for {key}"),
+                        kind: CodeActionKind::REFACTOR_REWRITE,
+                        is_preferred: None,
+                        diagnostics: None,
+                    }
+                    .build(
+                        self.uri,
+                        TextRange::new(position, position),
+                        replacement,
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// Parameter names retained by typed source analysis in declaration order.
+    fn documentation_parameters(&self, range: TextRange) -> Vec<String> {
+        self.document
+            .analysis()
+            .bindings()
+            .filter(|binding| {
+                binding.role == crate::meta::BindingRole::Parameter
+                    && range.contains_position(binding.range.start)
+            })
+            .map(|binding| binding.name.name().to_string())
+            .collect()
     }
 
     /// The client's diagnostic of `rule` at the cursor.
@@ -312,6 +609,7 @@ pub fn available_code_actions(
     let mut actions: CodeActionResponse = context
         .finding_fixes()
         .into_iter()
+        .chain(context.documentation_placeholders())
         .chain(context.raw_string())
         .chain(context.rewrites())
         .chain(primary_code_action(&context))

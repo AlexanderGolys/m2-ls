@@ -191,3 +191,34 @@ Every `m2-ls` diagnostic under the cursor also offers two actions that write a
 
 **Disable S04 in this file**
 : Inserts `-- m2-ls: disable S04` at the top of the file.
+
+## SimpleDoc documentation placeholders
+
+Place the cursor on a declaration and choose **Generate SimpleDoc documentation
+for …** to insert a `doc /// … ///` placeholder immediately above it.
+The action fills the documentation key and add explanatory text for sections
+that need your input.
+
+The full templates translate Macaulay2's
+[function](https://macaulay2.com/doc/Macaulay2/share/doc/Macaulay2/Macaulay2Doc/html/_function_spdocumentation_sptemplate.html),
+[optional argument](https://macaulay2.com/doc/Macaulay2/share/doc/Macaulay2/Macaulay2Doc/html/_optional_spargument_spdocumentation_sptemplate.html),
+[package](https://macaulay2.com/doc/Macaulay2/share/doc/Macaulay2/Macaulay2Doc/html/_package_spdocumentation_sptemplate.html), and
+[overview](https://macaulay2.com/doc/Macaulay2/share/doc/Macaulay2/Macaulay2Doc/html/_overview_spdocumentation_sptemplate.html)
+documentation templates into SimpleDoc syntax, preserving their section order.
+The sections follow the item's role: types and method functions receive overview
+nodes; ordinary functions and installed signatures receive usage, inputs, and
+outputs; option nodes describe the option's input rather than a return value.
+Only package pages include acknowledgements, contributors, references, and
+subnodes. Function and method declarations with literal option tables also offer
+separate actions using `[function, Option]`. Installations use signature keys
+such as `(f, ZZ)`, parameter names from source, their declared domain types, and
+the known codomain. Unknown types stay unspecified instead of being invented.
+
+Each item has one template action. It includes explanatory prose, an example,
+and a caveat, with consequences for callables and additional overview fields for
+packages. Fill in or remove the guidance text before publishing documentation.
+
+Load SimpleDoc in the package as usual, and move completed documentation to the
+package's documentation section when needed: executable documentation references
+may require their objects to have been defined first. These actions insert text
+without loading packages or rearranging declarations, and require no diagnostic.
