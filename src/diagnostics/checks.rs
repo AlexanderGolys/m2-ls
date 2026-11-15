@@ -15,6 +15,7 @@ mod location;
 mod method_typical_value;
 mod naming;
 mod native_dispatch;
+mod orphan;
 mod parse;
 mod predicate_declaration;
 
@@ -165,6 +166,9 @@ pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
             knowledge: &knowledge,
         };
         installation::spawn(&context, &mut sink);
+        if let Some(package) = packages.declaration_at(installation.span.start) {
+            orphan::spawn(&context, std::slice::from_ref(&package.name), &mut sink);
+        }
     }
     let context = DocumentContext {
         analysis,
@@ -211,6 +215,34 @@ pub fn collect_located(
         },
         &mut sink,
     );
+    sink.diagnostics
+}
+
+/// The orphan installations of a file without package declarations of its
+/// own that the packages `owners` load from inside their sections, so that its
+/// code runs as theirs.
+pub fn collect_loaded_orphans(
+    document: &DocumentSnapshot,
+    owners: &[crate::object_registry::ObjectName],
+) -> Vec<M2Diagnostic> {
+    let mut sink = DiagnosticSink::default();
+    if owners.is_empty()
+        || document.properties().primary_code
+        || !document.packages().declarations().is_empty()
+    {
+        return sink.diagnostics;
+    }
+    let analysis = document.analysis();
+    let registry = document.object_registry();
+    for installation in analysis.installations() {
+        let knowledge = registry.at(installation.span.start);
+        let context = InstallationContext {
+            analysis,
+            installation,
+            knowledge: &knowledge,
+        };
+        orphan::spawn(&context, owners, &mut sink);
+    }
     sink.diagnostics
 }
 
@@ -351,6 +383,89 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// The messages of the orphan installations `source` reports, against
+    /// the real builtin catalog.
+    fn orphans(source: &str) -> Vec<String> {
+        let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
+        let document = DocumentSnapshot::from_text(source.to_string(), &builtins)
+            .expect("fixture should parse");
+        document
+            .diagnostics()
+            .iter()
+            .filter(|reported| reported.rule.code == catalog::ORPHAN_INSTALLATION.code)
+            .map(|reported| reported.finding.message.clone())
+            .collect()
+    }
+
+    /// Whether the package fixture `body` reports an orphan installation.
+    fn orphaned(body: &str) -> bool {
+        !orphans(&format!("newPackage \"Pkg\"\n{body}\nendPackage \"Pkg\"\n")).is_empty()
+    }
+
+    /// Macaulay2 finds an installation only for arguments descending from each
+    /// of its domain types, so owning the method function or one domain type
+    /// keeps the method to callers of the package.
+    #[test]
+    fn package_installations_must_own_the_method_or_a_domain_type() {
+        assert!(orphaned("net ZZ := n -> \"n\""));
+        assert!(orphaned("ZZ + RR := (a, b) -> a"));
+        assert!(orphaned(
+            "installMethod(symbol *, Matrix, String, (m, s) -> m)"
+        ));
+        assert!(orphaned("toString(ZZ, QQ) := (a, b) -> \"\""));
+        assert!(orphaned("- Matrix := m -> m"));
+
+        assert!(!orphaned("T = new Type of List\nnet T := t -> \"t\""));
+        assert!(!orphaned("T = new Type of List\nZZ * T := (n, t) -> t"));
+        assert!(!orphaned(
+            "T = new Type of List\ninstallMethod(symbol +, ZZ, T, (n, t) -> t)"
+        ));
+        assert!(!orphaned("f = method()\nf ZZ := n -> n"));
+        assert!(!orphaned("f = method()\nf(ZZ, Matrix) := (n, m) -> m"));
+        assert!(!orphaned("R = QQ[x]\npromote(ZZ, R) := (n, R) -> n"));
+        assert!(
+            !orphaned("net Unbound := u -> \"u\""),
+            "a name nothing resolves may be defined where the package loads it from"
+        );
+    }
+
+    /// Ownership follows the value: a package name bound to another package's
+    /// type or method still installs on that type or method, and a codomain is
+    /// never dispatched on.
+    #[test]
+    fn ownership_follows_the_value_not_the_name() {
+        assert!(orphaned("Integer = ZZ\nnet Integer := n -> \"n\""));
+        assert!(orphaned("T = new Type of List\nnet ZZ := T => n -> \"n\""));
+        assert_eq!(
+            notes_of(
+                &catalog::ORPHAN_INSTALLATION,
+                "newPackage \"Pkg\"\nInteger = ZZ\nnet Integer := n -> \"n\"\n",
+            ),
+            [[(
+                1,
+                "`Integer` is bound here to a value another package defines".to_string()
+            )]]
+        );
+    }
+
+    /// Code outside a package section runs in the user's own session, where
+    /// changing builtin methods is the user's choice.
+    #[test]
+    fn only_package_code_is_held_to_the_orphan_rule() {
+        assert_eq!(orphans("net ZZ := n -> \"n\"\n"), Vec::<String>::new());
+        assert_eq!(
+            orphans("newPackage \"Pkg\"\nendPackage \"Pkg\"\nnet ZZ := n -> \"n\"\n"),
+            Vec::<String>::new()
+        );
+        let [message] = orphans("newPackage \"Pkg\"\nnet ZZ := n -> \"n\"\n")
+            .try_into()
+            .expect("one orphan installation");
+        assert!(
+            message.starts_with("`Pkg` installs `net` (Core) for `ZZ` (Core)"),
+            "{message}"
+        );
     }
 
     /// A finding about a name points at where the name got the value that

@@ -32,7 +32,7 @@ mod checks;
 pub mod rewrites;
 pub mod suppression;
 
-pub use checks::{collect, collect_located, DiagnosticInputs};
+pub use checks::{collect, collect_loaded_orphans, collect_located, DiagnosticInputs};
 
 use serde::{Deserialize, Deserializer};
 use tower_lsp::lsp_types::{
@@ -273,6 +273,10 @@ pub fn visible_diagnostics(
     if !document.properties().primary_code {
         if let Some(workspace) = workspace {
             located.extend(workspace.undocumented_exports(uri));
+            located.extend(collect_loaded_orphans(
+                document,
+                &workspace.loading_packages(uri),
+            ));
         }
     }
     document

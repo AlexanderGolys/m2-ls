@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add E25 `orphan-installation`, the orphan rule: warn when package code,
+  including files the package loads, installs a method without defining the
+  method function or any of its domain types, so that loading the package
+  changes that method for every session. Ownership follows the value, so a
+  package name bound to a builtin type does not count.
+
 ## 2.7.0 - 2026-11-13
 
 - Prevent semantic-token requests from panicking on invalid byte spans or

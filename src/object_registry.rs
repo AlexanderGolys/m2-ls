@@ -515,6 +515,11 @@ impl ObjectRegistryView<'_> {
         self.registry.package_name(package)
     }
 
+    /// Whether this identity was supplied by the workspace import graph.
+    pub fn is_source_object(&self, id: &ObjectId) -> bool {
+        self.registry.is_source_object(id)
+    }
+
     /// The packages loaded at the view's position, the last loaded first.
     pub fn loaded_packages(&self) -> Vec<ObjectName> {
         self.registry.loaded_packages_at(self.position)

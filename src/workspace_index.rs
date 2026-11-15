@@ -1294,6 +1294,18 @@ impl WorkspaceIndex {
         }
     }
 
+    /// The packages that load `uri` from inside their sections, so that its
+    /// code runs as theirs; empty for a file declaring packages itself.
+    pub fn loading_packages(&self, uri: &Url) -> Vec<ObjectName> {
+        if self.declared_packages_by_file.contains_key(uri) {
+            return Vec::new();
+        }
+        self.package_of_loaded_file
+            .get(uri)
+            .map(|packages| packages.value().iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Whether `uri` is one of the files of `package`: the file declaring
     /// it, or a file loaded from inside its section.
     fn belongs_to_package(&self, uri: &Url, package: &ObjectName) -> bool {
