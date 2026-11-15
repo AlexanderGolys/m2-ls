@@ -650,6 +650,20 @@ DIVISION_BY_ZERO {
         severity: ERROR,
     }
 
+    /// A method a package installs without owning the method function or any
+    /// of the types it dispatches on, so that loading the package changes the
+    /// method for every session: the orphan rule.
+    ///
+    /// ```m2
+    /// newPackage "Orphans"
+    /// net ZZ := n -> "an integer"
+    /// ```
+ORPHAN_INSTALLATION {
+        code: "E25",
+        name: "orphan-installation",
+        severity: WARNING,
+    }
+
     /// An `if` or `while` condition that is a computation with one value,
     /// such as a comparison of numbers, so that one branch never runs.
     ///

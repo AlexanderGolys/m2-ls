@@ -105,3 +105,31 @@ async fn loaded_documentation_covers_package_exports_across_files() {
     }
     server.shutdown().await;
 }
+
+/// A file a package loads from inside its section runs as the package's code,
+/// so it is held to the orphan rule against the types the whole package
+/// defines; a suppression directive silences the rule.
+#[tokio::test]
+async fn loaded_files_are_held_to_the_orphan_rule() {
+    let main = "newPackage \"P\"\nload \"implementation.m2\"\nendPackage \"P\"\n";
+    let workspace = TestWorkspace::new(main);
+    let fragment = concat!(
+        "Shape = new Type of HashTable\n",
+        "net Shape := s -> \"shape\"\n",
+        "net ZZ := n -> \"integer\"\n",
+        "-- m2-ls: disable-next-line orphan-installation\n",
+        "toString ZZ := n -> \"integer\"\n",
+    );
+    let fragment_uri = workspace.write_file("implementation.m2", fragment);
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    server.open_document(&workspace.uri, main).await;
+    let opened = server.open_document(&fragment_uri, fragment).await;
+    let lines = response_array(&opened["params"]["diagnostics"])
+        .iter()
+        .filter(|diagnostic| diagnostic["code"] == "E25")
+        .map(|diagnostic| diagnostic["range"]["start"]["line"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(lines, [2], "{opened}");
+    server.shutdown().await;
+}

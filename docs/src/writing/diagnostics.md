@@ -87,6 +87,7 @@ next.
 | `E22` | `unresolved-value` | error | an unbound callable, constructor type, Boolean operand or condition, or indexed receiver; declare or explicitly import the value |
 | `E23` | `matrix-shape-mismatch` | error | a sum, difference or product of matrices written out whose dimensions cannot combine: `A * A` for a 2×3 `A` |
 | `E24` | `division-by-zero` | error | a number divided by an exact zero written out: `1/0`, `1.5/0`; `1/0.` is valid and gives infinity |
+| `E25` | `orphan-installation` | warning | a package installing a method without defining the method function or any of its domain types, so loading it changes the method everywhere: `net ZZ := …` inside `newPackage`; see [Orphan installations](#orphans) |
 | `T01` | `parallel-assignment-type` | error | `(a, b) = 5` |
 | `T02` | `condition-type` | warning | an `if` or `while` condition known not to be `Boolean` |
 | `T03` | `install-codomain-missing` | hint | an installation other than `new` without a codomain that inference can deduce; fix: insert `ZZ =>` |
@@ -224,6 +225,39 @@ matters if the code sits inside a `try` that relied on that error escaping.
 Where a finding points at another place — `f` defined as a plain function on
 an earlier line — the diagnostic carries it as related information, which
 editors show as a clickable note.
+
+### Orphan installations { #orphans }
+
+A package that installs `net ZZ` or `sort (List, Function)` changes those
+methods for every session that loads it, including code that never uses a
+symbol from the package. `E25` reports such an installation when the package
+defines neither the method function nor any type in its domain:
+
+```m2
+newPackage "Shapes"
+Shape = new Type of HashTable
+net Shape := s -> "shape"          -- fine: `Shape` is the package's own
+area = method()
+area ZZ := n -> n                  -- fine: `area` is the package's own
+net ZZ := n -> "integer"           -- E25: neither `net` nor `ZZ` is
+Integer = ZZ
+toString Integer := n -> "integer" -- E25: `Integer` is still `ZZ`
+endPackage "Shapes"
+```
+
+Owning one domain type is enough. Macaulay2 looks a method up by the classes of
+the actual arguments, trying the key `(f, X, Y)` for each pair of ancestors of
+those classes, so an installation on `(ZZ, Shape)` is reached only with a
+`Shape` argument. Ownership follows the value: a package name bound to another
+package's type, as `Integer` above, does not make it yours, and a codomain
+annotation is never dispatched on. Operators always belong to the language.
+
+The rule covers code inside a `newPackage` section and files the package loads
+from there. Scripts and code after `endPackage` run as the user's own session
+and are not checked. A name whose value is unknown counts as owned, so the rule
+reports only installations it can prove foreign. When the installation is
+deliberate, such as a package meant to change how a builtin type prints,
+silence it with `-- m2-ls: disable-next-line orphan-installation`.
 
 ## Naming, options, and constructors { #naming }
 
