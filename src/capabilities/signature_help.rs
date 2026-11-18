@@ -7,18 +7,20 @@
 //! (local method records first, then the builtin/imported index), and report the
 //! active parameter as the number of completed arguments before the cursor.
 
-use m2_syn::nodes::{Expr, ExprCollection, ExprOpBinAdj, PackedContent};
+use m2_syn::nodes::{BinaryOperator, Elements, Expr, ExprBinary};
 use m2_syn::visit::{self, Visit};
+use m2_syn::Token;
 use tower_lsp::lsp_types::{
     ParameterInformation, ParameterLabel, Position, SignatureHelp, SignatureInformation,
 };
 
-use crate::analysis::{Analysis, FunctionInfo, Method};
+use crate::analysis::{Analysis, Dispatch, FunctionInfo, Method, TypeChecker};
+use crate::builtin_index::CallableOption;
 use crate::document::DocumentSnapshot;
 use crate::object_registry::ObjectName;
 use crate::record_lsp::{LspKnowledge, ResolvedSignature};
 use crate::source::{SourceNavigation, SyntaxSource};
-use crate::syntax::ExpressionSyntax;
+use crate::syntax::{BoundSymbols, ExpressionSyntax, LambdaSyntax};
 
 /// Help response used to render the resolved callable signature.
 pub fn signature_help_response(
@@ -31,20 +33,66 @@ pub fn signature_help_response(
     // Only a named (symbol) head can be resolved to recorded signatures; a
     // computed head (`(f g) x`, `obj#k a`) has no name to look up, so we give no
     // signature help for it rather than guess.
-    let callable_name = call.left_operand.symbol_name()?;
+    let callable_name = call.left.symbol_name()?;
 
-    let signatures = signature_informations(
+    let mut signatures = signature_informations(
         callable_name,
-        document.analysis(),
-        document.range_for_syntax(call.left_operand.as_ref())?.start,
+        document,
+        document.range_for_syntax(call.left.as_ref())?.start,
         knowledge,
     );
     if signatures.is_empty() {
         return None;
     }
 
-    let active_parameter = active_parameter_index(&call.right_operand, cursor, document);
-    let active_signature = active_signature_index(&signatures, active_parameter);
+    let options = TypeChecker::new(document.analysis(), knowledge)
+        .call_options(call, document, knowledge)
+        .unwrap_or_default();
+    let current_option = call
+        .right
+        .arguments()
+        .into_iter()
+        .flatten()
+        .find_map(|argument| match argument {
+            Expr::Option(option)
+                if document
+                    .syntax_bytes(argument)
+                    .is_some_and(|bytes| bytes.start <= cursor && cursor <= bytes.end) =>
+            {
+                option.key.symbol_name()
+            }
+            _ => None,
+        })
+        .filter(|name| options.iter().any(|option| option.name.name() == *name));
+    for signature in &mut signatures {
+        append_options(signature, &options, current_option);
+    }
+
+    let completed_options = call
+        .right
+        .arguments()
+        .into_iter()
+        .flatten()
+        .filter(|argument| {
+            matches!(argument, Expr::Option(option) if options.iter()
+            .any(|accepted| Some(accepted.name.name()) == option.key.symbol_name()))
+        })
+        .filter(|argument| {
+            document
+                .syntax_bytes(*argument)
+                .is_some_and(|bytes| bytes.end < cursor)
+        })
+        .count() as u32;
+    let positional_parameter =
+        active_parameter_index(&call.right, cursor, document).saturating_sub(completed_options);
+    let active_signature = if current_option.is_some() {
+        0
+    } else {
+        active_signature_index(&signatures, positional_parameter)
+    };
+    let active_parameter = signatures[active_signature]
+        .active_parameter
+        .unwrap_or(positional_parameter);
 
     Some(SignatureHelp {
         signatures,
@@ -53,27 +101,75 @@ pub fn signature_help_response(
     })
 }
 
+/// Adds named option slots before the signature's closing parenthesis and
+/// selects an option by its key, independent of the order used at the call.
+fn append_options(
+    signature: &mut SignatureInformation,
+    options: &[CallableOption],
+    current: Option<&str>,
+) {
+    if options.is_empty() {
+        return;
+    }
+    let parameters = signature.parameters.get_or_insert_default();
+    let labels = options
+        .iter()
+        .map(|option| {
+            let accepted = option
+                .accepted_types
+                .iter()
+                .chain(&option.possible_values)
+                .map(ObjectName::name)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let label = if accepted.is_empty() {
+                format!("{} => …", option.name)
+            } else {
+                format!("{} => {accepted}", option.name)
+            };
+            if current == Some(option.name.name()) {
+                signature.active_parameter = Some(parameters.len() as u32);
+            }
+            parameters.push(ParameterInformation {
+                label: ParameterLabel::Simple(label.clone()),
+                documentation: None,
+            });
+            label
+        })
+        .collect::<Vec<_>>();
+    if let Some(closing) = signature.label.rfind(')') {
+        let separator = if parameters.len() == options.len() {
+            ""
+        } else {
+            ", "
+        };
+        signature
+            .label
+            .insert_str(closing, &format!("{separator}{}", labels.join(", ")));
+    }
+}
+
 /// The active-parameter index: the number of completed arguments whose end falls
 /// strictly before the cursor (`f(a, |b)` → 1, the cursor is on the second
 /// argument). Strict `<` keeps the cursor on an argument while it sits at that
 /// argument's trailing edge (`f(a|, b)` stays on the first argument).
 fn active_parameter_index(argument: &Expr, cursor: usize, source: &impl SourceNavigation) -> u32 {
     let inner = match argument {
-        Expr::Holder(holder) => match holder.value.as_deref() {
+        Expr::Paren(holder) => match holder.expr.as_deref() {
             Some(value) => value,
             None => return 0,
         },
         _ => argument,
     };
     match inner {
-        Expr::Collection(ExprCollection::Sequence(sequence)) => match &sequence.elements {
-            Some(PackedContent::Expr(expression)) => u32::from(
+        Expr::Sequence(sequence) => match &sequence.elems {
+            Some(Elements::Single(expression)) => u32::from(
                 source
                     .syntax_bytes(expression.as_ref())
                     .is_some_and(|bytes| bytes.end < cursor),
             ),
-            Some(PackedContent::Pack(pack)) => pack
-                .pack
+            Some(Elements::Pack(pack)) => pack
+                .elems
                 .iter()
                 .filter(|component| {
                     source
@@ -100,7 +196,7 @@ pub struct CallAtCursor<'ast, 'source> {
     /// Syntax that must be enclosed by the call argument.
     anchor: std::ops::Range<usize>,
     /// Innermost call found so far.
-    call: Option<&'ast ExprOpBinAdj>,
+    call: Option<&'ast ExprBinary>,
 }
 
 impl<'ast> CallAtCursor<'ast, '_> {
@@ -109,7 +205,7 @@ impl<'ast> CallAtCursor<'ast, '_> {
         document: &'ast DocumentSnapshot,
         cursor: usize,
         anchor: std::ops::Range<usize>,
-    ) -> Option<&'ast ExprOpBinAdj> {
+    ) -> Option<&'ast ExprBinary> {
         let syntax = document.syntax();
         let mut query = CallAtCursor {
             document,
@@ -138,10 +234,13 @@ impl<'ast> Visit<'ast> for CallAtCursor<'ast, '_> {
         visit::visit_expr(self, expression);
     }
 
-    fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
+    fn visit_expr_binary(&mut self, call: &'ast ExprBinary) {
+        if !matches!(call.op, BinaryOperator::Space(_)) {
+            return visit::visit_expr_binary(self, call);
+        }
         if self
             .document
-            .syntax_bytes(call.right_operand.as_ref())
+            .syntax_bytes(call.right.as_ref())
             .is_some_and(|range| {
                 range.start <= self.cursor
                     && self.cursor <= range.end
@@ -151,7 +250,7 @@ impl<'ast> Visit<'ast> for CallAtCursor<'ast, '_> {
         {
             self.call = Some(call);
         }
-        visit::visit_expr_op_bin_adj(self, call);
+        visit::visit_expr_binary(self, call);
     }
 }
 
@@ -176,15 +275,18 @@ fn active_signature_index(signatures: &[SignatureInformation], active_parameter:
 /// installed methods (domain only).
 fn signature_informations(
     callable: &str,
-    analysis: &Analysis,
+    document: &DocumentSnapshot,
     position: Position,
     knowledge: &(impl LspKnowledge + ?Sized),
 ) -> Vec<SignatureInformation> {
+    let analysis = document.analysis();
     if let Some(function) = analysis.function_at(callable, position) {
-        let local = local_signatures(callable, analysis, function);
-        if !local.is_empty() {
-            return local;
+        if !function.is_method_function() {
+            return source_function_signature(callable, document, position)
+                .into_iter()
+                .collect();
         }
+        return local_signatures(callable, analysis, function);
     }
 
     let Some(record) = knowledge.get_record(&ObjectName::new(callable)) else {
@@ -207,6 +309,47 @@ fn signature_informations(
         signatures.push(signature_information(callable, &domain, None));
     }
     signatures
+}
+
+/// Recovers the actual argument names of a source function, including the
+/// inner lambda of `{Limit => 1} >> opts -> (value) -> value`.
+fn source_function_signature(
+    callable: &str,
+    document: &DocumentSnapshot,
+    position: Position,
+) -> Option<SignatureInformation> {
+    let binding = document.analysis().get_binding_at(callable, position)?;
+    let range = binding.state.value_range?;
+    let expression = document
+        .enclosing_expressions(range.start)
+        .into_iter()
+        .find(|expression| document.range_for_syntax(*expression) == Some(range))?;
+    let lambda = match expression.unparenthesized()? {
+        Expr::Binary(declaration) if declaration.op.spelling() == <Token![>>]>::SPELLING => {
+            declaration
+                .right
+                .assigned_function()?
+                .body()
+                .assigned_function()?
+        }
+        _ => expression.assigned_function()?,
+    };
+    let mut names = lambda
+        .bound_symbols()
+        .iter()
+        .map(|symbol| symbol.text().to_owned())
+        .collect::<Vec<_>>();
+    let variadic = lambda.dispatch() == Dispatch::Variadic;
+    if variadic {
+        for name in &mut names {
+            name.push('…');
+        }
+    }
+    let mut signature = signature_information(callable, &names, None);
+    if variadic {
+        signature.active_parameter = Some(0);
+    }
+    Some(signature)
 }
 
 /// The domain types of an installed method signature `[callable, D1, D2, …]` —
@@ -299,7 +442,7 @@ mod tests {
             .expect("fixture should parse");
         let call =
             CallAtCursor::find(&document, 2, 2..2).expect("fixture should contain an application");
-        call.right_operand
+        call.right
             .arguments()
             .into_iter()
             .map(|argument| {
@@ -367,9 +510,9 @@ mod tests {
         let cursor = text.find("Value").expect("value") + 2;
         let option = text.find("Option").expect("option")..text.find("))").expect("closing") + 1;
         let inner = CallAtCursor::find(&document, cursor, cursor..cursor).expect("inner call");
-        assert_eq!(inner.left_operand.symbol_name(), Some("inner"));
+        assert_eq!(inner.left.symbol_name(), Some("inner"));
         let outer = CallAtCursor::find(&document, cursor, option).expect("option's call");
-        assert_eq!(outer.left_operand.symbol_name(), Some("outer"));
+        assert_eq!(outer.left.symbol_name(), Some("outer"));
     }
 
     #[test]

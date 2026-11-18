@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
-use m2_syn::nodes::{Expr, ExprAssign, ExprOp, ExprOpBin, ExprOpBinIndex};
+use m2_syn::nodes::{AssignOperator, Expr, ExprAssign, ExprBinary};
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Lex, Token};
 use serde::Deserialize;
@@ -102,7 +102,7 @@ impl InitFileDirective {
             .cells()
             .iter()
             .flat_map(|cell| cell.trivia())
-            .filter(|comment| comment.kind() == m2_syn::TriviaKind::LineComment)
+            .filter(|comment| comment.kind() == m2_syn::CommentKind::Line)
             .filter_map(|comment| {
                 let bytes = source.syntax_bytes(comment)?;
                 let text = source.text().get(bytes.clone())?;
@@ -430,9 +430,14 @@ impl InitFiles {
         workspace_folder: Option<&Path>,
         environment: &Macaulay2Environment,
     ) -> Result<Option<InitFileLocation>, InitFileUnavailable> {
-        if settings.sources.init_file != InitFileChoice::Discovered {
+        if let Some(choice) = settings
+            .sources
+            .init_file
+            .as_ref()
+            .filter(|choice| **choice != InitFileChoice::Discovered)
+        {
             return Self::locate(
-                &settings.sources.init_file,
+                choice,
                 settings.sources.enabled,
                 workspace_folder,
                 environment,
@@ -651,36 +656,38 @@ struct PreloadedPackages<'source, S: ?Sized> {
 
 impl<S: SourceNavigation + ?Sized> PreloadedPackages<'_, S> {
     /// Whether the indexed target names the preloaded-package list.
-    fn is_preloaded_target(&self, target: &ExprOpBinIndex) -> bool {
-        target.receiver.symbol_name() == Some(Macaulay2Conventions::CORE)
-            && target.index.literal_source(self.source)
+    fn is_preloaded_target(&self, target: &ExprBinary) -> bool {
+        target.left.symbol_name() == Some(Macaulay2Conventions::CORE)
+            && target.right.literal_source(self.source)
                 == Some(Macaulay2Conventions::PRELOADED_PACKAGES_KEY)
     }
 }
 
 impl<'ast, S: SourceNavigation + ?Sized> Visit<'ast> for PreloadedPackages<'_, S> {
     fn visit_expr_assign(&mut self, assignment: &'ast ExprAssign) {
-        let parts = match assignment {
-            ExprAssign::Op(node) => match &node.argument_expr {
-                ExprOp::Bin(ExprOpBin::Index(target)) => Some((target, node.value_expr.as_ref())),
-                _ => None,
-            },
-            ExprAssign::Augmented(node)
-                if node
-                    .operator
+        let accepted = matches!(assignment.op, AssignOperator::Global(_))
+            || matches!(assignment.op, AssignOperator::Augmented(_))
+                && assignment
+                    .op
                     .to_token_stream()
                     .into_iter()
                     .next()
                     .and_then(|token| token.spelling().map(str::to_owned))
                     .as_deref()
-                    == Some(<m2_syn::Token![|=]>::SPELLING) =>
+                    == Some(<m2_syn::Token![|=]>::SPELLING);
+        let parts = match assignment.left.as_ref() {
+            Expr::Binary(target)
+                if accepted
+                    && target
+                        .op
+                        .to_token_stream()
+                        .into_iter()
+                        .next()
+                        .and_then(|token| token.spelling().map(str::to_owned))
+                        .as_deref()
+                        == Some(<m2_syn::Token![#]>::SPELLING) =>
             {
-                match node.target.as_ref() {
-                    Expr::Op(ExprOp::Bin(ExprOpBin::Index(target))) => {
-                        Some((target, node.value.as_ref()))
-                    }
-                    _ => None,
-                }
+                Some((target, assignment.right.as_ref()))
             }
             _ => None,
         };

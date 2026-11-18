@@ -1,7 +1,7 @@
 //! Declaration checks for predicates: the methods named `is` and an uppercase
 //! letter, which return Boolean.
 
-use m2_syn::nodes::{Expr, ExprAssign, ExprOp, ExprOpBin};
+use m2_syn::nodes::{BinaryOperator, Expr, ExprAssign};
 use m2_syn::visit::{self, Visit};
 
 use super::{naming, DiagnosticSink, DocumentContext};
@@ -59,11 +59,12 @@ impl PredicateDeclaration<'_, '_> {
             );
             return;
         }
-        let Some(Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call)))) = parts.value.unparenthesized()
-        else {
+        let Some(Expr::Binary(call)) = parts.value.unparenthesized() else {
             return;
         };
-        if call.left_operand.symbol_name() != Some(METHOD_CONSTRUCTOR) {
+        if !matches!(call.op, BinaryOperator::Space(_))
+            || call.left.symbol_name() != Some(METHOD_CONSTRUCTOR)
+        {
             return;
         }
         let analysis = self.context.analysis;

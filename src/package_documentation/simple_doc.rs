@@ -32,7 +32,7 @@
 use crate::semantic_token::M2SemanticTokenType;
 use std::ops::Range;
 
-use m2_syn::nodes::ExprOpBinAdj;
+use m2_syn::nodes::ExprBinary;
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 use tower_lsp::lsp_types::Range as TextRange;
 
@@ -296,7 +296,7 @@ struct PageReading {
 
 impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// Read the SimpleDoc string at `body` passed to `call`.
-    pub(super) fn read_simple_doc(&mut self, call: &ExprOpBinAdj, body: ByteRange) {
+    pub(super) fn read_simple_doc(&mut self, call: &ExprBinary, body: ByteRange) {
         let lines = SimpleDocLine::read_all(self.source.text(), body.clone());
         let sections = self.sections(&lines, SectionContext::Page);
         let nodes = sections
@@ -306,7 +306,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             .collect::<Vec<_>>();
         if nodes.is_empty() {
             let code = Code::in_document(self.source);
-            let callee = self.source.range_for_bytes(code.bytes(&*call.left_operand));
+            let callee = self.source.range_for_bytes(code.bytes(&*call.left));
             let call_range = self.source.range_for_bytes(code.bytes(call));
             self.read_page(&sections, call_range, callee);
             return;

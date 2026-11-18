@@ -1,0 +1,15 @@
+# Integer ranges Macaulay2's assignment hooks enforce on rebindable library
+# globals, probed against Macaulay2 1.26.06 by assigning 0 and -1 to every
+# ZZ-valued global of Core. Every other such global accepts any integer.
+#
+# `allowableThreads` is also bounded above by the machine's thread count,
+# which a static analyzer cannot know. `recursionLimit` accepts any integer,
+# but below 1 every later evaluation exceeds it.
+
+allowableThreads = { min = 1 }
+defaultPrecision = { min = 1 }
+recursionLimit = { min = 1 }
+numTBBThreads = { min = 0 }
+printingPrecision = { min = 0 }
+errorDepth = { min = 0, max = 255 }
+loadDepth = { min = 0, max = 255 }

@@ -2,14 +2,15 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use m2_syn::nodes::{Expr, ExprOption as OptionExpression, Symbol};
+use m2_syn::nodes::{BinaryOperator, Expr, ExprBinary, ExprOption as OptionExpression, Symbol};
 use m2_syn::visit::{self, Visit};
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionResponse, CompletionTextEdit,
     Position, Range as TextRange, SymbolKind, TextEdit, Url,
 };
 
-use crate::builtin_index::{CallableKind, Record};
+use crate::analysis::TypeChecker;
+use crate::builtin_index::{CallableKind, CallableOption, Record};
 use crate::capabilities::document_symbols::WorkspaceSourceSymbol;
 use crate::document::DocumentSnapshot;
 use crate::file_load::FileLoad;
@@ -76,9 +77,24 @@ pub trait CompletionKnowledge {
 
     /// Available proof that the child type belongs to the parent's subtype family.
     fn subtype_evidence(&self, child: &ObjectName, parent: &ObjectName) -> SubtypeEvidence;
+
+    /// Accepted options at this source call, including local declarations and
+    /// options forwarded to a statically selected installation.
+    fn call_options(
+        &self,
+        call: &ExprBinary,
+        document: &DocumentSnapshot,
+    ) -> Option<Vec<CallableOption>>;
 }
 
 impl<Knowledge: LspKnowledge> CompletionKnowledge for Knowledge {
+    fn call_options(
+        &self,
+        call: &ExprBinary,
+        document: &DocumentSnapshot,
+    ) -> Option<Vec<CallableOption>> {
+        TypeChecker::new(document.analysis(), self).call_options(call, document, self)
+    }
     fn records_with_prefix<'a>(&'a self, prefix: &str, limit: usize) -> Vec<(String, &'a Record)> {
         LspKnowledge::records_with_prefix(self, prefix, limit)
     }
@@ -302,6 +318,31 @@ pub fn completion_response<Knowledge: LspKnowledge>(
 }
 
 impl<'a> CompletionContext<'a> {
+    /// Resolves option metadata using the same call selection as signature
+    /// help. Source shadowing suppresses unrelated catalog options.
+    fn callable_options(
+        &self,
+        callable: &ObjectName,
+        knowledge: &dyn CompletionKnowledge,
+    ) -> Vec<CallableOption> {
+        if let Some(call) = super::signature_help::CallAtCursor::find(
+            self.document,
+            self.cursor,
+            self.cursor..self.cursor,
+        ) {
+            if call.left.symbol_name() == Some(callable.name()) {
+                return knowledge
+                    .call_options(call, self.document)
+                    .unwrap_or_default();
+            }
+        }
+        knowledge
+            .record(callable)
+            .and_then(Record::callable)
+            .map(|callable| callable.options.clone())
+            .unwrap_or_default()
+    }
+
     /// Constructs this value from the supplied dependencies and initial state.
     fn new(document: &'a DocumentSnapshot, uri: &'a Url, position: Position) -> Option<Self> {
         let cursor = document.byte_for_position(position)?;
@@ -361,14 +402,13 @@ impl<'a> CompletionContext<'a> {
         trigger: impl Fn(&str) -> bool,
     ) -> bool {
         expressions.iter().any(|expression| {
-            let Expr::Op(m2_syn::nodes::ExprOp::Bin(m2_syn::nodes::ExprOpBin::Adj(call))) =
-                expression
-            else {
+            let Expr::Binary(call) = expression else {
                 return false;
             };
-            call.left_operand.symbol_name().is_some_and(&trigger)
+            matches!(call.op, BinaryOperator::Space(_))
+                && call.left.symbol_name().is_some_and(&trigger)
                 && call
-                    .right_operand
+                    .right
                     .arguments()
                     .first()
                     .copied()
@@ -398,17 +438,16 @@ impl CompletionPattern for PackageImportPattern {
     fn query(&self, context: &CompletionContext<'_>) -> Option<CompletionQuery> {
         let (string, expressions) = context.string_context()?;
         let option = expressions.iter().any(|expression| {
-            let Expr::Op(m2_syn::nodes::ExprOp::Bin(m2_syn::nodes::ExprOpBin::Adj(call))) =
-                expression
-            else {
+            let Expr::Binary(call) = expression else {
                 return false;
             };
-            PackageLoadingOption::ALL.into_iter().any(|option| {
-                option
-                    .typed_package_names(call, context.document)
-                    .into_iter()
-                    .any(|package| std::ptr::eq(package, string))
-            })
+            matches!(call.op, BinaryOperator::Space(_))
+                && PackageLoadingOption::ALL.into_iter().any(|option| {
+                    option
+                        .typed_package_names(call, context.document)
+                        .into_iter()
+                        .any(|package| std::ptr::eq(package, string))
+                })
         });
         (option || context.string_argument(string, &expressions, is_package_import_trigger))
             .then_some(())?;
@@ -480,7 +519,7 @@ impl CompletionPattern for OptionValuePattern {
             context.cursor,
             option_bytes,
         )?;
-        call.left_operand.symbol_name().map(|callable| {
+        call.left.symbol_name().map(|callable| {
             CompletionQuery::new(
                 prefix,
                 OptionValues {
@@ -513,7 +552,7 @@ impl CompletionPattern for OptionKeyPattern {
             context.cursor,
             symbol_bytes,
         )?;
-        call.left_operand.symbol_name().map(|callable| {
+        call.left.symbol_name().map(|callable| {
             CompletionQuery::new(
                 prefix,
                 CallableOptions {
@@ -797,16 +836,14 @@ struct CallableOptions {
 impl CompletionSource for CallableOptions {
     fn candidates(
         &self,
-        _context: &CompletionContext<'_>,
+        context: &CompletionContext<'_>,
         prefix: &str,
         limit: usize,
         knowledge: &dyn CompletionKnowledge,
     ) -> Vec<CompletionCandidate> {
-        knowledge
-            .record(&self.callable)
-            .and_then(Record::callable)
+        context
+            .callable_options(&self.callable, knowledge)
             .into_iter()
-            .flat_map(|callable| &callable.options)
             .filter(|option| option.name.name().starts_with(prefix))
             .map(|option| {
                 CompletionCandidate::new(option.name.name(), CompletionItemKind::PROPERTY)
@@ -828,19 +865,21 @@ struct OptionValues {
 impl CompletionSource for OptionValues {
     fn candidates(
         &self,
-        _context: &CompletionContext<'_>,
+        context: &CompletionContext<'_>,
         prefix: &str,
         limit: usize,
         knowledge: &dyn CompletionKnowledge,
     ) -> Vec<CompletionCandidate> {
-        knowledge
-            .record(&self.callable)
-            .and_then(Record::callable)
+        let Some(option) = context
+            .callable_options(&self.callable, knowledge)
             .into_iter()
-            .flat_map(|callable| &callable.options)
             .find(|option| option.name == self.option)
-            .into_iter()
-            .flat_map(|option| &option.possible_values)
+        else {
+            return Vec::new();
+        };
+        let symbolic = option
+            .possible_values
+            .iter()
             .filter(|value| value.name().starts_with(prefix))
             .map(|value| {
                 let kind = knowledge
@@ -849,8 +888,11 @@ impl CompletionSource for OptionValues {
                 CompletionCandidate::new(value.name(), kind)
                     .with_detail(format!("Value for {}.{}", self.callable, self.option))
             })
-            .take(limit)
-            .collect()
+            .collect::<Vec<_>>();
+        let typed = option.accepted_types.into_iter().flat_map(|required| {
+            KnownSymbols::of_type(required).candidates(context, prefix, limit, knowledge)
+        });
+        symbolic.into_iter().chain(typed).take(limit).collect()
     }
 }
 

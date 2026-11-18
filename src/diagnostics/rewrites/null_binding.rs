@@ -11,11 +11,11 @@
 //! binding, `if value =!= null then result = value else result = fallback`, is
 //! the plain coalescence rewrite; this one also removes the intermediate local.
 
-use m2_syn::nodes::{Expr, Holder, PackedContent, Statement};
+use m2_syn::nodes::{Elements, Expr, ExprParen, Stmt};
 
 use super::{
-    guarded_value, symbol_assignment, NullBranch, NullTest, RewriteKind, RewriteSite, RewriteSites,
-    SubjectErrors,
+    guarded_value, may_fail, symbol_assignment, NullBranch, NullTest, RewriteKind, RewriteSite,
+    RewriteSites,
 };
 use crate::source::{ByteRange, SourceNavigation};
 use crate::syntax::{ClauseSyntax, ExpressionSyntax};
@@ -26,6 +26,8 @@ struct NullBinding {
     replacement: String,
     /// Bytes of the binding statement through the end of the conditional.
     extent: ByteRange,
+    /// Whether the initializer may fail, an error `??` turns into the fallback.
+    catches_errors: bool,
 }
 
 /// How the conditional following a binding assigns or yields its value.
@@ -58,15 +60,15 @@ impl<'ast, Source: SourceNavigation + ?Sized> RewriteSites<'ast, '_, Source> {
     /// Records the null bindings of one parenthesized block: a statement
     /// `name := e;` directly followed by a conditional testing `name` against
     /// `null`, when nothing else mentions `name`.
-    pub(super) fn null_bindings(&mut self, block: &'ast Holder) {
-        for (index, binding) in block.muted.iter().enumerate() {
-            let following = &block.muted[index + 1..];
+    pub(super) fn null_bindings(&mut self, block: &'ast ExprParen) {
+        for (index, binding) in block.stmts.iter().enumerate() {
+            let following = &block.stmts[index + 1..];
             let (conditional, trailing, yields_value) = match following.split_first() {
-                Some((next, rest)) => match &next.content {
-                    PackedContent::Expr(conditional) => (conditional.as_ref(), rest, false),
-                    PackedContent::Pack(_) => continue,
+                Some((next, rest)) => match &next.elems {
+                    Elements::Single(conditional) => (conditional.as_ref(), rest, false),
+                    Elements::Pack(_) => continue,
                 },
-                None => match block.value.as_deref() {
+                None => match block.expr.as_deref() {
                     Some(conditional) => (conditional, following, true),
                     None => continue,
                 },
@@ -74,7 +76,7 @@ impl<'ast, Source: SourceNavigation + ?Sized> RewriteSites<'ast, '_, Source> {
             let trailing_value = if yields_value {
                 None
             } else {
-                block.value.as_deref()
+                block.expr.as_deref()
             };
             let Some(rewrite) =
                 self.null_binding(binding, conditional, trailing, trailing_value, yields_value)
@@ -88,6 +90,7 @@ impl<'ast, Source: SourceNavigation + ?Sized> RewriteSites<'ast, '_, Source> {
                 owner: None,
                 replacement: rewrite.replacement,
                 extent: Some(rewrite.extent),
+                catches_errors: rewrite.catches_errors,
             });
         }
     }
@@ -97,13 +100,13 @@ impl<'ast, Source: SourceNavigation + ?Sized> RewriteSites<'ast, '_, Source> {
     /// `trailing_value` are what follows the conditional in its block.
     fn null_binding(
         &self,
-        binding: &'ast Statement,
+        binding: &'ast Stmt,
         conditional: &'ast Expr,
-        trailing: &'ast [Statement],
+        trailing: &'ast [Stmt],
         trailing_value: Option<&'ast Expr>,
         yields_value: bool,
     ) -> Option<NullBinding> {
-        let PackedContent::Expr(bound) = &binding.content else {
+        let Elements::Single(bound) = &binding.elems else {
             return None;
         };
         let (local, operator, initializer) = symbol_assignment(bound)?;
@@ -116,7 +119,8 @@ impl<'ast, Source: SourceNavigation + ?Sized> RewriteSites<'ast, '_, Source> {
         let NullTest {
             subject,
             null_branch,
-        } = self.null_test(test, SubjectErrors::Propagate)?;
+            ..
+        } = self.null_test(test)?;
         if subject.symbol_name() != Some(local) {
             return None;
         }
@@ -169,6 +173,7 @@ impl<'ast, Source: SourceNavigation + ?Sized> RewriteSites<'ast, '_, Source> {
         Some(NullBinding {
             replacement,
             extent: start..end,
+            catches_errors: may_fail(initializer),
         })
     }
 }

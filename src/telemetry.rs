@@ -5,10 +5,29 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::settings::LogLevel;
 use serde_json::{json, Value};
+
+/// Live verbosity shared by the executable's operational logger.
+static LOG_LEVEL: RwLock<LogLevel> = RwLock::new(LogLevel::Info);
+
+/// Applies a verbosity change without reopening or rotating the log file.
+pub fn set_level(level: LogLevel) {
+    *LOG_LEVEL
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = level;
+}
+
+/// Whether configured verbosity includes an event's severity.
+fn enabled(level: LogLevel) -> bool {
+    *LOG_LEVEL
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        >= level
+}
 
 /// Maximum log size before rotation replaces the previous log backup.
 const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
@@ -134,7 +153,10 @@ impl Logger {
     }
 
     /// Records a structured event without writing to the protocol stream.
-    fn event(&self, event: Value) {
+    fn event(&self, level: LogLevel, event: Value) {
+        if !enabled(level) {
+            return;
+        }
         let mut state = self
             .state
             .lock()
@@ -144,6 +166,13 @@ impl Logger {
 
     /// Records a finished operation and updates its aggregate duration statistics.
     fn complete(&self, operation: &str, fields: Value, elapsed: Duration, force: bool) {
+        if !enabled(if force {
+            LogLevel::Error
+        } else {
+            LogLevel::Info
+        }) {
+            return;
+        }
         let mut state = self
             .state
             .lock()
@@ -159,7 +188,7 @@ impl Logger {
             statistics.total_ms += milliseconds;
             statistics.maximum_ms = statistics.maximum_ms.max(milliseconds);
         }
-        if self.verbose || force || elapsed >= SLOW_OPERATION {
+        if self.verbose || enabled(LogLevel::Debug) || force || elapsed >= SLOW_OPERATION {
             self.write(
                 &mut state,
                 json!({"phase": "end", "operation": operation,
@@ -173,6 +202,9 @@ impl Logger {
 
     /// Writes accumulated operation counts and duration statistics.
     fn summary(&self, state: &mut LogState) {
+        if !enabled(LogLevel::Info) {
+            return;
+        }
         let mut statistics = state
             .statistics
             .iter()
@@ -213,8 +245,15 @@ impl Timing {
     pub fn start(operation: &'static str, mut fields: Value) -> Self {
         let id = NEXT_SPAN.fetch_add(1, Ordering::Relaxed);
         fields["span_id"] = json!(id);
-        if let Some(logger) = logger().filter(|logger| logger.verbose) {
-            logger.event(json!({"operation": operation, "phase": "start", "fields": fields}));
+        if let Some(logger) = logger().filter(|logger| logger.verbose || enabled(LogLevel::Trace)) {
+            logger.event(
+                if logger.verbose {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Trace
+                },
+                json!({"operation": operation, "phase": "start", "fields": fields}),
+            );
         }
         Self {
             operation,
@@ -250,8 +289,14 @@ impl Drop for Timing {
 
 /// Records a structured event without writing to the protocol stream.
 pub fn event(event: Value) {
+    event_at(LogLevel::Info, event);
+}
+
+/// Records an event with an explicit severity, for example a panic at `error`
+/// or a resource limit at `warn`, without touching the protocol stream.
+pub fn event_at(level: LogLevel, event: Value) {
     if let Some(logger) = logger() {
-        logger.event(event);
+        logger.event(level, event);
     }
 }
 

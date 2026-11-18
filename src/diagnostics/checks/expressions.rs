@@ -12,19 +12,19 @@ use std::collections::HashMap;
 use std::ptr;
 
 use m2_syn::nodes::{
-    AssignmentArgument, AssignmentList, AssignmentListContent, Expr, ExprAssign, ExprCollection,
-    ExprControl, ExprFor, ExprIf, ExprLambda, ExprLiteral, ExprOp, ExprOpBin, ExprOpBinAdj, Symbol,
+    AssignOperator, Elements, Expr, ExprAssign, ExprBinary, ExprIf, ExprSequence, Literal, Symbol,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Delimiter, DelimiterValue, Span, Spanned, Token};
 
 mod constant_values;
+mod library_global_values;
 
 use super::DiagnosticSink;
 use crate::analysis::{
-    Analysis, BindingId, CallOptionIssue, CallableHeadKind, ControlTransferTarget,
-    InferenceSession, InfixSyntax, MethodCodomainEdit, MethodHead, OptionDeclaration,
-    RingVariableError, TypeChecker,
+    Analysis, BindingId, CallOptionIssue, CallableHeadKind, ControlTransferTarget, Dispatch,
+    InferenceSession, InfixSyntax, MethodCodomainEdit, MethodConstructor, MethodDeclarationOption,
+    MethodHead, OptionDeclaration, RingVariableError, TypeChecker,
 };
 use crate::diagnostics::rewrites::{RewriteKind, RewriteSite, RewriteSites};
 use crate::diagnostics::{catalog, DiagnosticRule, Finding};
@@ -34,8 +34,8 @@ use crate::node_metadata::{ParsedCell, SyntaxSnapshot};
 use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry, ObjectRegistryView};
 use crate::source::{DocumentSource, SourceNavigation, SyntaxNavigation, SyntaxSource};
 use crate::syntax::{
-    AssignmentListSyntax, AssignmentOperator, AssignmentParts, AssignmentSyntax, AssignmentTarget,
-    ControlSyntax, ExpressionSyntax, PackedArguments,
+    AssignmentOperator, AssignmentParts, AssignmentSyntax, AssignmentTarget, ControlSyntax,
+    ExpressionSyntax, PackedArguments,
 };
 use crate::typesystem::{SubtypeEvidence, TypeKnowledge, TypeRole};
 
@@ -123,7 +123,7 @@ struct ExpressionChecks<'a, 'context> {
     rewrites: HashMap<*const Expr, Vec<RewriteSite<'a>>>,
     /// Control transfers of the cell, with the construct receiving each;
     /// absent when the cell's structure is unknown.
-    transfers: HashMap<*const ExprControl, Option<ControlTransferTarget<'a>>>,
+    transfers: HashMap<*const Expr, Option<ControlTransferTarget<'a>>>,
     /// Inheritance-test counts keyed by the resolved parameter binding.
     parameter_instance_tests: HashMap<BindingId, usize>,
     /// Findings spawned so far.
@@ -144,11 +144,6 @@ impl<'a> Visit<'a> for ExpressionChecks<'a, '_> {
         }
         visit::visit_expr(self, expression);
     }
-
-    fn visit_assignment_list(&mut self, list: &'a AssignmentList) {
-        self.missing_delimiter(&list.contents.delimiter.delimiter());
-        visit::visit_assignment_list(self, list);
-    }
 }
 
 impl<'a> ExpressionChecks<'a, '_> {
@@ -164,7 +159,9 @@ impl<'a> ExpressionChecks<'a, '_> {
             _ => None,
         };
         let call = match expression {
-            Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => Some(call),
+            Expr::Binary(call) if matches!(call.op, m2_syn::nodes::BinaryOperator::Space(_)) => {
+                Some(call)
+            }
             _ => None,
         };
         self.missing_closing_delimiter(expression);
@@ -180,10 +177,8 @@ impl<'a> ExpressionChecks<'a, '_> {
         self.float_key(expression, &knowledge);
         self.option_key_convention(expression, &knowledge);
         self.rewrite(expression, RewriteKind::RedundantControlParentheses);
-        self.coalescence(expression);
+        self.simplifications(expression);
         self.default_for_start(expression);
-        self.null_binding(expression);
-        self.simplification(expression);
         if let Some(call) = call {
             self.ring_variable_naming(call, &knowledge);
         }
@@ -193,8 +188,11 @@ impl<'a> ExpressionChecks<'a, '_> {
         if let Some(call) = call {
             self.protect_computed_symbol(call, &knowledge);
         }
-        if let Expr::Control(transfer) = expression {
-            self.invalid_control_transfer(transfer);
+        if matches!(
+            expression,
+            Expr::Return(_) | Expr::Break(_) | Expr::Continue(_)
+        ) {
+            self.invalid_control_transfer(expression);
         }
         if let Some((_, parts)) = &assignment {
             self.explicit_install_required(expression, parts);
@@ -207,9 +205,10 @@ impl<'a> ExpressionChecks<'a, '_> {
             self.install_codomain(node, &knowledge);
         }
         if let Some(call) = call {
+            self.call_arity(call, &knowledge);
             self.call_domain(call, &knowledge);
             self.call_options(call, &knowledge);
-            for entry in call.right_operand.arguments().into_iter().flatten() {
+            for entry in call.right.arguments().into_iter().flatten() {
                 self.option_symbol_convention(entry, &knowledge);
             }
         }
@@ -220,21 +219,34 @@ impl<'a> ExpressionChecks<'a, '_> {
     /// enum-like values, and quoted symbols, remain legitimate symbols.
     fn required_values(&mut self, expression: &Expr, knowledge: &ObjectRegistryView<'_>) {
         match expression {
-            Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => {
-                self.required_value(&call.left_operand, "callable", knowledge)
+            Expr::Binary(call) if matches!(call.op, m2_syn::nodes::BinaryOperator::Space(_)) => {
+                self.required_value(&call.left, "callable", knowledge);
+                if call.left.symbol_name() == Some("method")
+                    && self
+                        .context
+                        .source
+                        .position_for_syntax(call)
+                        .is_some_and(|position| {
+                            self.context
+                                .analysis
+                                .visible_source_binding_at("method", position, knowledge)
+                                .is_none()
+                        })
+                {
+                    if let Some(typical) = call.method_option(MethodDeclarationOption::TypicalValue)
+                    {
+                        self.required_value(typical, "typical-value type", knowledge);
+                    }
+                }
             }
             Expr::New(node) => self.required_value(&node.class, "type", knowledge),
-            Expr::If(node) => self.required_value(&node.condition, "Boolean condition", knowledge),
-            Expr::While(node) => {
-                self.required_value(&node.condition, "Boolean condition", knowledge)
+            Expr::If(node) => self.required_value(&node.cond, "Boolean condition", knowledge),
+            Expr::While(node) => self.required_value(&node.cond, "Boolean condition", knowledge),
+            Expr::Binary(index) if index.op.spelling() == <Token![#]>::SPELLING => {
+                self.required_value(&index.left, "indexed value", knowledge)
             }
-            Expr::Op(ExprOp::Bin(ExprOpBin::Index(index))) => {
-                self.required_value(&index.receiver, "indexed value", knowledge)
-            }
-            Expr::Op(ExprOp::Prefix(prefix))
-                if prefix.operator.spelling() == <Token![not]>::SPELLING =>
-            {
-                self.required_value(&prefix.operand, "Boolean operand", knowledge)
+            Expr::Prefix(prefix) if prefix.op.spelling() == <Token![not]>::SPELLING => {
+                self.required_value(&prefix.expr, "Boolean operand", knowledge)
             }
             _ => {}
         }
@@ -284,17 +296,17 @@ impl<'a> ExpressionChecks<'a, '_> {
     fn float_key(&mut self, expression: &'a Expr, knowledge: &ObjectRegistryView<'_>) {
         let key = match expression {
             Expr::Option(option) => option.key.as_ref(),
-            Expr::Op(ExprOp::Bin(ExprOpBin::Index(index))) => index.index.as_ref(),
-            Expr::Op(ExprOp::Bin(ExprOpBin::Regular(operation)))
-                if operation.operator.spelling() == <Token![#?]>::SPELLING =>
-            {
-                operation.right_operand.as_ref()
+            Expr::Binary(index) if index.op.spelling() == <Token![#]>::SPELLING => {
+                index.right.as_ref()
+            }
+            Expr::Binary(operation) if operation.op.spelling() == <Token![#?]>::SPELLING => {
+                operation.right.as_ref()
             }
             _ => return,
         };
         let literal = matches!(
             key.unparenthesized(),
-            Some(Expr::Literal(ExprLiteral::Float(_)))
+            Some(Expr::Literal(Literal::Float(_)))
         );
         let inferred =
             self.context
@@ -315,7 +327,8 @@ impl<'a> ExpressionChecks<'a, '_> {
     /// third test carries one warning; later tests do not repeat it. Unchanged
     /// expressions contribute to the count without republishing old findings.
     fn instance_dispatch(&mut self, expression: &Expr) {
-        if !matches!(expression, Expr::Op(ExprOp::Bin(ExprOpBin::Adj(_)))) {
+        if !matches!(expression, Expr::Binary(call) if matches!(call.op, m2_syn::nodes::BinaryOperator::Space(_)))
+        {
             return;
         }
         let Some((subject, _)) = self.instance_operands(expression) else {
@@ -366,10 +379,12 @@ impl<'a> ExpressionChecks<'a, '_> {
         &self,
         expression: &'test Expr,
     ) -> Option<(&'test Expr, &'test Expr)> {
-        let Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) = expression.unparenthesized()? else {
+        let Expr::Binary(call) = expression.unparenthesized()? else {
             return None;
         };
-        if call.left_operand.symbol_name()? != INSTANCE {
+        if !matches!(call.op, m2_syn::nodes::BinaryOperator::Space(_))
+            || call.left.symbol_name()? != INSTANCE
+        {
             return None;
         }
         let position = self.context.source.position_for_syntax(call)?;
@@ -382,7 +397,7 @@ impl<'a> ExpressionChecks<'a, '_> {
         {
             return None;
         }
-        let arguments = call.right_operand.arguments();
+        let arguments = call.right.arguments();
         let [Some(subject), Some(class)] = arguments.as_slice() else {
             return None;
         };
@@ -392,7 +407,7 @@ impl<'a> ExpressionChecks<'a, '_> {
     /// A list-family check and fixed multi-field length suggest a record type.
     fn list_record_shape(&mut self, conditional: &ExprIf) {
         let mut terms = Vec::new();
-        Self::condition_terms(&conditional.condition, &mut terms);
+        Self::condition_terms(&conditional.cond, &mut terms);
         let mut list_subjects = Vec::new();
         let mut length_subjects = Vec::new();
         for term in terms {
@@ -417,7 +432,7 @@ impl<'a> ExpressionChecks<'a, '_> {
         }) {
             self.spawn(
                 &catalog::LIST_RECORD_SHAPE,
-                &conditional.condition,
+                &conditional.cond,
                 "Consider making a struct-like type based on hash tables instead of a list.",
             );
         }
@@ -435,9 +450,9 @@ impl<'a> ExpressionChecks<'a, '_> {
                 return;
             }
         }
-        if let Expr::Op(ExprOp::Prefix(prefix)) = expression {
-            if prefix.operator.spelling() == "not" {
-                Self::condition_terms(&prefix.operand, terms);
+        if let Expr::Prefix(prefix) = expression {
+            if prefix.op.spelling() == "not" {
+                Self::condition_terms(&prefix.expr, terms);
                 return;
             }
         }
@@ -451,17 +466,17 @@ impl<'a> ExpressionChecks<'a, '_> {
             return None;
         }
         for (length, count) in [(binary.left, binary.right), (binary.right, binary.left)] {
-            let Some(Expr::Literal(ExprLiteral::Integer(integer))) = count.unparenthesized() else {
+            let Some(Expr::Literal(Literal::Integer(integer))) = count.unparenthesized() else {
                 continue;
             };
             if !integer.text().parse::<u64>().is_ok_and(|count| count > 1) {
                 continue;
             }
-            let Some(Expr::Op(ExprOp::Prefix(prefix))) = length.unparenthesized() else {
+            let Some(Expr::Prefix(prefix)) = length.unparenthesized() else {
                 continue;
             };
-            if prefix.operator.spelling() == "#" {
-                return Some(&prefix.operand);
+            if prefix.op.spelling() == "#" {
+                return Some(&prefix.expr);
             }
         }
         None
@@ -491,12 +506,15 @@ impl<'a> ExpressionChecks<'a, '_> {
     /// is missing.
     fn missing_closing_delimiter(&mut self, expression: &Expr) {
         let delimiter = match expression {
-            Expr::Collection(ExprCollection::Sequence(node)) => node.delimiter.delimiter(),
-            Expr::Collection(ExprCollection::List(node)) => node.delimiter.delimiter(),
-            Expr::Collection(ExprCollection::Array(node)) => node.delimiter.delimiter(),
-            Expr::Collection(ExprCollection::AngleBar(node)) => node.delimiter.delimiter(),
-            Expr::Holder(node) => node.delimiter.delimiter(),
-            Expr::Lambda(ExprLambda::List(node)) => node.arguments.delimiter.delimiter(),
+            Expr::Sequence(node) => node.delimiter.delimiter(),
+            Expr::List(node) => node.delimiter.delimiter(),
+            Expr::Array(node) => node.delimiter.delimiter(),
+            Expr::AngleBar(node) => node.delimiter.delimiter(),
+            Expr::Paren(node) => node.delimiter.delimiter(),
+            Expr::Function(node) => match &node.params {
+                m2_syn::nodes::FunctionParams::List(list) => list.params.delimiter.delimiter(),
+                _ => return,
+            },
             _ => return,
         };
         self.missing_delimiter(&delimiter);
@@ -536,13 +554,16 @@ impl<'a> ExpressionChecks<'a, '_> {
     /// default. The recorded edit removes only the keyword and integer spelling,
     /// retaining comments between them and the remainder of the loop header.
     fn default_for_start(&mut self, expression: &Expr) {
-        let Expr::For(ExprFor::Range(loop_)) = expression else {
+        let Expr::For(loop_) = expression else {
             return;
         };
-        let Some(bound) = &loop_.lower_bound else {
+        let Some(m2_syn::nodes::ForIter::Range(range)) = &loop_.iter else {
             return;
         };
-        let Expr::Literal(ExprLiteral::Integer(integer)) = bound.value.as_ref() else {
+        let Some(bound) = &range.from_clause else {
+            return;
+        };
+        let Expr::Literal(Literal::Integer(integer)) = bound.expr.as_ref() else {
             return;
         };
         if integer.text().parse::<u64>() != Ok(0) {
@@ -574,55 +595,37 @@ impl<'a> ExpressionChecks<'a, '_> {
         );
     }
 
-    /// A conditional that `??` or `??=` expresses.
-    fn coalescence(&mut self, expression: &Expr) {
-        if let Some(replacement) = self.site(expression, RewriteKind::is_coalescence) {
-            self.spawn(
-                &catalog::PREFER_COALESCENCE,
-                expression,
-                format!("This conditional can be simplified to `{replacement}`"),
-            );
-        }
-    }
-
-    /// A null-tested local that `??` folds into the statement using it, reported
-    /// over the binding and the conditional together.
-    fn null_binding(&mut self, expression: &Expr) {
-        let extent = self
+    /// Reports the coalescences, inlined null bindings, and simplifications of
+    /// `expression`, each under its site's rule. An inlined binding covers the
+    /// binding statement as well as the conditional.
+    fn simplifications(&mut self, expression: &Expr) {
+        let findings = self
             .rewrites
             .get(&ptr::from_ref(expression))
             .into_iter()
             .flatten()
-            .find(|site| site.kind == RewriteKind::InlinedNullBinding)
-            .and_then(|site| Some((site.extent.clone()?, site.replacement.clone())));
-        if let Some((bytes, replacement)) = extent {
-            let range = self.context.source.range_for_bytes(bytes);
-            self.sink.spawn(
-                &catalog::INLINE_NULL_BINDING,
-                Finding::new(
-                    range,
-                    format!("This local only feeds a null test; use `{replacement}`"),
-                ),
-            );
-        }
-    }
-
-    /// Reports each expression simplification under its own configurable rule.
-    fn simplification(&mut self, expression: &Expr) {
-        let rewrites = self
-            .rewrites
-            .get(&ptr::from_ref(expression))
-            .into_iter()
-            .flatten()
-            .filter(|site| site.kind.is_simplification())
-            .map(|site| (site.kind.rule(), site.replacement.clone()))
+            .filter_map(|site| {
+                let summary = match site.kind {
+                    kind if kind.is_coalescence() => "This conditional can be simplified to",
+                    RewriteKind::InlinedNullBinding => "This local only feeds a null test; use",
+                    kind if kind.is_simplification() => "This expression can be simplified to",
+                    _ => return None,
+                };
+                let range = match &site.extent {
+                    Some(bytes) => self.context.source.range_for_bytes(bytes.clone()),
+                    None => self.context.source.range_for_syntax(site.expression)?,
+                };
+                let caveat = if site.catches_errors {
+                    ", which also yields the fallback where the tested value fails"
+                } else {
+                    ""
+                };
+                let message = format!("{summary} `{}`{caveat}", site.replacement);
+                Some((site.rule(), Finding::new(range, message)))
+            })
             .collect::<Vec<_>>();
-        for (rule, replacement) in rewrites {
-            self.spawn(
-                rule,
-                expression,
-                format!("This expression can be simplified to `{replacement}`"),
-            );
+        for (rule, finding) in findings {
+            self.sink.spawn(rule, finding);
         }
     }
 
@@ -684,26 +687,34 @@ impl<'a> ExpressionChecks<'a, '_> {
     /// that installs nothing or a literal operand (`x + 1`) is rejected.
     fn targets_are_assignable(
         &self,
-        targets: &AssignmentList,
+        targets: &ExprSequence,
         operator: AssignmentOperator,
         knowledge: &ObjectRegistryView<'_>,
     ) -> bool {
-        targets.targets().into_iter().all(|target| match target {
-            AssignmentArgument::List(nested) => {
-                self.targets_are_assignable(nested, operator, knowledge)
-            }
-            AssignmentArgument::Op(operation) => {
-                operator == AssignmentOperator::Global
-                    || self.is_installation_target(operation, knowledge)
-            }
-            _ => true,
-        })
+        sequence_targets(targets)
+            .into_iter()
+            .flatten()
+            .all(|target| match target.unparenthesized() {
+                Some(Expr::Sequence(nested)) => {
+                    self.targets_are_assignable(nested, operator, knowledge)
+                }
+                Some(
+                    operation @ (Expr::Binary(_)
+                    | Expr::Prefix(_)
+                    | Expr::Postfix(_)
+                    | Expr::Field(_)),
+                ) => {
+                    operator == AssignmentOperator::Global
+                        || self.is_installation_target(operation, knowledge)
+                }
+                _ => true,
+            })
     }
 
     /// Whether `target` can receive a `:=` installation: it has an
     /// installation shape and no operand is a literal, which can never be a
     /// type.
-    fn is_installation_target(&self, target: &ExprOp, knowledge: &ObjectRegistryView<'_>) -> bool {
+    fn is_installation_target(&self, target: &Expr, knowledge: &ObjectRegistryView<'_>) -> bool {
         let Some(position) = self.context.source.position_for_syntax(target) else {
             return false;
         };
@@ -720,10 +731,12 @@ impl<'a> ExpressionChecks<'a, '_> {
 
     /// `x#i := v`, which cannot assign to a part.
     fn colon_equal_part_assignment(&mut self, parts: &AssignmentParts<'a>) {
-        let AssignmentTarget::Operator(target @ ExprOp::Bin(ExprOpBin::Index(_))) = parts.target
-        else {
+        let AssignmentTarget::Operator(target @ Expr::Binary(index)) = parts.target else {
             return;
         };
+        if index.op.spelling() != <Token![#]>::SPELLING {
+            return;
+        }
         if parts.operator != AssignmentOperator::Local {
             return;
         }
@@ -775,11 +788,11 @@ impl<'a> ExpressionChecks<'a, '_> {
     /// into nested lists of equal length.
     fn match_parallel_assignment(
         &mut self,
-        targets: &AssignmentList,
+        targets: &ExprSequence,
         value: &'a Expr,
         knowledge: &ObjectRegistryView<'_>,
     ) {
-        let targets_written = targets.targets();
+        let targets_written = sequence_targets(targets);
         let Some(values) = value.collection_elements() else {
             self.parallel_assignment_value_type(targets_written.len(), value, knowledge);
             return;
@@ -797,7 +810,9 @@ impl<'a> ExpressionChecks<'a, '_> {
             return;
         }
         for (target, value) in targets_written.into_iter().zip(values) {
-            if let (AssignmentArgument::List(nested), Some(value)) = (target, value) {
+            if let (Some(Expr::Sequence(nested)), Some(value)) =
+                (target.and_then(Expr::unparenthesized), value)
+            {
                 self.match_parallel_assignment(nested, value, knowledge);
             }
         }
@@ -849,7 +864,7 @@ impl<'a> ExpressionChecks<'a, '_> {
         );
     }
 
-    /// Rebinding a protected name outside the library's own code. Only names
+    /// Rebinding a protected or package name outside the library's own code. Only names
     /// being rebound are checked; an indexed or member target changes a value,
     /// and an installation changes a method table rather than its binding.
     fn protected_assignment(
@@ -872,13 +887,26 @@ impl<'a> ExpressionChecks<'a, '_> {
             },
             target => target.bound_symbols(),
         };
+        let value = matches!(
+            (parts.operator, &parts.target),
+            (AssignmentOperator::Global, AssignmentTarget::Symbol(_))
+        )
+        .then_some(parts.value);
         for symbol in symbols {
-            self.protected_symbol(symbol, knowledge);
+            self.rebound_library_name(symbol, value, knowledge);
         }
     }
 
-    /// Spawns when `symbol` names a protected global rather than a local.
-    fn protected_symbol(&mut self, symbol: &Symbol, knowledge: &ObjectRegistryView<'_>) {
+    /// Spawns when `symbol` rebinds a library name rather than a local: a
+    /// protected global, which Macaulay2 refuses, a package name, which it
+    /// accepts and thereby loses the package, or a rebindable global given
+    /// `value`, the whole value of a plain `=`, that the global cannot hold.
+    fn rebound_library_name(
+        &mut self,
+        symbol: &Symbol,
+        value: Option<&'a Expr>,
+        knowledge: &ObjectRegistryView<'_>,
+    ) {
         let analysis = self.context.analysis;
         let name = symbol.text();
         let Some(range) = self.context.source.range_for_syntax(symbol) else {
@@ -891,27 +919,39 @@ impl<'a> ExpressionChecks<'a, '_> {
         {
             return;
         }
-        if knowledge
-            .get_record(&ObjectName::new(name))
-            .is_some_and(|record| record.protected)
-        {
-            self.sink.spawn(
-                &catalog::PROTECTED_ASSIGNMENT,
-                Finding::new(
-                    range,
-                    format!(
-                        "Cannot assign to protected symbol `{name}`; a file implementing the \
-                         library itself declares `{}`",
-                        FileProperties::primary_code_directive()
-                    ),
+        let object = ObjectName::new(name);
+        let Some(record) = knowledge.get_record(&object) else {
+            return;
+        };
+        let (rule, message) = if knowledge.binds_package(&object) {
+            (
+                &catalog::PACKAGE_REBINDING,
+                format!(
+                    "`{name}` names a package; rebinding it makes `package` return `null` for \
+                     everything `{name}` defines, so choose another name"
                 ),
-            );
-        }
+            )
+        } else if record.protected {
+            (
+                &catalog::PROTECTED_ASSIGNMENT,
+                format!(
+                    "Cannot assign to protected symbol `{name}`; a file implementing the \
+                     library itself declares `{}`",
+                    FileProperties::primary_code_directive()
+                ),
+            )
+        } else {
+            if let Some(value) = value {
+                self.library_global_value(record, value, range, knowledge);
+            }
+            return;
+        };
+        self.sink.spawn(rule, Finding::new(range, message));
     }
 
     /// A ring variable subscript, `R_i` or `R_"x"`, selecting no variable.
     fn ring_variable(&mut self, expression: &'a Expr, knowledge: &ObjectRegistryView<'_>) {
-        let Expr::Op(ExprOp::Bin(binary)) = expression else {
+        let Expr::Binary(binary) = expression else {
             return;
         };
         if binary
@@ -948,7 +988,7 @@ impl<'a> ExpressionChecks<'a, '_> {
             return;
         };
         let entries = list
-            .elements
+            .elems
             .as_ref()
             .map(PackedArguments::arguments)
             .unwrap_or_default();
@@ -999,7 +1039,7 @@ impl<'a> ExpressionChecks<'a, '_> {
 
     /// Multi-character ring variables, which read as an indexed family but
     /// are unrelated symbols.
-    fn ring_variable_naming(&mut self, call: &'a ExprOpBinAdj, knowledge: &ObjectRegistryView<'_>) {
+    fn ring_variable_naming(&mut self, call: &'a ExprBinary, knowledge: &ObjectRegistryView<'_>) {
         let analysis = self.context.analysis;
         let Some(position) = self.context.source.position_for_syntax(call) else {
             return;
@@ -1021,7 +1061,8 @@ impl<'a> ExpressionChecks<'a, '_> {
         parts: &AssignmentParts<'a>,
         knowledge: &ObjectRegistryView<'_>,
     ) {
-        if parts.operator != AssignmentOperator::Global || !matches!(parts.value, Expr::Lambda(_)) {
+        if parts.operator != AssignmentOperator::Global || !matches!(parts.value, Expr::Function(_))
+        {
             return;
         }
         let analysis = self.context.analysis;
@@ -1071,10 +1112,10 @@ impl<'a> ExpressionChecks<'a, '_> {
     /// symbol only at run time.
     fn protect_computed_symbol(
         &mut self,
-        call: &'a ExprOpBinAdj,
+        call: &'a ExprBinary,
         knowledge: &ObjectRegistryView<'_>,
     ) {
-        let Expr::Symbol(callable) = call.left_operand.as_ref() else {
+        let Expr::Symbol(callable) = call.left.as_ref() else {
             return;
         };
         if callable.text() != PROTECT {
@@ -1082,7 +1123,7 @@ impl<'a> ExpressionChecks<'a, '_> {
         }
         let analysis = self.context.analysis;
         let source = self.context.source;
-        let argument = call.right_operand.as_ref();
+        let argument = call.right.as_ref();
         if source
             .position_for_syntax(callable)
             .is_none_or(|position| analysis.binding_id_at(callable.text(), position).is_some())
@@ -1108,7 +1149,7 @@ impl<'a> ExpressionChecks<'a, '_> {
 
     /// A `return`, `break`, or `continue` that no enclosing function or loop
     /// receives.
-    fn invalid_control_transfer(&mut self, transfer: &ExprControl) {
+    fn invalid_control_transfer(&mut self, transfer: &Expr) {
         let Some(&target) = self.transfers.get(&ptr::from_ref(transfer)) else {
             return;
         };
@@ -1116,11 +1157,11 @@ impl<'a> ExpressionChecks<'a, '_> {
             return;
         }
         let message = match transfer {
-            ExprControl::Return(_) => "`return` can only be used inside a function body",
-            ExprControl::Break(_) => {
+            Expr::Return(_) => "`return` can only be used inside a function body",
+            Expr::Break(_) => {
                 "`break` can only be used inside a loop body or an `apply`/`scan` callback"
             }
-            ExprControl::Continue(_)
+            Expr::Continue(_)
                 if transfer.transferred_value().is_some()
                     && matches!(
                         target,
@@ -1132,32 +1173,32 @@ impl<'a> ExpressionChecks<'a, '_> {
             {
                 "`continue` with a value requires a `list` clause"
             }
-            ExprControl::Continue(_) => {
-                "`continue` can only be used inside a `list` or `do` loop body"
-            }
+            Expr::Continue(_) => "`continue` can only be used inside a `list` or `do` loop body",
+            _ => return,
         };
         match transfer {
-            ExprControl::Return(node) => {
+            Expr::Return(node) => {
                 self.spawn(
                     &catalog::INVALID_CONTROL_TRANSFER,
                     &node.return_token,
                     message,
                 );
             }
-            ExprControl::Break(node) => {
+            Expr::Break(node) => {
                 self.spawn(
                     &catalog::INVALID_CONTROL_TRANSFER,
                     &node.break_token,
                     message,
                 );
             }
-            ExprControl::Continue(node) => {
+            Expr::Continue(node) => {
                 self.spawn(
                     &catalog::INVALID_CONTROL_TRANSFER,
                     &node.continue_token,
                     message,
                 );
             }
+            _ => {}
         }
     }
 
@@ -1172,15 +1213,10 @@ impl<'a> ExpressionChecks<'a, '_> {
                     if inner.parts().operator == AssignmentOperator::Local
                         && inner.parts().value.assigned_function().is_some()
             ),
-            // `(x <- y) := f`
-            AssignmentTarget::List(list) => {
+            AssignmentTarget::Expression(Expr::Assign(inner)) => {
                 parts.operator == AssignmentOperator::Local
                     && installs_function
-                    && matches!(
-                        &list.contents.contents,
-                        Some(AssignmentListContent::Argument(argument))
-                            if matches!(argument, AssignmentArgument::Evaluated(_))
-                    )
+                    && matches!(inner.op, AssignOperator::Evaluated(_))
             }
             _ => false,
         };
@@ -1194,7 +1230,7 @@ impl<'a> ExpressionChecks<'a, '_> {
         let AssignmentTarget::List(list) = parts.target else {
             return;
         };
-        if !matches!(list.contents.contents, Some(AssignmentListContent::Pack(_))) {
+        if !matches!(list.elems, Some(Elements::Pack(_))) {
             return;
         }
         for target in left_arrow_targets(list) {
@@ -1210,8 +1246,8 @@ impl<'a> ExpressionChecks<'a, '_> {
     /// An `if` or `while` condition whose type cannot be `Boolean`.
     fn condition_type(&mut self, expression: &'a Expr, knowledge: &ObjectRegistryView<'_>) {
         let (construct, condition) = match expression {
-            Expr::If(node) => ("if", node.condition.as_ref()),
-            Expr::While(node) => ("while", node.condition.as_ref()),
+            Expr::If(node) => ("if", node.cond.as_ref()),
+            Expr::While(node) => ("while", node.cond.as_ref()),
             _ => return,
         };
         let Some(range) = self.context.source.range_for_syntax(condition) else {
@@ -1293,8 +1329,49 @@ impl<'a> ExpressionChecks<'a, '_> {
         }
     }
 
+    /// Checks fixed source-lambda arity when the argument pack's size is
+    /// apparent. A computed Sequence may have any size, so stays unchecked.
+    fn call_arity(&mut self, call: &ExprBinary, knowledge: &ObjectRegistryView<'_>) {
+        let Some(name) = call.left.symbol_name() else {
+            return;
+        };
+        let Some(position) = self.context.source.position_for_syntax(call) else {
+            return;
+        };
+        let analysis = self.context.analysis;
+        let Some(function) = analysis
+            .function_at(name, position)
+            .filter(|function| !function.is_method_function())
+        else {
+            return;
+        };
+        let Some(Dispatch::Fixed(expected)) = function.dispatch else {
+            return;
+        };
+        let argument = call.right.unparenthesized().unwrap_or(&call.right);
+        let arguments = argument.arguments();
+        if !matches!(argument, Expr::Sequence(_))
+            && analysis
+                .infer_expression_static_type(argument, self.context.source, knowledge)
+                .is_none_or(|class| knowledge.has_type_role(&class, TypeRole::Sequence))
+        {
+            return;
+        }
+        let actual = arguments.into_iter().filter(|argument| {
+            !matches!(argument, Some(Expr::Option(option)) if function.declared_options.as_ref()
+                .is_some_and(|options| options.iter().any(|accepted| Some(accepted.name.name()) == option.key.symbol_name())))
+        }).count();
+        if actual != expected {
+            self.spawn(
+                &catalog::CALL_ARITY_MISMATCH,
+                call,
+                format!("`{name}` takes {expected} argument(s), but this call supplies {actual}"),
+            );
+        }
+    }
+
     /// A call whose argument types no known method domain accepts.
-    fn call_domain(&mut self, call: &ExprOpBinAdj, knowledge: &ObjectRegistryView<'_>) {
+    fn call_domain(&mut self, call: &ExprBinary, knowledge: &ObjectRegistryView<'_>) {
         let Some(arguments) = TypeChecker::new(self.context.analysis, knowledge)
             .disjoint_call_argument_types(call, self.context.source, knowledge)
         else {
@@ -1316,13 +1393,13 @@ impl<'a> ExpressionChecks<'a, '_> {
 
     /// Options a call passes that its function does not accept: unknown
     /// names, and values outside the documented types or possible symbols.
-    fn call_options(&mut self, call: &'a ExprOpBinAdj, knowledge: &ObjectRegistryView<'_>) {
+    fn call_options(&mut self, call: &'a ExprBinary, knowledge: &ObjectRegistryView<'_>) {
         let checker = TypeChecker::new(self.context.analysis, knowledge);
         let issues = checker.call_option_issues(call, self.context.source, knowledge);
         if issues.is_empty() {
             return;
         }
-        let function = self.text(call.left_operand.as_ref());
+        let function = self.text(call.left.as_ref());
         let quoted = |names: &[ObjectName]| {
             names
                 .iter()
@@ -1402,12 +1479,24 @@ impl<'a> ExpressionChecks<'a, '_> {
 }
 
 /// The `x <- y` targets of a parallel assignment list, at any nesting depth.
-fn left_arrow_targets(list: &AssignmentList) -> Vec<&AssignmentArgument> {
-    list.targets()
+fn sequence_targets(list: &ExprSequence) -> Vec<Option<&Expr>> {
+    list.elems
+        .as_ref()
+        .map_or_else(Vec::new, PackedArguments::arguments)
+}
+
+/// The `x <- y` targets of a parallel assignment list, at any nesting depth.
+fn left_arrow_targets(list: &ExprSequence) -> Vec<&Expr> {
+    sequence_targets(list)
         .into_iter()
-        .flat_map(|target| match target {
-            AssignmentArgument::Evaluated(_) => vec![target],
-            AssignmentArgument::List(nested) => left_arrow_targets(nested),
+        .flatten()
+        .flat_map(|target| match target.unparenthesized() {
+            Some(Expr::Assign(assignment))
+                if matches!(assignment.op, AssignOperator::Evaluated(_)) =>
+            {
+                vec![target]
+            }
+            Some(Expr::Sequence(nested)) => left_arrow_targets(nested),
             _ => Vec::new(),
         })
         .collect()
@@ -1779,7 +1868,8 @@ mod tests {
             document
                 .diagnostics()
                 .iter()
-                .all(|diagnostic| diagnostic.rule.code == catalog::UNRESOLVED_VALUE.code),
+                .all(|diagnostic| matches!(diagnostic.rule.code,
+                    code if code == catalog::UNRESOLVED_VALUE.code || code == catalog::UNINTRODUCED_SYMBOL.code)),
             "an already-simplest condition must not be reported: {:?}",
             document
                 .diagnostics()

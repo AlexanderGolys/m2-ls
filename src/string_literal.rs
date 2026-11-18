@@ -1,7 +1,7 @@
 //! Macaulay2's two string literal forms, read into and written from the
 //! strings they denote.
 
-use m2_syn::nodes::{Expr, ExprLiteral};
+use m2_syn::nodes::{Expr, Literal};
 use m2_syn::Spanned;
 
 use crate::source::{ByteRange, SourceNavigation};
@@ -27,17 +27,17 @@ impl LiteralSource for Expr {
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<ByteRange> {
         let (width, last): (usize, Option<&dyn Spanned>) = match self {
-            Expr::Literal(ExprLiteral::String(literal)) => (
+            Expr::Literal(Literal::String(literal)) => (
                 1,
                 literal
-                    .elements
+                    .fragments
                     .last()
                     .map(|element| element as &dyn Spanned),
             ),
-            Expr::Literal(ExprLiteral::RawString(literal)) => (
+            Expr::Literal(Literal::RawString(literal)) => (
                 3,
                 literal
-                    .elements
+                    .fragments
                     .last()
                     .map(|element| element as &dyn Spanned),
             ),
@@ -78,8 +78,8 @@ impl StringDelimiter {
     /// The delimiter of a generated literal expression.
     pub fn of_expression(expression: &Expr) -> Option<Self> {
         match expression {
-            Expr::Literal(ExprLiteral::String(_)) => Some(Self::Quote),
-            Expr::Literal(ExprLiteral::RawString(_)) => Some(Self::TripleSlash),
+            Expr::Literal(Literal::String(_)) => Some(Self::Quote),
+            Expr::Literal(Literal::RawString(_)) => Some(Self::TripleSlash),
             _ => None,
         }
     }

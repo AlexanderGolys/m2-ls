@@ -27,14 +27,14 @@ impl<'ast> ConstructorCall<'ast> {
         let Expr::New(construction) = expression else {
             return None;
         };
-        if construction.parent_class.is_some() {
+        if construction.of_clause.is_some() {
             return None;
         }
         UnarySymbolCall::grouped_value(&construction.class)?.symbol_name()?;
         let class = construction.class.as_ref();
         Some(Self {
             class,
-            value: construction.instance.as_ref()?.clause_value(),
+            value: construction.from_clause.as_ref()?.clause_value(),
         })
     }
 

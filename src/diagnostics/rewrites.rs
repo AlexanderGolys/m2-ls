@@ -12,16 +12,16 @@ use std::collections::HashSet;
 use std::ptr;
 
 use m2_syn::nodes::{
-    Cell, ElseClause, Expr, ExprAssign, ExprAssignSimple, ExprControl, ExprDebug, ExprIf,
-    ExprLambda, ExprLiteral, ExprOp, ExprOpBin, ExprOpBinAdj, ExprProfile, ExprTry, ExprWhile,
-    FromInstance, Holder, OfClass, PackedContent, RangeBoundFrom, RangeBoundTo, Statement,
-    ThenClause, TokenParseRule, TryFallback, TryFallbackExcept, WhenCondition, TOKEN_PARSE_RULES,
+    AssignOperator, Cell, Elements, ElseClause, ExceptClause, Expr, ExprBinary, ExprDebug, ExprIf,
+    ExprParen, ExprTiming, ExprTry, ExprWhile, FromClause, Literal, OfClause, Stmt, ThenClause,
+    ToClause, TryFallback, WhenClause,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Spanned, Token};
 
 use crate::analysis::{Analysis, InfixSyntax};
 use crate::diagnostics::{catalog, DiagnosticRule};
+use crate::node_metadata::binding_precedence;
 use crate::object_registry::ObjectRegistry;
 use crate::source::{ByteRange, SourceNavigation, SyntaxSource};
 use crate::syntax::{AssignmentSyntax, ClauseSyntax, ControlSyntax, ExpressionSyntax};
@@ -152,6 +152,21 @@ pub struct RewriteSite<'ast> {
     /// statements an inlining rewrite absorbs before it. The expression is
     /// where the rewrite is reported and found.
     pub extent: Option<ByteRange>,
+    /// Whether the replacement turns an error into a fallback value:
+    /// `if h.k =!= null then h.k else v` fails when `h` has no key `k`, while
+    /// its replacement `h.k ?? v` yields `v`.
+    pub catches_errors: bool,
+}
+
+impl RewriteSite<'_> {
+    /// The rule reporting the site: its kind's, unless it catches errors.
+    pub fn rule(&self) -> &'static DiagnosticRule {
+        if self.catches_errors {
+            &catalog::ERROR_CATCHING_REWRITE
+        } else {
+            self.kind.rule()
+        }
+    }
 }
 
 /// Collects the rewrite sites of typed syntax in source order.
@@ -269,7 +284,20 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             owner,
             replacement,
             extent: None,
+            catches_errors: self.catches_errors(kind, expression),
         });
+    }
+
+    /// Whether the `kind` rewrite of `expression` replaces a null test whose
+    /// subject may fail by a `??`, which turns that failure into its fallback.
+    fn catches_errors(&self, kind: RewriteKind, expression: &Expr) -> bool {
+        let Expr::If(conditional) = expression else {
+            return false;
+        };
+        (kind.is_coalescence() || kind == RewriteKind::NullReturnGuard)
+            && self
+                .null_test(conditional)
+                .is_some_and(|test| test.fallible)
     }
 
     /// Marks `value` as the slot a control construct delimits.
@@ -316,7 +344,7 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             None,
             replacement,
         );
-        if let Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) = expression {
+        if let Expr::Binary(call) = expression {
             let replacement = self.ambiguous_float_member_access(call);
             self.push(
                 RewriteKind::AmbiguousFloatMemberAccess,
@@ -331,7 +359,7 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             .find(|(slot, _)| ptr::eq(*slot, expression))
         {
             // Parentheses around statements are a block, not a grouping.
-            if matches!(expression, Expr::Holder(holder) if holder.muted.is_empty()) {
+            if matches!(expression, Expr::Paren(holder) if holder.stmts.is_empty()) {
                 let replacement = expression
                     .unparenthesized()
                     .map(|inner| self.text(inner).to_string());
@@ -389,12 +417,15 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
 
     /// `x#3` for `x .3`, an application to a float literal written right
     /// after a name.
-    fn ambiguous_float_member_access(&self, call: &ExprOpBinAdj) -> Option<String> {
-        let name = call.left_operand.symbol_name()?;
-        let Expr::Literal(ExprLiteral::Float(float)) = call.right_operand.as_ref() else {
+    fn ambiguous_float_member_access(&self, call: &ExprBinary) -> Option<String> {
+        if !matches!(call.op, m2_syn::nodes::BinaryOperator::Space(_)) {
+            return None;
+        }
+        let name = call.left.symbol_name()?;
+        let Expr::Literal(Literal::Float(float)) = call.right.as_ref() else {
             return None;
         };
-        let adjacent = self.source.syntax_bytes(call.left_operand.as_ref())?.end
+        let adjacent = self.source.syntax_bytes(call.left.as_ref())?.end
             == self.source.syntax_bytes(float)?.start;
         let fractional = self.text(float).strip_prefix('.')?;
         (adjacent && !fractional.is_empty() && fractional.chars().all(|ch| ch.is_ascii_digit()))
@@ -410,18 +441,23 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             value,
             Expr::Symbol(_)
                 | Expr::Literal(_)
-                | Expr::Collection(_)
-                | Expr::Holder(_)
-                | Expr::Op(ExprOp::Bin(ExprOpBin::Adj(_)))
-        );
+                | Expr::List(_)
+                | Expr::Array(_)
+                | Expr::Sequence(_)
+                | Expr::AngleBar(_)
+                | Expr::Paren(_)
+        ) && !matches!(value, Expr::Binary(binary) if matches!(binary.op, m2_syn::nodes::BinaryOperator::Space(_)));
         let replacement = format!(
             "{} {}",
             self.text(construction.class).trim(),
             self.parenthesized_if(value, grouped)
         );
-        let nested = self
-            .parent
-            .is_some_and(|parent| matches!(parent, Expr::Op(_)));
+        let nested = self.parent.is_some_and(|parent| {
+            matches!(
+                parent,
+                Expr::Binary(_) | Expr::Prefix(_) | Expr::Postfix(_) | Expr::Field(_)
+            )
+        });
         Some(if nested {
             format!("({replacement})")
         } else {
@@ -434,13 +470,16 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
     /// function. Fixed parameter lists, computed callees, type constructors,
     /// extra arguments, and statement-bearing holders keep their wrappers.
     fn forwarding_lambda(&self, expression: &Expr) -> Option<String> {
-        let Expr::Lambda(ExprLambda::Variadic(lambda)) = expression else {
+        let Expr::Function(lambda) = expression else {
+            return None;
+        };
+        let m2_syn::nodes::FunctionParams::Variadic(parameter) = &lambda.params else {
             return None;
         };
         let call = UnarySymbolCall::of(&lambda.body)?;
         let function = call.function.symbol_name()?;
-        (call.argument.symbol_name()? == lambda.argument.text()
-            && function != lambda.argument.text()
+        (call.argument.symbol_name()? == parameter.text()
+            && function != parameter.text()
             && UnarySymbolCall::has_function_name(call.function))
         .then(|| self.text(call.function).trim().to_string())
     }
@@ -458,9 +497,12 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             self.text(composition.outer).trim(),
             self.text(composition.inner).trim()
         );
-        let needs_parentheses = self
-            .parent
-            .is_some_and(|parent| matches!(parent, Expr::Op(_)));
+        let needs_parentheses = self.parent.is_some_and(|parent| {
+            matches!(
+                parent,
+                Expr::Binary(_) | Expr::Prefix(_) | Expr::Postfix(_) | Expr::Field(_)
+            )
+        });
         Some(if needs_parentheses {
             format!("({replacement})")
         } else {
@@ -472,21 +514,24 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
     /// A symbol callee and fixed symbol avoid moving computed expressions out
     /// of the callback. Neither may refer to the disappearing parameter.
     fn partial_application_lambda(&self, expression: &Expr) -> Option<String> {
-        let Expr::Lambda(ExprLambda::Variadic(lambda)) = expression else {
+        let Expr::Function(lambda) = expression else {
+            return None;
+        };
+        let m2_syn::nodes::FunctionParams::Variadic(parameter) = &lambda.params else {
             return None;
         };
         let call = UnarySymbolCall::application(&lambda.body)?;
-        let function = UnarySymbolCall::grouped_value(&call.left_operand)?;
+        let function = UnarySymbolCall::grouped_value(&call.left)?;
         if !UnarySymbolCall::has_function_name(function) {
             return None;
         }
-        let arguments = UnarySymbolCall::grouped_value(&call.right_operand)?.arguments();
+        let arguments = UnarySymbolCall::grouped_value(&call.right)?.arguments();
         let [Some(fixed), Some(forwarded)] = arguments.as_slice() else {
             return None;
         };
         let fixed = UnarySymbolCall::grouped_value(fixed)?;
         let forwarded = UnarySymbolCall::grouped_value(forwarded)?;
-        let parameter = lambda.argument.text();
+        let parameter = parameter.text();
         (forwarded.symbol_name()? == parameter
             && fixed.symbol_name()? != parameter
             && function.symbol_name()? != parameter)
@@ -504,13 +549,15 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
         }
         let replacement = self.negated_condition(comparison.subject.unparenthesized()?);
         let needs_parentheses = self.parent.is_some_and(|parent| {
-            matches!(parent, Expr::Op(_))
-                && parent.infix_operands().is_none_or(|operands| {
-                    !matches!(
-                        operands.operator,
-                        <Token![and]>::SPELLING | <Token![or]>::SPELLING
-                    )
-                })
+            matches!(
+                parent,
+                Expr::Binary(_) | Expr::Prefix(_) | Expr::Postfix(_) | Expr::Field(_)
+            ) && parent.infix_operands().is_none_or(|operands| {
+                !matches!(
+                    operands.operator,
+                    <Token![and]>::SPELLING | <Token![or]>::SPELLING
+                )
+            })
         });
         Some(if needs_parentheses {
             format!("({replacement})")
@@ -527,7 +574,7 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
         let collection = mapping.collection;
         let grouped = collection.infix_operands().is_some()
             || starts_with_keyword(collection)
-            || matches!(collection, Expr::Lambda(_));
+            || matches!(collection, Expr::Function(_));
         let replacement = format!(
             "{} / {} @@ {}",
             self.parenthesized_if(collection, grouped),
@@ -535,7 +582,7 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             self.text(mapping.inner).trim(),
         );
         let needs_parentheses = self.parent.is_some_and(|parent| {
-            !matches!(parent, Expr::Assign(_) | Expr::Lambda(_) | Expr::Holder(_))
+            !matches!(parent, Expr::Assign(_) | Expr::Function(_) | Expr::Paren(_))
         });
         Some(if needs_parentheses {
             format!("({replacement})")
@@ -561,12 +608,12 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
                 self.covered.insert(ptr::from_ref(conditional));
                 Some((RewriteKind::Coalescence, replacement))
             }
-            Expr::Assign(ExprAssign::Simple(ExprAssignSimple::Global(assignment))) => {
-                let conditional @ Expr::If(test) = assignment.value.as_ref() else {
+            Expr::Assign(assignment) if matches!(assignment.op, AssignOperator::Global(_)) => {
+                let conditional @ Expr::If(test) = assignment.right.as_ref() else {
                     return None;
                 };
-                let (subject, fallback) = self.coalescence_parts(test, SubjectErrors::Propagate)?;
-                let target = assignment.variable.text();
+                let (subject, fallback) = self.coalescence_parts(test)?;
+                let target = assignment.left.symbol_name()?;
                 (target == self.text(subject)).then(|| {
                     self.covered.insert(ptr::from_ref(conditional));
                     (
@@ -579,8 +626,7 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
                 let discarded = self.discarded.contains(&ptr::from_ref(expression));
                 self.coalescing_assignment(conditional, discarded)
                     .or_else(|| {
-                        let (subject, fallback) =
-                            self.coalescence_parts(conditional, SubjectErrors::Propagate)?;
+                        let (subject, fallback) = self.coalescence_parts(conditional)?;
                         Some((
                             RewriteKind::Coalescence,
                             self.coalescence_expression(subject, fallback),
@@ -596,17 +642,17 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
     /// error would yield something else. Returns the conditional with the
     /// replacement.
     fn guarded_conditional(&self, guard: &'ast ExprTry) -> Option<(&'ast Expr, String)> {
-        if guard.on_success.is_some() {
+        if guard.then_clause.is_some() {
             return None;
         }
         let Some(TryFallback::Else(error_fallback)) = &guard.fallback else {
             return None;
         };
-        let conditional = guard.value.unparenthesized()?;
+        let conditional = guard.expr.unparenthesized()?;
         let Expr::If(test) = conditional else {
             return None;
         };
-        let (subject, fallback) = self.coalescence_parts(test, SubjectErrors::Caught)?;
+        let (subject, fallback) = self.coalescence_parts(test)?;
         self.same_expression(fallback, error_fallback.clause_value())
             .then(|| (conditional, self.coalescence_expression(subject, fallback)))
     }
@@ -634,7 +680,8 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
         let NullTest {
             subject,
             null_branch,
-        } = self.null_test(conditional, SubjectErrors::Propagate)?;
+            ..
+        } = self.null_test(conditional)?;
         let then_value = conditional.then_clause.clause_value();
         let Some(else_clause) = &conditional.else_clause else {
             // `if x === null then x = v` yields `null` where `x ??= v` yields `x`,
@@ -718,18 +765,18 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
         let NullTest {
             subject,
             null_branch,
-        } = self.null_test(conditional, SubjectErrors::Propagate)?;
+            ..
+        } = self.null_test(conditional)?;
         let fallback = conditional.then_clause.clause_value().unparenthesized()?;
-        (null_branch == NullBranch::Then
-            && matches!(fallback, Expr::Control(ExprControl::Return(_))))
-        .then(|| self.coalescence_expression(subject, fallback))
+        (null_branch == NullBranch::Then && matches!(fallback, Expr::Return(_)))
+            .then(|| self.coalescence_expression(subject, fallback))
     }
 
     /// `fallback` as the right operand of `??`, parenthesized when it binds more
     /// loosely than `??` and would otherwise take the coalescence as its own left
     /// operand, as `x ?? y -> y` reads `(x ?? y) -> y`.
     fn coalescence_operand(&self, fallback: &Expr) -> String {
-        let binds_looser = matches!(fallback, Expr::Lambda(_))
+        let binds_looser = matches!(fallback, Expr::Function(_))
             || precedence_relative_to_coalescence(fallback).is_some_and(Ordering::is_lt);
         self.parenthesized_if(fallback, binds_looser)
     }
@@ -738,7 +785,7 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
     /// tightly: `??` groups to the right, so `a or b ?? v` reads `a or (b ?? v)`,
     /// and a keyword expression such as `try e` would take `?? v` as part of `e`.
     fn coalescence_subject(&self, subject: &Expr) -> String {
-        let binds_tighter = !matches!(subject, Expr::Lambda(_))
+        let binds_tighter = !matches!(subject, Expr::Function(_))
             && !starts_with_keyword(subject)
             && precedence_relative_to_coalescence(subject).is_none_or(Ordering::is_gt);
         self.parenthesized_if(subject, !binds_tighter)
@@ -762,17 +809,10 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             .is_some_and(|(left, right)| self.text(left).trim() == self.text(right).trim())
     }
 
-    /// The expression an `if` compares with `null` using `===` or `=!=`. `??`
-    /// treats an error in its left side like `null`, so the subject must be one
-    /// whose errors are handled the same way: a symbol, which never fails to
-    /// evaluate, an expression under a bare `try` (`(try f x) === null`), or any
-    /// expression when a `try` around the conditional catches its errors.
-    fn null_test<'test>(
-        &self,
-        conditional: &'test ExprIf,
-        subject_errors: SubjectErrors,
-    ) -> Option<NullTest<'test>> {
-        let operands = conditional.condition.infix_operands()?;
+    /// The expression an `if` compares with `null` using `===` or `=!=`, seen
+    /// through a bare `try`: `(try f x) === null` tests `f x`.
+    fn null_test<'test>(&self, conditional: &'test ExprIf) -> Option<NullTest<'test>> {
+        let operands = conditional.cond.infix_operands()?;
         let tested = match (is_null(operands.left), is_null(operands.right)) {
             (true, false) => operands.right,
             (false, true) => operands.left,
@@ -785,18 +825,10 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
         } else {
             return None;
         };
-        let subject = match guarded_value(tested) {
-            Some(guarded) => guarded,
-            None if subject_errors == SubjectErrors::Caught
-                || matches!(tested, Expr::Symbol(_)) =>
-            {
-                tested.unparenthesized()?
-            }
-            None => return None,
-        };
         Some(NullTest {
-            subject,
+            subject: guarded_value(tested).or_else(|| tested.unparenthesized())?,
             null_branch,
+            fallible: may_fail(tested),
         })
     }
 
@@ -804,12 +836,12 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
     fn coalescence_parts<'test>(
         &self,
         conditional: &'test ExprIf,
-        subject_errors: SubjectErrors,
     ) -> Option<(&'test Expr, &'test Expr)> {
         let NullTest {
             subject,
             null_branch,
-        } = self.null_test(conditional, subject_errors)?;
+            ..
+        } = self.null_test(conditional)?;
         let then_value = conditional.then_clause.clause_value();
         let else_value = conditional.else_clause.as_ref()?.clause_value();
         let (fallback, repeated_subject) = match null_branch {
@@ -828,14 +860,14 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
         if is_null(else_branch) {
             return Some(format!(
                 "if {} then {}",
-                self.text(conditional.condition.as_ref()).trim_end(),
+                self.text(conditional.cond.as_ref()).trim_end(),
                 self.text(then_branch)
             ));
         }
         is_null(then_branch).then(|| {
             format!(
                 "if {} then {}",
-                self.negated_condition(&conditional.condition),
+                self.negated_condition(&conditional.cond),
                 self.text(else_branch),
             )
         })
@@ -843,9 +875,9 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
 
     /// A `try` without a `then` repeating its value, or without an `else null`.
     fn try_statement(&self, guard: &ExprTry) -> Option<String> {
-        let condition_text = self.text(guard.value.as_ref());
+        let condition_text = self.text(guard.expr.as_ref());
         let consequence_text = guard
-            .on_success
+            .then_clause
             .as_ref()
             .map(|clause| self.text(clause.clause_value()));
         let alternative = match &guard.fallback {
@@ -872,7 +904,7 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
     /// An `if` whose condition loses a negation: `if a != b then x` for `if not
     /// (a == b) then x`.
     fn if_condition(&self, conditional: &ExprIf) -> Option<String> {
-        let simplified = self.simplified_condition(&conditional.condition)?;
+        let simplified = self.simplified_condition(&conditional.cond)?;
         let mut replacement = format!(
             "if {} then {}",
             simplified,
@@ -909,7 +941,7 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             .unwrap_or_else(|| self.text(nested).to_string());
         Some(format!(
             "if {} then {} else {}",
-            self.negated_condition(&conditional.condition),
+            self.negated_condition(&conditional.cond),
             self.text(else_branch),
             nested_replacement
         ))
@@ -986,43 +1018,46 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
 impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for RewriteSites<'ast, '_, Source> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
         self.rewrite(expression);
+        if let Some(value) = expression.transferred_value() {
+            self.control_slot(value, expression);
+        }
         let parent = self.parent.replace(expression);
         visit::visit_expr(self, expression);
         self.parent = parent;
     }
 
     fn visit_cell(&mut self, cell: &'ast Cell) {
-        if let PackedContent::Expr(value) = &cell.content {
+        if let Elements::Single(value) = &cell.elems {
             self.discarded.insert(ptr::from_ref(value.as_ref()));
         }
         visit::visit_cell(self, cell);
     }
 
-    fn visit_statement(&mut self, statement: &'ast Statement) {
-        if let PackedContent::Expr(value) = &statement.content {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if let Elements::Single(value) = &statement.elems {
             self.discarded.insert(ptr::from_ref(value.as_ref()));
         }
-        visit::visit_statement(self, statement);
+        visit::visit_stmt(self, statement);
     }
 
-    fn visit_holder(&mut self, node: &'ast Holder) {
+    fn visit_expr_paren(&mut self, node: &'ast ExprParen) {
         self.null_bindings(node);
-        visit::visit_holder(self, node);
+        visit::visit_expr_paren(self, node);
     }
 
     fn visit_expr_if(&mut self, node: &'ast ExprIf) {
-        self.control_slot(&node.condition, node);
+        self.control_slot(&node.cond, node);
         visit::visit_expr_if(self, node);
     }
 
     fn visit_expr_while(&mut self, node: &'ast ExprWhile) {
-        self.control_slot(&node.condition, node);
+        self.control_slot(&node.cond, node);
         visit::visit_expr_while(self, node);
     }
 
-    fn visit_when_condition(&mut self, node: &'ast WhenCondition) {
-        self.control_slot(&node.condition, node);
-        visit::visit_when_condition(self, node);
+    fn visit_when_clause(&mut self, node: &'ast WhenClause) {
+        self.control_slot(&node.expr, node);
+        visit::visit_when_clause(self, node);
     }
 
     fn visit_then_clause(&mut self, node: &'ast ThenClause) {
@@ -1036,66 +1071,40 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for RewriteSites<'ast,
     }
 
     fn visit_expr_try(&mut self, node: &'ast ExprTry) {
-        self.control_slot(&node.value, node);
+        self.control_slot(&node.expr, node);
         visit::visit_expr_try(self, node);
     }
 
-    fn visit_try_fallback_except(&mut self, node: &'ast TryFallbackExcept) {
-        self.control_slot(&node.value, node);
-        visit::visit_try_fallback_except(self, node);
+    fn visit_except_clause(&mut self, node: &'ast ExceptClause) {
+        self.control_slot(&node.expr, node);
+        visit::visit_except_clause(self, node);
     }
 
-    fn visit_of_class(&mut self, node: &'ast OfClass) {
-        self.control_slot(&node.parent, node);
-        visit::visit_of_class(self, node);
+    fn visit_of_clause(&mut self, node: &'ast OfClause) {
+        self.control_slot(&node.expr, node);
+        visit::visit_of_clause(self, node);
     }
 
-    fn visit_from_instance(&mut self, node: &'ast FromInstance) {
-        self.control_slot(&node.instance, node);
-        visit::visit_from_instance(self, node);
+    fn visit_from_clause(&mut self, node: &'ast FromClause) {
+        self.control_slot(&node.expr, node);
+        visit::visit_from_clause(self, node);
     }
 
-    fn visit_range_bound_from(&mut self, node: &'ast RangeBoundFrom) {
-        self.control_slot(&node.value, node);
-        visit::visit_range_bound_from(self, node);
-    }
-
-    fn visit_range_bound_to(&mut self, node: &'ast RangeBoundTo) {
-        self.control_slot(&node.value, node);
-        visit::visit_range_bound_to(self, node);
-    }
-
-    fn visit_expr_control(&mut self, node: &'ast ExprControl) {
-        if let Some(value) = node.transferred_value() {
-            self.control_slot(value, node);
-        }
-        visit::visit_expr_control(self, node);
+    fn visit_to_clause(&mut self, node: &'ast ToClause) {
+        self.control_slot(&node.expr, node);
+        visit::visit_to_clause(self, node);
     }
 
     fn visit_expr_debug(&mut self, node: &'ast ExprDebug) {
-        let value = match node {
-            ExprDebug::Test(debug) => debug.value.as_deref(),
-            ExprDebug::Step(debug) => debug.value.as_deref(),
-            ExprDebug::Finish(debug) => debug.value.as_deref(),
-            ExprDebug::Shield(debug) => debug.value.as_deref(),
-            ExprDebug::Breakpoint(debug) => debug.value.as_deref(),
-        };
-        if let Some(value) = value {
+        if let Some(value) = node.expr.as_deref() {
             self.control_slot(value, node);
         }
         visit::visit_expr_debug(self, node);
     }
 
-    fn visit_expr_profile(&mut self, node: &'ast ExprProfile) {
-        let value = match node {
-            ExprProfile::ElapsedTime(profile) => &profile.value,
-            ExprProfile::ElapsedTiming(profile) => &profile.value,
-            ExprProfile::Profile(profile) => &profile.value,
-            ExprProfile::Time(profile) => &profile.value,
-            ExprProfile::Timing(profile) => &profile.value,
-        };
-        self.control_slot(value, node);
-        visit::visit_expr_profile(self, node);
+    fn visit_expr_timing(&mut self, node: &'ast ExprTiming) {
+        self.control_slot(&node.expr, node);
+        visit::visit_expr_timing(self, node);
     }
 }
 
@@ -1108,23 +1117,18 @@ enum NullBranch {
     Else,
 }
 
-/// Whether errors raised while evaluating a null test's subject are caught by
-/// a `try` around the whole conditional.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubjectErrors {
-    /// The failure propagates beyond this expression.
-    Propagate,
-    /// The failure is handled by this expression's fallback.
-    Caught,
-}
-
 /// What an `if` compares with `null`, and the branch that runs when it is null.
+/// `if (try f x) === null then v else f x` tests the subject `f x`, which is
+/// not fallible because the `try` turns its errors into `null`.
 #[derive(Debug, Clone, Copy)]
 struct NullTest<'ast> {
     /// Expression whose behavior the rewrite preserves.
     subject: &'ast Expr,
     /// Branch returning the null value in a conditional rewrite.
     null_branch: NullBranch,
+    /// Whether an error in the test escapes the conditional, where `??`
+    /// would turn it into the fallback.
+    fallible: bool,
 }
 
 /// Whether `expression` is the symbol `null`.
@@ -1134,41 +1138,41 @@ fn is_null(expression: &Expr) -> bool {
 
 /// The target name, operator, and value of `x = v` or `x := v`.
 fn symbol_assignment(expression: &Expr) -> Option<(&str, &'static str, &Expr)> {
-    let Expr::Assign(ExprAssign::Simple(assignment)) = expression else {
+    let Expr::Assign(assignment) = expression else {
         return None;
     };
-    match assignment {
-        ExprAssignSimple::Global(assignment) => Some((
-            assignment.variable.text(),
-            <Token![=]>::SPELLING,
-            assignment.value.as_ref(),
-        )),
-        ExprAssignSimple::Local(assignment) => Some((
-            assignment.variable.text(),
-            <Token![:=]>::SPELLING,
-            assignment.value.as_ref(),
-        )),
-    }
+    let name = assignment.left.symbol_name()?;
+    let operator = match assignment.op {
+        AssignOperator::Global(_) => <Token![=]>::SPELLING,
+        AssignOperator::Local(_) => <Token![:=]>::SPELLING,
+        _ => return None,
+    };
+    Some((name, operator, &assignment.right))
 }
 
 /// The expression a bare `try e` evaluates, seen through parentheses; errors
 /// in it yield `null`.
 fn guarded_value(expression: &Expr) -> Option<&Expr> {
     match expression.unparenthesized()? {
-        Expr::Try(guard) if guard.on_success.is_none() && guard.fallback.is_none() => {
-            guard.value.unparenthesized()
+        Expr::Try(guard) if guard.then_clause.is_none() && guard.fallback.is_none() => {
+            guard.expr.unparenthesized()
         }
         _ => None,
     }
 }
 
+/// Whether evaluating `expression` may raise an error: anything but a symbol,
+/// which always has a value, or a bare `try`, which turns errors into `null`.
+fn may_fail(expression: &Expr) -> bool {
+    guarded_value(expression).is_none()
+        && !matches!(expression.unparenthesized(), Some(Expr::Symbol(_)))
+}
+
 /// The operand of a `not`.
 fn negated_operand(expression: &Expr) -> Option<&Expr> {
     match expression {
-        Expr::Op(ExprOp::Prefix(prefix))
-            if prefix.operator.spelling() == <Token![not]>::SPELLING =>
-        {
-            Some(&prefix.operand)
+        Expr::Prefix(prefix) if prefix.op.spelling() == <Token![not]>::SPELLING => {
+            Some(&prefix.expr)
         }
         _ => None,
     }
@@ -1177,11 +1181,11 @@ fn negated_operand(expression: &Expr) -> Option<&Expr> {
 /// The single value parentheses hold, or the expression itself.
 fn unwrap_parentheses(expression: &Expr) -> &Expr {
     match expression {
-        Expr::Holder(Holder {
-            muted,
-            value: Some(value),
+        Expr::Paren(ExprParen {
+            stmts,
+            expr: Some(value),
             ..
-        }) if muted.is_empty() => value,
+        }) if stmts.is_empty() => value,
         _ => expression,
     }
 }
@@ -1195,14 +1199,16 @@ fn starts_with_keyword(expression: &Expr) -> bool {
         | Expr::While(_)
         | Expr::Try(_)
         | Expr::New(_)
-        | Expr::Control(_)
+        | Expr::Break(_)
+        | Expr::Continue(_)
+        | Expr::Return(_)
         | Expr::Catch(_)
         | Expr::Throw(_)
         | Expr::Trap(_)
         | Expr::Debug(_)
-        | Expr::Profile(_) => true,
-        Expr::Op(ExprOp::Prefix(prefix)) => prefix
-            .operator
+        | Expr::Timing(_) => true,
+        Expr::Prefix(prefix) => prefix
+            .op
             .spelling()
             .starts_with(|first: char| first.is_alphabetic()),
         _ => false,
@@ -1224,21 +1230,6 @@ fn precedence_relative_to_coalescence(expression: &Expr) -> Option<Ordering> {
         _ => expression.infix_operands()?.operator,
     };
     Some(binding_precedence(operator)?.cmp(&coalescence))
-}
-
-/// The parsing precedence of the operator spelled `spelling`.
-fn binding_precedence(spelling: &str) -> Option<u8> {
-    let index = TOKEN_PARSE_RULES
-        .binary_search_by_key(&spelling, |(token, _)| token)
-        .ok()?;
-    Some(match TOKEN_PARSE_RULES[index].1 {
-        TokenParseRule::Precedence(precedence)
-        | TokenParseRule::Postfix(precedence)
-        | TokenParseRule::Binary(precedence, _)
-        | TokenParseRule::Prefix(precedence, _)
-        | TokenParseRule::PrefixBinary(precedence, _, _)
-        | TokenParseRule::Unary(precedence, _) => precedence,
-    })
 }
 
 /// Equivalent comparison operator after logical negation, when one exists.
@@ -1278,8 +1269,17 @@ mod tests {
         .collect()
     }
 
-    /// The coalescence rewrites of `text`, of either kind.
+    /// The coalescence rewrites of `text`, of either kind, that keep its errors.
     fn coalescences(text: &str) -> Vec<(RewriteKind, String)> {
+        coalescences_catching_errors(text, false)
+    }
+
+    /// The coalescence rewrites of `text`, of either kind, that turn an error
+    /// into the fallback exactly when `catches_errors`.
+    fn coalescences_catching_errors(
+        text: &str,
+        catches_errors: bool,
+    ) -> Vec<(RewriteKind, String)> {
         let snapshot = SyntaxSnapshot::parse(text, None);
         let mut source = DocumentSource::new(text.to_owned());
         source.register_syntax(&snapshot);
@@ -1288,7 +1288,7 @@ mod tests {
             &source,
         )
         .into_iter()
-        .filter(|site| site.kind.is_coalescence())
+        .filter(|site| site.kind.is_coalescence() && site.catches_errors == catches_errors)
         .map(|site| (site.kind, site.replacement))
         .collect()
     }
@@ -1296,7 +1296,7 @@ mod tests {
     /// An assignment repeating its symbol target as the left operand of an
     /// operator with an augmented form becomes that augmented assignment.
     #[test]
-    fn a_target_repeated_as_the_left_operand_becomes_an_augmented_assignment() {
+    fn a_target_repeated_as_the_left_becomes_an_augmented_assignment() {
         let augmented = |text: &str| rewrites(text, RewriteKind::AugmentedAssignment);
 
         assert_eq!(augmented("prefix = prefix | \"X\"\n"), ["prefix |= \"X\""]);
@@ -1472,7 +1472,7 @@ mod tests {
     /// where `??` would swallow it; a `try` without the matching `else` yields
     /// `null` on error rather than the fallback; and a `try` around an
     /// assignment also swallows errors from the fallback, which `??=` lets
-    /// through.
+    /// through. The first three coalesce only as error-catching rewrites.
     #[test]
     fn null_tests_whose_errors_behave_differently_do_not_coalesce() {
         for text in [
@@ -1483,6 +1483,10 @@ mod tests {
         ] {
             assert_eq!(coalescences(text), [], "{text:?}");
         }
+        assert_eq!(
+            coalescences_catching_errors("y = if h.Text =!= null then h.Text else 0\n", true),
+            [(RewriteKind::Coalescence, "h.Text ?? 0".to_string())]
+        );
     }
 
     #[test]

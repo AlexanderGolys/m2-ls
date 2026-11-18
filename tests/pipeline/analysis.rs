@@ -1,5 +1,7 @@
 //! End-to-end analysis behavior observed through standard LSP capabilities.
 
+use std::collections::BTreeSet;
+
 use serde_json::{json, Value};
 
 use crate::support::{document_position, position, response_array, DocumentSession};
@@ -663,6 +665,47 @@ async fn protected_assignments_follow_symbol_protection_and_local_scope() {
     session.shutdown().await;
 }
 
+/// Macaulay2 accepts rebinding a package name, which loses the package; only
+/// a local shadow or an unloaded package's spelling is free.
+#[tokio::test]
+async fn package_rebinding_is_an_error() {
+    let source = concat!(
+        "Core = 3\n",
+        "(x, Core) = (1, 2)\n",
+        "f = () -> (Core := 1; Core = 7)\n",
+        "Graphics = 1\n",
+        "Core#\"key\" = 7\n",
+    );
+    let session = DocumentSession::open(source).await;
+    assert_eq!(diagnostic_lines(&session, "E25"), vec![0, 1]);
+    assert!(diagnostic_lines(&session, "E13").is_empty());
+    session.shutdown().await;
+}
+
+/// A rebindable library setting keeps its recorded class and accepted range;
+/// globals recorded only as `null` or their own symbol take anything.
+#[tokio::test]
+async fn library_global_values_keep_class_and_range() {
+    let source = concat!(
+        "allowableThreads = matrix {{1}}\n",
+        "allowableThreads = 0\n",
+        "allowableThreads = 2 - 3\n",
+        "allowableThreads = 4\n",
+        "errorDepth = 256\n",
+        "debugLevel = -1\n",
+        "path = \"dir\"\n",
+        "path = {\"dir\"}\n",
+        "allowableThreads = f 1\n",
+        "lastMatch = 3\n",
+        "oo = 3\n",
+        "allowableThreads += 1\n",
+        "g = () -> (allowableThreads := \"x\")\n",
+    );
+    let session = DocumentSession::open(source).await;
+    assert_eq!(diagnostic_lines(&session, "E26"), vec![0, 1, 2, 4, 6]);
+    session.shutdown().await;
+}
+
 #[tokio::test]
 async fn primary_code_analyzes_definitions_with_only_core_loaded() {
     let mut session = DocumentSession::open("ZZ = 7\n").await;
@@ -741,10 +784,11 @@ async fn primary_code_resolves_core_names_it_does_not_define() {
     session.shutdown().await;
 }
 
-/// Library export modifiers follow indexed binding protection and exclude local aliases.
+/// Library export modifiers follow indexed binding protection and exclude local
+/// aliases; a package name is a namespace, never a configuration parameter.
 #[tokio::test]
 async fn indexed_library_modifiers_follow_binding_protection() {
-    let source = "ZZ\nallowableThreads\nalias = ZZ\nalias\nf = ZZ -> ZZ\n";
+    let source = "ZZ\nallowableThreads\nalias = ZZ\nalias\nf = ZZ -> ZZ\nCore\nloadedPackages\n";
     let mut session = DocumentSession::open(source).await;
     let tokens = semantic_tokens(&mut session).await;
     let constant = session.semantic_token_modifier("libraryConst");
@@ -765,6 +809,11 @@ async fn indexed_library_modifiers_follow_binding_protection() {
     for occurrence in 2..4 {
         assert_eq!(token_at(&tokens, source, "ZZ", occurrence).1 & library, 0);
     }
+    assert_eq!(token_at(&tokens, source, "Core", 0).1 & library, 0);
+    assert_eq!(
+        token_at(&tokens, source, "loadedPackages", 0),
+        (session.semantic_token_type("struct"), config)
+    );
     session.shutdown().await;
 }
 
@@ -1077,9 +1126,9 @@ async fn installation_and_syntax_diagnostics_run_through_the_server_pipeline() {
         ("isGood = method(TypicalValue => Boolean)\nisGood ZZ := n -> n > 0\n", "S22", false),
         ("isGood = method(TypicalValue => Boolean)\nisGood ZZ := ZZ => n -> n\n", "S22", true),
         ("isGood = method(TypicalValue => Boolean)\nisGood ZZ := Boolean => n -> n > 0\n", "S22", false),
-        ("Widget = new Type of HashTable\ntoWidget = method()\ntoWidget ZZ := Widget => n -> new Widget\n", "S10", false),
-        ("Widget = new Type of HashTable\ntoWidget = method(TypicalValue => Thing)\ntoWidget ZZ := n -> new Widget\n", "S10", false),
-        ("Widget = new Type of HashTable\ntoWidget = method()\ntoWidget ZZ := String => n -> \"w\"\n", "S10", false),
+        ("Widget = new Type of HashTable\ntoWidget = method()\ntoWidget ZZ := Widget => n -> new Widget\n", "S10", true),
+        ("Widget = new Type of HashTable\ntoWidget = method(TypicalValue => Thing)\ntoWidget ZZ := n -> new Widget\n", "S10", true),
+        ("Widget = new Type of HashTable\ntoWidget = method()\ntoWidget ZZ := String => n -> \"w\"\n", "S10", true),
         ("frobnicate = method()\nfrobnicate ZZ := n -> n\n", "S10", false),
         ("HashTable = new Type of Thing\nhashTable = method()\nhashTable ZZ := n -> n\n", "S10", true),
         ("MyType = new Type of HashTable\nmytype = method()\nmytype ZZ := n -> n\n", "S10", false),
@@ -5886,30 +5935,69 @@ async fn redundant_method_codomains_are_fixed_across_all_domains() {
     session.shutdown().await;
 }
 
+/// Package preamble exporting the declarations of the documentation fixtures,
+/// which follow it on [`DOCUMENTED_LINE`].
+const EXPORTING_PACKAGE: &str = "newPackage \"DocFixture\"\nexport {\"f\", \"T\"}\n";
+
+/// The line of the declaration following [`EXPORTING_PACKAGE`].
+const DOCUMENTED_LINE: u32 = 2;
+
+/// The documentation placeholder titles offered at the start of `line`.
+async fn documentation_actions(session: &mut DocumentSession, line: u32) -> Vec<String> {
+    let uri = session.uri().to_string();
+    let actions = session.request("textDocument/codeAction", json!({
+        "textDocument": {"uri": uri},
+        "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 0}},
+        "context": {"diagnostics": []}
+    })).await;
+    // The server answers `null` when it has no action at all.
+    (actions.as_array().into_iter().flatten())
+        .filter_map(|action| action["title"].as_str())
+        .filter(|title| title.starts_with("Generate SimpleDoc documentation"))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Documentation refactors preserve SimpleDoc's template and insert before each declaration.
 #[tokio::test]
 async fn simple_doc_placeholders_cover_declarations_and_options() {
-    for (source, keys) in [
-        ("T = new Type of Thing\n", vec!["T"]),
-        ("f = x -> x\n", vec!["f"]),
+    let exported = |declaration: &str| format!("{EXPORTING_PACKAGE}{declaration}");
+    for (source, line, keys) in [
         (
-            "f = method(Options => {Verbose => false})\n",
+            exported("T = new Type of Thing\n"),
+            DOCUMENTED_LINE,
+            vec!["T"],
+        ),
+        (exported("f = x -> x\n"), DOCUMENTED_LINE, vec!["f"]),
+        (
+            exported("f = method(Options => {Verbose => false})\n"),
+            DOCUMENTED_LINE,
             vec!["f", "[f, Verbose]"],
         ),
         (
-            "f = {Verbose => false} >> o -> x -> x\n",
+            exported("f = {Verbose => false} >> o -> x -> x\n"),
+            DOCUMENTED_LINE,
             vec!["f", "[f, Verbose]"],
         ),
-        ("f ZZ := ZZ => x -> x\n", vec!["(f, ZZ)"]),
-        ("newPackage \"DocFixture\"\n", vec!["DocFixture"]),
+        (
+            exported("f ZZ := ZZ => x -> x\n"),
+            DOCUMENTED_LINE,
+            vec!["(f, ZZ)"],
+        ),
+        (
+            "newPackage \"DocFixture\"\n".to_string(),
+            0,
+            vec!["DocFixture"],
+        ),
     ] {
-        let mut session = DocumentSession::open(source).await;
+        let mut session = DocumentSession::open(&source).await;
         let uri = session.uri().to_string();
         let actions = session.request("textDocument/codeAction", json!({
             "textDocument": {"uri": uri},
-            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+            "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 0}},
             "context": {"diagnostics": []}
         })).await;
+        let is_method = source.contains("f = method");
         for key in keys {
             let title = format!("Generate SimpleDoc documentation for {key}");
             let action = response_array(&actions)
@@ -5934,9 +6022,7 @@ async fn simple_doc_placeholders_cover_declarations_and_options() {
                 .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
                 .collect::<Vec<_>>();
             let mut expected = vec!["  Key", "  Headline"];
-            let callable = key.starts_with('[')
-                || key == "(f, ZZ)"
-                || key == "f" && !source.starts_with("f = method");
+            let callable = key.starts_with('[') || key == "(f, ZZ)" || key == "f" && !is_method;
             if callable {
                 expected.extend(["  Usage", "  Inputs"]);
                 if !key.starts_with('[') {
@@ -5964,7 +6050,7 @@ async fn simple_doc_placeholders_cover_declarations_and_options() {
             if key.starts_with('[') {
                 assert!(!text.contains("  Outputs\n"));
             }
-            if key == "T" || source.starts_with("f = method") && key == "f" {
+            if key == "T" || is_method && key == "f" {
                 assert!(!text.contains("  Inputs\n"));
                 assert!(!text.contains("  Outputs\n"));
             }
@@ -5973,11 +6059,67 @@ async fn simple_doc_placeholders_cover_declarations_and_options() {
                     .as_str()
                     .is_some_and(|title| title.contains("minimal SimpleDoc")))
             );
-            assert_eq!(edit["range"]["start"], json!({"line": 0, "character": 0}));
+            assert_eq!(
+                edit["range"]["start"],
+                json!({"line": line, "character": 0})
+            );
             assert_eq!(edit["range"]["start"], edit["range"]["end"]);
         }
         session.shutdown().await;
     }
+}
+
+/// Documentation is offered only for what a package exports: a script, a
+/// package's private globals, and a private method installed on an exported
+/// type have no documentation reader, while `net` installed on it has.
+#[tokio::test]
+async fn simple_doc_placeholders_require_an_export() {
+    for (source, line, expected) in [
+        ("f = x -> x\n".to_string(), 0, vec![]),
+        (
+            format!("{EXPORTING_PACKAGE}g = x -> x\n"),
+            DOCUMENTED_LINE,
+            vec![],
+        ),
+        (
+            format!("{EXPORTING_PACKAGE}T = new Type of List\ng = method()\ng T := x -> x\n"),
+            DOCUMENTED_LINE + 2,
+            vec![],
+        ),
+        (
+            format!("{EXPORTING_PACKAGE}T = new Type of List\nnet T := x -> \"t\"\n"),
+            DOCUMENTED_LINE + 1,
+            vec!["Generate SimpleDoc documentation for (net, T)"],
+        ),
+    ] {
+        let mut session = DocumentSession::open(&source).await;
+        assert_eq!(
+            documentation_actions(&mut session, line).await,
+            expected,
+            "{source}"
+        );
+        session.shutdown().await;
+    }
+}
+
+/// A file a package loads is documented by the exports of the package's own
+/// file.
+#[tokio::test]
+async fn simple_doc_placeholders_follow_the_loading_package_exports() {
+    let package = concat!(
+        "newPackage \"DocFixture\"\n",
+        "export {\"linkText\"}\n",
+        "load \"capability_spectrum.m2\"\n",
+    );
+    let mut session =
+        DocumentSession::open_with_related("linkText = x -> x\ntargetName = x -> x\n", package)
+            .await;
+    assert_eq!(
+        documentation_actions(&mut session, 0).await,
+        ["Generate SimpleDoc documentation for linkText"]
+    );
+    assert!(documentation_actions(&mut session, 1).await.is_empty());
+    session.shutdown().await;
 }
 
 /// Markup constructors do not become unresolved keys when the catalog lacks Text exports.
@@ -6304,5 +6446,42 @@ async fn emoji_identifier_tokens_and_navigation_use_utf16_ranges() {
             4
         );
     }
+    session.shutdown().await;
+}
+
+/// Stacked `disable-next-line` directives all silence the expression below
+/// the stack, on every line it spans, and nothing after it.
+#[tokio::test]
+async fn stacked_next_line_directives_silence_the_expression_below() {
+    let expression = "(if not (left == right)\n    then value\n    else null)\n";
+    let mut session = DocumentSession::open(expression).await;
+    let reported = |session: &DocumentSession| {
+        (session.diagnostics().iter())
+            .map(|diagnostic| {
+                let line = diagnostic["range"]["start"]["line"].as_u64().unwrap();
+                (diagnostic["code"].as_str().unwrap().to_string(), line)
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let unsilenced = reported(&session);
+    let codes = unsilenced
+        .iter()
+        .map(|(code, _)| code)
+        .collect::<BTreeSet<_>>();
+    assert!(
+        codes.len() > 1,
+        "the fixture needs several rules: {unsilenced:?}"
+    );
+    let directives = (codes.iter())
+        .map(|code| format!("-- m2-ls: disable-next-line {code}\n"))
+        .collect::<String>();
+    session
+        .replace(&format!("{directives}{expression}{expression}"))
+        .await;
+    let shift = (codes.len() + expression.lines().count()) as u64;
+    let shifted = (unsilenced.into_iter())
+        .map(|(code, line)| (code, line + shift))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(reported(&session), shifted);
     session.shutdown().await;
 }

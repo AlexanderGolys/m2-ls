@@ -23,7 +23,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::builtin_index::BuiltinIndex;
-use crate::settings::CatalogSettings;
+use crate::settings::{CatalogSettings, ServerSettings};
 
 /// Environment variable selecting a Cargo-style M2Book release requirement.
 const CATALOG_VERSION_ENV: &str = "M2_LS_CATALOG_VERSION";
@@ -84,7 +84,9 @@ impl CatalogSource {
             None => {
                 let requirement = match env::var(CATALOG_VERSION_ENV) {
                     Ok(requirement) => requirement,
-                    Err(env::VarError::NotPresent) => CatalogSettings::DEFAULT_VERSION.to_owned(),
+                    Err(env::VarError::NotPresent) => {
+                        ServerSettings::defaults().catalog.version.to_string()
+                    }
                     Err(error) => return Err(IOError::new(ErrorKind::InvalidInput, error)),
                 };
                 let requirement = if requirement == "latest" {

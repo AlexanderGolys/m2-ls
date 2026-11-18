@@ -11,7 +11,7 @@
 
 use std::cmp::Ordering;
 
-use m2_syn::nodes::{Expr, ExprCollection, ExprLiteral, ExprOp, ExprOpBin, ExprOpBinAdj, Symbol};
+use m2_syn::nodes::{BinaryOperator, Expr, ExprBinary, Literal, Symbol};
 use m2_syn::Token;
 use strum::EnumString;
 
@@ -140,17 +140,19 @@ where
         }
         let expression = expression.unparenthesized()?;
         match expression {
-            literal @ Expr::Literal(ExprLiteral::Integer(_)) => {
+            literal @ Expr::Literal(Literal::Integer(_)) => {
                 let value = self.text(literal)?.trim().parse().ok()?;
                 number(ExactNumber::integer(value))
             }
             Expr::Symbol(symbol) => self.named(symbol, depth),
-            Expr::Op(ExprOp::Prefix(prefix)) => {
-                let operand = self.evaluate(&prefix.operand, depth + 1)?;
-                self.prefix(prefix.operator.spelling(), operand)
+            Expr::Prefix(prefix) => {
+                let operand = self.evaluate(&prefix.expr, depth + 1)?;
+                self.prefix(prefix.op.spelling(), operand)
             }
-            Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => self.call(expression, call, depth),
-            operation @ Expr::Op(ExprOp::Bin(_)) => {
+            Expr::Binary(call) if matches!(call.op, BinaryOperator::Space(_)) => {
+                self.call(expression, call, depth)
+            }
+            operation @ Expr::Binary(_) => {
                 let operands = operation.infix_operands()?;
                 self.infix(operands.operator, operands.left, operands.right, depth)
             }
@@ -268,16 +270,11 @@ where
     }
 
     /// A call of a builtin whose name the program does not redefine.
-    fn call(
-        &self,
-        whole: &'ast Expr,
-        call: &'ast ExprOpBinAdj,
-        depth: usize,
-    ) -> Option<KnownValue> {
+    fn call(&self, whole: &'ast Expr, call: &'ast ExprBinary, depth: usize) -> Option<KnownValue> {
         if let Some(properties) = self.ring_properties_of_call(whole, call, depth) {
             return Some(properties.into());
         }
-        let Expr::Symbol(name) = call.left_operand.unparenthesized()? else {
+        let Expr::Symbol(name) = call.left.unparenthesized()? else {
             return None;
         };
         if self.binding(name).is_some() {
@@ -285,7 +282,7 @@ where
         }
         let function = name.text().parse::<ConstantFunction>().ok()?;
         let arguments = call
-            .right_operand
+            .right
             .arguments()
             .into_iter()
             .collect::<Option<Vec<_>>>()?;
@@ -379,7 +376,7 @@ where
     /// The number of elements of a list written out in the source.
     fn list_length(&self, list: &Expr) -> Option<usize> {
         let list = list.unparenthesized()?;
-        matches!(list, Expr::Collection(ExprCollection::List(_)))
+        matches!(list, Expr::List(_))
             .then(|| list.collection_elements().map(|elements| elements.len()))?
     }
 
@@ -407,19 +404,19 @@ where
     fn ring_properties_of_call(
         &self,
         whole: &'ast Expr,
-        call: &'ast ExprOpBinAdj,
+        call: &'ast ExprBinary,
         depth: usize,
     ) -> Option<RingProperties> {
         if let Some(properties) = self.polynomial_ring_properties(whole, call, depth) {
             return Some(properties);
         }
-        let Expr::Symbol(constructor) = call.left_operand.unparenthesized()? else {
+        let Expr::Symbol(constructor) = call.left.unparenthesized()? else {
             return None;
         };
         if constructor.text() != GALOIS_FIELD || self.binding(constructor).is_some() {
             return None;
         }
-        let KnownValue::Number(order) = self.evaluate(&call.right_operand, depth + 1)? else {
+        let KnownValue::Number(order) = self.evaluate(&call.right, depth + 1)? else {
             return None;
         };
         Some(RingProperties {
@@ -434,7 +431,7 @@ where
     fn polynomial_ring_properties(
         &self,
         whole: &'ast Expr,
-        constructor: &'ast ExprOpBinAdj,
+        constructor: &'ast ExprBinary,
         depth: usize,
     ) -> Option<RingProperties> {
         let Some(RingValue::Polynomial { variables, .. }) = self.value(whole) else {
@@ -444,7 +441,7 @@ where
             .iter()
             .map(|generator| generator.variable_count())
             .sum::<Option<usize>>()?;
-        let coefficients = self.ring_properties(&constructor.left_operand, depth + 1)?;
+        let coefficients = self.ring_properties(&constructor.left, depth + 1)?;
         Some(RingProperties {
             variables: adjoined,
             characteristic: coefficients.characteristic,
@@ -470,10 +467,10 @@ where
                 }
                 Some(_) => None,
             },
-            whole @ Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => {
+            whole @ Expr::Binary(call) if matches!(call.op, BinaryOperator::Space(_)) => {
                 self.ring_properties_of_call(whole, call, depth)
             }
-            quotient @ Expr::Op(ExprOp::Bin(_)) => {
+            quotient @ Expr::Binary(_) => {
                 let operands = quotient.infix_operands()?;
                 if operands.operator != <Token![/]>::SPELLING {
                     return None;

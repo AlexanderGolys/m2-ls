@@ -10,8 +10,7 @@ use std::collections::HashMap;
 use std::ptr;
 
 use m2_syn::nodes::{
-    Cell, Expr, ExprCollection, ExprControl, ExprFor, ExprLambda, ExprOpBinAdj, ExprWhile,
-    LoopBody, Symbol,
+    BinaryOperator, Cell, Expr, ExprBinary, ExprFor, ExprFunction, ExprWhile, LoopBody, Symbol,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::Spanned;
@@ -49,7 +48,7 @@ impl<'ast> LoopStatement<'ast> {
 #[non_exhaustive]
 pub enum ControlTransferTarget<'ast> {
     /// The function a `return` leaves.
-    Function(&'ast ExprLambda),
+    Function(&'ast ExprFunction),
     /// A loop whose `list` step collects the values its body yields.
     ListLoop(LoopStatement<'ast>),
     /// A loop whose `do` step evaluates its body only for its effects.
@@ -57,7 +56,7 @@ pub enum ControlTransferTarget<'ast> {
     /// A callback a loop-like callable invokes for each element.
     LoopCallback {
         /// The callback function.
-        function: &'ast ExprLambda,
+        function: &'ast ExprFunction,
         /// The callable invoking it, such as `apply`.
         callable: &'ast Symbol,
     },
@@ -73,13 +72,13 @@ impl<'ast> ControlTransferTarget<'ast> {
     }
 
     /// Whether this target can receive the given transfer form.
-    pub fn accepts(self, transfer: &ExprControl) -> bool {
+    pub fn accepts(self, transfer: &Expr) -> bool {
         match (self, transfer) {
-            (Self::Function(_), ExprControl::Return(_)) => true,
-            (Self::ListLoop(_), ExprControl::Break(_) | ExprControl::Continue(_)) => true,
-            (Self::LoopCallback { .. }, ExprControl::Break(_)) => true,
-            (Self::DoLoop(_), ExprControl::Break(_)) => true,
-            (Self::DoLoop(_), ExprControl::Continue(_)) => transfer.transferred_value().is_none(),
+            (Self::Function(_), Expr::Return(_)) => true,
+            (Self::ListLoop(_), Expr::Break(_) | Expr::Continue(_)) => true,
+            (Self::LoopCallback { .. }, Expr::Break(_)) => true,
+            (Self::DoLoop(_), Expr::Break(_)) => true,
+            (Self::DoLoop(_), Expr::Continue(_)) => transfer.transferred_value().is_none(),
             _ => false,
         }
     }
@@ -89,7 +88,7 @@ impl<'ast> ControlTransferTarget<'ast> {
 #[derive(Debug, Clone, Copy)]
 pub struct ControlTransfer<'ast> {
     /// The `return`, `break`, or `continue`.
-    pub transfer: &'ast ExprControl,
+    pub transfer: &'ast Expr,
     /// The function or loop receiving it.
     pub target: Option<ControlTransferTarget<'ast>>,
 }
@@ -146,7 +145,7 @@ impl Analysis {
 #[derive(Debug, Clone, Copy)]
 enum Owner<'ast> {
     /// A function body.
-    Function(&'ast ExprLambda),
+    Function(&'ast ExprFunction),
     /// The `list` step of a loop.
     ListStep(LoopStatement<'ast>),
     /// The `do` step of a loop.
@@ -166,7 +165,7 @@ struct ControlTransfers<'ast, 'analysis, Source: ?Sized, Knowledge: ?Sized> {
     /// Loops whose body is visited next, innermost last.
     loops: Vec<LoopStatement<'ast>>,
     /// Callback functions, by identity, with the callable passing them.
-    callbacks: HashMap<*const ExprLambda, &'ast Symbol>,
+    callbacks: HashMap<*const ExprFunction, &'ast Symbol>,
     /// Transfers found so far.
     found: Vec<ControlTransfer<'ast>>,
 }
@@ -187,8 +186,8 @@ where
     /// function, passing through any loop steps between them; `break` and
     /// `continue` go to the innermost owner, when that owner can receive a
     /// transfer of their form.
-    fn target(&self, transfer: &ExprControl) -> Option<ControlTransferTarget<'ast>> {
-        if let ExprControl::Return(_) = transfer {
+    fn target(&self, transfer: &Expr) -> Option<ControlTransferTarget<'ast>> {
+        if let Expr::Return(_) = transfer {
             return self.owners.iter().rev().find_map(|owner| match *owner {
                 Owner::Function(function) => Some(ControlTransferTarget::Function(function)),
                 Owner::ListStep(_) | Owner::DoStep(_) => None,
@@ -209,15 +208,13 @@ where
 
 /// The function a call passes as its final argument, seen through
 /// parentheses: the `x -> …` of `apply(L, x -> …)`.
-fn final_lambda_argument(call: &ExprOpBinAdj) -> Option<&ExprLambda> {
-    let mut argument = call.right_operand.as_ref();
+fn final_lambda_argument(call: &ExprBinary) -> Option<&ExprFunction> {
+    let mut argument = call.right.as_ref();
     loop {
         argument = match argument {
-            Expr::Lambda(lambda) => return Some(lambda),
-            Expr::Holder(holder) => holder.value.as_deref()?,
-            Expr::Collection(ExprCollection::Sequence(_)) => {
-                argument.collection_elements()?.into_iter().last()??
-            }
+            Expr::Function(lambda) => return Some(lambda),
+            Expr::Paren(holder) => holder.expr.as_deref()?,
+            Expr::Sequence(_) => argument.collection_elements()?.into_iter().last()??,
             _ => return None,
         };
     }
@@ -228,27 +225,34 @@ where
     Source: SourceNavigation + ?Sized,
     Knowledge: PositionedTypeKnowledge + ?Sized,
 {
-    fn visit_expr_control(&mut self, transfer: &'ast ExprControl) {
-        self.found.push(ControlTransfer {
-            transfer,
-            target: self.target(transfer),
-        });
-        visit::visit_expr_control(self, transfer);
-    }
-
-    fn visit_expr_lambda(&mut self, lambda: &'ast ExprLambda) {
-        self.within(Owner::Function(lambda), |this| {
-            visit::visit_expr_lambda(this, lambda);
-        });
-    }
-
-    fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
-        if let (Expr::Symbol(callable), Some(callback)) =
-            (call.left_operand.as_ref(), final_lambda_argument(call))
-        {
-            self.callbacks.insert(ptr::from_ref(callback), callable);
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if matches!(
+            expression,
+            Expr::Return(_) | Expr::Break(_) | Expr::Continue(_)
+        ) {
+            self.found.push(ControlTransfer {
+                transfer: expression,
+                target: self.target(expression),
+            });
         }
-        visit::visit_expr_op_bin_adj(self, call);
+        visit::visit_expr(self, expression);
+    }
+
+    fn visit_expr_function(&mut self, function: &'ast ExprFunction) {
+        self.within(Owner::Function(function), |this| {
+            visit::visit_expr_function(this, function);
+        });
+    }
+
+    fn visit_expr_binary(&mut self, call: &'ast ExprBinary) {
+        if matches!(call.op, BinaryOperator::Space(_)) {
+            if let (Expr::Symbol(callable), Some(callback)) =
+                (call.left.as_ref(), final_lambda_argument(call))
+            {
+                self.callbacks.insert(ptr::from_ref(callback), callable);
+            }
+        }
+        visit::visit_expr_binary(self, call);
     }
 
     fn visit_expr_for(&mut self, node: &'ast ExprFor) {
@@ -267,13 +271,13 @@ where
         let Some(&statement) = self.loops.last() else {
             return visit::visit_loop_body(self, body);
         };
-        if let Some(step) = &body.list_step {
+        if let Some(step) = &body.list_clause {
             self.within(Owner::ListStep(statement), |this| {
-                this.visit_list_step(step)
+                this.visit_list_clause(step)
             });
         }
-        if let Some(step) = &body.do_step {
-            self.within(Owner::DoStep(statement), |this| this.visit_do_step(step));
+        if let Some(step) = &body.do_clause {
+            self.within(Owner::DoStep(statement), |this| this.visit_do_clause(step));
         }
     }
 }

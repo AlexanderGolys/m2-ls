@@ -24,8 +24,7 @@ to change indentation:
 
 ```toml
 [language-server.m2-ls.config.formatting]
-indent = 4
-useTabs = false
+indent = 4        # four spaces; "tab" or "editor" otherwise
 ```
 
 See [Helix's language configuration documentation](https://docs.helix-editor.com/languages.html)

@@ -2,16 +2,17 @@
 
 Settings are grouped by what they control: diagnostic publication, formatting,
 hint contents and placement, highlighting, installation discovery, source
-lookup, and initialization. Every field is optional; an omitted field takes
+lookup, initialization, and operational logging. Every field is optional; an omitted field takes
 its default.
 
 ## Complete default configuration { #defaults }
 
-The same groups work in TOML files and in the JSON your editor sends. This
-example is checked against the server's defaults:
+The same groups work in TOML files and in the JSON your editor sends. This is
+the server's own defaults file, compiled in as the bottom configuration layer;
+a key your configuration leaves out takes the value written here:
 
 ```toml
-{{#include ../../../tests/fixtures/configuration.toml}}
+{{#include ../../../src/settings/defaults.toml}}
 ```
 
 ## Delivery, scope, and updates { #delivery }
@@ -41,9 +42,11 @@ vim.lsp.config('m2_ls', {
 
 Settings are merged in this order, with later values taking precedence:
 
-1. Global `~/.m2-ls/M2LS.toml`.
-2. `M2LS.toml` in the editor's workspace root.
-3. Explicit settings sent by the editor.
+1. The [default configuration](#defaults), compiled into the server, so it
+   works with no configuration file at all.
+2. Global `~/.m2-ls/M2LS.toml`.
+3. `M2LS.toml` in the editor's workspace root.
+4. Explicit settings sent by the editor.
 
 Tables merge recursively; arrays and individual values replace earlier values.
 Omitted fields use the previous layer, then the built-in defaults. Each editor
@@ -101,6 +104,14 @@ them. Other settings can be updated while the server is running.
 : Disables selected rules by code or name, such as `T03` or `unused-binding`.
   See the [diagnostic catalog](../writing/diagnostics.md#catalog).
 
+`diagnostics.errorCatchingRewrites` (boolean, default `false`)
+: Also suggests rewrites that turn an error into a fallback value, reported as
+  [`S32 error-catching-rewrite`](../writing/diagnostics.md#error-catching).
+  `??` yields its fallback when its left side fails, so
+  `if h.k =!= null then h.k else v` becomes `h.k ?? v`, which yields `v`
+  where the original fails because `h` has no key `k`. Off, neither the hint
+  nor its fix is offered, and code is never rewritten this way.
+
 ### Publication categories { #emit-as }
 
 Each list in `diagnostics.emitAs` defaults to `[]`:
@@ -125,13 +136,16 @@ fixActionOnly = ["install-codomain-missing"]
 
 ## Formatting { #formatting }
 
-`formatting.indent` (unsigned integer or `null`, default `4`)
-: Indentation width in columns. `0` is clamped to `1`; `null` follows the
-  editor's `tabSize`, or four columns in standalone tools.
+`formatting.indent` (`"editor"`, `"tab"`, or a number of spaces, default `"editor"`)
+: One indentation level. `"editor"` follows the editor's `insertSpaces` and
+  `tabSize`, and indents with tabs in standalone tools; `"tab"` always uses a
+  tab. JSON's `null` means `"editor"`. The 2.7.0 key `useTabs` is still read,
+  with a deprecation warning: `true` as `"tab"` with the old `indent` as
+  `tabWidth`, `false` as that many spaces.
 
-`formatting.useTabs` (boolean or `null`, default `true`)
-: Use tabs for indentation. `false` uses spaces; `null` follows the editor's
-  `insertSpaces`, or spaces in standalone tools.
+`formatting.tabWidth` (unsigned integer, unset by default)
+: Columns a tab counts as when measuring line widths. Unset uses the
+  editor's `tabSize`, or `4` in standalone tools.
 
 `formatting.softWrapWidth` (unsigned integer or `null`, default `78`)
 : Preferred line wrapping width. `0` or `null` disables this target.
@@ -156,9 +170,50 @@ fixActionOnly = ["install-codomain-missing"]
   Wrapping widths, conditional expansion, and `breakAfterSemicolon` have no
   effect in this mode.
 
-`formatting.spaceInBraces` (boolean or `null`, default `null`)
-: `true` writes `{ 1, 2 }`, `false` writes `{1, 2}`, and `null` preserves the
-  existing padding. Empty braces remain `{}`.
+`formatting.redundantParentheses` (string, default `"action"`)
+: Parentheses the code parses the same without, as in `(a*b) + c`. `"action"`
+  offers the **Remove redundant parentheses in file** source action, `"format"`
+  also removes them whenever the document is formatted, and `"off"` does
+  neither. See [redundant parentheses](../writing/formatting.md#parentheses).
+
+`formatting.callParentheses` (string, default `"remove"`)
+: Whether redundant parentheses around a call's argument go too: `"remove"`
+  turns `f(x)` into `f x`, `"keep"` leaves calls as written.
+
+`formatting.operators.spacesAround.binary`, `formatting.operators.compact.binary` (lists of operators)
+: Binary operators written `a + b` and those written `a^b`. By default
+  comparisons, logic, sums, assignments, arrows and the factor operators
+  `*`, `/`, `%`, `**` are spaced (the factors then compacted by
+  `compactFactorOperators`); powers, subscripts, `@`, `·`, `#` and `#?` are
+  compact. The complete lists are in the [default configuration](#defaults).
+
+`formatting.operators.spacesAround.unary`, `formatting.operators.compact.unary` (lists of operators)
+: Prefix and postfix operators, spaced or compacted on their operand's side:
+  `<< x` is spaced by default, while signs, `#`, prefix comparisons and every
+  postfix operator (`n!`, `M^*`, `f(*)`) are compact.
+
+`formatting.brackets.spacesInside`, `formatting.brackets.compact` (lists of `"{}"`, `"()"`, `"[]"`, `"<||>"`, default `[]`)
+: Brackets padded as `{ x }` and those written `{x}`. `"()"` covers
+  parentheses, call arguments, parameter lists and parallel assignments.
+  Empty brackets are always closed up, as `{}`.
+
+Operators and brackets listed in neither list keep their spacing as written.
+Each list given replaces its default; a list left unset is its default minus
+whatever the other list names, so `compact.binary = ["+"]` alone takes `+`
+out of the spaced operators and leaves the other defaults alone. An entry that
+is not an operator of that arity, or not a bracket pair, is reported and
+ignored. The 2.7.0 key `spaceInBraces` is still read, as `"{}"` listed under
+`spacesInside` (`true`) or `compact` (`false`), with a deprecation warning.
+
+```toml
+[formatting.operators.compact]
+binary = ["+", "-"]          # a+b, but `^` falls back to as-written
+[formatting.operators.spacesAround]
+unary = ["<<", "!"]          # n !
+[formatting.brackets]
+spacesInside = ["{}"]        # { 1, 2 }
+compact = ["()", "[]"]       # f(x), [1, 2]
+```
 
 ## Inlay hints { #inlay-hints }
 
@@ -245,9 +300,12 @@ These keys belong to `inlayHints.hide`:
 
 `trivial` (boolean, default `true`)
 : Omit results whose type is apparent from their producer. Literal forms are
-  recognized now; broader constructor and conversion-function recognition is
-  planned. Conceptually, `matrix {{1},{1}}`, `string 11`, and `toString ZZ`
-  are trivial even though the calls themselves are not literals.
+  recognized along with conventional constructors (`widget` for `Widget`),
+  `toType` conversions, wrapper/header/self-initializing type application,
+  loops, and `if` expressions. Named constructors require inferred evidence
+  that their result belongs to the named type. Inner computations retain
+  their hints. `matrix {{1},{1}}` and `toString ZZ` are trivial calls,
+  while their calls are not literals.
 
 `sequential` (boolean, default `true`)
 : When multiple type labels appear consecutively at one source position, keep
@@ -408,3 +466,18 @@ path the backup is `/tmp/m2-ls.log.1`. Timing summaries are written every
 verbose logging; values such as `0` are treated as paths, not as an off switch.
 Logs contain paths, timings, and error metadata rather than document contents
 or full request parameters.
+
+## Operational logging { #logging }
+
+`logging.level` (string, default `"info"`)
+: Controls operational logging: `off`, `error`, `warn`, `info`, `debug`, or
+  `trace`. Errors retain failed operations; `info` adds ordinary events, slow
+  operations, and timing summaries. `debug` includes fast timings; `trace`
+  also records operation starts. Changes apply during the session. This
+  setting does not change source diagnostics or the usage log.
+
+The default operational log is `/tmp/m2-ls.log`. `M2_LS_LOG` can select its
+path; `M2_LS_LOG=off` disables the writer regardless of settings. The legacy
+verbose mode (`M2_LS_LOG=1`, `true`, or a path) also enables detailed timings
+within the configured level. CLI tools accept the same `[logging]` group
+through their configuration files.

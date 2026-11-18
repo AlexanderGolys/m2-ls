@@ -1,6 +1,6 @@
 //! Unary symbol calls whose grouping can be removed without losing statements.
 
-use m2_syn::nodes::{Expr, ExprOp, ExprOpBin, ExprOpBinAdj};
+use m2_syn::nodes::{BinaryOperator, Expr, ExprBinary};
 
 use crate::syntax::ExpressionSyntax;
 
@@ -18,9 +18,9 @@ impl<'ast> UnarySymbolCall<'ast> {
     /// containing statements before the returned expression.
     pub fn of(expression: &'ast Expr) -> Option<Self> {
         let call = Self::application(expression)?;
-        let function = Self::grouped_value(&call.left_operand)?;
+        let function = Self::grouped_value(&call.left)?;
         function.symbol_name()?;
-        let arguments = Self::grouped_value(&call.right_operand)?.arguments();
+        let arguments = Self::grouped_value(&call.right)?.arguments();
         let [Some(argument)] = arguments.as_slice() else {
             return None;
         };
@@ -31,9 +31,9 @@ impl<'ast> UnarySymbolCall<'ast> {
     }
 
     /// Typed application after removing only statement-free grouping holders.
-    pub fn application(expression: &Expr) -> Option<&ExprOpBinAdj> {
+    pub fn application(expression: &Expr) -> Option<&ExprBinary> {
         match Self::grouped_value(expression)? {
-            Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => Some(call),
+            Expr::Binary(call) if matches!(call.op, BinaryOperator::Space(_)) => Some(call),
             _ => None,
         }
     }
@@ -41,11 +41,11 @@ impl<'ast> UnarySymbolCall<'ast> {
     /// Removes parentheses used solely for grouping. A statement-bearing or
     /// empty holder cannot be discarded by a source simplification.
     pub fn grouped_value(mut expression: &Expr) -> Option<&Expr> {
-        while let Expr::Holder(holder) = expression {
-            if !holder.muted.is_empty() {
+        while let Expr::Paren(holder) = expression {
+            if !holder.stmts.is_empty() {
                 return None;
             }
-            expression = holder.value.as_deref()?;
+            expression = holder.expr.as_deref()?;
         }
         Some(expression)
     }

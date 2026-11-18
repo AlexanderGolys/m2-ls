@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::iter;
 
 use m2_syn::nodes::{
-    AssignmentArgument, AssignmentList, Cell, Expr, ExprCollection, ExprControl, ExprLambda,
-    ExprOp, ExprOpBin, ExprOpBinAdj, PackedContent, Symbol,
+    BinaryOperator, Cell, Elements, Expr, ExprBinary, ExprFunction, ExprSequence, FunctionParams,
+    Symbol,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Lex, Spanned, Token, TokenStream, TokenTree};
@@ -21,18 +21,19 @@ use tower_lsp::lsp_types::{
     Position, Range as TextRange,
 };
 
-use crate::analysis::{CallStaticFacts, InfixSyntax, MethodInstallation, Operator};
+use crate::analysis::{CallStaticFacts, InfixSyntax, MethodInstallation, Operator, TypeChecker};
 use crate::builtin_index::MethodSignature;
 use crate::document::DocumentSnapshot;
+use crate::macaulay2::Macaulay2Conventions;
 use crate::meta::BindingRole;
 use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::settings::{ArgumentNameSettings, HintBracket, InlayHintSettings};
 use crate::source::{ByteRange, SourceNavigation, SyntaxSource};
 use crate::syntax::{
-    AssignmentListSyntax, AssignmentOperator, AssignmentSyntax, AssignmentTarget, BoundSymbols,
-    ExpressionSyntax, LambdaSyntax,
+    AssignmentOperator, AssignmentSyntax, AssignmentTarget, BoundSymbols, ExpressionSyntax,
+    LambdaSyntax, PackedArguments,
 };
-use crate::typesystem::InferredType;
+use crate::typesystem::{InferredType, TypeRole};
 use crate::util::TextRangeExt;
 
 /// What a call-result hint starts with, before the type the call returns.
@@ -222,7 +223,7 @@ fn hint_order(label: &InlayHintLabel) -> bool {
 #[derive(Default)]
 struct HintSyntax<'a> {
     /// Every function literal, to find the parameters a call passes to.
-    lambdas: Vec<&'a ExprLambda>,
+    lambdas: Vec<&'a ExprFunction>,
     /// Every assignment expression.
     assignments: Vec<&'a Expr>,
     /// The argument expressions of applications, by identity.
@@ -232,7 +233,7 @@ struct HintSyntax<'a> {
     /// The value each cell ends with, as Macaulay2's `oN : T` line reads it.
     cell_values: Vec<&'a Expr>,
     /// The `return`s, by identity, whose value some function receives.
-    received_returns: HashSet<*const ExprControl>,
+    received_returns: HashSet<*const Expr>,
 }
 
 /// Visitor collecting [`HintSyntax`].
@@ -245,16 +246,16 @@ struct HintSyntaxVisitor<'a, 'document> {
 
 impl<'a> HintSyntaxVisitor<'a, '_> {
     /// Records the final value of discarded `content` as discarded.
-    fn discard(&mut self, content: &PackedContent) {
+    fn discard(&mut self, content: &Elements) {
         let value = match content {
-            PackedContent::Expr(expression) => Some(expression.as_ref()),
-            PackedContent::Pack(pack) => {
-                pack.pack
+            Elements::Single(expression) => Some(expression.as_ref()),
+            Elements::Pack(pack) => {
+                pack.elems
                     .iter()
                     .last()
                     .and_then(|component| match component {
-                        m2_syn::nodes::Component::Expr(expression) => Some(expression.as_ref()),
-                        m2_syn::nodes::Component::Empty(_) => None,
+                        m2_syn::nodes::Element::Expr(expression) => Some(expression.as_ref()),
+                        m2_syn::nodes::Element::Empty(_) => None,
                     })
             }
         };
@@ -266,28 +267,28 @@ impl<'a> HintSyntaxVisitor<'a, '_> {
 
 impl<'a> Visit<'a> for HintSyntaxVisitor<'a, '_> {
     fn visit_cell(&mut self, cell: &'a Cell) {
-        if let PackedContent::Expr(value) = &cell.content {
+        if let Elements::Single(value) = &cell.elems {
             self.syntax.cell_values.push(value);
         }
-        if cell.semicolon.is_some() {
-            self.discard(&cell.content);
+        if cell.semi_token.is_some() {
+            self.discard(&cell.elems);
         }
         visit::visit_cell(self, cell);
     }
 
-    fn visit_statement(&mut self, statement: &'a m2_syn::nodes::Statement) {
-        self.discard(&statement.content);
-        visit::visit_statement(self, statement);
+    fn visit_stmt(&mut self, statement: &'a m2_syn::nodes::Stmt) {
+        self.discard(&statement.elems);
+        visit::visit_stmt(self, statement);
     }
 
     fn visit_expr(&mut self, expression: &'a Expr) {
         match expression {
-            Expr::Lambda(lambda) => self.syntax.lambdas.push(lambda),
+            Expr::Function(lambda) => self.syntax.lambdas.push(lambda),
             Expr::Assign(_) => self.syntax.assignments.push(expression),
-            Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => {
+            Expr::Binary(call) if matches!(call.op, BinaryOperator::Space(_)) => {
                 self.syntax
                     .call_arguments
-                    .insert(std::ptr::from_ref(call.right_operand.as_ref()));
+                    .insert(std::ptr::from_ref(call.right.as_ref()));
             }
             _ => {}
         }
@@ -357,14 +358,17 @@ impl<'request, 'a> HintContext<'request, 'a> {
     /// Computed collection elements and lambda bodies retain their own hints.
     fn literal_is_opaque(value: &Expr) -> bool {
         match value.unparenthesized() {
-            Some(Expr::Lambda(_)) => false,
-            Some(collection @ Expr::Collection(_)) => {
-                collection.collection_elements().is_some_and(|elements| {
-                    elements
-                        .into_iter()
-                        .all(|element| element.is_none_or(Self::literal_is_opaque))
-                })
-            }
+            Some(Expr::Function(_)) => false,
+            Some(
+                collection @ (Expr::Sequence(_)
+                | Expr::List(_)
+                | Expr::Array(_)
+                | Expr::AngleBar(_)),
+            ) => collection.collection_elements().is_some_and(|elements| {
+                elements
+                    .into_iter()
+                    .all(|element| element.is_none_or(Self::literal_is_opaque))
+            }),
             _ => is_literal_value(value),
         }
     }
@@ -430,11 +434,11 @@ impl<'request, 'a> HintContext<'request, 'a> {
     /// Whether this exact delimiter form is selected outside call arguments.
     fn has_hint_brackets(&self, value: &Expr) -> bool {
         let kind = match value {
-            Expr::Collection(ExprCollection::Sequence(_)) => HintBracket::Parentheses,
-            Expr::Collection(ExprCollection::Array(_)) => HintBracket::Array,
-            Expr::Collection(ExprCollection::List(_)) => HintBracket::List,
-            Expr::Collection(ExprCollection::AngleBar(_)) => HintBracket::AngleBar,
-            Expr::Holder(_) => HintBracket::Holder,
+            Expr::Sequence(_) => HintBracket::Parentheses,
+            Expr::Array(_) => HintBracket::Array,
+            Expr::List(_) => HintBracket::List,
+            Expr::AngleBar(_) => HintBracket::AngleBar,
+            Expr::Paren(_) => HintBracket::Holder,
             _ => return false,
         };
         (self.options.bracket_kinds.contains(&kind)
@@ -454,6 +458,67 @@ impl<'request, 'a> HintContext<'request, 'a> {
     fn inferred_type(&self, expression: &Expr) -> Option<&InferredType> {
         let index = *self.typed_index.get(&std::ptr::from_ref(expression))?;
         Some(&self.typed[index].1)
+    }
+
+    /// Independent producer rules, extended by adding a predicate. Only the
+    /// outer value is classified: a trivial producer does not hide useful
+    /// hints inside its arguments, branches, or loop body.
+    fn is_trivial_value(&self, value: &Expr) -> bool {
+        let value = described_value(value);
+        let rules: &[fn(&Self, &Expr) -> bool] = &[
+            |_, value| is_literal_value(value),
+            |_, value| matches!(value, Expr::For(_) | Expr::While(_) | Expr::If(_)),
+            |context, value| context.is_constructor_call(value),
+        ];
+        rules.iter().any(|rule| rule(self, value))
+    }
+
+    /// Conventional named constructors and conversions, and type application
+    /// sugar. Inferred subtype evidence prevents unrelated similarly named
+    /// functions from losing useful result hints.
+    fn is_constructor_call(&self, value: &Expr) -> bool {
+        let Some(Expr::Binary(call)) = value.unparenthesized() else {
+            return false;
+        };
+        if !matches!(call.op, BinaryOperator::Space(_)) {
+            return false;
+        }
+        let Some(name) = call.left.symbol_name() else {
+            return false;
+        };
+        let Some(position) = self.document.position_for_syntax(value) else {
+            return false;
+        };
+        let knowledge = self.knowledge.at(position);
+        let analysis = TypeChecker::new(self.document.analysis(), self.knowledge);
+        let target = Macaulay2Conventions::constructed_type_name(name).map(ObjectName::new);
+        let conventional = target.as_ref().is_some_and(|target| {
+            self.inferred_type(value)
+                .and_then(InferredType::single)
+                .is_some_and(|result| analysis.is_subtype(result, target, position, &knowledge))
+        });
+        conventional
+            || self
+                .inferred_type(&call.left)
+                .and_then(InferredType::single)
+                .is_some_and(|metaclass| {
+                    [
+                        TypeRole::WrapperType,
+                        TypeRole::HeaderType,
+                        TypeRole::SelfInitializingType,
+                    ]
+                    .into_iter()
+                    .any(|role| {
+                        analysis.is_subtype(metaclass, &role.object_name(), position, &knowledge)
+                    })
+                })
+    }
+
+    /// Whether either independently configured source-apparency filter hides
+    /// this value. Explicit holder requests bypass this decision at placement.
+    fn hides_producer(&self, value: &Expr) -> bool {
+        (!self.options.show_literal && is_literal_value(value))
+            || (self.options.hide_trivial && self.is_trivial_value(value))
     }
 
     /// The hints of each of `values` placed at `placement` that the filters
@@ -480,7 +545,7 @@ impl<'request, 'a> HintContext<'request, 'a> {
     ) -> Option<PlacedHint> {
         let inferred_type = self.inferred_type(value)?;
         let value_range = self.document.range_for_syntax(value)?;
-        let requested_holder = source == HintSource::Delimited && matches!(value, Expr::Holder(_));
+        let requested_holder = source == HintSource::Delimited && matches!(value, Expr::Paren(_));
         let repeated = || {
             self.assignment_parts
                 .suppresses(value_range, is_application(value))
@@ -500,6 +565,7 @@ impl<'request, 'a> HintContext<'request, 'a> {
             || (!requested_holder
                 && (!self.options.show_literal || self.options.hide_trivial)
                 && stated_by_literal())
+            || (!requested_holder && self.hides_producer(value))
         {
             return None;
         }
@@ -539,17 +605,17 @@ impl<'request, 'a> HintContext<'request, 'a> {
             .typed_expressions()
             .filter(|value| !self.is_excluded_call(value))
             .filter_map(|value| match value {
-                Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => Some(call),
+                Expr::Binary(call) if matches!(call.op, BinaryOperator::Space(_)) => Some(call),
                 _ => None,
             })
             .flat_map(|call| {
-                let arguments = call.right_operand.arguments();
+                let arguments = call.right.arguments();
                 let parameters = self.called_parameters(call);
                 if arguments.len() != parameters.len() {
                     return Vec::new();
                 }
                 let names_allowed = !self.options.argument_names.require_bracket
-                    || call.right_operand.delimiter().is_some();
+                    || call.right.delimiter().is_some();
                 iter::zip(arguments, parameters)
                     .filter_map(|(argument, mut parameter)| {
                         if !names_allowed {
@@ -563,14 +629,8 @@ impl<'request, 'a> HintContext<'request, 'a> {
         if !self.options.hide_operator_calls {
             hints.extend(
                 self.typed_expressions()
-                    .filter_map(|value| match value {
-                        Expr::Op(operation)
-                            if !matches!(operation, ExprOp::Bin(ExprOpBin::Adj(_))) =>
-                        {
-                            Some(operation)
-                        }
-                        _ => None,
-                    })
+                    .filter(|value| matches!(value, Expr::Binary(binary) if !matches!(binary.op, BinaryOperator::Space(_)))
+                        || matches!(value, Expr::Prefix(_) | Expr::Postfix(_)))
                     .flat_map(|operation| self.operator_parameter_hints(operation)),
             );
         }
@@ -580,8 +640,8 @@ impl<'request, 'a> HintContext<'request, 'a> {
     /// The parameters `call` passes its arguments to, as far as they are
     /// known: of the one local method installation or library signature the
     /// argument types select, or of the lambda a local function is.
-    fn called_parameters(&self, call: &ExprOpBinAdj) -> Vec<CalledParameter> {
-        let Expr::Symbol(head) = call.left_operand.as_ref() else {
+    fn called_parameters(&self, call: &ExprBinary) -> Vec<CalledParameter> {
+        let Expr::Symbol(head) = call.left.as_ref() else {
             return Vec::new();
         };
         let name = head.text();
@@ -631,15 +691,16 @@ impl<'request, 'a> HintContext<'request, 'a> {
     }
 
     /// Names supplied by a source lambda, respecting variadic-name filtering.
-    fn parameter_names(&self, lambda: &ExprLambda) -> Option<Vec<String>> {
-        (!self.options.argument_names.ignore_variadic || !matches!(lambda, ExprLambda::Variadic(_)))
-            .then(|| {
-                lambda
-                    .bound_symbols()
-                    .iter()
-                    .map(|symbol| symbol.text().to_string())
-                    .collect()
-            })
+    fn parameter_names(&self, lambda: &ExprFunction) -> Option<Vec<String>> {
+        (!self.options.argument_names.ignore_variadic
+            || !matches!(lambda.params, FunctionParams::Variadic(_)))
+        .then(|| {
+            lambda
+                .bound_symbols()
+                .iter()
+                .map(|symbol| symbol.text().to_string())
+                .collect()
+        })
     }
 
     /// Parameter names and domains supplied by one selected source installation.
@@ -684,7 +745,7 @@ impl<'request, 'a> HintContext<'request, 'a> {
     }
 
     /// Parameter labels on typed operator operands, independently of expression type hints.
-    fn operator_parameter_hints(&self, operation: &ExprOp) -> Vec<InlayHint> {
+    fn operator_parameter_hints(&self, operation: &Expr) -> Vec<InlayHint> {
         let Some(range) = self.document.range_for_syntax(operation) else {
             return Vec::new();
         };
@@ -700,14 +761,15 @@ impl<'request, 'a> HintContext<'request, 'a> {
             return Vec::new();
         };
         let operands = match operation {
-            ExprOp::Bin(binary) => {
+            Expr::Binary(binary) => {
                 let Some(operands) = binary.infix_operands() else {
                     return Vec::new();
                 };
                 vec![operands.left, operands.right]
             }
-            ExprOp::Prefix(prefix) => vec![prefix.operand.as_ref()],
-            ExprOp::Postfix(postfix) => vec![postfix.operand.as_ref()],
+            Expr::Prefix(prefix) => vec![prefix.expr.as_ref()],
+            Expr::Postfix(postfix) => vec![postfix.expr.as_ref()],
+            _ => return Vec::new(),
         };
         let facts = CallStaticFacts {
             argument_types: operands
@@ -893,8 +955,8 @@ impl<'request, 'a> HintContext<'request, 'a> {
     /// Whether `value` calls a function the settings exclude.
     fn is_excluded_call(&self, value: &Expr) -> bool {
         match value {
-            Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => call
-                .left_operand
+            Expr::Binary(call) if matches!(call.op, BinaryOperator::Space(_)) => call
+                .left
                 .symbol_name()
                 .is_some_and(|name| self.options.excluded_calls.contains(name)),
             _ => false,
@@ -937,15 +999,15 @@ impl<'request, 'a> HintContext<'request, 'a> {
     fn lambda_return_type_hints(&self) -> Vec<PlacedHint> {
         self.typed_expressions()
             .filter_map(|value| match value {
-                Expr::Control(transfer @ ExprControl::Return(node))
+                transfer @ Expr::Return(node)
                     if self
                         .syntax
                         .received_returns
                         .contains(&std::ptr::from_ref(transfer)) =>
                 {
-                    node.value.as_deref().map(|value| (value, None))
+                    node.expr.as_deref().map(|value| (value, None))
                 }
-                Expr::Lambda(lambda) => {
+                Expr::Function(lambda) => {
                     let installation = self
                         .document
                         .analysis()
@@ -959,11 +1021,7 @@ impl<'request, 'a> HintContext<'request, 'a> {
                 }
                 _ => None,
             })
-            .filter(|(value, constructed)| {
-                constructed.is_some()
-                    || self.options.show_literal && !self.options.hide_trivial
-                    || !is_literal_value(value)
-            })
+            .filter(|(value, constructed)| constructed.is_some() || !self.hides_producer(value))
             .filter_map(|(value, constructed)| {
                 let value_range = self.document.range_for_syntax(value)?;
                 if !self.range.contains_position(value_range.end) {
@@ -1076,12 +1134,10 @@ impl<'request, 'a> HintContext<'request, 'a> {
                 let value_range = assigned
                     .map(|value| value.value_range)
                     .or(state.value_range);
-                if (!self.options.show_literal || self.options.hide_trivial)
-                    && value_range.is_some_and(|value_range| {
-                        self_describing_values.contains(&value_range)
-                            && assigned.is_none_or(|value| !value.destructured)
-                    })
-                {
+                if value_range.is_some_and(|value_range| {
+                    self_describing_values.contains(&value_range)
+                        && assigned.is_none_or(|value| !value.destructured)
+                }) {
                     continue;
                 }
                 let position = state.span.end;
@@ -1221,7 +1277,7 @@ impl<'request, 'a> HintContext<'request, 'a> {
                 };
                 let parts = assignment.parts();
                 (matches!(parts.target, AssignmentTarget::Symbol(_))
-                    && is_literal_value(parts.value))
+                    && self.hides_producer(parts.value))
                 .then_some(parts.value)
             })
             .collect()
@@ -1229,14 +1285,14 @@ impl<'request, 'a> HintContext<'request, 'a> {
 }
 
 /// Final expression contributing the lambda's return value.
-fn lambda_final_value(lambda: &ExprLambda) -> Option<&Expr> {
+fn lambda_final_value(lambda: &ExprFunction) -> Option<&Expr> {
     let value = lambda.body().unparenthesized()?;
-    (!matches!(value, Expr::Control(ExprControl::Return(_)))).then_some(value)
+    (!matches!(value, Expr::Return(_))).then_some(value)
 }
 
 /// Whether `value` applies a function.
 fn is_application(value: &Expr) -> bool {
-    matches!(value, Expr::Op(ExprOp::Bin(ExprOpBin::Adj(_))))
+    matches!(value, Expr::Binary(call) if matches!(call.op, BinaryOperator::Space(_)))
 }
 
 /// A call whose arguments are bracketed, as `f(x)`, `f()` or `QQ[x]`, not
@@ -1244,8 +1300,8 @@ fn is_application(value: &Expr) -> bool {
 fn is_bracketed_call(value: &Expr) -> bool {
     matches!(
         value,
-        Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call)))
-            if matches!(call.right_operand.as_ref(), Expr::Collection(_) | Expr::Holder(_))
+        Expr::Binary(call) if matches!(call.op, BinaryOperator::Space(_))
+            && matches!(call.right.as_ref(), Expr::Sequence(_) | Expr::List(_) | Expr::Array(_) | Expr::AngleBar(_) | Expr::Paren(_))
     )
 }
 
@@ -1293,7 +1349,7 @@ fn described_value(mut value: &Expr) -> &Expr {
                 )
                 .then_some(parts.value)
             }
-            Expr::Holder(holder) => holder.value.as_deref(),
+            Expr::Paren(holder) => holder.expr.as_deref(),
             _ => None,
         };
         match inner {
@@ -1343,16 +1399,19 @@ impl AssignmentParts {
 /// The symbols of a parallel assignment's `targets` paired with the values
 /// `value` assigns them, by position.
 fn paired_assignment_values<'a>(
-    targets: &'a AssignmentList,
+    targets: &'a ExprSequence,
     value: &'a Expr,
 ) -> Vec<(&'a Symbol, &'a Expr)> {
-    let targets = targets.targets();
+    let targets = targets
+        .elems
+        .as_ref()
+        .map_or_else(Vec::new, PackedArguments::arguments);
     let Some(value) = value.unparenthesized() else {
         return Vec::new();
     };
-    let pair = |target: &'a AssignmentArgument, value: &'a Expr| match target {
-        AssignmentArgument::Symbol(symbol) => vec![(symbol, value)],
-        AssignmentArgument::List(nested) => paired_assignment_values(nested, value),
+    let pair = |target: &'a Expr, value: &'a Expr| match target.unparenthesized() {
+        Some(Expr::Symbol(symbol)) => vec![(symbol, value)],
+        Some(Expr::Sequence(nested)) => paired_assignment_values(nested, value),
         _ => Vec::new(),
     };
     if let Some(values) = value.collection_elements() {
@@ -1362,12 +1421,12 @@ fn paired_assignment_values<'a>(
         return targets
             .into_iter()
             .zip(values)
-            .filter_map(|(target, value)| Some(pair(target, value?)))
+            .filter_map(|(target, value)| Some(pair(target?, value?)))
             .flatten()
             .collect();
     }
     match targets.as_slice() {
-        [target] => pair(target, value),
+        [Some(target)] => pair(target, value),
         _ => Vec::new(),
     }
 }
@@ -1376,7 +1435,15 @@ fn paired_assignment_values<'a>(
 /// lambda, or explicit `new` construction. Holders preserve this classification.
 fn is_literal_value(value: &Expr) -> bool {
     match described_value(value).unparenthesized() {
-        Some(Expr::Literal(_) | Expr::Lambda(_) | Expr::New(_) | Expr::Collection(_)) => true,
+        Some(
+            Expr::Literal(_)
+            | Expr::Function(_)
+            | Expr::New(_)
+            | Expr::Sequence(_)
+            | Expr::List(_)
+            | Expr::Array(_)
+            | Expr::AngleBar(_),
+        ) => true,
         Some(Expr::Symbol(symbol)) => LITERAL_SYMBOLS.contains(&symbol.text()),
         _ => false,
     }
@@ -1389,6 +1456,7 @@ fn range_contains(outer: TextRange, inner: TextRange) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::settings::ServerSettings;
     use std::collections::HashSet;
 
     use super::*;
@@ -1408,7 +1476,7 @@ mod tests {
             hide_sequential: false,
             hide_operator_calls: false,
             excluded_calls: HashSet::new(),
-            ..InlayHintSettings::default()
+            ..ServerSettings::defaults().inlay_hints.clone()
         }
     }
 
@@ -1433,7 +1501,7 @@ mod tests {
         let options = InlayHintSettings {
             show_thing: true,
             everywhere: subexpressions,
-            ..InlayHintSettings::default()
+            ..ServerSettings::defaults().inlay_hints.clone()
         };
         hints_with(text, &options, &ObjectRegistry::default())
     }
@@ -1743,7 +1811,10 @@ mod tests {
                     arg_types: true,
                     argument_names: crate::settings::ArgumentNameSettings {
                         ignore_variadic: false,
-                        ..Default::default()
+                        ..ServerSettings::defaults()
+                            .inlay_hints
+                            .argument_names
+                            .clone()
                     },
                     ..nowhere()
                 }
@@ -1849,7 +1920,7 @@ mod tests {
                 source,
                 &InlayHintSettings {
                     show_thing: unknown_types,
-                    ..InlayHintSettings::default()
+                    ..ServerSettings::defaults().inlay_hints.clone()
                 },
                 &registry,
             ))
@@ -1860,10 +1931,9 @@ mod tests {
     }
 
     #[test]
-    fn calm_default_shows_informative_computed_assignment_types() {
+    fn calm_default_hides_apparent_assignment_types() {
         let computed = hints("x = if condition then 1 else 2\n", false);
-        assert_eq!(labels(&computed), vec!["ZZ".to_string()]);
-        assert_eq!(computed[0].position, pos!(0, 1));
+        assert!(computed.is_empty());
 
         let self_describing = concat!(
             "x = 1\n",

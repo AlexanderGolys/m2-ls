@@ -17,6 +17,7 @@ mod naming;
 mod native_dispatch;
 mod parse;
 mod predicate_declaration;
+mod symbol_introduction;
 
 use tower_lsp::lsp_types::Url;
 
@@ -50,6 +51,8 @@ struct DocumentContext<'context> {
     syntax: &'context SyntaxSnapshot,
     /// Source data supplying text and coordinate conversions.
     source: &'context DocumentSource,
+    /// Object visibility at each source occurrence.
+    knowledge: &'context ObjectRegistry,
 }
 
 /// What the documentation occasion provides: the package documentation the
@@ -170,9 +173,11 @@ pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
         analysis,
         syntax,
         source,
+        knowledge,
     };
     let mut positioned = DiagnosticSink::default();
     document::naming_conventions(&context, &mut positioned);
+    method_typical_value::MethodTypicalValue::spawn(&context, &mut positioned);
     counted_loop::CountedLoops::spawn(&context, &mut positioned);
     sink.diagnostics
         .extend(positioned.diagnostics.into_iter().filter(|diagnostic| {

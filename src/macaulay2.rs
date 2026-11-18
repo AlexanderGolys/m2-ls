@@ -7,6 +7,29 @@
 pub struct Macaulay2Conventions;
 
 impl Macaulay2Conventions {
+    /// Noninteractive execution: retain ordinary initialization, stop on an
+    /// error, and evaluate the source supplied after `-e`.
+    pub const EXECUTION_ARGUMENTS: [&str; 5] =
+        ["--silent", "--no-readline", "--no-prompts", "--stop", "-e"];
+
+    /// Type named by a conventional constructor or conversion: `markdown`
+    /// and `toMarkdown` both name `Markdown`. This recognizes spelling only;
+    /// callers must resolve the type in the relevant scope.
+    pub fn constructed_type_name(name: &str) -> Option<String> {
+        if let Some(target) = name
+            .strip_prefix("to")
+            .filter(|rest| rest.starts_with(|first: char| first.is_ascii_uppercase()))
+        {
+            return Some(target.to_owned());
+        }
+        if !name.starts_with(|first: char| first.is_ascii_lowercase()) {
+            return None;
+        }
+        let mut target = name.to_owned();
+        target[..1].make_ascii_uppercase();
+        Some(target)
+    }
+
     /// Runtime operator name used to dispatch application by juxtaposition.
     pub const APPLICATION_OPERATOR: &str = "SPACE";
 

@@ -1,13 +1,18 @@
 //! Document-owned cell parses and immutable syntax revisions.
 
+use m2_syn::nodes::{Cell, Expr, ParamList};
+use m2_syn::visit::{self, Visit};
 use m2_syn::{
-    frame_recovering, lex_str_recovering, nodes::Cell, CellStream, CellTokenStream, CommentTrivia,
-    LexError, LexErrorKind, NativeParseError, NativeParser, Parser, Span, Spanned, Token, Trivia,
+    frame_recovering, lex_str_recovering, CellStream, CellTokenStream, Comment, Comments,
+    Delimiter, DelimiterValue, LexError, LexErrorKind, NativeParseError, NativeParser, Parser,
+    Source, Span, Spanned, Token,
 };
 use serde_json::json;
 use std::sync::Arc;
 use std::{iter, ops::Range};
 
+use super::{CallParentheses, UngroupedText};
+use crate::syntax::ExpressionSyntax;
 use crate::telemetry::Timing;
 
 /// A revision-specific location of an independently retained parse result.
@@ -29,11 +34,14 @@ struct CellData {
     /// Unlocated source snapshot shared by the cell syntax or its fatal diagnostic.
     source_site: Option<Span>,
     /// Comments retained alongside the cell parse.
-    trivia: Vec<Trivia>,
+    trivia: Vec<Comment>,
     /// Recoverable and fatal lexical errors for this cell.
     lexer_diagnostics: Vec<LexError>,
     /// Fatal grammatical error, absent when parsing succeeded.
     parse_error: Option<NativeParseError>,
+    /// The source without its redundant parentheses, worked out on first use
+    /// and shared by every revision retaining the cell.
+    ungrouped: UngroupedText,
 }
 
 impl ParsedCell {
@@ -55,12 +63,17 @@ impl ParsedCell {
         self.data.syntax.as_ref()
     }
     /// Comments retained alongside the cell, including when its code fails to parse.
-    pub fn trivia(&self) -> &[Trivia] {
+    pub fn trivia(&self) -> &[Comment] {
         &self.data.trivia
     }
     /// Recoverable and fatal lexical diagnostics recorded for this cell.
     pub fn lexer_diagnostics(&self) -> &[LexError] {
         &self.data.lexer_diagnostics
+    }
+    /// The source without its redundant parentheses under `calls`, `None`
+    /// when it has none or does not parse. Each parse works it out once.
+    pub fn without_redundant_parentheses(&self, calls: CallParentheses) -> Option<&str> {
+        self.data.ungrouped.of(self, calls)
     }
     /// Fatal grammatical error for the owning cell, when one was recorded.
     pub fn parse_error(&self) -> Option<&NativeParseError> {
@@ -118,26 +131,19 @@ impl ParsedCell {
             trivia: Vec::new(),
             lexer_diagnostics: Vec::new(),
             parse_error: None,
+            ungrouped: UngroupedText::default(),
         };
         match lex_str_recovering(source) {
             Ok(recovered) => {
-                data.source_site = recovered
+                let source_snapshot = recovered
                     .value
                     .try_span()
-                    .map(|span| Span::unlocated(Arc::clone(span.source())));
-                let comments = CommentTrivia::of(&recovered.value);
-                data.trivia = comments
-                    .outer()
-                    .iter()
-                    .chain(comments.inner())
-                    .cloned()
+                    .map(|span| Arc::clone(span.source()))
+                    .unwrap_or_else(|| Source::new(source));
+                data.source_site = Some(Span::unlocated(Arc::clone(&source_snapshot)));
+                data.trivia = Comments::within(&Span::ranged(source_snapshot, 0..source.len()))
+                    .into_iter()
                     .collect();
-                data.source_site = data.source_site.or_else(|| {
-                    data.trivia
-                        .first()?
-                        .try_span()
-                        .map(|span| Span::unlocated(Arc::clone(span.source())))
-                });
                 data.lexer_diagnostics = recovered.diagnostics;
                 let framed = frame_recovering(recovered.value);
                 let cells =
@@ -164,7 +170,7 @@ impl ParsedCell {
             Err(error) => {
                 if let Some(end) = error.span().start() {
                     if let Ok(prefix) = lex_str_recovering(&source[..end]) {
-                        let comments = CommentTrivia::of(&prefix.value);
+                        let comments = Comments::of(&prefix.value);
                         data.trivia = comments
                             .outer()
                             .iter()
@@ -181,6 +187,20 @@ impl ParsedCell {
             range,
             data: Arc::new(data),
         }
+    }
+}
+
+/// The bracket pairs met so far by [`SyntaxSnapshot::delimiters`].
+struct DelimiterWalk(Vec<Delimiter>);
+
+impl<'ast> Visit<'ast> for DelimiterWalk {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        self.0.extend(expression.delimiter());
+        visit::visit_expr(self, expression);
+    }
+    fn visit_param_list(&mut self, params: &'ast ParamList) {
+        self.0.push(params.params.delimiter.delimiter());
+        visit::visit_param_list(self, params);
     }
 }
 
@@ -203,6 +223,15 @@ impl SyntaxSnapshot {
                 visitor.visit_cell(syntax);
             }
         }
+    }
+
+    /// Every bracket pair in document order, outer before inner: collections,
+    /// parentheses, call arguments, parallel-assignment targets and lambda
+    /// parameter lists.
+    pub fn delimiters(&self) -> Vec<Delimiter> {
+        let mut walk = DelimiterWalk(Vec::new());
+        self.visit(&mut walk);
+        walk.0
     }
 
     /// Original source bytes owned by this retained parse.

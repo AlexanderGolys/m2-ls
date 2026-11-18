@@ -2,6 +2,7 @@
 
 mod pipeline {
     mod analysis;
+    mod call_presentation;
     mod coalescing_update;
     mod counted_loop;
     mod hierarchies;

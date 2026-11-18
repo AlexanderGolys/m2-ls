@@ -7,7 +7,7 @@
 //! receiving its arguments. The pass follows generated fields from each
 //! assignment, lambda, and call it visits.
 
-use m2_syn::nodes::{Expr, ExprAssign, ExprLambda, ExprOp, ExprOpBin, ExprOpBinAdj, Symbol};
+use m2_syn::nodes::{BinaryOperator, Expr, ExprAssign, ExprBinary, ExprFunction, Symbol};
 use m2_syn::visit::{self, Visit};
 
 use super::first_pass::BindingFact;
@@ -36,7 +36,7 @@ impl Analysis {
 
     /// Types a lambda's parameters by the domain of the installation
     /// receiving its arguments.
-    fn enrich_lambda(&mut self, lambda: &ExprLambda, source: &(impl SourceNavigation + ?Sized)) {
+    fn enrich_lambda(&mut self, lambda: &ExprFunction, source: &(impl SourceNavigation + ?Sized)) {
         let mut parameter_types = self.argument_lambda_domain(lambda, source).cloned();
         if self
             .installation_receiving_arguments(lambda, source)
@@ -101,7 +101,7 @@ impl Analysis {
         let parent_type = source
             .position_for_syntax(value)
             .and_then(|position| self.declared_type_parent(value, type_name, position, &knowledge));
-        let presentation_kind = if matches!(value, Expr::Lambda(_))
+        let presentation_kind = if matches!(value, Expr::Function(_))
             || declaration.is_some()
             || type_name
                 .is_some_and(|type_name| knowledge.has_type_role(type_name, TypeRole::Function))
@@ -158,9 +158,7 @@ impl Analysis {
         }
 
         if parts.operator == AssignmentOperator::Global {
-            if let AssignmentTarget::Operator(ExprOp::Bin(ExprOpBin::Regular(target))) =
-                parts.target
-            {
+            if let AssignmentTarget::Operator(Expr::Binary(target)) = parts.target {
                 let value_type = type_name
                     .cloned()
                     .unwrap_or_else(|| TypeRole::Thing.object_name());
@@ -239,11 +237,11 @@ impl Analysis {
             (
                 None,
                 AssignmentOperator::Global,
-                AssignmentTarget::Operator(ExprOp::Bin(ExprOpBin::Regular(target))),
-            ) if target.operator.spelling() == <m2_syn::Token![_]>::SPELLING => {
+                AssignmentTarget::Operator(Expr::Binary(target)),
+            ) if target.op.spelling() == <m2_syn::Token![_]>::SPELLING => {
                 AssignmentFactKind::IndexedVariable
             }
-            (None, AssignmentOperator::Global, AssignmentTarget::Operator(ExprOp::Bin(_))) => {
+            (None, AssignmentOperator::Global, AssignmentTarget::Operator(Expr::Binary(_))) => {
                 AssignmentFactKind::ScopedCallable
             }
             _ => return,
@@ -291,7 +289,7 @@ impl Analysis {
     /// A `newPackage` name string binds its global symbol to the new package.
     fn enrich_package_declaration(
         &mut self,
-        call: &ExprOpBinAdj,
+        call: &ExprBinary,
         source: &(impl SourceNavigation + ?Sized),
     ) {
         let Some(binding_state) = BindingFact::package_name_bytes(call, source).and_then(|name| {
@@ -357,7 +355,7 @@ impl Analysis {
             )
         })?;
         let parent = new
-            .parent_class
+            .of_clause
             .as_ref()
             .and_then(|parent| parent.clause_value().symbol_name())
             .map(ObjectName::new)
@@ -387,7 +385,7 @@ impl Analysis {
                 kind: LocalFunctionKind::Method(declaration.options()),
                 declared_options: declaration.declared_options(),
             }
-        } else if let Expr::Lambda(lambda) = value {
+        } else if let Expr::Function(lambda) = value {
             FunctionInfo {
                 typical_value: None,
                 installations: Vec::new(),
@@ -407,7 +405,7 @@ impl Analysis {
                 indexed_callable: None,
                 dispatch: None,
                 kind: LocalFunctionKind::Plain,
-                declared_options: OptionDeclaration::declared_options(&declaration.left_operand),
+                declared_options: OptionDeclaration::declared_options(&declaration.left),
             }
         } else {
             return None;
@@ -506,23 +504,25 @@ where
         visit::visit_expr_assign(self, node);
     }
 
-    fn visit_expr_lambda(&mut self, node: &'ast ExprLambda) {
+    fn visit_expr_function(&mut self, node: &'ast ExprFunction) {
         self.analysis.enrich_lambda(node, self.source);
-        visit::visit_expr_lambda(self, node);
+        visit::visit_expr_function(self, node);
     }
 
-    fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
-        if let Some(position) = self.source.position_for_syntax(call) {
-            let knowledge = self.knowledge_provider.at_position(position);
-            let _ = self
-                .analysis
-                .record_install_method_call(call, self.source, &knowledge);
-            self.analysis.enrich_package_declaration(call, self.source);
-            self.analysis
-                .bind_anonymous_ring_generators(call, self.source, &knowledge);
-            self.analysis
-                .rebind_ring_generators_on_use(call, self.source);
+    fn visit_expr_binary(&mut self, call: &'ast ExprBinary) {
+        if matches!(call.op, BinaryOperator::Space(_)) {
+            if let Some(position) = self.source.position_for_syntax(call) {
+                let knowledge = self.knowledge_provider.at_position(position);
+                let _ = self
+                    .analysis
+                    .record_install_method_call(call, self.source, &knowledge);
+                self.analysis.enrich_package_declaration(call, self.source);
+                self.analysis
+                    .bind_anonymous_ring_generators(call, self.source, &knowledge);
+                self.analysis
+                    .rebind_ring_generators_on_use(call, self.source);
+            }
         }
-        visit::visit_expr_op_bin_adj(self, call);
+        visit::visit_expr_binary(self, call);
     }
 }

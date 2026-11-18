@@ -4,7 +4,7 @@
 //! delegate to their alternatives; operands remain borrowed typed expressions.
 //! The context supplies positioned semantic knowledge and memoized recursion.
 
-use m2_syn::{nodes::*, Spanned, Token};
+use m2_syn::{nodes::*, Spanned};
 
 use crate::object_registry::OperatorForm;
 use crate::typesystem::{InferredType, TypeRole};
@@ -26,7 +26,9 @@ pub trait InferenceContext<'ast> {
     /// Resolves a symbol through source bindings, output history, and the catalog.
     fn symbol(&self, symbol: &'ast Symbol) -> InferredType;
     /// Infers application from the callable and its typed argument expression.
-    fn application(&self, application: &'ast ExprOpBinAdj) -> InferredType;
+    fn application(&self, application: &'ast ExprBinary) -> InferredType;
+    /// Infers a field access whose key is a literal symbol.
+    fn field(&self, field: &'ast ExprField) -> InferredType;
     /// Dispatches an infix operator using its two typed operands.
     fn binary(
         &self,
@@ -66,9 +68,10 @@ macro_rules! exact_classes {
 exact_classes! {
     FloatLiteral => Real, IntegerLiteral => Integer,
     StringLiteral => String, RawStringLiteral => String,
-    List => List, Array => Array, AngleBarList => AngleBarList, Sequence => Sequence,
-    ExprLambda => FunctionClosure, ExprQuote => Symbol, ExprOption => Option,
-    ExprWhile => Nothing, Empty => Nothing, Statement => Nothing, ExprPack => Sequence,
+    ExprList => List, ExprArray => Array, ExprAngleBar => AngleBarList, ExprSequence => Sequence,
+    ExprFunction => FunctionClosure, ExprQuote => Symbol, ExprOption => Option,
+    ExprWhile => Nothing, Empty => Nothing, Stmt => Nothing,
+
 }
 
 /// Delegates one generated category to the rules of its existing alternatives.
@@ -81,59 +84,67 @@ macro_rules! delegate_variants {
         }
     };
 }
-delegate_variants!(ExprLiteral {
+delegate_variants!(Literal {
     Float,
     Integer,
     RawString,
     String
 });
-delegate_variants!(ExprCollection {
-    Sequence,
-    List,
-    Array,
-    AngleBar
-});
-delegate_variants!(ExprOp {
-    Bin,
-    Prefix,
-    Postfix
-});
-delegate_variants!(ExprOpBin {
-    Adj,
-    Regular,
-    Member,
-    Index
-});
-delegate_variants!(PackedContent { Expr, Pack });
 
 impl InferType for Expr {
     fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
         match self {
             Self::Literal(value) => value.infer(context),
-            Self::Collection(value) => value.infer(context),
-            Self::Holder(value) => value.infer(context),
-            Self::Op(value) => value.infer(context),
+            Self::Array(value) => value.infer(context),
+            Self::List(value) => value.infer(context),
+            Self::Sequence(value) => value.infer(context),
+            Self::AngleBar(value) => value.infer(context),
+            Self::Paren(value) => value.infer(context),
+            Self::Binary(value) => value.infer(context),
+            Self::Field(value) => context.field(value),
+            Self::Prefix(value) => value.infer(context),
+            Self::Postfix(value) => value.infer(context),
             Self::Assign(value) => value.infer(context),
             Self::Option(value) => value.infer(context),
-            Self::Lambda(value) => value.infer(context),
+            Self::Function(value) => value.infer(context),
             Self::If(value) => value.infer(context),
             Self::For(value) => value.infer(context),
             Self::While(value) => value.infer(context),
             Self::Try(value) => value.infer(context),
             Self::Quote(value) => value.infer(context),
             Self::New(value) => value.infer(context),
-            Self::Control(value) => value.infer(context),
+            Self::Break(value) => value.expr.as_deref().map_or_else(
+                || context.exact(value, TypeRole::Nothing),
+                |expr| context.expression(expr),
+            ),
+            Self::Continue(value) => value.expr.as_deref().map_or_else(
+                || context.exact(value, TypeRole::Nothing),
+                |expr| context.expression(expr),
+            ),
+            Self::Return(value) => value.expr.as_deref().map_or_else(
+                || context.exact(value, TypeRole::Nothing),
+                |expr| context.expression(expr),
+            ),
             Self::Debug(value) => value.infer(context),
-            Self::Profile(value) => value.infer(context),
+            Self::Timing(value) => value.infer(context),
             Self::Symbol(value) => value.infer(context),
             Self::Catch(_) | Self::Throw(_) | Self::Trap(_) => InferredType::unknown(),
         }
     }
 }
 
-impl InferType for Holder {
+impl InferType for Elements {
     fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        self.value.as_deref().map_or_else(
+        match self {
+            Self::Single(expression) => context.expression(expression),
+            Self::Pack(_) => context.exact(self, TypeRole::Sequence),
+        }
+    }
+}
+
+impl InferType for ExprParen {
+    fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
+        self.expr.as_deref().map_or_else(
             || context.exact(self, TypeRole::Nothing),
             |value| context.expression(value),
         )
@@ -166,9 +177,9 @@ impl InferType for ExprIf {
 impl InferType for ExprTry {
     fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
         let success = context.expression(
-            self.on_success
+            self.then_clause
                 .as_ref()
-                .map_or(&self.value, |clause| &clause.expr),
+                .map_or(&self.expr, |clause| &clause.expr),
         );
         // An exception-binding fallback remains conservative, as before: its
         // handler is checked independently rather than assumed to complete.
@@ -182,14 +193,9 @@ impl InferType for ExprTry {
 
 impl InferType for ExprFor {
     fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        let body = match self {
-            Self::Bare(loop_) => &loop_.body,
-            Self::Range(loop_) => &loop_.body,
-            Self::In(loop_) => &loop_.body,
-        };
         context.exact(
             self,
-            if body.list_step.is_some() {
+            if self.body.list_clause.is_some() {
                 TypeRole::List
             } else {
                 TypeRole::Nothing
@@ -207,108 +213,38 @@ impl InferType for ExprNew {
     }
 }
 
-impl InferType for ExprControl {
-    fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        let value = match self {
-            Self::Break(transfer) => &transfer.value,
-            Self::Continue(transfer) => &transfer.value,
-            Self::Return(transfer) => &transfer.value,
-        };
-        value.as_deref().map_or_else(
-            || context.exact(self, TypeRole::Nothing),
-            |value| context.expression(value),
-        )
-    }
-}
-
 impl InferType for ExprDebug {
     fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        let value = match self {
-            Self::Test(debug) => &debug.value,
-            Self::Step(debug) => &debug.value,
-            Self::Finish(debug) => &debug.value,
-            Self::Shield(debug) => &debug.value,
-            Self::Breakpoint(debug) => &debug.value,
-        };
-        value
+        self.expr
             .as_deref()
             .map_or_else(InferredType::unknown, |value| context.expression(value))
     }
 }
 
-impl InferType for ExprProfile {
+impl InferType for ExprTiming {
     fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        let value = match self {
-            Self::ElapsedTime(profile) => &profile.value,
-            Self::ElapsedTiming(profile) => &profile.value,
-            Self::Profile(profile) => &profile.value,
-            Self::Time(profile) => &profile.value,
-            Self::Timing(profile) => &profile.value,
-        };
-        context.expression(value)
+        context.expression(&self.expr)
     }
 }
 
-impl InferType for ExprOpBinAdj {
+impl InferType for ExprBinary {
     fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        context.application(self)
-    }
-}
-
-impl InferType for ExprOpBinRegular {
-    fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        context.binary(
-            self,
-            self.operator.spelling(),
-            &self.left_operand,
-            &self.right_operand,
-        )
-    }
-}
-
-impl InferType for ExprOpBinIndex {
-    fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        context.binary(self, <Token![#]>::SPELLING, &self.receiver, &self.index)
-    }
-}
-
-impl InferType for ExprOpBinMember {
-    fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        match self {
-            Self::Dot(access) => context.binary(
-                self,
-                <Token![.]>::SPELLING,
-                &access.receiver,
-                &access.member,
-            ),
-            Self::Optional(access) => context.binary(
-                self,
-                <Token![.?]>::SPELLING,
-                &access.receiver,
-                &access.member,
-            ),
+        if matches!(self.op, BinaryOperator::Space(_)) {
+            context.application(self)
+        } else {
+            context.binary(self, self.op.spelling(), &self.left, &self.right)
         }
     }
 }
 
-impl InferType for ExprOpPrefix {
+impl InferType for ExprPrefix {
     fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        context.unary(
-            self,
-            self.operator.spelling(),
-            &self.operand,
-            OperatorForm::Prefix,
-        )
+        context.unary(self, self.op.spelling(), &self.expr, OperatorForm::Prefix)
     }
 }
 
-impl InferType for ExprOpPostfix {
+impl InferType for ExprPostfix {
     fn infer<'ast>(&'ast self, context: &dyn InferenceContext<'ast>) -> InferredType {
-        context.unary(
-            self,
-            self.operator.spelling(),
-            &self.operand,
-            OperatorForm::Postfix,
-        )
+        context.unary(self, self.op.spelling(), &self.expr, OperatorForm::Postfix)
     }
 }

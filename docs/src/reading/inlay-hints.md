@@ -111,10 +111,14 @@ operatorCalls = true
   expressions. Computed elements do not stop a collection from being literal.
 
 `trivial`
-: Hide types apparent from the producer. Literal forms are recognized now;
-  broader constructor/conversion recognition is planned. For example,
-  `matrix {{1},{1}}` is conceptually trivial, while only its bracket-created
-  argument is literal.
+: Hide types apparent from the producer. Literal forms,
+  conventional constructors (`widget` for `Widget`), `toType` conversions,
+  explicit `new`, wrapper/header/self-initializing type application, loops,
+  and `if` expressions are recognized. Named constructors are hidden only
+  when the inferred result belongs to the named type. Computations inside
+  arguments, branches, and loop bodies keep their own hints. For example,
+  `matrix {{1},{1}}` is trivial, while only its bracket-created argument
+  is literal.
 
 `sequential`
 : At a position with several consecutive type labels, keep only the final

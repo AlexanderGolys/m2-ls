@@ -124,16 +124,17 @@ Settings are grouped by what they control. The editor sends JSON under its
 }
 ```
 
-A [complete TOML example](tests/fixtures/configuration.toml) lists the defaults.
+The [defaults file](src/settings/defaults.toml) is compiled into the server as the bottom layer: every key a configuration leaves out takes its value there.
 
 | Group | Purpose and defaults |
 | --- | --- |
 | `catalog` | `enabled = true`; set to `false` to skip catalog reads, downloads, and updates. `version = "0.1.*"` bounds updates to compatible M2Book releases. The server reads this group from `initializationOptions`; restart to change it. |
 | `diagnostics` | Enabled by default; `disabled` lists rule names or codes. |
 | `diagnostics.emitAs` | `error`, `warning`, `info`, `hint`, and `fixActionOnly` select publication categories; all lists default to empty. `fixActionOnly` retains quick fixes without publishing diagnostics. |
-| `formatting` | Four-column indentation with tabs, soft wrapping at `78`, hard width `90`. `keepLineBreaks = true` preserves existing line breaks. |
+| `formatting` | `indent = "editor"` (also `"tab"` or a number of spaces), soft wrapping at `78`, hard width `90`. `keepLineBreaks = true` preserves existing line breaks. `operators.spacesAround` / `operators.compact` (`binary`, `unary`) and `brackets.spacesInside` / `brackets.compact` choose `a + b` vs `a^b` and `{ x }` vs `{x}`; anything unlisted keeps its spacing. |
 | `inlayHints.argNames` | Enabled; requires bracketed arguments, ignores variadic parameter names, and limits names to `15` characters. |
 | `inlayHints.types` | Enables type hints independently of argument names. `after` selects calls, line ends, cell ends, assignments, delimiters, and returns. Return hints default to off. |
+| `logging.level` | Operational verbosity: `off`, `error`, `warn`, `info` (default), `debug`, or `trace`. |
 | `inlayHints.hide` | Filters types, calls, literal and trivial results, adjacent type labels, and operator parameter labels. `nonExactMark` hides only the `↑` marker. |
 | `semanticTokens` | `standardOnly` defaults to `false`; `defaultLibrary` defaults to `["CompiledFunction"]` and combines policy names and package names. |
 | `macaulay2` | Optional `executable`, `prefix`, and `applicationDirectory` overrides. `runtimeDiscovery` defaults to `true`; disabling it prevents executable queries. |
@@ -282,7 +283,9 @@ hashes and indexing summaries, without RPC traffic or test results.
 [Usage history](docs/src/beyond/command-line.md#usage-history) for fields and an
 analysis example. Tests leave both result and operational logging disabled.
 
-The server writes structured JSON lines to `/tmp/m2-ls.log`. Request errors
+The server writes structured JSON lines to `/tmp/m2-ls.log`.
+`logging.level` selects `off`, `error`, `warn`, `info` (default), `debug`,
+or `trace`, and can be changed during the session. Request errors
 include the method, request ID, document URI, and error code. Operations taking
 at least 100 ms are recorded automatically, with timing summaries every 30
 seconds of activity and at shutdown. Summaries include count, total, mean, and

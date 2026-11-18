@@ -879,7 +879,7 @@ fn canonical_object_id(raw: &RawRecord) -> ObjectId {
 fn package_object_id(raw: &RawRecord) -> ObjectId {
     raw.package
         .as_deref()
-        .map_or_else(core_package_id, ObjectId::new)
+        .map_or_else(ObjectId::core_package, ObjectId::new)
 }
 
 /// Object name used to identify or resolve an owning package.
@@ -889,11 +889,6 @@ fn package_object_name(raw: &RawRecord) -> ObjectName {
         .map(deref_ref)
         .map(ObjectName)
         .unwrap_or_else(|| ObjectName::new("Core"))
-}
-
-/// Package id identifying the core runtime package.
-fn core_package_id() -> ObjectId {
-    ObjectId::new("$Core$Core")
 }
 
 /// Package id retained when the corresponding package cannot be resolved.

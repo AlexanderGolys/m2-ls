@@ -2,12 +2,14 @@
 
 use std::collections::HashMap;
 
-use m2_syn::nodes::{Expr, ExprAssign, ExprOp, ExprOpBin};
+use m2_syn::nodes::{BinaryOperator, Expr, ExprAssign};
 use m2_syn::visit::{self, Visit};
+use tower_lsp::lsp_types::{Range, SymbolKind};
 
 use super::{DiagnosticSink, DocumentContext};
-use crate::analysis::{CodomainOrigin, MethodDeclarationOption};
+use crate::analysis::{CodomainOrigin, FunctionInfo, MethodDeclarationOption};
 use crate::diagnostics::{catalog, Finding};
+use crate::macaulay2::Macaulay2Conventions;
 use crate::node_metadata::ParsedCell;
 use crate::source::SourceNavigation;
 use crate::syntax::{AssignmentSyntax, AssignmentTarget, ExpressionSyntax};
@@ -44,11 +46,12 @@ impl MethodTypicalValue<'_, '_> {
         let AssignmentTarget::Symbol(symbol) = parts.target else {
             return;
         };
-        let Some(Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call)))) = parts.value.unparenthesized()
-        else {
+        let Some(Expr::Binary(call)) = parts.value.unparenthesized() else {
             return;
         };
-        if call.left_operand.symbol_name() != Some(METHOD_CONSTRUCTOR) {
+        if !matches!(call.op, BinaryOperator::Space(_))
+            || call.left.symbol_name() != Some(METHOD_CONSTRUCTOR)
+        {
             return;
         }
         let Some(range) = self.context.source.range_for_syntax(symbol) else {
@@ -61,7 +64,11 @@ impl MethodTypicalValue<'_, '_> {
         let Some(function) = analysis.function_for_binding(binding) else {
             return;
         };
-        if !function.is_method_function() || function.typical_value.is_some() {
+        if !function.is_method_function() {
+            return;
+        }
+        self.constructor_typical_value(symbol.text(), range, function);
+        if function.typical_value.is_some() {
             return;
         }
         let installations = analysis
@@ -96,6 +103,31 @@ impl MethodTypicalValue<'_, '_> {
                 ),
             ),
         );
+    }
+
+    /// Checks the global contract of a source-owned constructor for a
+    /// source-owned type. Calls to an existing function are never checked.
+    fn constructor_typical_value(&mut self, name: &str, range: Range, function: &FunctionInfo) {
+        let Some(target) = Macaulay2Conventions::constructed_type_name(name) else {
+            return;
+        };
+        if !self
+            .context
+            .analysis
+            .get_binding_at(&target, range.start)
+            .is_some_and(|binding| binding.state.presentation_kind == SymbolKind::CLASS)
+        {
+            return;
+        }
+        if function
+            .typical_value
+            .as_ref()
+            .is_some_and(|typical| typical.name() == target)
+        {
+            return;
+        }
+        self.sink.spawn(&catalog::CONSTRUCTOR_TYPICAL_VALUE, Finding::new(range,
+            format!("`{name}` constructs instances of `{target}`; declare `TypicalValue => {target}` on its `method(...)` declaration. Individual installations may narrow it to a subtype.")));
     }
 }
 

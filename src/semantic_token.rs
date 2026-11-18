@@ -48,7 +48,9 @@
 use crate::algebraic_kind::AlgebraicKind;
 use crate::builtin_index::Record;
 use crate::meta::{BindingRole, Metadata};
-use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry, ObjectRegistryView};
+use crate::object_registry::{
+    ObjectId, ObjectKnowledge, ObjectName, ObjectRegistry, ObjectRegistryView,
+};
 use crate::settings::SemanticTokenSettings;
 use crate::source::DocumentSpan;
 use crate::typesystem::TypeKnowledge;
@@ -128,8 +130,9 @@ pub enum M2SemanticTokenType {
     Package = SemanticTokenType::NAMESPACE,
     /// A library object that is a table of the interpreter's own data rather
     /// than a value: a `Dictionary`, such as `OutputDictionary`, a
-    /// `HashTable` or `MutableHashTable`, such as `typicalValues`, or a
-    /// `NumberedVerticalList`. Sent as `struct`.
+    /// `HashTable` or `MutableHashTable`, such as `typicalValues`, a
+    /// `NumberedVerticalList`, or a list `Core` keeps as its state, such as
+    /// `loadedPackages`. Sent as `struct`.
     Table = SemanticTokenType::STRUCT,
     /// A name used as a `Symbol` rather than for a value: a protected symbol
     /// (`Strategy`, an option value such as `Linear`) or a quoted name
@@ -692,13 +695,17 @@ const SEPARATORS: [&str; 2] = [<Token![,]>::SPELLING, <Token![;]>::SPELLING];
 /// `MutableHashTable` is a `HashTable`.
 const TABLE_CLASSES: [&str; 3] = ["Dictionary", "HashTable", "NumberedVerticalList"];
 
+/// The class whose `Core` instances are [`Table`](M2SemanticTokenType::Table)s
+/// as well: the interpreter's state lists, such as `loadedPackages`.
+const CORE_TABLE_CLASS: &str = "List";
+
 /// Keywords selecting how a quote binds its symbol.
 const QUOTE_MODIFIERS: [&str; 5] = [
     <Token![global]>::SPELLING,
     <Token![local]>::SPELLING,
     <Token![symbol]>::SPELLING,
     <Token![threadLocal]>::SPELLING,
-    <Token![threadVariable]>::SPELLING,
+    "threadVariable",
 ];
 
 /// Operators spelled as words.
@@ -871,7 +878,7 @@ pub fn semantic_token_from_knowledge(
     } else {
         semantic_token_for_static_type_from_knowledge(knowledge, record.class.as_ref())
             .or_else(|| {
-                is_table_class(knowledge, record.class.as_ref())
+                record_is_table(knowledge, record)
                     .then(|| M2SemanticToken::new(M2SemanticTokenType::Table))
             })
             .unwrap_or_else(|| M2SemanticToken::new(M2SemanticTokenType::Variable))
@@ -933,13 +940,15 @@ pub fn semantic_token_for_static_type_from_knowledge(
     Some(token)
 }
 
-/// Whether `class` is one of the interpreter's table classes, whose library
-/// instances are tables of its own data.
-fn is_table_class(knowledge: &(impl TypeKnowledge + ?Sized), class: &str) -> bool {
-    let class = ObjectName::new(class);
-    TABLE_CLASSES
-        .into_iter()
-        .any(|table| knowledge.is_subtype(&class, &ObjectName::new(table)))
+/// Whether a library record is a table of the interpreter's own data: an
+/// instance of one of the [`TABLE_CLASSES`], or a list `Core` keeps as its
+/// state, such as `loadedPackages` or `path`. A package's own lists, such as
+/// the rings `EngineTests` enumerates, are values.
+fn record_is_table(knowledge: &(impl TypeKnowledge + ?Sized), record: &Record) -> bool {
+    let class = ObjectName::new(record.class.as_ref());
+    let subtype_of = |parent: &str| knowledge.is_subtype(&class, &ObjectName::new(parent));
+    TABLE_CLASSES.into_iter().any(subtype_of)
+        || (record.package == ObjectId::core_package() && subtype_of(CORE_TABLE_CLASS))
 }
 
 /// Whether `ring` is installed on `class` or one of its ancestors.

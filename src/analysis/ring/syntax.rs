@@ -53,9 +53,9 @@ impl RingSyntax {
     /// Immediate collection elements, excluding empty slots and muted statements.
     pub fn elements(expression: &Expr) -> Option<Vec<&Expr>> {
         let contents = match expression.unparenthesized()? {
-            Expr::Collection(ExprCollection::Array(array)) => &array.elements,
-            Expr::Collection(ExprCollection::List(list)) => &list.elements,
-            Expr::Collection(ExprCollection::Sequence(sequence)) => &sequence.elements,
+            Expr::Array(array) => &array.elems,
+            Expr::List(list) => &list.elems,
+            Expr::Sequence(sequence) => &sequence.elems,
             _ => return None,
         };
         Some(
@@ -76,13 +76,13 @@ impl RingSyntax {
     /// Original literal contents from generated elements, preserving escape spelling.
     pub fn literal_contents(expression: &Expr) -> Option<String> {
         match expression.unparenthesized()? {
-            Expr::Literal(ExprLiteral::String(string)) => string
-                .elements
+            Expr::Literal(Literal::String(string)) => string
+                .fragments
                 .iter()
                 .map(|element| Some(element.try_span()?.text()?.to_owned()))
                 .collect(),
-            Expr::Literal(ExprLiteral::RawString(string)) => string
-                .elements
+            Expr::Literal(Literal::RawString(string)) => string
+                .fragments
                 .iter()
                 .map(|element| Some(element.try_span()?.text()?.to_owned()))
                 .collect(),
@@ -108,14 +108,9 @@ impl RingSyntax {
     }
 
     /// The delimited variable specification of a polynomial constructor.
-    pub fn constructor_variables(application: &ExprOpBinAdj) -> Option<&Expr> {
-        let argument = application.right_operand.unparenthesized()?;
-        let collection = |expression: &Expr| {
-            matches!(
-                expression,
-                Expr::Collection(ExprCollection::Array(_) | ExprCollection::List(_))
-            )
-        };
+    pub fn constructor_variables(application: &ExprBinary) -> Option<&Expr> {
+        let argument = application.right.unparenthesized()?;
+        let collection = |expression: &Expr| matches!(expression, Expr::Array(_) | Expr::List(_));
         if collection(argument) {
             return Some(argument);
         }
@@ -142,7 +137,7 @@ impl RingSyntax {
         for element in elements {
             if matches!(element, Expr::Option(_)) {
                 if let Some(variables) = Self::option(element, "Variables") {
-                    if let Expr::Literal(ExprLiteral::Integer(integer)) = variables {
+                    if let Expr::Literal(Literal::Integer(integer)) = variables {
                         let indices = integer
                             .text()
                             .parse::<i64>()
@@ -196,9 +191,11 @@ impl RingSyntax {
         let Some(expression) = expression.unparenthesized() else {
             return;
         };
-        if let Expr::Op(ExprOp::Bin(ExprOpBin::Adj(application))) = expression {
-            if application.left_operand.symbol_name() == Some(super::GET_SYMBOL_FUNCTION) {
-                if let Some(name) = Self::literal_contents(&application.right_operand) {
+        if let Expr::Binary(application) = expression {
+            if matches!(application.op, BinaryOperator::Space(_))
+                && application.left.symbol_name() == Some(super::GET_SYMBOL_FUNCTION)
+            {
+                if let Some(name) = Self::literal_contents(&application.right) {
                     Self::push(
                         specs,
                         GeneratorSpec {
@@ -209,9 +206,9 @@ impl RingSyntax {
                             },
                             anchor: GeneratorAnchor::Expression(
                                 application
-                                    .right_operand
+                                    .right
                                     .unparenthesized()
-                                    .unwrap_or(&application.right_operand),
+                                    .unwrap_or(&application.right),
                             ),
                         },
                     );
@@ -349,16 +346,14 @@ impl IndexKey {
     pub fn from_expression(expression: &Expr, bare: &dyn Fn(&Symbol) -> bool) -> Option<Self> {
         let expression = expression.unparenthesized()?;
         match expression {
-            Expr::Literal(ExprLiteral::Integer(integer)) => {
+            Expr::Literal(Literal::Integer(integer)) => {
                 return integer.text().parse().ok().map(Self::Integer)
             }
             Expr::Symbol(symbol) => {
                 return bare(symbol).then(|| Self::Symbol(ObjectName::new(symbol.text())))
             }
-            Expr::Op(ExprOp::Prefix(prefix))
-                if prefix.operator.spelling() == <Token![-]>::SPELLING =>
-            {
-                let Self::Integer(value) = Self::from_expression(&prefix.operand, bare)? else {
+            Expr::Prefix(prefix) if prefix.op.spelling() == <Token![-]>::SPELLING => {
+                let Self::Integer(value) = Self::from_expression(&prefix.expr, bare)? else {
                     return None;
                 };
                 return value.checked_neg().map(Self::Integer);
@@ -385,8 +380,8 @@ impl IndexKey {
             .map(|element| Self::from_expression(element, bare))
             .collect::<Option<Vec<_>>>()?;
         match expression {
-            Expr::Collection(ExprCollection::List(_)) => Some(Self::List(items)),
-            Expr::Collection(ExprCollection::Sequence(_)) => Some(Self::Sequence(items)),
+            Expr::List(_) => Some(Self::List(items)),
+            Expr::Sequence(_) => Some(Self::Sequence(items)),
             _ => None,
         }
     }

@@ -1,6 +1,6 @@
 //! Ring construction, generator rebinding, and ring-specific type rules.
 
-use m2_syn::nodes::{ExprLiteral, ExprOp, ExprOpBin, ExprOpBinRegular, Symbol};
+use m2_syn::nodes::{BinaryOperator, ExprBinary, Literal, Symbol};
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Spanned, Token};
 use std::fmt::{self, Display, Formatter};
@@ -764,7 +764,7 @@ impl Analysis {
     /// symbols and are left out, so callers see exactly the names an author typed.
     pub(crate) fn ring_constructor_symbol_variables<'ast>(
         &self,
-        call: &'ast ExprOpBinAdj,
+        call: &'ast ExprBinary,
         source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
         scope_idx: usize,
@@ -789,14 +789,14 @@ impl Analysis {
     /// `QQ[x, y]`: an application of a ring or a family of inexact fields.
     fn ring_constructor_variables<'ast>(
         &self,
-        call: &'ast ExprOpBinAdj,
+        call: &'ast ExprBinary,
         source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
         scope_idx: usize,
     ) -> Option<&'ast Expr> {
         let variables = syntax::RingSyntax::constructor_variables(call)?;
         TypeChecker::new(self, knowledge)
-            .infer_type(call.left_operand.as_ref(), source, scope_idx)
+            .infer_type(call.left.as_ref(), source, scope_idx)
             .single()
             .is_some_and(|head_type| {
                 knowledge.has_type_role(head_type, TypeRole::Ring)
@@ -810,7 +810,7 @@ impl Analysis {
     /// constructor runs, `QQ[x]` alone making `x` an element of that ring.
     pub fn bind_anonymous_ring_generators(
         &mut self,
-        call: &ExprOpBinAdj,
+        call: &ExprBinary,
         source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) {
@@ -869,12 +869,14 @@ impl Analysis {
         expression: &'ast Expr,
         bare: &dyn Fn(&Symbol) -> bool,
     ) -> Option<(&'ast Expr, Vec<syntax::GeneratorSpec<'ast>>)> {
-        let Expr::Op(ExprOp::Bin(ExprOpBin::Adj(application))) = expression.unparenthesized()?
-        else {
+        let Expr::Binary(application) = expression.unparenthesized()? else {
             return None;
         };
+        if !matches!(application.op, BinaryOperator::Space(_)) {
+            return None;
+        }
         let value = application
-            .right_operand
+            .right
             .arguments()
             .into_iter()
             .flatten()
@@ -887,14 +889,14 @@ impl Analysis {
     /// ring constructor's.
     pub(super) fn indexed_ring_generator(
         &self,
-        access: &ExprOpBinRegular,
+        access: &ExprBinary,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<(BindingId, IndexKey)> {
-        if access.operator.spelling() != <Token![_]>::SPELLING {
+        if access.op.spelling() != <Token![_]>::SPELLING {
             return None;
         }
-        let base = syntax::RingSyntax::name(&access.left_operand)?;
-        let index = IndexKey::from_expression(&access.right_operand, &|_| false)?;
+        let base = syntax::RingSyntax::name(&access.left)?;
+        let index = IndexKey::from_expression(&access.right, &|_| false)?;
         let position = source.position_for_syntax(base)?;
         let binding = self.get_binding_from_scope(
             base.text(),
@@ -913,11 +915,11 @@ impl Analysis {
     /// The source of the indexed generator an access names, from its name
     /// on: `z_0`, also in `symbol z_0`, whose quote is no part of the name.
     pub(super) fn indexed_ring_generator_bytes(
-        access: &ExprOpBinRegular,
+        access: &ExprBinary,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<ByteRange> {
         let end = source.syntax_bytes(access)?.end;
-        let start = match syntax::RingSyntax::name(&access.left_operand) {
+        let start = match syntax::RingSyntax::name(&access.left) {
             Some(base) => source.syntax_bytes(base)?.start,
             None => source.syntax_bytes(access)?.start,
         };
@@ -931,18 +933,15 @@ impl Analysis {
     /// a generator, keep their parts.
     pub(super) fn constant_subscript_role(
         &self,
-        access: &ExprOpBinRegular,
+        access: &ExprBinary,
         source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<SourceSemanticRole> {
-        if access.operator.spelling() != <Token![_]>::SPELLING {
+        if access.op.spelling() != <Token![_]>::SPELLING {
             return None;
         }
-        let (left, right) = (access.left_operand.as_ref(), access.right_operand.as_ref());
-        if matches!(
-            left,
-            Expr::Literal(ExprLiteral::Integer(_) | ExprLiteral::Float(_))
-        ) {
+        let (left, right) = (access.left.as_ref(), access.right.as_ref());
+        if matches!(left, Expr::Literal(Literal::Integer(_) | Literal::Float(_))) {
             let Expr::Symbol(_) = right else {
                 return None;
             };
@@ -951,8 +950,7 @@ impl Analysis {
                 || knowledge.is_subtype(&ring, &ObjectName::new(INEXACT_FIELD_FAMILY)))
             .then_some(SourceSemanticRole::RingLiteral);
         }
-        if !matches!(left, Expr::Symbol(_))
-            || !matches!(right, Expr::Literal(ExprLiteral::Integer(_)))
+        if !matches!(left, Expr::Symbol(_)) || !matches!(right, Expr::Literal(Literal::Integer(_)))
         {
             return None;
         }
@@ -1044,13 +1042,12 @@ impl Analysis {
     /// kills is rebound like any other.
     pub fn rebind_ring_generators_on_use(
         &mut self,
-        call: &ExprOpBinAdj,
+        call: &ExprBinary,
         source: &(impl SyntaxSource + ?Sized),
     ) {
-        let (Some(Expr::Symbol(command)), Some(Expr::Symbol(ring))) = (
-            call.left_operand.unparenthesized(),
-            call.right_operand.unparenthesized(),
-        ) else {
+        let (Some(Expr::Symbol(command)), Some(Expr::Symbol(ring))) =
+            (call.left.unparenthesized(), call.right.unparenthesized())
+        else {
             return;
         };
         let position = source.position_for_syntax(command);
@@ -1127,15 +1124,15 @@ impl Analysis {
     /// value of `x`.
     pub fn register_indexed_assignment(
         &mut self,
-        target: &ExprOpBinRegular,
+        target: &ExprBinary,
         value_type: ObjectName,
         source: &(impl SyntaxSource + ?Sized),
     ) {
-        if target.operator.spelling() != <Token![_]>::SPELLING {
+        if target.op.spelling() != <Token![_]>::SPELLING {
             return;
         }
         let (Some(base), Some(position)) = (
-            syntax::RingSyntax::name(&target.left_operand),
+            syntax::RingSyntax::name(&target.left),
             source.position_for_syntax(target),
         ) else {
             return;
@@ -1154,7 +1151,7 @@ impl Analysis {
             .and_then(|binding| binding.state.indexed_element_type.clone())
             .unwrap_or_default();
         writes.writes.push(IndexedWrite {
-            selection: IndexKey::from_expression(&target.right_operand, &|_| false)
+            selection: IndexKey::from_expression(&target.right, &|_| false)
                 .map_or(IndexSelection::Unknown, IndexSelection::Exact),
             value_type,
             writer: IndexedWriter::Assignment,
@@ -1232,14 +1229,14 @@ struct IndexedGenerators<'analysis, 'source, Source: ?Sized> {
 }
 
 impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for IndexedGenerators<'_, '_, Source> {
-    fn visit_expr_op_bin_regular(&mut self, access: &'ast ExprOpBinRegular) {
+    fn visit_expr_binary(&mut self, access: &'ast ExprBinary) {
         if let (Some(generator), Some(bytes)) = (
             self.analysis.indexed_ring_generator(access, self.source),
             Analysis::indexed_ring_generator_bytes(access, self.source),
         ) {
             self.found.push((bytes, generator));
         }
-        visit::visit_expr_op_bin_regular(self, access);
+        visit::visit_expr_binary(self, access);
     }
 }
 

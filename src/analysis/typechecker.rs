@@ -15,7 +15,7 @@ use crate::builtin_index::CallableInfo;
 use crate::node_metadata::SyntaxSnapshot;
 use std::ops::Deref;
 
-use m2_syn::nodes::{Expr, ExprCollection, ExprOpBinAdj};
+use m2_syn::nodes::{Expr, ExprBinary};
 
 use super::inference::session::{ExpressionTypes, InferenceSession};
 use super::inference::InferType;
@@ -476,16 +476,16 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
     /// Argument types and literal options of a call.
     pub fn call_facts<'ast>(
         &self,
-        call: &'ast ExprOpBinAdj,
+        call: &'ast ExprBinary,
         source: &'ast (impl SyntaxSource + ?Sized),
         scope_idx: usize,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> CallStaticFacts {
         self.argument_facts(
-            &call.right_operand,
+            &call.right,
             source,
             scope_idx,
-            call.left_operand.symbol_name(),
+            call.left.symbol_name(),
             knowledge,
         )
     }
@@ -509,11 +509,11 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
     /// argument type. Missing type or signature facts leave the call unchecked.
     pub fn disjoint_call_argument_types(
         &self,
-        call: &ExprOpBinAdj,
+        call: &ExprBinary,
         source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<Vec<InferredType>> {
-        let name = call.left_operand.symbol_name()?;
+        let name = call.left.symbol_name()?;
         let position = source.position_for_syntax(call)?;
         let scope = self.find_scope_at(position).unwrap_or(0);
         let function = self.local_function_at(name, scope, position, knowledge);
@@ -599,21 +599,16 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
     /// installation the call reaches.
     pub fn call_option_issues<'ast>(
         &self,
-        call: &'ast ExprOpBinAdj,
+        call: &'ast ExprBinary,
         source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Vec<CallOptionIssue<'ast>> {
-        let Some(name) = call.left_operand.symbol_name() else {
+        let Some(name) = call.left.symbol_name() else {
             return Vec::new();
         };
-        let arguments = call
-            .right_operand
-            .unparenthesized()
-            .unwrap_or(&call.right_operand);
+        let arguments = call.right.unparenthesized().unwrap_or(&call.right);
         let passed = match arguments {
-            Expr::Collection(ExprCollection::Sequence(_)) => {
-                arguments.collection_elements().unwrap_or_default()
-            }
+            Expr::Sequence(_) => arguments.collection_elements().unwrap_or_default(),
             _ => vec![Some(arguments)],
         };
         let passed = passed
@@ -659,12 +654,27 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         issues
     }
 
+    /// Accepted named arguments at this call, respecting source shadowing and
+    /// forwarded options selected by dispatch. `None` means the option set
+    /// cannot be established, rather than that the call accepts no options.
+    pub fn call_options(
+        &self,
+        call: &ExprBinary,
+        source: &(impl SyntaxSource + ?Sized),
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Option<Vec<CallableOption>> {
+        let name = call.left.symbol_name()?;
+        let position = source.position_for_syntax(call)?;
+        let scope = self.find_scope_at(position)?;
+        self.accepted_call_options(name, call, scope, position, source, knowledge)
+    }
+
     /// The complete option list of the function `name` names at a call with
     /// `arguments`, or `None` when it is not known.
     fn accepted_call_options(
         &self,
         name: &str,
-        call: &ExprOpBinAdj,
+        call: &ExprBinary,
         scope: usize,
         position: Position,
         source: &(impl SyntaxSource + ?Sized),

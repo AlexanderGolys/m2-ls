@@ -1,8 +1,9 @@
 //! The settings a client configures m2-ls with.
 //!
 //! Each group below is a plain struct whose fields are the settings, under
-//! their camelCase JSON names; its `Default` impl holds the defaults. The
-//! client sends them under the `m2-ls` section (`macaulay2` is accepted too):
+//! their camelCase JSON names. Their values default to the compiled-in
+//! [defaults file](ServerSettings::DEFAULTS_FILE), the bottom layer under the
+//! global, project and editor settings. The client sends them under the `m2-ls` section (`macaulay2` is accepted too):
 //!
 //! ```json
 //! { "m2-ls": { "formatting": { "indent": 4 }, "sources": { "packagePaths": ["~/packages"] } } }
@@ -10,12 +11,13 @@
 //!
 //! Settings are read leniently: a value that does not deserialize, an unknown
 //! key in a group, or an unknown entry in a list is reported as a
-//! [`SettingProblem`] and dropped, and everything else still applies. A
+//! [`SettingProblem`] and dropped, its default showing through, and
+//! everything else still applies. A
 //! deprecated key is read as the settings that replaced it, and reported too.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{LazyLock, RwLock};
 use std::{fmt, mem};
 
 use semver::VersionReq;
@@ -24,13 +26,16 @@ use serde_json::{Map, Value};
 use serde_path_to_error::{Path, Segment};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-use crate::capabilities::formatting::ControlFlowLayout;
-use crate::diagnostics::DiagnosticCode;
+use crate::capabilities::formatting::{ControlFlowLayout, RedundantParentheses};
+use crate::diagnostics::{catalog, DiagnosticCode};
 use crate::init_file::InitFileChoice;
+use crate::node_metadata::CallParentheses;
 use crate::object_registry::ObjectName;
 
 mod project;
 pub use project::ProjectConfiguration;
+pub mod spacing;
+use spacing::{BracketSpacingSettings, OperatorSpacingSettings, OPPOSED_LISTS};
 
 /// The current value of a setting that requests read while the client
 /// replaces it.
@@ -72,10 +77,10 @@ impl<T: Clone> SettingsStore<T> {
 
 /// Every setting m2-ls reads. Other top-level keys of the section belong to
 /// the client (e.g. an extension's `server.path`) and are ignored.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerSettings {
-    /// Whether builtin metadata and documentation are loaded. Default `true`.
+    /// Whether builtin metadata and documentation are loaded.
     pub catalog: CatalogSettings,
     /// `diagnostics.*`: which diagnostics are published, and how prominently.
     pub diagnostics: DiagnosticSettings,
@@ -91,40 +96,56 @@ pub struct ServerSettings {
     pub macaulay2: Macaulay2Settings,
     /// Files analyzed before each ordinary document, in order.
     pub initialization: InitializationSettings,
+    /// Operational log verbosity; independent of source diagnostic severity.
+    pub logging: LoggingSettings,
+}
+
+/// Operational logging configuration, for example `[logging] level = "debug"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoggingSettings {
+    /// Maximum verbosity recorded in the operational log.
+    pub level: LogLevel,
+}
+
+/// Increasing operational verbosity. For example, `error` keeps failed
+/// operations, while `debug` also records fast operation timings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum LogLevel {
+    /// Disable operational log output.
+    Off,
+    /// Record failed operations and error events.
+    Error,
+    /// Record errors and warnings.
+    Warn,
+    /// Also record ordinary events, slow operations, and summaries.
+    Info,
+    /// Also record fast operation timings.
+    Debug,
+    /// Also record the start of each operation.
+    Trace,
 }
 
 /// Controls optional builtin metadata and documentation.
 /// The server reads this group during initialization; changes require a restart.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CatalogSettings {
-    /// Read and automatically download the catalog. Default `true`.
+    /// Read and automatically download the catalog.
     /// Disabling skips catalog reads, downloads, and background updates.
     pub enabled: bool,
-    /// Cargo-style M2Book release bound. Default `0.1.*` excludes breaking releases.
+    /// Cargo-style M2Book release bound; `0.1.*` excludes breaking releases.
     pub version: VersionReq,
-}
-
-impl CatalogSettings {
-    /// Catalog release line understood by this server version.
-    pub const DEFAULT_VERSION: &str = "0.1.*";
-}
-
-impl Default for CatalogSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            version: VersionReq::parse(Self::DEFAULT_VERSION).expect("valid catalog release bound"),
-        }
-    }
 }
 
 /// `diagnostics.*`: which diagnostics are published, and how prominently.
 /// Rules are named by code or by name, e.g. `T02` or `unused-binding`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiagnosticSettings {
-    /// Whether any diagnostic is shown. Default `true`.
+    /// Whether any diagnostic is shown.
     pub enabled: bool,
     /// Rules that are never shown.
     pub disabled: HashSet<DiagnosticCode>,
@@ -134,19 +155,24 @@ pub struct DiagnosticSettings {
     pub warnings_as_info: HashSet<DiagnosticCode>,
     /// Explicit publication categories for selected rules.
     pub emit_as: DiagnosticEmissionSettings,
+    /// Whether rewrites may turn an error into a fallback value, such as
+    /// `h.k ?? v` for `if h.k =!= null then h.k else v`, which yields `v`
+    /// where the conditional fails because `h` lacks the key `k`.
+    pub error_catching_rewrites: bool,
 }
 
 /// `formatting.*`: how the formatter lays out a document.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FormattingSettings {
-    /// Spaces per indentation level; the editor's tab size when unset.
-    pub indent: Option<u32>,
-    /// Whether to indent with tabs; the editor's choice when unset.
-    pub use_tabs: Option<bool>,
+    /// One indentation level: `"editor"`, `"tab"` or a number of spaces.
+    pub indent: Indent,
+    /// Columns a tab is displayed as, for line widths; the editor's tab
+    /// size when unset.
+    pub tab_width: Option<u32>,
     /// The width lines are preferably wrapped at; `0` or `null` disables it.
     /// It never exceeds `hardLineWidth`.
-    #[serde(rename = "softWrapWidth", alias = "softLineWidth")]
+    #[serde(rename = "softWrapWidth")]
     pub soft_line_width: Option<u32>,
     /// The width lines are always wrapped at; `0` or `null` disables it.
     pub hard_line_width: Option<u32>,
@@ -160,8 +186,58 @@ pub struct FormattingSettings {
     /// indentation change, so line widths and `controlFlowLayout` have no
     /// effect.
     pub keep_line_breaks: bool,
-    /// `{ b }` when `true`, `{b}` when `false`; as written when unset.
-    pub space_in_braces: Option<bool>,
+    /// `operators.*`: operators written `a + b` and those written `a^b`.
+    pub operators: OperatorSpacingSettings,
+    /// `brackets.*`: brackets written `{ x }` and those written `{x}`.
+    pub brackets: BracketSpacingSettings,
+    /// `off`, `action` (a source action removes them) or `format` (also
+    /// removed by formatting): parentheses the syntax does not need.
+    pub redundant_parentheses: RedundantParentheses,
+    /// `remove` or `keep`: whether redundant parentheses around a call's
+    /// argument go too, `f(x)` as `f x`.
+    pub call_parentheses: CallParentheses,
+}
+
+/// One level of indentation, written `indent = "editor"`, `indent = "tab"`
+/// or `indent = 2` for two spaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "IndentValue")]
+pub enum Indent {
+    /// Tabs or spaces as the editor indents; JSON's `null` means the same.
+    Editor,
+    /// One tab.
+    Tab,
+    /// This many spaces.
+    Spaces(u32),
+}
+
+/// [`Indent`] as written: a word, a count, or JSON's `null`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum IndentValue {
+    /// `null`.
+    Unset(()),
+    /// A number of spaces.
+    Spaces(u32),
+    /// `"editor"` or `"tab"`.
+    Word(String),
+}
+
+impl TryFrom<IndentValue> for Indent {
+    type Error = String;
+    fn try_from(value: IndentValue) -> Result<Self, String> {
+        match value {
+            IndentValue::Unset(()) => Ok(Self::Editor),
+            IndentValue::Spaces(columns) => Ok(Self::Spaces(columns)),
+            IndentValue::Word(word) => match word.as_str() {
+                "editor" => Ok(Self::Editor),
+                "tab" => Ok(Self::Tab),
+                _ => Err(format!(
+                    "`{word}`: expected \"editor\", \"tab\" or a number of spaces"
+                )),
+            },
+        }
+    }
 }
 
 /// `inlayHints.*`: which inferred types are shown inline, and where.
@@ -173,53 +249,53 @@ pub struct FormattingSettings {
 #[serde(from = "HintConfiguration")]
 pub struct InlayHintSettings {
     /// After each call whose arguments are bracketed, as `f(x)`, `f()` or
-    /// `f(x, y)`, but not `f x`: the type it returns. Default `true`.
+    /// `f(x, y)`, but not `f x`: the type it returns.
     pub after_call: bool,
     /// At the end of each line: the type of the last expression complete on
-    /// it, as `2` after `2+` and `2+2` after the `2` below it. Default `true`.
+    /// it, as `2` after `2+` and `2+2` after the `2` below it.
     pub after_line_end: bool,
     /// After each top-level expression, as Macaulay2's `oN : T` line.
-    /// Default `true`.
+    ///
     pub after_cell: bool,
     /// After a name being assigned, where its type is first known or
-    /// changes. Default `true`.
+    /// changes.
     pub during_assignment: bool,
     /// Before each argument of a call, the name of the parameter it is
-    /// passed to, as `f(x: 2)`. Default `true`.
+    /// passed to, as `f(x: 2)`.
     pub arg_names: bool,
     /// Before each argument of a call, the type the parameter it is passed
     /// to is declared for, as `f(Number 2)`, or with argument names `f(Number x:
-    /// 2)`. Default `false`.
+    /// 2)`.
     pub arg_types: bool,
     /// After each parenthesized value, as `(2)` or `(a + b)`: the type of
     /// the value it evaluates to. Not after collections such as `(2,)`,
-    /// `()`, `[2]` or `{2}`, nor after a call's arguments. Default `false`.
+    /// `()`, `[2]` or `{2}`, nor after a call's arguments.
     pub after_brackets: bool,
-    /// After the value a function returns. Default `false`.
+    /// After the value a function returns.
     pub after_return: bool,
-    /// After every expression. Default `false`.
+    /// After every expression.
     pub everywhere: bool,
-    /// Also the types a literal states, as in `x = 3`. Default `false`.
+    /// Also the types a literal states, as in `x = 3`.
     pub show_literal: bool,
     /// Marks a type standing also for its subtypes with `↑`, as `↑Ring`.
-    /// Default `true`.
+    ///
     pub show_upper_closure: bool,
     /// Also the hints that say nothing, of values only known to be a
-    /// `Thing`. Default `false`.
+    /// `Thing`.
     pub show_thing: bool,
     /// Also the hints of values known to be `null`, of type `Nothing`.
-    /// Default `false`.
+    ///
     pub show_nothing: bool,
     /// Also the types a nearby hint already shows: a binding's unchanged
-    /// type, and an assignment's beside its binding's. Default `false`.
+    /// type, and an assignment's beside its binding's.
     pub show_repeated: bool,
     /// Types never shown, e.g. `["ZZ", "String"]`.
     pub hide_types: HashSet<ObjectName>,
     /// Drops the hints of values a `;` ends, whose value is discarded.
-    /// Default `false`.
+    ///
     pub hide_after_semicolon: bool,
     /// The longest label shown in full; a longer one is cut, its whole type
-    /// in the tooltip. `0` or `null` never cuts. Unlimited by default.
+    /// in the tooltip. `0` or `null` never cuts.
     pub max_label_length: Option<u32>,
     /// Functions whose calls and arguments get no hints, e.g. `["print"]`.
     pub excluded_calls: HashSet<ObjectName>,
@@ -242,16 +318,16 @@ pub struct InlayHintSettings {
 /// The legend offers standard token types, custom escape sequences, and both
 /// standard and custom modifiers. Changes take effect through a semantic-token
 /// refresh.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SemanticTokenSettings {
     /// Only LSP-standard classifications: custom escapes become strings,
     /// delimiters and punctuation become operators, algebraic modifiers become
     /// abstract, and documentation styles become documentation. Remaining custom
-    /// modifiers are dropped. Default `false`.
+    /// modifiers are dropped.
     pub standard_only: bool,
     /// Which values receive `defaultLibrary`: a named policy or a list of
-    /// policies and defining packages. Default `["CompiledFunction"]`.
+    /// policies and defining packages.
     pub default_library: DefaultLibrarySetting,
 }
 
@@ -264,12 +340,6 @@ pub enum DefaultLibrarySetting {
     Mode(DefaultLibraryMode),
     /// Policy and package selectors combined by union, written as an array.
     Selectors(Vec<String>),
-}
-
-impl Default for DefaultLibrarySetting {
-    fn default() -> Self {
-        Self::Selectors(vec!["CompiledFunction".to_string()])
-    }
 }
 
 /// Named policies for `semanticTokens.defaultLibrary`. Package policies apply
@@ -293,17 +363,17 @@ pub enum DefaultLibraryMode {
 /// `sources.*`: where the Macaulay2 library sources are, for navigation and
 /// for analyzing the files implementing the library.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceSettings {
     /// Whether the library sources are discovered at all: navigation enters
     /// them, the discovered Core sources are analyzed as primary code, and
-    /// the discovered `init.m2` is the init file. Default `true`.
+    /// the discovered `init.m2` is the init file.
     pub enabled: bool,
     /// Searched before the discovered installation: each an `M2` executable
     /// or an installation prefix (a build tree's `usr-dist` included),
     /// standing for that installation, or else a directory added to
     /// Macaulay2's `path`. A leading `~` is the home directory.
-    #[serde(rename = "packagePaths", alias = "paths")]
+    #[serde(rename = "packagePaths")]
     pub paths: Vec<PathBuf>,
     /// Directories whose files implement the library itself, analyzed as if
     /// each declared `-- m2-ls: primaryCode`, in addition to the discovered
@@ -314,61 +384,16 @@ pub struct SourceSettings {
     /// `-- m2-ls: initFile` comment selects another: `true` for the
     /// discovered `init.m2`, `false` for none, or a path, relative to the
     /// workspace folder, a leading `~` the home directory. Independent of
-    /// `enabled` when a path. Default `true`.
-    pub init_file: InitFileChoice,
+    /// `enabled` when a path. Unset leaves the init file to
+    /// `initialization.files`.
+    pub init_file: Option<InitFileChoice>,
     /// Core source discovery: `auto`, `false`, or an explicit directory.
     pub core_path: CorePathSetting,
 }
 
-impl Default for DiagnosticSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            disabled: HashSet::new(),
-            warnings_as_hint: HashSet::new(),
-            warnings_as_info: HashSet::new(),
-            emit_as: DiagnosticEmissionSettings::default(),
-        }
-    }
-}
-
-impl Default for FormattingSettings {
-    fn default() -> Self {
-        Self {
-            indent: Some(4),
-            use_tabs: Some(true),
-            soft_line_width: Some(78),
-            hard_line_width: Some(90),
-            control_flow_layout: ControlFlowLayout::default(),
-            compact_factor_operators: true,
-            break_after_semicolon: false,
-            keep_line_breaks: false,
-            space_in_braces: None,
-        }
-    }
-}
-
-impl Default for InlayHintSettings {
-    fn default() -> Self {
-        HintConfiguration::default().into()
-    }
-}
-
-impl Default for SourceSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            paths: Vec::new(),
-            primary_code_paths: Vec::new(),
-            init_file: InitFileChoice::Discovered,
-            core_path: CorePathSetting::default(),
-        }
-    }
-}
-
 /// Grouped hint configuration accepted from editor settings and configuration files.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HintConfiguration {
     /// Parameter-name hint controls.
     pub arg_names: ArgumentNameSettings,
@@ -388,26 +413,17 @@ pub struct HintConfiguration {
 
 /// Type annotations, independently enabled from parameter-name annotations.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TypeHintSettings {
-    /// Enable type annotations. Default `true`.
+    /// Enable type annotations.
     pub enabled: bool,
     /// Expression positions after which annotations are displayed.
     pub after: TypeHintPositions,
 }
 
-impl Default for TypeHintSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            after: TypeHintPositions::default(),
-        }
-    }
-}
-
 /// Independent positions at which the type of an expression is displayed.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TypeHintPositions {
     /// After the result of a function call.
     pub call: bool,
@@ -424,22 +440,9 @@ pub struct TypeHintPositions {
     pub return_value: bool,
 }
 
-impl Default for TypeHintPositions {
-    fn default() -> Self {
-        Self {
-            call: true,
-            end_of_line: true,
-            end_of_cell: true,
-            assignment: true,
-            brackets: HashSet::from([HintBracket::Parentheses]),
-            return_value: false,
-        }
-    }
-}
-
 /// Filters shared by type hint positions.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HiddenHintSettings {
     /// Type names whose hints are omitted.
     pub types: HashSet<ObjectName>,
@@ -457,24 +460,6 @@ pub struct HiddenHintSettings {
     pub before_semicolon: bool,
     /// Hide operator operand parameter labels, preserving expression type hints.
     pub operator_calls: bool,
-}
-
-impl Default for HiddenHintSettings {
-    fn default() -> Self {
-        Self {
-            types: HashSet::from([ObjectName::new("Thing"), ObjectName::new("Nothing")]),
-            calls: ["toString", "net", "toList"]
-                .into_iter()
-                .map(ObjectName::new)
-                .collect(),
-            non_exact_mark: false,
-            literal: true,
-            trivial: true,
-            sequential: true,
-            before_semicolon: false,
-            operator_calls: true,
-        }
-    }
 }
 
 impl From<HintConfiguration> for InlayHintSettings {
@@ -514,8 +499,8 @@ impl From<HintConfiguration> for InlayHintSettings {
 
 /// Rules explicitly assigned to each diagnostic publication category.
 /// If a rule is listed more than once, the first category in field order wins.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiagnosticEmissionSettings {
     /// Rules emitted as errors, regardless of their original severity.
     pub error: HashSet<DiagnosticCode>,
@@ -531,27 +516,16 @@ pub struct DiagnosticEmissionSettings {
 
 /// Controls the presentation of argument names without truncating type labels.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ArgumentNameSettings {
-    /// Whether parameter names are shown. Default `true`.
+    /// Whether parameter names are shown.
     pub enabled: bool,
-    /// Show names only for calls with bracketed arguments. Default `true`.
+    /// Show names only for calls with bracketed arguments.
     pub require_bracket: bool,
-    /// Omit names for variadic parameters. Default `true`.
+    /// Omit names for variadic parameters.
     pub ignore_variadic: bool,
     /// Maximum parameter-name length, or no limit with `0` or `null`.
     pub max_length: Option<u32>,
-}
-
-impl Default for ArgumentNameSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            require_bracket: true,
-            ignore_variadic: true,
-            max_length: Some(15),
-        }
-    }
 }
 
 impl ArgumentNameSettings {
@@ -600,7 +574,7 @@ pub enum HintBracket {
 
 /// Explicit Macaulay2 installation paths; omitted paths are discovered.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Macaulay2Settings {
     /// The Macaulay2 executable, overriding discovery through PATH.
     pub executable: Option<PathBuf>,
@@ -612,31 +586,12 @@ pub struct Macaulay2Settings {
     pub runtime_discovery: bool,
 }
 
-impl Default for Macaulay2Settings {
-    fn default() -> Self {
-        Self {
-            executable: None,
-            prefix: None,
-            application_directory: None,
-            runtime_discovery: true,
-        }
-    }
-}
-
 /// Files supplying the initial globals and packages of document sessions.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InitializationSettings {
     /// Initialization files in execution order; an empty list disables initialization.
     pub files: Vec<PathBuf>,
-}
-
-impl Default for InitializationSettings {
-    fn default() -> Self {
-        Self {
-            files: vec![PathBuf::from("${applicationDirectory}/init.m2")],
-        }
-    }
 }
 
 /// Whether Core sources are discovered, disabled, or selected explicitly.
@@ -648,12 +603,6 @@ pub enum CorePathSetting {
     Path(PathBuf),
     /// `false` disables Core sources; `true` enables automatic discovery.
     Enabled(bool),
-}
-
-impl Default for CorePathSetting {
-    fn default() -> Self {
-        Self::Path(PathBuf::from("auto"))
-    }
 }
 
 /// Settings read from a client, plus every value that could not be used.
@@ -728,35 +677,79 @@ impl ServerSettings {
         value.get("m2-ls").or(legacy_section).unwrap_or(value)
     }
 
-    /// Read the settings in `value`, either the section itself or an object
-    /// holding it. Each value that fails to deserialize is reported, removed,
-    /// and the rest read again, until what remains reads cleanly.
-    pub fn from_value(value: &Value) -> ParsedSettings {
-        let mut section = Self::section(value).clone();
-        if section.is_null() {
-            section = Value::Object(Default::default());
+    /// The defaults file, compiled in: every setting's value where no
+    /// global, project or editor layer sets it.
+    pub const DEFAULTS_FILE: &str = include_str!("settings/defaults.toml");
+
+    /// The settings [`Self::DEFAULTS_FILE`] gives on its own.
+    pub fn defaults() -> &'static Self {
+        static DEFAULTS: LazyLock<ServerSettings> = LazyLock::new(|| {
+            serde_path_to_error::deserialize(ServerSettings::defaults_section())
+                .unwrap_or_else(|error| panic!("the defaults file: {error}"))
+        });
+        &DEFAULTS
+    }
+
+    /// [`Self::DEFAULTS_FILE`] as a settings section.
+    fn defaults_section() -> &'static Value {
+        static SECTION: LazyLock<Value> = LazyLock::new(|| {
+            toml::from_str(ServerSettings::DEFAULTS_FILE)
+                .unwrap_or_else(|error| panic!("the defaults file: {error}"))
+        });
+        &SECTION
+    }
+
+    /// `section` laid over the defaults file: tables merge, other values
+    /// replace. An item `section` lists in one of an opposed pair of lists
+    /// leaves the other list's default.
+    fn over_defaults(section: &Value) -> Value {
+        let mut merged = Self::defaults_section().clone();
+        for [first, second] in OPPOSED_LISTS {
+            for (listed, opposed) in [(first, second), (second, first)] {
+                if let (Some(Value::Array(listed)), Some(Value::Array(opposed))) =
+                    (section.pointer(listed), merged.pointer_mut(opposed))
+                {
+                    opposed.retain(|item| !listed.contains(item));
+                }
+            }
         }
-        let mut problems = InlayHintSettings::upgrade_deprecated_keys(&mut section);
+        ProjectConfiguration::merge(&mut merged, section);
+        merged
+    }
+
+    /// Read the settings in `value`, either the section itself or an object
+    /// holding it, over the defaults file. Each value that fails to
+    /// deserialize is reported and dropped, so its default shows through.
+    pub fn from_value(value: &Value) -> ParsedSettings {
+        let mut problems = Vec::new();
+        let mut section = match Self::section(value) {
+            Value::Object(fields) => Value::Object(fields.clone()),
+            Value::Null => Value::Object(Map::new()),
+            other => {
+                problems.push(SettingProblem {
+                    path: "settings".to_string(),
+                    issue: SettingIssue::Invalid(format!("expected a table, found {other}")),
+                });
+                Value::Object(Map::new())
+            }
+        };
+        problems.extend(InlayHintSettings::upgrade_deprecated_keys(&mut section));
+        problems.extend(FormattingSettings::upgrade_deprecated_keys(&mut section));
+        problems.extend(SourceSettings::upgrade_deprecated_keys(&mut section));
         Self::upgrade_hint_layout(&mut section);
         loop {
-            match serde_path_to_error::deserialize::<_, Self>(&section) {
+            match serde_path_to_error::deserialize::<_, Self>(&Self::over_defaults(&section)) {
                 Ok(settings) => return ParsedSettings { settings, problems },
                 Err(error) => {
-                    let removed = Self::remove_value(&mut section, error.path());
+                    assert!(
+                        Self::remove_value(&mut section, error.path()),
+                        "the defaults file is rejected at `{}`",
+                        error.path()
+                    );
                     problems.push(SettingProblem {
-                        path: if error.path().iter().next().is_some() {
-                            error.path().to_string()
-                        } else {
-                            "settings".to_string()
-                        },
+                        path: error.path().to_string(),
                         issue: SettingIssue::Invalid(error.into_inner().to_string()),
                     });
-                    if !removed {
-                        return ParsedSettings {
-                            settings: Self::default(),
-                            problems,
-                        };
-                    }
                 }
             }
         }
@@ -874,20 +867,114 @@ impl ServerSettings {
     }
 }
 
-impl InlayHintSettings {
+/// A group of settings under one key of the section, e.g. `formatting`,
+/// whose deprecated keys are read as the settings replacing them.
+trait SettingsGroup {
     /// The group's key in the settings section.
-    const SECTION_KEY: &str = "inlayHints";
+    const SECTION_KEY: &str;
 
-    /// Rewrite the keys of the `inlayHints` group in `section` that 2.0.0
-    /// read into the settings replacing them, reporting each as deprecated.
-    /// A replacing setting the client sets itself keeps its value.
+    /// Rewrite the deprecated keys of the group in `section` into the
+    /// settings replacing them, reporting each as deprecated. A replacing
+    /// setting the client sets itself keeps its value.
     fn upgrade_deprecated_keys(section: &mut Value) -> Vec<SettingProblem> {
-        let Some(group) = section
+        section
             .get_mut(Self::SECTION_KEY)
             .and_then(Value::as_object_mut)
-        else {
-            return Vec::new();
-        };
+            .map(Self::upgrade_group)
+            .unwrap_or_default()
+    }
+
+    /// [`Self::upgrade_deprecated_keys`] within the group's own fields.
+    fn upgrade_group(group: &mut Map<String, Value>) -> Vec<SettingProblem>;
+
+    /// Remove the deprecated `key` from `group`, setting what `replacing`
+    /// translates its value into where the client has not, and report it
+    /// as read as `replacement`.
+    fn upgrade_deprecated_key(
+        group: &mut Map<String, Value>,
+        key: &str,
+        replacement: &'static str,
+        replacing: impl FnOnce(&Value) -> Vec<(&'static str, Value)>,
+    ) -> Option<SettingProblem> {
+        let value = group.remove(key)?;
+        for (replacing_key, replacing_value) in replacing(&value) {
+            group.entry(replacing_key).or_insert(replacing_value);
+        }
+        Some(SettingProblem {
+            path: format!("{}.{key}", Self::SECTION_KEY),
+            issue: SettingIssue::Deprecated(replacement),
+        })
+    }
+}
+
+impl SettingsGroup for FormattingSettings {
+    const SECTION_KEY: &str = "formatting";
+
+    /// `softLineWidth` is read as `softWrapWidth`. `spaceInBraces` (2.7.0) is read as `{}` listed under
+    /// `brackets.spacesInside` or `brackets.compact`. `useTabs` (2.7.0) is
+    /// read into `indent`: its old companion `indent = N`, `4` when unset,
+    /// was the width of a tab or the count of spaces.
+    fn upgrade_group(group: &mut Map<String, Value>) -> Vec<SettingProblem> {
+        let columns = group
+            .get("indent")
+            .and_then(Value::as_u64)
+            .unwrap_or(Self::LEGACY_INDENT_COLUMNS);
+        let tabs = group.get("useTabs").and_then(Value::as_bool);
+        if tabs == Some(true) {
+            group.remove("indent");
+        }
+        let use_tabs = Self::upgrade_deprecated_key(
+            group,
+            "useTabs",
+            "`indent = \"tab\"` with `tabWidth`, or `indent` spaces",
+            |_| match tabs {
+                Some(true) => vec![("indent", "tab".into()), ("tabWidth", columns.into())],
+                Some(false) => vec![("indent", columns.into())],
+                None => Vec::new(),
+            },
+        );
+        let soft_line_width =
+            Self::upgrade_deprecated_key(group, "softLineWidth", "`softWrapWidth`", |value| {
+                vec![("softWrapWidth", value.clone())]
+            });
+        let space_in_braces = Self::upgrade_deprecated_key(
+            group,
+            "spaceInBraces",
+            "`brackets.spacesInside` or `brackets.compact` listing `{}`",
+            |value| {
+                let list = match value.as_bool() {
+                    Some(true) => "spacesInside",
+                    Some(false) => "compact",
+                    None => return Vec::new(),
+                };
+                vec![("brackets", serde_json::json!({ list: ["{}"] }))]
+            },
+        );
+        [use_tabs, soft_line_width, space_in_braces]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+}
+
+impl SettingsGroup for SourceSettings {
+    const SECTION_KEY: &str = "sources";
+
+    /// `paths` is read as `packagePaths`.
+    fn upgrade_group(group: &mut Map<String, Value>) -> Vec<SettingProblem> {
+        Self::upgrade_deprecated_key(group, "paths", "`packagePaths`", |value| {
+            vec![("packagePaths", value.clone())]
+        })
+        .into_iter()
+        .collect()
+    }
+}
+
+impl SettingsGroup for InlayHintSettings {
+    const SECTION_KEY: &str = "inlayHints";
+
+    /// The keys 2.0.0 replaced.
+    fn upgrade_group(group: &mut Map<String, Value>) -> Vec<SettingProblem> {
         let enabled = |value: &Value| *value == Value::Bool(true);
         [
             Self::upgrade_deprecated_key(group, "expressionTypes", "`everywhere`", |value| {
@@ -931,32 +1018,16 @@ impl InlayHintSettings {
         .flatten()
         .collect()
     }
-
-    /// Remove the deprecated `key` from `group`, setting what `replacing`
-    /// translates its value into where the client has not, and report it
-    /// as read as `replacement`.
-    fn upgrade_deprecated_key(
-        group: &mut Map<String, Value>,
-        key: &str,
-        replacement: &'static str,
-        replacing: impl FnOnce(&Value) -> Vec<(&'static str, Value)>,
-    ) -> Option<SettingProblem> {
-        let value = group.remove(key)?;
-        for (replacing_key, replacing_value) in replacing(&value) {
-            group.entry(replacing_key).or_insert(replacing_value);
-        }
-        Some(SettingProblem {
-            path: format!("{}.{key}", Self::SECTION_KEY),
-            issue: SettingIssue::Deprecated(replacement),
-        })
-    }
 }
 
 impl DiagnosticSettings {
-    /// Whether findings filed under `code` are shown: diagnostics are enabled
-    /// and the user has not disabled this one.
+    /// Whether findings filed under `code` are shown: diagnostics are enabled,
+    /// the user has not disabled this one, and it changes no error into a value
+    /// unless the user opted into such rewrites.
     pub fn allows(&self, code: DiagnosticCode) -> bool {
-        self.enabled && !self.disabled.contains(&code)
+        self.enabled
+            && !self.disabled.contains(&code)
+            && (self.error_catching_rewrites || code != catalog::ERROR_CATCHING_REWRITE.code)
     }
 
     /// Whether the rule is published, rather than available only as a quick fix.
@@ -998,6 +1069,10 @@ impl DiagnosticSettings {
 }
 
 impl FormattingSettings {
+    /// The `indent` 2.7.0 assumed when unset, as a tab width or a count of
+    /// spaces depending on `useTabs`.
+    const LEGACY_INDENT_COLUMNS: u64 = 4;
+
     /// The soft and hard wrapping widths in effect: a zero width is none, and
     /// the soft width never exceeds the hard one.
     pub fn line_widths(&self) -> (Option<u32>, Option<u32>) {
@@ -1013,7 +1088,6 @@ impl FormattingSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnostics::catalog;
 
     /// Settings parsed from `value`, which must contain no invalid setting.
     fn valid_settings(value: Value) -> ServerSettings {
@@ -1027,12 +1101,21 @@ mod tests {
         let settings = valid_settings(serde_json::json!({}));
 
         assert!(settings.diagnostics.allows(catalog::UNUSED_BINDING.code));
-        assert_eq!(settings.formatting, FormattingSettings::default());
-        assert_eq!(settings.inlay_hints, InlayHintSettings::default());
+        assert_eq!(
+            settings.formatting,
+            ServerSettings::defaults().formatting.clone()
+        );
+        assert_eq!(
+            settings.inlay_hints,
+            ServerSettings::defaults().inlay_hints.clone()
+        );
         assert!(!settings.semantic_tokens.standard_only);
         assert_eq!(
             settings.semantic_tokens.default_library,
-            DefaultLibrarySetting::default()
+            ServerSettings::defaults()
+                .semantic_tokens
+                .default_library
+                .clone()
         );
         assert_eq!(valid_settings(Value::Null), settings);
     }
@@ -1046,8 +1129,7 @@ mod tests {
                 },
                 "formatting": {
                     "indent": 2,
-                    "useTabs": false,
-                    "softLineWidth": 88,
+                    "softWrapWidth": 88,
                     "hardLineWidth": 88,
                     "controlFlowLayout": "multiline",
                     "compactFactorOperators": true,
@@ -1077,8 +1159,7 @@ mod tests {
             .diagnostics
             .allows(catalog::OPTION_KEY_CONVENTION.code));
         assert!(settings.diagnostics.allows(catalog::SYNTAX_ERROR.code));
-        assert_eq!(settings.formatting.indent, Some(2));
-        assert_eq!(settings.formatting.use_tabs, Some(false));
+        assert_eq!(settings.formatting.indent, Indent::Spaces(2));
         assert_eq!(settings.formatting.line_widths(), (Some(88), Some(88)));
         assert_eq!(
             settings.formatting.control_flow_layout,
@@ -1106,7 +1187,7 @@ mod tests {
                     ignore_variadic: false,
                     max_length: None
                 },
-                ..InlayHintSettings::default()
+                ..ServerSettings::defaults().inlay_hints.clone()
             }
         );
         assert!(settings.semantic_tokens.standard_only);
@@ -1132,7 +1213,7 @@ mod tests {
                 after_line_end: false,
                 show_thing: true,
                 show_repeated: false,
-                ..InlayHintSettings::default()
+                ..ServerSettings::defaults().inlay_hints.clone()
             }
         );
         let problems = parsed
@@ -1189,7 +1270,10 @@ mod tests {
         }));
         assert_eq!(
             parsed.settings.semantic_tokens.default_library,
-            DefaultLibrarySetting::default()
+            ServerSettings::defaults()
+                .semantic_tokens
+                .default_library
+                .clone()
         );
         assert!(parsed.settings.semantic_tokens.standard_only);
         assert_eq!(parsed.problems.len(), 1);
@@ -1206,7 +1290,7 @@ mod tests {
                 },
                 "formatting": {
                     "indent": "two",
-                    "useTabs": true
+                    "tabWidth": 8
                 },
                 "inlayHints": "on"
             }
@@ -1215,9 +1299,12 @@ mod tests {
         let settings = &parsed.settings;
         assert!(!settings.diagnostics.allows(catalog::UNUSED_BINDING.code));
         assert!(settings.diagnostics.allows(catalog::SYNTAX_ERROR.code));
-        assert_eq!(settings.formatting.indent, Some(4));
-        assert_eq!(settings.formatting.use_tabs, Some(true));
-        assert_eq!(settings.inlay_hints, InlayHintSettings::default());
+        assert_eq!(settings.formatting.indent, Indent::Editor);
+        assert_eq!(settings.formatting.tab_width, Some(8));
+        assert_eq!(
+            settings.inlay_hints,
+            ServerSettings::defaults().inlay_hints.clone()
+        );
 
         let problems = parsed
             .problems
@@ -1234,7 +1321,7 @@ mod tests {
             "{problems:?}"
         );
         assert!(
-            problems[2].starts_with("`formatting.indent`: invalid type"),
+            problems[2].starts_with("`formatting.indent`: `two`: expected"),
             "{problems:?}"
         );
         assert!(
@@ -1247,7 +1334,7 @@ mod tests {
     fn a_section_that_is_not_an_object_keeps_the_defaults() {
         let parsed = ServerSettings::from_value(&serde_json::json!("on"));
 
-        assert_eq!(parsed.settings, ServerSettings::default());
+        assert_eq!(parsed.settings, ServerSettings::defaults().clone());
         assert_eq!(parsed.problems.len(), 1);
         assert!(parsed.problems[0].to_string().starts_with("`settings`:"));
     }
@@ -1297,7 +1384,7 @@ mod tests {
         for width in [Value::Null, serde_json::json!(0)] {
             let settings = valid_settings(serde_json::json!({
                 "formatting": {
-                    "softLineWidth": width,
+                    "softWrapWidth": width,
                     "hardLineWidth": width
                 }
             }));
@@ -1310,7 +1397,7 @@ mod tests {
     fn parses_soft_and_hard_line_widths_and_clamps_the_soft_target() {
         let settings = valid_settings(serde_json::json!({
             "formatting": {
-                "softLineWidth": 90,
+                "softWrapWidth": 90,
                 "hardLineWidth": 110
             }
         }));
@@ -1318,7 +1405,7 @@ mod tests {
 
         let clamped = valid_settings(serde_json::json!({
             "formatting": {
-                "softLineWidth": 140,
+                "softWrapWidth": 140,
                 "hardLineWidth": 120
             }
         }));
@@ -1347,25 +1434,19 @@ mod tests {
 
     #[test]
     fn the_init_file_is_discovered_disabled_or_a_path() {
-        assert_eq!(
-            ServerSettings::default().sources.init_file,
-            InitFileChoice::Discovered
-        );
+        assert_eq!(ServerSettings::defaults().sources.init_file, None);
         let settings = valid_settings(serde_json::json!({"sources": {"initFile": false}}));
-        assert_eq!(settings.sources.init_file, InitFileChoice::Disabled);
+        assert_eq!(settings.sources.init_file, Some(InitFileChoice::Disabled));
         let settings =
             valid_settings(serde_json::json!({"sources": {"initFile": "~/project/init.m2"}}));
         assert_eq!(
             settings.sources.init_file,
-            InitFileChoice::Path(PathBuf::from("~/project/init.m2"))
+            Some(InitFileChoice::Path(PathBuf::from("~/project/init.m2")))
         );
         let parsed = ServerSettings::from_value(&serde_json::json!({
             "sources": {"initFile": "", "primaryCodePaths": ["~/M2"]}
         }));
-        assert_eq!(
-            parsed.settings.sources.init_file,
-            InitFileChoice::Discovered
-        );
+        assert_eq!(parsed.settings.sources.init_file, None);
         assert_eq!(
             parsed.settings.sources.primary_code_paths,
             [PathBuf::from("~/M2")]
@@ -1381,13 +1462,13 @@ mod tests {
 
         assert_eq!(store.snapshot(), vec![1, 2, 3]);
     }
-    /// The complete documented TOML example is the server's actual default configuration.
+    /// The compiled-in defaults file reads with no problem, as a user's file too.
     #[test]
-    fn grouped_example_matches_every_default() {
-        let value = toml::from_str(include_str!("../tests/fixtures/configuration.toml")).unwrap();
+    fn the_defaults_file_reads_cleanly() {
+        let value = toml::from_str(ServerSettings::DEFAULTS_FILE).unwrap();
         let parsed = ServerSettings::from_value(&value);
         assert!(parsed.problems.is_empty(), "{:?}", parsed.problems);
-        assert_eq!(parsed.settings, ServerSettings::default());
+        assert_eq!(parsed.settings, ServerSettings::defaults().clone());
     }
 
     /// Invalid nested settings retain valid siblings and defaults for rejected values.
@@ -1413,6 +1494,6 @@ mod tests {
         assert_eq!(parsed.problems.len(), 2, "{:?}", parsed.problems);
         let store = SettingsStore::new(parsed.settings);
         store.replace(ServerSettings::from_value(&serde_json::json!({})).settings);
-        assert_eq!(store.snapshot(), ServerSettings::default());
+        assert_eq!(store.snapshot(), ServerSettings::defaults().clone());
     }
 }

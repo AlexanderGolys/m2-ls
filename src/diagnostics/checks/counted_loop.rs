@@ -8,10 +8,7 @@
 use std::collections::HashSet;
 use std::ptr;
 
-use m2_syn::nodes::{
-    Expr, ExprAssign, ExprAssignSimple, ExprControl, ExprLambda, ExprLiteral, ExprOp, Holder,
-    PackedContent,
-};
+use m2_syn::nodes::{AssignOperator, Elements, Expr, ExprAssign, ExprFunction, ExprParen, Literal};
 use m2_syn::visit::{self, Visit};
 use m2_syn::Token;
 
@@ -39,45 +36,48 @@ impl CountedLoops<'_, '_> {
 
     /// Checks one adjacent initializer/loop pair, allowing the loop to be the
     /// block's final value as well as a semicolon-terminated statement.
-    fn check(&mut self, block: &Holder, index: usize) -> Option<()> {
-        let PackedContent::Expr(initializer) = &block.muted[index].content else {
+    fn check(&mut self, block: &ExprParen, index: usize) -> Option<()> {
+        let Elements::Single(initializer) = &block.stmts[index].elems else {
             return None;
         };
-        let Expr::Assign(ExprAssign::Simple(ExprAssignSimple::Local(binding))) =
-            initializer.as_ref()
+        let Expr::Assign(binding) = initializer.as_ref() else {
+            return None;
+        };
+        let (
+            AssignOperator::Local(_),
+            Expr::Symbol(variable),
+            Expr::Literal(Literal::Integer(start)),
+        ) = (&binding.op, binding.left.as_ref(), binding.right.as_ref())
         else {
             return None;
         };
-        let Expr::Literal(ExprLiteral::Integer(start)) = binding.value.as_ref() else {
-            return None;
-        };
         let initial = start.text().parse::<isize>().ok()?;
-        let counter = binding.variable.text();
-        let next = match block.muted.get(index + 1) {
-            Some(statement) => match &statement.content {
-                PackedContent::Expr(expression) => expression.as_ref(),
-                PackedContent::Pack(_) => return None,
+        let counter = variable.text();
+        let next = match block.stmts.get(index + 1) {
+            Some(statement) => match &statement.elems {
+                Elements::Single(expression) => expression.as_ref(),
+                Elements::Pack(_) => return None,
             },
-            None => block.value.as_deref()?,
+            None => block.expr.as_deref()?,
         };
         let Expr::While(loop_) = next else {
             return None;
         };
-        let comparison = loop_.condition.infix_operands()?;
+        let comparison = loop_.cond.infix_operands()?;
         if comparison.left.symbol_name() != Some(counter)
             || !matches!(comparison.operator, "<" | "<=")
-            || loop_.body.list_step.is_some()
+            || loop_.body.list_clause.is_some()
         {
             return None;
         }
         let bound = comparison.right.unparenthesized()?;
         match bound {
-            Expr::Literal(ExprLiteral::Integer(integer)) => {
+            Expr::Literal(Literal::Integer(integer)) => {
                 integer.text().parse::<isize>().ok()?;
             }
-            Expr::Op(ExprOp::Prefix(prefix))
-                if prefix.operator.spelling() == <Token![#]>::SPELLING
-                    && prefix.operand.symbol_name().is_some() => {}
+            Expr::Prefix(prefix)
+                if prefix.op.spelling() == <Token![#]>::SPELLING
+                    && prefix.expr.symbol_name().is_some() => {}
             _ => return None,
         }
         let mut bound_references = BindingReferences::default();
@@ -90,14 +90,14 @@ impl CountedLoops<'_, '_> {
         if bound_names.contains(counter) {
             return None;
         }
-        let Expr::Holder(body) = loop_.body.do_step.as_ref()?.statement.as_ref() else {
+        let Expr::Paren(body) = loop_.body.do_clause.as_ref()?.expr.as_ref() else {
             return None;
         };
-        let increment = match body.value.as_deref() {
+        let increment = match body.expr.as_deref() {
             Some(value) => value,
-            None => match &body.muted.last()?.content {
-                PackedContent::Expr(expression) => expression.as_ref(),
-                PackedContent::Pack(_) => return None,
+            None => match &body.stmts.last()?.elems {
+                Elements::Single(expression) => expression.as_ref(),
+                Elements::Pack(_) => return None,
             },
         };
         let increment = Self::unit_increment(increment, counter)?;
@@ -108,9 +108,9 @@ impl CountedLoops<'_, '_> {
             changes_iteration: false,
             checking_condition: true,
         };
-        effects.visit_expr(&loop_.condition);
+        effects.visit_expr(&loop_.cond);
         effects.checking_condition = false;
-        effects.visit_holder(body);
+        effects.visit_expr_paren(body);
         if effects.changes_iteration || Self::used_outside_loop(block, index, counter) {
             return None;
         }
@@ -139,17 +139,17 @@ impl CountedLoops<'_, '_> {
         let Expr::Assign(assignment) = expression else {
             return None;
         };
-        let value = match assignment {
-            ExprAssign::Augmented(assignment)
-                if assignment.target.symbol_name() == Some(counter)
-                    && assignment.operator.spelling() == <Token![+=]>::SPELLING =>
+        if assignment.left.symbol_name() != Some(counter) {
+            return None;
+        }
+        let value = match &assignment.op {
+            AssignOperator::Augmented(operator)
+                if operator.spelling() == <Token![+=]>::SPELLING =>
             {
-                assignment.value.as_ref()
+                assignment.right.as_ref()
             }
-            ExprAssign::Simple(ExprAssignSimple::Global(assignment))
-                if assignment.variable.text() == counter =>
-            {
-                let addition = assignment.value.infix_operands()?;
+            AssignOperator::Global(_) => {
+                let addition = assignment.right.infix_operands()?;
                 if addition.operator != <Token![+]>::SPELLING
                     || addition.left.symbol_name() != Some(counter)
                 {
@@ -159,7 +159,7 @@ impl CountedLoops<'_, '_> {
             }
             _ => return None,
         };
-        let Expr::Literal(ExprLiteral::Integer(integer)) = value else {
+        let Expr::Literal(Literal::Integer(integer)) = value else {
             return None;
         };
         (integer.text().parse::<u8>() == Ok(1)).then_some(assignment)
@@ -168,15 +168,15 @@ impl CountedLoops<'_, '_> {
     /// A `for` index has a narrower scope than the original local. Reject
     /// references elsewhere in the block, including forward references and
     /// references captured by callbacks created before or after the loop.
-    fn used_outside_loop(block: &Holder, initializer: usize, counter: &str) -> bool {
+    fn used_outside_loop(block: &ExprParen, initializer: usize, counter: &str) -> bool {
         let mut references = BindingReferences::default();
-        for (index, statement) in block.muted.iter().enumerate() {
+        for (index, statement) in block.stmts.iter().enumerate() {
             if index != initializer && index != initializer + 1 {
-                references.visit_statement(statement);
+                references.visit_stmt(statement);
             }
         }
-        if initializer + 1 < block.muted.len() {
-            if let Some(value) = &block.value {
+        if initializer + 1 < block.stmts.len() {
+            if let Some(value) = &block.expr {
                 references.visit_expr(value);
             }
         }
@@ -186,11 +186,11 @@ impl CountedLoops<'_, '_> {
 
 impl<'ast> Visit<'ast> for CountedLoops<'_, '_> {
     /// Checks each possible initializer before descending into nested blocks.
-    fn visit_holder(&mut self, block: &'ast Holder) {
-        for index in 0..block.muted.len() {
+    fn visit_expr_paren(&mut self, block: &'ast ExprParen) {
+        for index in 0..block.stmts.len() {
             self.check(block, index);
         }
-        visit::visit_holder(self, block);
+        visit::visit_expr_paren(self, block);
     }
 }
 
@@ -218,7 +218,7 @@ impl CounterEffects<'_> {
             AssignmentTarget::List(list) => references
                 .0
                 .extend(AssignmentTarget::List(list).bound_symbols()),
-            AssignmentTarget::Operator(operation) => references.visit_expr_op(operation),
+            AssignmentTarget::Operator(operation) => references.visit_expr(operation),
             AssignmentTarget::Augmented(expression) | AssignmentTarget::Evaluated(expression) => {
                 references.visit_expr(expression)
             }
@@ -253,13 +253,13 @@ impl<'ast> Visit<'ast> for CounterEffects<'_> {
 
     /// `continue` skips the explicit increment in a `while`, but increments the
     /// index of a `for`. Nested loops are conservatively excluded too.
-    fn visit_expr_control(&mut self, control: &'ast ExprControl) {
-        self.changes_iteration |= matches!(control, ExprControl::Continue(_));
-        visit::visit_expr_control(self, control);
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        self.changes_iteration |= matches!(expression, Expr::Continue(_));
+        visit::visit_expr(self, expression);
     }
 
     /// A closure can expose the counter beyond the scope of a new `for` index.
-    fn visit_expr_lambda(&mut self, _lambda: &'ast ExprLambda) {
+    fn visit_expr_function(&mut self, _function: &'ast ExprFunction) {
         self.changes_iteration = true;
     }
 }

@@ -83,3 +83,9 @@ no catalog documentation; types and documented option values may be unavailable.
 - What is in scope follows source order: a binding written further down is not
   offered, and a package's names appear only after the line importing it.
 - Completion never inserts snippets or parentheses; it finishes the name.
+
+Options declared in source with `method(Options => {...})` or `{...} >> ...`
+also supply option-key completions. Option-value suggestions include visible
+bindings whose inferred types satisfy the accepted option types, alongside
+explicitly documented symbolic values. A local function shadows a catalog
+function of the same name, including its option list.

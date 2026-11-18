@@ -9,7 +9,7 @@
 //! operator that has an augmented form: `+ - * / // % ^ | & ++ ** << >> @@ …`
 //! have one, while `== < <= or and ? :` and the rest do not.
 
-use m2_syn::nodes::{Expr, ExprAssign, ExprAssignSimple, PackedContent};
+use m2_syn::nodes::{AssignOperator, Elements, Expr};
 
 use super::RewriteSites;
 use crate::analysis::InfixSyntax;
@@ -21,12 +21,16 @@ impl<'ast, Source: SourceNavigation + ?Sized> RewriteSites<'ast, '_, Source> {
     /// The augmented assignment `x op= e` that `expression`, `x = x op e`,
     /// abbreviates.
     pub(super) fn augmented_assignment(&self, expression: &'ast Expr) -> Option<String> {
-        let Expr::Assign(ExprAssign::Simple(ExprAssignSimple::Global(assignment))) = expression
+        let Expr::Assign(assignment) = expression else {
+            return None;
+        };
+        let (AssignOperator::Global(_), Expr::Symbol(symbol)) =
+            (&assignment.op, assignment.left.as_ref())
         else {
             return None;
         };
-        let target = assignment.variable.text();
-        let operands = assignment.value.infix_operands()?;
+        let target = symbol.text();
+        let operands = assignment.right.infix_operands()?;
         if operands.left.symbol_name() != Some(target) {
             return None;
         }
@@ -50,9 +54,9 @@ impl<'ast, Source: SourceNavigation + ?Sized> RewriteSites<'ast, '_, Source> {
         cell.parse_error().is_none()
             && cell.syntax().is_some_and(|syntax| {
                 matches!(
-                    &syntax.content,
-                    PackedContent::Expr(value)
-                        if matches!(value.as_ref(), Expr::Assign(ExprAssign::Augmented(_)))
+                    &syntax.elems,
+                    Elements::Single(value)
+                        if matches!(value.as_ref(), Expr::Assign(assignment) if matches!(assignment.op, AssignOperator::Augmented(_)))
                 )
             })
     }

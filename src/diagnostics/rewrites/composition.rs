@@ -1,6 +1,6 @@
 //! Typed recognition of composed lambdas and semantic checks for mapping them.
 
-use m2_syn::nodes::{Expr, ExprLambda, ExprOp, ExprOpBin, ExprOpBinAdj};
+use m2_syn::nodes::{Expr, ExprBinary, FunctionParams};
 
 use crate::analysis::Analysis;
 use crate::object_registry::ObjectRegistry;
@@ -19,7 +19,7 @@ const APPLY: &str = "apply";
 #[derive(Debug, Clone, Copy)]
 pub struct MappingComposition<'ast> {
     /// Original mapping call, used to check whether `apply` is shadowed.
-    call: &'ast ExprOpBinAdj,
+    call: &'ast ExprBinary,
     /// Input traversed by `apply` and by `/`.
     pub collection: &'ast Expr,
     /// Function applied after the inner function.
@@ -33,14 +33,11 @@ impl<'ast> MappingComposition<'ast> {
     /// Rejects extra arguments, multiple parameters, and use of the parameter
     /// as a function head, since that binding disappears in the replacement.
     pub fn of(expression: &'ast Expr) -> Option<Self> {
-        if !matches!(expression, Expr::Op(ExprOp::Bin(ExprOpBin::Adj(_)))) {
-            return None;
-        }
         let call = UnarySymbolCall::application(expression)?;
-        if call.left_operand.symbol_name()? != APPLY {
+        if call.left.symbol_name()? != APPLY {
             return None;
         }
-        let arguments = UnarySymbolCall::grouped_value(&call.right_operand)?.arguments();
+        let arguments = UnarySymbolCall::grouped_value(&call.right)?.arguments();
         let [Some(collection), Some(callback)] = arguments.as_slice() else {
             return None;
         };
@@ -97,12 +94,15 @@ impl<'ast> LambdaComposition<'ast> {
     /// Fixed parameter lists unpack sequences differently and are excluded,
     /// as are extra arguments and callees referring to the removed parameter.
     pub fn of(expression: &'ast Expr) -> Option<Self> {
-        let Expr::Lambda(ExprLambda::Variadic(lambda)) = expression else {
+        let Expr::Function(lambda) = expression else {
             return None;
         };
         let outer = UnarySymbolCall::of(&lambda.body)?;
         let inner = UnarySymbolCall::of(outer.argument)?;
-        let parameter = lambda.argument.text();
+        let FunctionParams::Variadic(parameter) = &lambda.params else {
+            return None;
+        };
+        let parameter = parameter.text();
         if inner.argument.symbol_name()? != parameter
             || outer.function.symbol_name()? == parameter
             || inner.function.symbol_name()? == parameter

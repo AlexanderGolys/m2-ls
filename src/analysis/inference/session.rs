@@ -204,14 +204,17 @@ where
         else {
             return self.exact(symbol, TypeRole::Symbol);
         };
-        if current.syntax().is_none_or(|cell| cell.semicolon.is_some()) {
+        if current
+            .syntax()
+            .is_none_or(|cell| cell.semi_token.is_some())
+        {
             return self.exact(symbol, TypeRole::Symbol);
         }
         let previous = cells
             .iter()
             .take_while(|cell| cell.document_range().end <= current.document_range().start)
             .filter_map(|cell| cell.syntax())
-            .filter(|cell| cell.semicolon.is_none())
+            .filter(|cell| cell.semi_token.is_none())
             .collect::<Vec<_>>();
         let selected = match reference {
             OutputReference::Relative(distance) => {
@@ -224,16 +227,16 @@ where
             return self.exact(symbol, TypeRole::Symbol);
         };
         let scope = self
-            .position(&cell.content)
+            .position(&cell.elems)
             .and_then(|position| self.session.checker.find_scope_at(position))
             .unwrap_or(self.scope);
-        cell.content.infer(&self.session.context(scope))
+        cell.elems.infer(&self.session.context(scope))
     }
 
     /// Infers application with an explicitly selected argument, including precedence lowering.
     pub fn application_argument(
         &self,
-        application: &'ast ExprOpBinAdj,
+        application: &'ast ExprBinary,
         argument: &'ast Expr,
     ) -> InferredType {
         if let Some(result) = self.trailing_operator(application, argument) {
@@ -244,7 +247,7 @@ where
         };
         let checker = self.session.checker;
         let knowledge = checker.knowledge_at(position);
-        let callable = &application.left_operand;
+        let callable = &application.left;
         let name = callable.symbol_name();
         let facts = self.call_facts(argument, name, &knowledge);
         let Some(callable_position) = self.position(callable.as_ref()) else {
@@ -338,12 +341,15 @@ where
     /// Applies delimited arguments before a trailing infix operator without reparsing source.
     pub fn trailing_operator(
         &self,
-        application: &'ast ExprOpBinAdj,
+        application: &'ast ExprBinary,
         argument: &'ast Expr,
     ) -> Option<InferredType> {
         let binary = argument.infix_operands()?;
         let left = binary.left;
-        let applied = if matches!(left, Expr::Collection(_) | Expr::Holder(_)) {
+        let applied = if matches!(
+            left,
+            Expr::Array(_) | Expr::List(_) | Expr::Sequence(_) | Expr::AngleBar(_) | Expr::Paren(_)
+        ) {
             self.application_argument(application, left)
         } else {
             self.trailing_operator(application, left)?
@@ -423,11 +429,35 @@ where
             },
         )
     }
-    fn application(&self, application: &'ast ExprOpBinAdj) -> InferredType {
+    fn application(&self, application: &'ast ExprBinary) -> InferredType {
         if let Some(class) = application.method_class() {
             return self.exact(application, class);
         }
-        self.application_argument(application, &application.right_operand)
+        self.application_argument(application, &application.right)
+    }
+    fn field(&self, field: &'ast ExprField) -> InferredType {
+        let Some(position) = self.position(field) else {
+            return InferredType::unknown();
+        };
+        let checker = self.session.checker;
+        let knowledge = checker.knowledge_at(position);
+        let operator = match field.op {
+            FieldOperator::Dot(_) => ".",
+            FieldOperator::OptionalDot(_) => ".?",
+        };
+        checker.dispatch_codomain(
+            &knowledge,
+            &Operator {
+                token: ObjectName::new(operator),
+                form: OperatorForm::Binary,
+            },
+            &[
+                self.expression(&field.base),
+                self.exact(&field.member, TypeRole::Symbol),
+            ],
+            &[],
+            position,
+        )
     }
     fn binary(
         &self,
@@ -561,7 +591,7 @@ mod tests {
         expression: Option<&'ast Expr>,
     }
     impl<'ast> Visit<'ast> for LambdaBody<'ast> {
-        fn visit_expr_lambda_variadic(&mut self, lambda: &'ast ExprLambdaVariadic) {
+        fn visit_expr_function(&mut self, lambda: &'ast ExprFunction) {
             self.expression = Some(&lambda.body);
         }
     }

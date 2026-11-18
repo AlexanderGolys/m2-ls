@@ -11,7 +11,7 @@
 //! the end of its file is closed by Macaulay2 from a file-exit hook, so its
 //! section then runs to the end of the file.
 
-use m2_syn::nodes::{Expr, ExprDebug, ExprLiteral, ExprOpBinAdj};
+use m2_syn::nodes::{Expr, ExprBinary, ExprDebug, Literal};
 use m2_syn::visit::{self, Visit};
 use strum::{Display, EnumString, IntoStaticStr};
 use tower_lsp::lsp_types::{Position, Range as TextRange};
@@ -324,6 +324,17 @@ impl SourcePackages {
             .find(|declaration| declaration.contains(position))
     }
 
+    /// The exports the file alone shows to apply at `position`: those of the
+    /// section containing it or, in a file declaring no package, the file's
+    /// fragment exports, whose package a loader supplies.
+    pub fn exports_at(&self, position: Position) -> &[PackageExport] {
+        if self.declarations.is_empty() {
+            return &self.fragment_exports;
+        }
+        self.declaration_at(position)
+            .map_or(&[], |declaration| &declaration.exports)
+    }
+
     /// Mutable access to the package declaration active at the supplied source position.
     fn declaration_at_mut(&mut self, position: Position) -> Option<&mut PackageDeclaration> {
         self.declarations
@@ -397,12 +408,13 @@ impl<S: SourceNavigation + ?Sized> PackageCallCollector<'_, S> {
 }
 
 impl<'ast, S: SourceNavigation + ?Sized> Visit<'ast> for PackageCallCollector<'_, S> {
-    fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
-        if let (Some(head), Some(bytes)) = (
-            call.left_operand.symbol_name(),
-            self.source.syntax_bytes(call),
-        ) {
-            let argument = call.right_operand.arguments().into_iter().next().flatten();
+    fn visit_expr_binary(&mut self, call: &'ast ExprBinary) {
+        if !matches!(call.op, m2_syn::nodes::BinaryOperator::Space(_)) {
+            return visit::visit_expr_binary(self, call);
+        }
+        if let (Some(head), Some(bytes)) = (call.left.symbol_name(), self.source.syntax_bytes(call))
+        {
+            let argument = call.right.arguments().into_iter().next().flatten();
             if let Some(argument) = argument {
                 if head == Macaulay2Conventions::PACKAGE_CONSTRUCTOR {
                     if let Some(name) = argument
@@ -438,12 +450,12 @@ impl<'ast, S: SourceNavigation + ?Sized> Visit<'ast> for PackageCallCollector<'_
                 }
             }
         }
-        visit::visit_expr_op_bin_adj(self, call);
+        visit::visit_expr_binary(self, call);
     }
 
     fn visit_expr_debug(&mut self, debug: &'ast ExprDebug) {
-        if let ExprDebug::Test(test) = debug {
-            if let Some(body @ Expr::Literal(ExprLiteral::RawString(_))) = test.value.as_deref() {
+        if matches!(debug.keyword, m2_syn::nodes::DebugKeyword::Test(_)) {
+            if let Some(body @ Expr::Literal(Literal::RawString(_))) = debug.expr.as_deref() {
                 if let (Some(range), Some(body)) = (
                     self.source.range_for_syntax(debug),
                     body.literal_content_bytes(self.source),

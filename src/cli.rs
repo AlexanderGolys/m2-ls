@@ -203,6 +203,7 @@ impl Tool {
             return Ok(0);
         };
         let settings = options.settings()?;
+        crate::telemetry::set_level(settings.logging.level);
         let label = options.input.label();
         let text = options
             .input

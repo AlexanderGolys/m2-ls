@@ -510,6 +510,13 @@ impl ObjectRegistryView<'_> {
         self.registry.records_by_precedence_at(self.position)
     }
 
+    /// Whether `name` is bound at the view's position to a package, such as
+    /// `Core`, rather than to a value that only shares a package's spelling.
+    pub fn binds_package(&self, name: &ObjectName) -> bool {
+        self.get_record(name)
+            .is_some_and(|record| self.registry.catalog_package_id(name) == Some(&record.id))
+    }
+
     /// The name of the package `package`.
     pub fn package_name(&self, package: &ObjectId) -> Option<&str> {
         self.registry.package_name(package)
@@ -571,6 +578,11 @@ impl ObjectId {
     /// The identity as spelled.
     pub fn name(&self) -> &str {
         self.0.name()
+    }
+
+    /// The package made of Macaulay2's basic files, `$Core$Core`.
+    pub fn core_package() -> Self {
+        Self::new("$Core$Core")
     }
 }
 

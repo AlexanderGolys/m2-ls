@@ -15,7 +15,7 @@
 
 use std::fmt::{self, Display, Formatter};
 
-use m2_syn::nodes::{Expr, ExprLiteral, ExprOp, ExprOpBin, ExprOpBinAdj};
+use m2_syn::nodes::{BinaryOperator, Expr, ExprBinary, Literal};
 use m2_syn::Token;
 use strum::EnumString;
 
@@ -217,10 +217,8 @@ where
         }
         let expression = expression.unparenthesized()?;
         match expression {
-            Expr::Literal(ExprLiteral::Integer(_)) => {
-                Some(RingLineage::native(NumberField::Integers))
-            }
-            Expr::Literal(ExprLiteral::Float(_)) => Some(RingLineage::native(NumberField::Reals)),
+            Expr::Literal(Literal::Integer(_)) => Some(RingLineage::native(NumberField::Integers)),
+            Expr::Literal(Literal::Float(_)) => Some(RingLineage::native(NumberField::Reals)),
             Expr::Symbol(symbol) => {
                 let binding = self.binding(symbol)?;
                 if binding.state.is_ring_generator {
@@ -233,12 +231,10 @@ where
                 let supplied = self.expression_at(binding.state.value_range?)?;
                 self.element_ring(supplied, depth + 1)
             }
-            Expr::Op(ExprOp::Prefix(prefix))
-                if prefix.operator.spelling() == <Token![-]>::SPELLING =>
-            {
-                self.element_ring(&prefix.operand, depth + 1)
+            Expr::Prefix(prefix) if prefix.op.spelling() == <Token![-]>::SPELLING => {
+                self.element_ring(&prefix.expr, depth + 1)
             }
-            operation @ Expr::Op(ExprOp::Bin(_)) => {
+            operation @ Expr::Binary(_) => {
                 match self.selected(operation) {
                     Some(Ok(selected)) => return self.ring_lineage(selected.ring, depth + 1),
                     Some(Err(_)) => return None,
@@ -292,7 +288,7 @@ where
         if operator == <Token![^]>::SPELLING {
             let exponent = right.unparenthesized()?;
             return match (base.number_field(), exponent) {
-                (Some(NumberField::Integers), Expr::Literal(ExprLiteral::Integer(_)))
+                (Some(NumberField::Integers), Expr::Literal(Literal::Integer(_)))
                 | (Some(NumberField::Rationals | NumberField::Reals | NumberField::Complexes), _)
                 | (None, _) => Some(base),
                 (Some(NumberField::Integers), _) => None,
@@ -337,10 +333,10 @@ where
                 }
                 Some(_) => None,
             },
-            Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => {
+            Expr::Binary(call) if matches!(call.op, BinaryOperator::Space(_)) => {
                 self.constructed_ring(expression, call, depth)
             }
-            quotient @ Expr::Op(ExprOp::Bin(_)) => {
+            quotient @ Expr::Binary(_) => {
                 let operands = quotient.infix_operands()?;
                 if operands.operator == <Token![_]>::SPELLING {
                     return self.precision_field(operands.left);
@@ -372,14 +368,14 @@ where
     fn constructed_ring(
         &self,
         whole: &'ast Expr,
-        call: &'ast ExprOpBinAdj,
+        call: &'ast ExprBinary,
         depth: usize,
     ) -> Option<RingLineage> {
         if self.constructor_variables(call).is_some() {
-            let coefficients = self.ring_lineage(&call.left_operand, depth + 1)?;
+            let coefficients = self.ring_lineage(&call.left, depth + 1)?;
             return self.constructed(coefficients, whole, false);
         }
-        let Expr::Symbol(constructor) = call.left_operand.unparenthesized()? else {
+        let Expr::Symbol(constructor) = call.left.unparenthesized()? else {
             return None;
         };
         if constructor.text() != "GF" || self.binding(constructor).is_some() {

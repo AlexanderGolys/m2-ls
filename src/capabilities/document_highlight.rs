@@ -1,6 +1,6 @@
 //! In-document highlighting for resolved symbols and compound-statement words.
 
-use m2_syn::nodes::{Expr, ExprControl, ExprLambda};
+use m2_syn::nodes::{Expr, ExprFunction};
 use m2_syn::{Lex, Span, Spanned, Token, TokenStream, TokenTree};
 
 use crate::analysis::{ControlTransfer, ControlTransferTarget, LoopStatement};
@@ -313,10 +313,10 @@ fn control_transfer_highlights(
     knowledge: &(impl TypeKnowledge + ?Sized),
 ) -> Option<Vec<DocumentHighlight>> {
     let (transfers, byte) = control_transfers_at(document, position, knowledge)?;
-    let transfer = transfers
-        .iter()
-        .rev()
-        .find(|transfer| spans_byte(document, transfer_keyword(transfer.transfer), byte))?;
+    let transfer = transfers.iter().rev().find(|transfer| {
+        transfer_keyword(transfer.transfer)
+            .is_some_and(|keyword| spans_byte(document, keyword, byte))
+    })?;
     let target = transfer.target?;
     let mut keywords = match target {
         ControlTransferTarget::LoopCallback { callable, .. } => {
@@ -348,13 +348,15 @@ fn control_owner_highlights(
     knowledge: &(impl TypeKnowledge + ?Sized),
 ) -> Option<Vec<DocumentHighlight>> {
     let enclosing = document.enclosing_expressions(position);
-    let owner = enclosing
-        .iter()
-        .rev()
-        .find(|expression| matches!(expression, Expr::Lambda(_) | Expr::For(_) | Expr::While(_)))?;
+    let owner = enclosing.iter().rev().find(|expression| {
+        matches!(
+            expression,
+            Expr::Function(_) | Expr::For(_) | Expr::While(_)
+        )
+    })?;
     let (transfers, byte) = control_transfers_at(document, position, knowledge)?;
     let mut keywords = match owner {
-        Expr::Lambda(function) => lambda_operator(function).into_iter().collect(),
+        Expr::Function(function) => lambda_operator(function).into_iter().collect(),
         _ => owner.keywords(),
     };
     if !keywords
@@ -381,25 +383,23 @@ fn owned_transfer_keywords(
                 owner.is_some() && document.syntax_bytes(target.owner()) == owner
             })
         })
-        .filter_map(|transfer| transfer_keyword(transfer.transfer).try_span())
+        .filter_map(|transfer| transfer_keyword(transfer.transfer).and_then(Spanned::try_span))
         .collect()
 }
 
 /// The keyword of a `return`, `break`, or `continue`.
-fn transfer_keyword(transfer: &ExprControl) -> &dyn Spanned {
+fn transfer_keyword(transfer: &Expr) -> Option<&dyn Spanned> {
     match transfer {
-        ExprControl::Return(node) => &node.return_token,
-        ExprControl::Break(node) => &node.break_token,
-        ExprControl::Continue(node) => &node.continue_token,
+        Expr::Return(node) => Some(&node.return_token),
+        Expr::Break(node) => Some(&node.break_token),
+        Expr::Continue(node) => Some(&node.continue_token),
+        _ => None,
     }
 }
 
 /// The `->` of a function.
-fn lambda_operator(function: &ExprLambda) -> Option<Span> {
-    match function {
-        ExprLambda::Variadic(node) => node.operator.try_span(),
-        ExprLambda::List(node) => node.operator.try_span(),
-    }
+fn lambda_operator(function: &ExprFunction) -> Option<Span> {
+    function.arrow_token.try_span()
 }
 
 /// Whether `syntax` covers the document byte `byte`.

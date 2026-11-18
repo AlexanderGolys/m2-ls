@@ -1,7 +1,8 @@
 # Running code and tests
 
 Run a saved script, evaluate a selected cell, or test a package through explicit
-language-server commands. These commands require `M2` on `PATH` and run only
+language-server commands. These commands use `macaulay2.executable` when configured, otherwise `M2`
+on `PATH`, and run only
 when you invoke them. Ordinary analysis does not execute your code.
 
 Send `workspace/executeCommand` with one object in `arguments`. For example,

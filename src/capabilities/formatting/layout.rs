@@ -1,6 +1,6 @@
 //! Mutable whitespace coordinates over one immutable, already parsed tree.
 
-use m2_syn::nodes::{Expr, ExprLiteral};
+use m2_syn::nodes::{Expr, Literal};
 use m2_syn::visit::{self, Visit};
 use std::ops::Range;
 
@@ -173,7 +173,7 @@ impl<'ast> Visit<'ast> for ProtectedSyntax<'_> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
         if matches!(
             expression,
-            Expr::Literal(ExprLiteral::String(_) | ExprLiteral::RawString(_))
+            Expr::Literal(Literal::String(_) | Literal::RawString(_))
         ) {
             self.ranges.extend(self.source.syntax_bytes(expression));
         }

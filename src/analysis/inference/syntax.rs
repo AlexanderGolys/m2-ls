@@ -3,7 +3,7 @@
 use crate::analysis::{MethodDeclarationOption, MethodOptions};
 use crate::syntax::ExpressionSyntax;
 use crate::typesystem::TypeRole;
-use m2_syn::{nodes::*, Span, Spanned, Token};
+use m2_syn::{nodes::*, Span, Spanned};
 
 /// The value produced by each generated assignment alternative.
 pub trait AssignmentValue {
@@ -13,18 +13,7 @@ pub trait AssignmentValue {
 
 impl AssignmentValue for ExprAssign {
     fn assigned_value(&self) -> &Expr {
-        match self {
-            Self::Simple(ExprAssignSimple::Global(node)) => &node.value,
-            Self::Simple(ExprAssignSimple::Local(node)) => &node.value,
-            Self::Parallel(ExprAssignParallel::Global(node)) => &node.value,
-            Self::Parallel(ExprAssignParallel::Local(node)) => &node.value,
-            Self::Evaluated(node) => &node.value,
-            Self::Augmented(node) => &node.value,
-            Self::Install(ExprAssignInstall::Method(node)) => &node.function,
-            Self::Install(ExprAssignInstall::Op(node)) => &node.function,
-            Self::Install(ExprAssignInstall::New(node)) => &node.function,
-            Self::Op(node) => &node.value_expr,
-        }
+        &self.right
     }
 }
 
@@ -35,9 +24,9 @@ pub trait MethodConstructor {
     /// Runtime class when this call is a method constructor.
     fn method_class(&self) -> Option<TypeRole>;
 }
-impl MethodConstructor for ExprOpBinAdj {
+impl MethodConstructor for ExprBinary {
     fn method_option(&self, option: MethodDeclarationOption) -> Option<&Expr> {
-        self.right_operand
+        self.right
             .arguments()
             .into_iter()
             .flatten()
@@ -50,7 +39,7 @@ impl MethodConstructor for ExprOpBinAdj {
             .next_back()
     }
     fn method_class(&self) -> Option<TypeRole> {
-        if self.left_operand.symbol_name() != Some("method") {
+        if self.left.symbol_name() != Some("method") {
             return None;
         }
         let symbol = |option| {
@@ -104,46 +93,22 @@ pub trait InfixSyntax {
 impl InfixSyntax for Expr {
     fn infix_operands(&self) -> Option<InfixOperands<'_>> {
         match self {
-            Self::Op(ExprOp::Bin(binary)) => binary.infix_operands(),
+            Self::Binary(binary) => binary.infix_operands(),
             _ => None,
         }
     }
 }
 
-impl InfixSyntax for ExprOpBin {
+impl InfixSyntax for ExprBinary {
     fn infix_operands(&self) -> Option<InfixOperands<'_>> {
-        let (left, right, operator, operator_span) = match self {
-            Self::Adj(_) => return None,
-            Self::Regular(binary) => (
-                &binary.left_operand,
-                &binary.right_operand,
-                binary.operator.spelling(),
-                binary.operator.try_span(),
-            ),
-            Self::Index(index) => (
-                &index.receiver,
-                &index.index,
-                <Token![#]>::SPELLING,
-                index.operator.try_span(),
-            ),
-            Self::Member(ExprOpBinMember::Dot(member)) => (
-                &member.receiver,
-                &member.member,
-                <Token![.]>::SPELLING,
-                member.operator.try_span(),
-            ),
-            Self::Member(ExprOpBinMember::Optional(member)) => (
-                &member.receiver,
-                &member.member,
-                <Token![.?]>::SPELLING,
-                member.operator.try_span(),
-            ),
-        };
+        if matches!(self.op, BinaryOperator::Space(_)) {
+            return None;
+        }
         Some(InfixOperands {
-            left,
-            right,
-            operator,
-            operator_span,
+            left: &self.left,
+            right: &self.right,
+            operator: self.op.spelling(),
+            operator_span: self.op.try_span(),
         })
     }
 }

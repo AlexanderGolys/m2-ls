@@ -12,9 +12,8 @@
 use std::collections::VecDeque;
 
 use m2_syn::nodes::{
-    Component, ElseClause, Expr, ExprFor as ForLoop, ExprIf as IfStatement,
-    ExprTry as TryStatement, ExprWhile as WhileLoop, List, LoopBody, PackedContent, Sequence,
-    Symbol, ThenClause,
+    Element, Elements, ElseClause, Expr, ExprFor as ForLoop, ExprIf as IfStatement, ExprList,
+    ExprSequence, ExprTry as TryStatement, ExprWhile as WhileLoop, LoopBody, Symbol, ThenClause,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Delimiter, DelimiterValue, Token};
@@ -24,16 +23,28 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::document::DocumentSnapshot;
-use crate::node_metadata::{matches_token, SyntaxSnapshot};
+use crate::node_metadata::{matches_token, CallParentheses, SyntaxSnapshot};
 use crate::package_documentation::PackageDocumentation;
 
 mod layout;
-use crate::settings::FormattingSettings;
+
+/// Whether the operator text spells any of the listed token types:
+/// `matches_tokens!(operator, Token![*], Token![/])`.
+macro_rules! matches_tokens {
+    ($text:expr, $($token:ty),+ $(,)?) => {
+        false $(|| matches_token::<$token>($text))+
+    };
+}
+
+use crate::settings::spacing::{
+    BracketPair, BracketSpacingSettings, OperatorSpacingSettings, Spacing,
+};
+use crate::settings::{FormattingSettings, Indent, ServerSettings};
 use crate::source::{SourceNavigation, SyntaxSource};
 use crate::syntax::{AssignmentSyntax, ExpressionSyntax};
 use layout::LayoutSource;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// Placement of control-flow keywords and their bodies during formatting.
 #[non_exhaustive]
@@ -43,11 +54,30 @@ pub enum ControlFlowLayout {
     /// Places control-flow clause bodies on separate lines.
     Multiline,
     /// Uses multiline bodies while retaining compact else placement where possible.
-    #[default]
     MultilineCompactElse,
     /// `then` and `else` each start a line under their `if`, followed by
     /// their body; loops and `try` are laid out as in `Multiline`.
     LeadingKeywords,
+}
+
+/// What becomes of parentheses the syntax does not need, as in `(a*b) + c`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum RedundantParentheses {
+    /// Left as written, and no action offers to remove them.
+    Off,
+    /// Removed by the "Remove redundant parentheses in file" source action.
+    Action,
+    /// Removed by the source action and whenever the document is formatted.
+    Format,
+}
+
+impl RedundantParentheses {
+    /// Whether the source action removing them is offered.
+    pub fn offers_action(self) -> bool {
+        self != Self::Off
+    }
 }
 
 /// Formatting settings resolved into the layout parameters the formatter
@@ -72,25 +102,28 @@ pub struct FormatOptions {
     break_after_semicolon: bool,
     /// Whether existing line boundaries are preserved.
     keep_line_breaks: bool,
-    /// Explicit brace-spacing preference, absent to preserve the existing style.
-    space_in_braces: Option<bool>,
-}
-
-impl Default for FormatOptions {
-    fn default() -> Self {
-        Self::from(&FormattingSettings::default())
-    }
+    /// Operators written spaced or compact.
+    operators: OperatorSpacingSettings,
+    /// Brackets written padded or compact inside.
+    brackets: BracketSpacingSettings,
+    /// Whether formatting the document removes redundant parentheses.
+    removes_redundant_parentheses: bool,
+    /// Whether those include the parentheses around call arguments.
+    call_parentheses: CallParentheses,
 }
 
 impl From<&FormattingSettings> for FormatOptions {
-    /// Resolve settings without an editor, using four-space indentation as
-    /// the fallback for both the CLI and `Default`.
+    /// Resolve settings without an editor, as the CLI and `Default` do:
+    /// what is left to the editor indents with tabs.
     fn from(settings: &FormattingSettings) -> Self {
-        Self::from_settings(4, true, settings)
+        Self::from_settings(Self::STANDALONE_TAB_SIZE, false, settings)
     }
 }
 
 impl FormatOptions {
+    /// The tab size standalone tools assume in place of an editor's.
+    const STANDALONE_TAB_SIZE: u32 = 4;
+
     /// The options for `settings`, with the editor's `tab_size` and
     /// `insert_spaces` where the settings leave indentation to the editor.
     pub fn from_settings(
@@ -98,8 +131,7 @@ impl FormatOptions {
         insert_spaces: bool,
         settings: &FormattingSettings,
     ) -> Self {
-        let tab_width = settings.indent.unwrap_or(tab_size).max(1) as usize;
-        let use_tabs = settings.use_tabs.unwrap_or(!insert_spaces);
+        let tab_width = settings.tab_width.unwrap_or(tab_size).max(1) as usize;
         let keep_line_breaks = settings.keep_line_breaks;
         let (soft_line_width, hard_line_width) = if keep_line_breaks {
             (None, None)
@@ -107,10 +139,10 @@ impl FormatOptions {
             settings.line_widths()
         };
         Self {
-            indent: if use_tabs {
-                "\t".to_string()
-            } else {
-                " ".repeat(tab_width)
+            indent: match settings.indent {
+                Indent::Editor if insert_spaces => " ".repeat(tab_size.max(1) as usize),
+                Indent::Editor | Indent::Tab => "\t".to_string(),
+                Indent::Spaces(columns) => " ".repeat(columns as usize),
             },
             tab_width,
             soft_line_width: soft_line_width.map(|width| width as usize),
@@ -123,8 +155,35 @@ impl FormatOptions {
             compact_factor_operators: settings.compact_factor_operators,
             break_after_semicolon: settings.break_after_semicolon && !keep_line_breaks,
             keep_line_breaks,
-            space_in_braces: settings.space_in_braces,
+            operators: settings.operators.clone(),
+            brackets: settings.brackets.clone(),
+            removes_redundant_parentheses: settings.redundant_parentheses
+                == RedundantParentheses::Format,
+            call_parentheses: settings.call_parentheses,
         }
+    }
+
+    /// How the binary `operator` is written: as configured, except that
+    /// `compactFactorOperators` compacts a spaced factor operator (`*`, `/`,
+    /// `%`, `**`) `between_factors`, as `2*x`. `None` keeps it as written.
+    fn binary_spacing(&self, operator: &str, between_factors: bool) -> Option<Spacing> {
+        let spacing = self.operators.binary(operator)?;
+        let compacted_factor = self.compact_factor_operators
+            && between_factors
+            && matches_tokens!(operator, Token![*], Token![/], Token![%], Token![**]);
+        Some(if compacted_factor {
+            Spacing::Compact
+        } else {
+            spacing
+        })
+    }
+
+    /// Whether `operator`, dangling at the end of a line, takes a trailing
+    /// space and so makes the next row an indented continuation: `a +` does,
+    /// `a^` does not. Without operands to look at, a factor operator counts
+    /// as between factors.
+    fn is_spaced_line_final_operator(&self, operator: &str) -> bool {
+        self.binary_spacing(operator, true) == Some(Spacing::Spaced)
     }
 }
 
@@ -206,8 +265,15 @@ struct FormatEdit {
 
 /// Format the whole document: whitespace normalization around operators and
 /// punctuation, tree-derived indentation, and width-based wrapping at parsed
-/// syntax boundaries.
+/// syntax boundaries, after removing redundant parentheses when configured.
 pub fn format_document_with_options(syntax: &SyntaxSnapshot, options: &FormatOptions) -> String {
+    let ungrouped;
+    let syntax = if options.removes_redundant_parentheses {
+        ungrouped = syntax.without_redundant_parentheses(options.call_parentheses);
+        &ungrouped
+    } else {
+        syntax
+    };
     formatted_layout(syntax, options).into_text()
 }
 
@@ -310,13 +376,15 @@ fn separate_line_end_bracket_closers(
     layout: &LayoutSource,
     newline: &'static str,
 ) -> Vec<FormatEdit> {
-    let mut visitor = ClosingDelimiterBreaks {
+    let mut breaks = ClosingDelimiterBreaks {
         layout,
         newline,
         edits: Vec::new(),
     };
-    syntax.visit(&mut visitor);
-    visitor.edits
+    for delimiter in syntax.delimiters() {
+        breaks.consider(delimiter);
+    }
+    breaks.edits
 }
 
 /// Separates typed closing delimiters from content when the opener ends a line.
@@ -362,21 +430,6 @@ impl ClosingDelimiterBreaks<'_> {
     }
 }
 
-impl<'ast> Visit<'ast> for ClosingDelimiterBreaks<'_> {
-    fn visit_expr(&mut self, expression: &'ast Expr) {
-        let delimiter = expression.delimiter();
-        if let Some(delimiter) = delimiter {
-            self.consider(delimiter);
-        }
-        visit::visit_expr(self, expression);
-    }
-
-    fn visit_assignment_list(&mut self, list: &'ast m2_syn::nodes::AssignmentList) {
-        self.consider(list.contents.delimiter.delimiter());
-        visit::visit_assignment_list(self, list);
-    }
-}
-
 /// Lays out every hash-table construction, a `{…}` list of at least two
 /// options and nothing else, one option per line; re-indentation then indents
 /// the options and puts the closing brace back at the opener's level:
@@ -412,17 +465,17 @@ struct OptionTableBreaks<'a> {
 }
 
 impl<'ast> Visit<'ast> for OptionTableBreaks<'_> {
-    fn visit_list(&mut self, list: &'ast List) {
-        if let Some(PackedContent::Pack(pack)) = &list.elements {
-            if pack.pack.iter().all(|component| matches!(component, Component::Expr(value) if matches!(value.as_ref(), Expr::Option(_)))) {
+    fn visit_expr_list(&mut self, list: &'ast ExprList) {
+        if let Some(Elements::Pack(pack)) = &list.elems {
+            if pack.elems.iter().all(|component| matches!(component, Element::Expr(value) if matches!(value.as_ref(), Expr::Option(_)))) {
                 let delimiter = list.delimiter.delimiter();
-                let first = list.statements.first().and_then(|statement| self.layout.syntax_range(statement)).or_else(|| self.layout.syntax_range(pack.pack.first()));
+                let first = list.stmts.first().and_then(|statement| self.layout.syntax_range(statement)).or_else(|| self.layout.syntax_range(pack.elems.first()));
                 let opening = self.layout.syntax_range(&delimiter.opening_span());
                 let closing = delimiter.closing_span().and_then(|span| self.layout.syntax_range(&span));
-                let last = pack.pack.iter().last().and_then(|component| self.layout.syntax_range(component));
+                let last = pack.elems.iter().last().and_then(|component| self.layout.syntax_range(component));
                 if let (Some(opening), Some(first), Some(last), Some(closing)) = (opening, first, last, closing) {
                     push_line_break_between(self.layout.text(), opening.end, first.start, self.newline, &mut self.edits);
-                    for (comma, component) in pack.pack.pairs() {
+                    for (comma, component) in pack.elems.pairs() {
                         if let (Some(comma), Some(component)) = (self.layout.syntax_range(comma), self.layout.syntax_range(component)) {
                             push_line_break_between(self.layout.text(), comma.end, component.start, self.newline, &mut self.edits);
                         }
@@ -431,7 +484,7 @@ impl<'ast> Visit<'ast> for OptionTableBreaks<'_> {
                 }
             }
         }
-        visit::visit_list(self, list);
+        visit::visit_expr_list(self, list);
     }
 }
 
@@ -499,7 +552,7 @@ fn lead_rows_with_operators(
 struct LeadingOperators<'a> {
     /// Current whitespace coordinates.
     layout: &'a LayoutSource,
-    /// Formatting choices controlling factor operators.
+    /// The operator spacing in effect.
     options: &'a FormatOptions,
     /// Document line ending.
     newline: &'static str,
@@ -517,27 +570,20 @@ impl<'ast> Visit<'ast> for LeadingOperators<'_> {
         self.depth -= usize::from(delimited);
     }
 
-    fn visit_assignment_list(&mut self, list: &'ast m2_syn::nodes::AssignmentList) {
-        self.depth += 1;
-        visit::visit_assignment_list(self, list);
-        self.depth -= 1;
-    }
-
-    fn visit_expr_op_bin_regular(&mut self, expression: &'ast m2_syn::nodes::ExprOpBinRegular) {
+    fn visit_expr_binary(&mut self, expression: &'ast m2_syn::nodes::ExprBinary) {
         let spans = (
-            self.layout.syntax_range(expression.left_operand.as_ref()),
-            self.layout.syntax_range(&expression.operator),
-            self.layout.syntax_range(expression.right_operand.as_ref()),
+            self.layout.syntax_range(expression.left.as_ref()),
+            self.layout.syntax_range(&expression.op),
+            self.layout.syntax_range(expression.right.as_ref()),
         );
         if let (Some(left), Some(operator), Some(right)) = spans {
             let text = self.layout.text();
             if self.depth > 0
                 && left.end <= operator.start
                 && operator.end <= right.start
-                && is_spaced_line_final_operator(
-                    &text[operator.clone()],
-                    self.options.compact_factor_operators,
-                )
+                && self
+                    .options
+                    .is_spaced_line_final_operator(&text[operator.clone()])
             {
                 let before = &text[left.end..operator.start];
                 let after = &text[operator.end..right.start];
@@ -558,7 +604,7 @@ impl<'ast> Visit<'ast> for LeadingOperators<'_> {
                 }
             }
         }
-        visit::visit_expr_op_bin_regular(self, expression);
+        visit::visit_expr_binary(self, expression);
     }
 }
 
@@ -613,8 +659,8 @@ impl EmptyBodyEdits<'_> {
 impl<'ast> Visit<'ast> for EmptyBodyEdits<'_> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
         match expression {
-            Expr::Lambda(lambda) => self.consider(crate::syntax::LambdaSyntax::body(lambda)),
-            Expr::Try(node) => self.consider(&node.value),
+            Expr::Function(lambda) => self.consider(crate::syntax::LambdaSyntax::body(lambda)),
+            Expr::Try(node) => self.consider(&node.expr),
             _ => {}
         }
         visit::visit_expr(self, expression);
@@ -627,25 +673,25 @@ impl<'ast> Visit<'ast> for EmptyBodyEdits<'_> {
         self.consider(&clause.expr);
         visit::visit_else_clause(self, clause);
     }
-    fn visit_range_bound_from(&mut self, clause: &'ast m2_syn::nodes::RangeBoundFrom) {
-        self.consider(&clause.value);
-        visit::visit_range_bound_from(self, clause);
-    }
-    fn visit_range_bound_to(&mut self, clause: &'ast m2_syn::nodes::RangeBoundTo) {
-        self.consider(&clause.value);
-        visit::visit_range_bound_to(self, clause);
-    }
-    fn visit_when_condition(&mut self, clause: &'ast m2_syn::nodes::WhenCondition) {
-        self.consider(&clause.condition);
-        visit::visit_when_condition(self, clause);
-    }
-    fn visit_list_step(&mut self, clause: &'ast m2_syn::nodes::ListStep) {
+    fn visit_from_clause(&mut self, clause: &'ast m2_syn::nodes::FromClause) {
         self.consider(&clause.expr);
-        visit::visit_list_step(self, clause);
+        visit::visit_from_clause(self, clause);
     }
-    fn visit_do_step(&mut self, clause: &'ast m2_syn::nodes::DoStep) {
-        self.consider(&clause.statement);
-        visit::visit_do_step(self, clause);
+    fn visit_to_clause(&mut self, clause: &'ast m2_syn::nodes::ToClause) {
+        self.consider(&clause.expr);
+        visit::visit_to_clause(self, clause);
+    }
+    fn visit_when_clause(&mut self, clause: &'ast m2_syn::nodes::WhenClause) {
+        self.consider(&clause.expr);
+        visit::visit_when_clause(self, clause);
+    }
+    fn visit_list_clause(&mut self, clause: &'ast m2_syn::nodes::ListClause) {
+        self.consider(&clause.expr);
+        visit::visit_list_clause(self, clause);
+    }
+    fn visit_do_clause(&mut self, clause: &'ast m2_syn::nodes::DoClause) {
+        self.consider(&clause.expr);
+        visit::visit_do_clause(self, clause);
     }
 }
 
@@ -859,18 +905,13 @@ impl<'ast> Visit<'ast> for ControlFlowEdits<'_> {
         visit::visit_expr(self, expression);
         self.delimited_depth -= usize::from(delimited);
     }
-    fn visit_assignment_list(&mut self, list: &'ast m2_syn::nodes::AssignmentList) {
-        self.delimited_depth += 1;
-        visit::visit_assignment_list(self, list);
-        self.delimited_depth -= 1;
-    }
     fn visit_expr_if(&mut self, node: &'ast IfStatement) {
         let else_if_owner = self.else_if_owner.take();
         let control =
             else_if_owner.unwrap_or_else(|| self.context_for(node, node.else_clause.is_some()));
         self.within(control, |this| {
             this.then_clause(true, &node.then_clause);
-            this.visit_expr(&node.condition);
+            this.visit_expr(&node.cond);
             this.visit_then_clause(&node.then_clause);
             if let Some(clause) = &node.else_clause {
                 this.else_clause(true, Some(&node.then_clause), clause);
@@ -885,16 +926,16 @@ impl<'ast> Visit<'ast> for ControlFlowEdits<'_> {
     fn visit_expr_try(&mut self, node: &'ast TryStatement) {
         let control = self.context_for(node, node.fallback.is_some());
         self.within(control, |this| {
-            if let Some(clause) = &node.on_success {
+            if let Some(clause) = &node.then_clause {
                 this.then_clause(false, clause);
             }
             match &node.fallback {
                 Some(m2_syn::nodes::TryFallback::Else(clause)) => {
-                    this.else_clause(false, node.on_success.as_ref(), clause);
+                    this.else_clause(false, node.then_clause.as_ref(), clause);
                 }
                 Some(m2_syn::nodes::TryFallback::Except(clause)) if this.breaks_are_parseable() => {
                     this.break_before(&clause.except_token);
-                    this.break_after(&clause.do_token, &clause.value);
+                    this.break_after(&clause.do_token, &clause.expr);
                 }
                 _ => {}
             }
@@ -911,11 +952,11 @@ impl<'ast> Visit<'ast> for ControlFlowEdits<'_> {
     }
     fn visit_loop_body(&mut self, body: &'ast LoopBody) {
         if self.breaks_are_parseable() {
-            if let Some(step) = &body.list_step {
+            if let Some(step) = &body.list_clause {
                 self.break_after(&step.list_token, &step.expr);
             }
-            if let Some(step) = &body.do_step {
-                self.break_after(&step.do_token, &step.statement);
+            if let Some(step) = &body.do_clause {
+                self.break_after(&step.do_token, &step.expr);
             }
         }
         visit::visit_loop_body(self, body);
@@ -955,7 +996,7 @@ fn reindent_from_syntax(
     options: &FormatOptions,
 ) -> Vec<FormatEdit> {
     let text = source.text();
-    let layout = TreeIndentLayout::from_syntax(syntax, source, options.compact_factor_operators);
+    let layout = TreeIndentLayout::from_syntax(syntax, source, options);
     let protected = source.protected_ranges().collect::<Vec<_>>();
     let mut edits = Vec::new();
     for (row, line) in text_lines(text).into_iter().enumerate() {
@@ -1043,54 +1084,47 @@ impl DelimiterBreaks<'_> {
 }
 
 impl<'ast> Visit<'ast> for DelimiterBreaks<'_> {
-    fn visit_list(&mut self, node: &'ast List) {
+    fn visit_expr_list(&mut self, node: &'ast ExprList) {
         self.consider(
             node.delimiter.delimiter(),
-            !node.statements.is_empty() || node.elements.is_some(),
+            !node.stmts.is_empty() || node.elems.is_some(),
         );
-        visit::visit_list(self, node);
+        visit::visit_expr_list(self, node);
     }
-    fn visit_array(&mut self, node: &'ast m2_syn::nodes::Array) {
+    fn visit_expr_array(&mut self, node: &'ast m2_syn::nodes::ExprArray) {
         self.consider(
             node.delimiter.delimiter(),
-            !node.statements.is_empty() || node.elements.is_some(),
+            !node.stmts.is_empty() || node.elems.is_some(),
         );
-        visit::visit_array(self, node);
+        visit::visit_expr_array(self, node);
     }
-    fn visit_sequence(&mut self, node: &'ast Sequence) {
+    fn visit_expr_sequence(&mut self, node: &'ast ExprSequence) {
         self.consider(
             node.delimiter.delimiter(),
-            !node.statements.is_empty() || node.elements.is_some(),
+            !node.stmts.is_empty() || node.elems.is_some(),
         );
-        visit::visit_sequence(self, node);
+        visit::visit_expr_sequence(self, node);
     }
-    fn visit_angle_bar_list(&mut self, node: &'ast m2_syn::nodes::AngleBarList) {
+    fn visit_expr_angle_bar(&mut self, node: &'ast m2_syn::nodes::ExprAngleBar) {
         self.consider(
             node.delimiter.delimiter(),
-            !node.statements.is_empty() || node.elements.is_some(),
+            !node.stmts.is_empty() || node.elems.is_some(),
         );
-        visit::visit_angle_bar_list(self, node);
+        visit::visit_expr_angle_bar(self, node);
     }
-    fn visit_holder(&mut self, node: &'ast m2_syn::nodes::Holder) {
+    fn visit_expr_paren(&mut self, node: &'ast m2_syn::nodes::ExprParen) {
         self.consider(
             node.delimiter.delimiter(),
-            !node.muted.is_empty() || node.value.is_some(),
+            !node.stmts.is_empty() || node.expr.is_some(),
         );
-        visit::visit_holder(self, node);
+        visit::visit_expr_paren(self, node);
     }
-    fn visit_assignment_list(&mut self, node: &'ast m2_syn::nodes::AssignmentList) {
+    fn visit_param_list(&mut self, node: &'ast m2_syn::nodes::ParamList) {
         self.consider(
-            node.contents.delimiter.delimiter(),
-            node.contents.contents.is_some(),
+            node.params.delimiter.delimiter(),
+            node.params.contents.is_some(),
         );
-        visit::visit_assignment_list(self, node);
-    }
-    fn visit_expr_lambda_list(&mut self, node: &'ast m2_syn::nodes::ExprLambdaList) {
-        self.consider(
-            node.arguments.delimiter.delimiter(),
-            node.arguments.contents.is_some(),
-        );
-        visit::visit_expr_lambda_list(self, node);
+        visit::visit_param_list(self, node);
     }
 }
 
@@ -1165,25 +1199,13 @@ impl CommaBreaks<'_> {
 }
 
 impl<'ast> Visit<'ast> for CommaBreaks<'_> {
-    fn visit_expr_pack(&mut self, node: &'ast m2_syn::nodes::ExprPack) {
-        self.collect(&node.pack, |value| matches!(value, Component::Empty(_)));
-        visit::visit_expr_pack(self, node);
+    fn visit_elements_pack(&mut self, node: &'ast m2_syn::nodes::ElementsPack) {
+        self.collect(&node.elems, |value| matches!(value, Element::Empty(_)));
+        visit::visit_elements_pack(self, node);
     }
-    fn visit_assignment_list_content_pack(
-        &mut self,
-        node: &'ast m2_syn::nodes::AssignmentListContentPack,
-    ) {
-        self.collect(&node.arguments, |value| {
-            matches!(value, m2_syn::nodes::AssignmentArgument::Empty(_))
-        });
-        visit::visit_assignment_list_content_pack(self, node);
-    }
-    fn visit_argument_list_content_pack(
-        &mut self,
-        node: &'ast m2_syn::nodes::ArgumentListContentPack,
-    ) {
-        self.collect(&node.arguments, |_| false);
-        visit::visit_argument_list_content_pack(self, node);
+    fn visit_params_pack(&mut self, node: &'ast m2_syn::nodes::ParamsPack) {
+        self.collect(&node.params, |_| false);
+        visit::visit_params_pack(self, node);
     }
 }
 
@@ -1191,8 +1213,8 @@ impl<'ast> Visit<'ast> for CommaBreaks<'_> {
 struct OperatorBreaks<'a> {
     /// Current formatter coordinates.
     layout: &'a LayoutSource,
-    /// Whether factor operators stay compact.
-    compact_factors: bool,
+    /// The operator spacing in effect.
+    options: &'a FormatOptions,
     /// Number of enclosing delimited constructs.
     depth: usize,
     /// Candidate locations.
@@ -1206,7 +1228,10 @@ impl OperatorBreaks<'_> {
             return;
         };
         let text = self.layout.text();
-        if !is_spaced_line_final_operator(&text[bytes.clone()], self.compact_factors) {
+        if !self
+            .options
+            .is_spaced_line_final_operator(&text[bytes.clone()])
+        {
             return;
         }
         let range = if before {
@@ -1230,14 +1255,11 @@ impl<'ast> Visit<'ast> for OperatorBreaks<'_> {
         visit::visit_expr(self, expression);
         self.depth -= usize::from(delimited);
     }
-    fn visit_assignment_list(&mut self, list: &'ast m2_syn::nodes::AssignmentList) {
-        self.depth += 1;
-        visit::visit_assignment_list(self, list);
-        self.depth -= 1;
-    }
-    fn visit_expr_op_bin_regular(&mut self, node: &'ast m2_syn::nodes::ExprOpBinRegular) {
-        self.consider(&node.operator, self.depth > 0);
-        visit::visit_expr_op_bin_regular(self, node);
+    fn visit_expr_binary(&mut self, node: &'ast m2_syn::nodes::ExprBinary) {
+        if !matches!(node.op, m2_syn::nodes::BinaryOperator::Space(_)) {
+            self.consider(&node.op, self.depth > 0);
+        }
+        visit::visit_expr_binary(self, node);
     }
     fn visit_expr_assign(&mut self, node: &'ast m2_syn::nodes::ExprAssign) {
         if let Some(span) = node.parts().operator_span {
@@ -1245,21 +1267,13 @@ impl<'ast> Visit<'ast> for OperatorBreaks<'_> {
         }
         visit::visit_expr_assign(self, node);
     }
-    fn visit_expr_assign_evaluated(&mut self, node: &'ast m2_syn::nodes::ExprAssignEvaluated) {
-        self.consider(&node.operator, false);
-        visit::visit_expr_assign_evaluated(self, node);
-    }
     fn visit_expr_option(&mut self, node: &'ast m2_syn::nodes::ExprOption) {
-        self.consider(&node.operator, false);
+        self.consider(&node.fat_arrow_token, false);
         visit::visit_expr_option(self, node);
     }
-    fn visit_expr_lambda_variadic(&mut self, node: &'ast m2_syn::nodes::ExprLambdaVariadic) {
-        self.consider(&node.operator, false);
-        visit::visit_expr_lambda_variadic(self, node);
-    }
-    fn visit_expr_lambda_list(&mut self, node: &'ast m2_syn::nodes::ExprLambdaList) {
-        self.consider(&node.operator, false);
-        visit::visit_expr_lambda_list(self, node);
+    fn visit_expr_function(&mut self, node: &'ast m2_syn::nodes::ExprFunction) {
+        self.consider(&node.arrow_token, false);
+        visit::visit_expr_function(self, node);
     }
 }
 
@@ -1289,7 +1303,7 @@ fn wrap_long_lines(
         .min(max_line_width);
     let mut operators = OperatorBreaks {
         layout,
-        compact_factors: options.compact_factor_operators,
+        options,
         depth: 0,
         candidates: Vec::new(),
     };
@@ -1398,7 +1412,11 @@ fn visual_width(text: &str, tab_width: usize) -> usize {
 fn folding_ranges_for_syntax(syntax: &SyntaxSnapshot) -> Vec<FormatFoldRange> {
     let source = LayoutSource::new(syntax);
     let text = source.text();
-    let layout = TreeIndentLayout::from_syntax(syntax, &source, false);
+    let layout = TreeIndentLayout::from_syntax(
+        syntax,
+        &source,
+        &FormatOptions::from(&ServerSettings::defaults().formatting),
+    );
     let indented_lines = text
         .lines()
         .enumerate()
@@ -1438,7 +1456,7 @@ impl TreeIndentLayout {
     fn from_syntax(
         syntax: &SyntaxSnapshot,
         source: &LayoutSource,
-        compact_factor_operators: bool,
+        options: &FormatOptions,
     ) -> Self {
         let text = source.text();
         let line_count = text.lines().count().max(1);
@@ -1448,7 +1466,7 @@ impl TreeIndentLayout {
         let literal_folds = collect_literal_fold_ranges(syntax, source, &line_leads);
         let mut right_operands = RightOperandContinuations {
             layout: source,
-            compact_factors: compact_factor_operators,
+            options,
             values: Vec::new(),
             leading_operators: Vec::new(),
             clause_bodies: Vec::new(),
@@ -1525,11 +1543,11 @@ fn collect_literal_fold_ranges(
         bytes.end -= text.len() - text.trim_end_matches(['\r', '\n']).len();
         let start = layout.point_for_byte(bytes.start);
         let end = layout.point_for_byte(bytes.end);
-        if comment.kind() == m2_syn::TriviaKind::LineComment
+        if comment.kind() == m2_syn::CommentKind::Line
             && line_leads.get(start.row).copied() == Some(start.column)
         {
             line_comment_rows.extend((start.row..=end.row).map(|row| row as u32));
-        } else if comment.kind() == m2_syn::TriviaKind::BlockComment && start.row < end.row {
+        } else if comment.kind() == m2_syn::CommentKind::Block && start.row < end.row {
             ranges.push(FormatFoldRange {
                 start_line: start.row as u32,
                 end_line: end.row as u32,
@@ -1566,9 +1584,7 @@ impl<'ast> Visit<'ast> for StringFolds<'_> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
         if matches!(
             expression,
-            Expr::Literal(
-                m2_syn::nodes::ExprLiteral::String(_) | m2_syn::nodes::ExprLiteral::RawString(_)
-            )
+            Expr::Literal(m2_syn::nodes::Literal::String(_) | m2_syn::nodes::Literal::RawString(_))
         ) {
             if let Some(bytes) = self.layout.syntax_range(expression) {
                 let start = self.layout.point_for_byte(bytes.start);
@@ -1625,13 +1641,15 @@ fn collect_bracket_groups(
     layout: &LayoutSource,
     line_count: usize,
 ) -> Vec<BracketGroup> {
-    let mut visitor = BracketGroups {
+    let mut groups = BracketGroups {
         layout,
         line_count,
         groups: Vec::new(),
     };
-    syntax.visit(&mut visitor);
-    visitor.groups
+    for delimiter in syntax.delimiters() {
+        groups.consider(delimiter);
+    }
+    groups.groups
 }
 
 /// Collects bracket indentation from generated delimiter fields.
@@ -1673,20 +1691,6 @@ impl BracketGroups<'_> {
                 closing_delimiter_column: close.column,
             });
         }
-    }
-}
-
-impl<'ast> Visit<'ast> for BracketGroups<'_> {
-    fn visit_expr(&mut self, expression: &'ast Expr) {
-        let delimiter = expression.delimiter();
-        if let Some(delimiter) = delimiter {
-            self.consider(delimiter);
-        }
-        visit::visit_expr(self, expression);
-    }
-    fn visit_assignment_list(&mut self, list: &'ast m2_syn::nodes::AssignmentList) {
-        self.consider(list.contents.delimiter.delimiter());
-        visit::visit_assignment_list(self, list);
     }
 }
 
@@ -1790,8 +1794,8 @@ fn line_continuation(
 struct RightOperandContinuations<'a> {
     /// Current whitespace coordinates.
     layout: &'a LayoutSource,
-    /// Whether factor operators are compact.
-    compact_factors: bool,
+    /// The operator spacing in effect.
+    options: &'a FormatOptions,
     /// Operand start byte and operator row.
     values: Vec<(usize, usize)>,
     /// Operator start byte and the row where its left operand starts.
@@ -1855,10 +1859,10 @@ impl RightOperandContinuations<'_> {
         ) else {
             return;
         };
-        if is_spaced_line_final_operator(
-            &self.layout.text()[operator.clone()],
-            self.compact_factors,
-        ) {
+        if self
+            .options
+            .is_spaced_line_final_operator(&self.layout.text()[operator.clone()])
+        {
             self.values
                 .push((value.start, self.layout.point_for_byte(operator.start).row));
         }
@@ -1907,47 +1911,34 @@ impl<'ast> Visit<'ast> for RightOperandContinuations<'_> {
         }
         visit::visit_symbol(self, node);
     }
-    fn visit_list_step(&mut self, node: &'ast m2_syn::nodes::ListStep) {
+    fn visit_list_clause(&mut self, node: &'ast m2_syn::nodes::ListClause) {
         self.record_clause(&node.list_token, &node.expr);
-        visit::visit_list_step(self, node);
+        visit::visit_list_clause(self, node);
     }
-    fn visit_do_step(&mut self, node: &'ast m2_syn::nodes::DoStep) {
-        self.record_clause(&node.do_token, &node.statement);
-        visit::visit_do_step(self, node);
+    fn visit_do_clause(&mut self, node: &'ast m2_syn::nodes::DoClause) {
+        self.record_clause(&node.do_token, &node.expr);
+        visit::visit_do_clause(self, node);
     }
     fn visit_try_fallback(&mut self, node: &'ast m2_syn::nodes::TryFallback) {
         if let m2_syn::nodes::TryFallback::Except(clause) = node {
-            self.record_clause(&clause.do_token, &clause.value);
+            self.record_clause(&clause.do_token, &clause.expr);
         }
         visit::visit_try_fallback(self, node);
     }
-    fn visit_expr_op_bin_regular(&mut self, node: &'ast m2_syn::nodes::ExprOpBinRegular) {
-        self.record(&node.operator, &node.right_operand);
-        self.record_leading(&node.operator, &node.left_operand);
-        visit::visit_expr_op_bin_regular(self, node);
-    }
-    fn visit_expr_op_bin_adj(&mut self, node: &'ast m2_syn::nodes::ExprOpBinAdj) {
-        self.record_leading(&node.operator, &node.left_operand);
-        visit::visit_expr_op_bin_adj(self, node);
-    }
-    fn visit_expr_op_bin_index(&mut self, node: &'ast m2_syn::nodes::ExprOpBinIndex) {
-        self.record_leading(&node.operator, &node.receiver);
-        visit::visit_expr_op_bin_index(self, node);
-    }
-    fn visit_expr_op_bin_member(&mut self, node: &'ast m2_syn::nodes::ExprOpBinMember) {
-        match node {
-            m2_syn::nodes::ExprOpBinMember::Dot(node) => {
-                self.record_leading(&node.operator, &node.receiver)
-            }
-            m2_syn::nodes::ExprOpBinMember::Optional(node) => {
-                self.record_leading(&node.operator, &node.receiver)
-            }
+    fn visit_expr_binary(&mut self, node: &'ast m2_syn::nodes::ExprBinary) {
+        if !matches!(node.op, m2_syn::nodes::BinaryOperator::Space(_)) {
+            self.record(&node.op, &node.right);
         }
-        visit::visit_expr_op_bin_member(self, node);
+        self.record_leading(&node.op, &node.left);
+        visit::visit_expr_binary(self, node);
+    }
+    fn visit_expr_field(&mut self, node: &'ast m2_syn::nodes::ExprField) {
+        self.record_leading(&node.op, &node.base);
+        visit::visit_expr_field(self, node);
     }
     fn visit_expr_option(&mut self, node: &'ast m2_syn::nodes::ExprOption) {
-        self.record(&node.operator, &node.value);
-        self.record_leading(&node.operator, &node.key);
+        self.record(&node.fat_arrow_token, &node.value);
+        self.record_leading(&node.fat_arrow_token, &node.key);
         visit::visit_expr_option(self, node);
     }
     fn visit_expr_assign(&mut self, node: &'ast m2_syn::nodes::ExprAssign) {
@@ -1962,20 +1953,9 @@ impl<'ast> Visit<'ast> for RightOperandContinuations<'_> {
         }
         visit::visit_expr_assign(self, node);
     }
-    fn visit_expr_assign_evaluated(&mut self, node: &'ast m2_syn::nodes::ExprAssignEvaluated) {
-        self.record_leading(&node.operator, &node.evaluated_domain);
-        if !matches!(node.value.as_ref(), Expr::If(_) | Expr::Assign(_)) {
-            self.record(&node.operator, &node.value);
-        }
-        visit::visit_expr_assign_evaluated(self, node);
-    }
-    fn visit_expr_lambda_variadic(&mut self, node: &'ast m2_syn::nodes::ExprLambdaVariadic) {
-        self.record(&node.operator, &node.body);
-        visit::visit_expr_lambda_variadic(self, node);
-    }
-    fn visit_expr_lambda_list(&mut self, node: &'ast m2_syn::nodes::ExprLambdaList) {
-        self.record(&node.operator, &node.body);
-        visit::visit_expr_lambda_list(self, node);
+    fn visit_expr_function(&mut self, node: &'ast m2_syn::nodes::ExprFunction) {
+        self.record(&node.arrow_token, &node.body);
+        visit::visit_expr_function(self, node);
     }
 }
 
@@ -2097,124 +2077,170 @@ fn normalize_whitespace(
     };
     syntax.visit(&mut semicolons);
     edits.extend(semicolons.edits);
-    let mut braces = BraceSpacing {
+    let mut brackets = BracketSpacing {
         layout,
-        space_in_braces: options.space_in_braces,
+        brackets: &options.brackets,
         edits: Vec::new(),
     };
-    syntax.visit(&mut braces);
-    edits.extend(braces.edits);
-    let mut prefixes = PrefixSpacing {
+    for delimiter in syntax.delimiters() {
+        brackets.consider(delimiter);
+    }
+    edits.extend(brackets.edits);
+    let mut operators = OperatorGaps {
         layout,
+        options,
+        seen: std::collections::HashSet::new(),
         edits: Vec::new(),
     };
-    syntax.visit(&mut prefixes);
-    edits.extend(prefixes.edits);
-    let mut binaries = BinarySpacing {
-        layout,
-        compact_factors: options.compact_factor_operators,
-        edits: Vec::new(),
-    };
-    syntax.visit(&mut binaries);
-    edits.extend(binaries.edits);
+    syntax.visit(&mut operators);
+    edits.extend(operators.edits);
     let mut calls = CallSpacing {
         layout,
         edits: Vec::new(),
     };
     syntax.visit(&mut calls);
     edits.extend(calls.edits);
-    let mut assignments = AssignmentSpacing {
-        layout,
-        seen: std::collections::HashSet::new(),
-        edits: Vec::new(),
-    };
-    syntax.visit(&mut assignments);
-    edits.extend(assignments.edits);
     edits
 }
 
-/// Spacing around assignment, option and lambda operators.
-struct AssignmentSpacing<'a> {
+/// A side of an operator, where its operands' whitespace sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// Between the left operand and the operator, as in `a +`.
+    Before,
+    /// Between the operator and the right operand, as in `+ b`.
+    After,
+}
+
+impl Side {
+    /// Both sides of a binary operator.
+    const BOTH: &[Self] = &[Self::Before, Self::After];
+}
+
+/// Spacing around every operator, as configured: binary, assignment,
+/// option, lambda, member and index operators on both sides, a prefix
+/// operator after itself and a postfix operator before itself.
+struct OperatorGaps<'a> {
     /// Current formatter coordinates.
     layout: &'a LayoutSource,
-    /// Operator ranges already visited through generated enum variants.
+    /// The operator spacing in effect.
+    options: &'a FormatOptions,
+    /// Operator ranges already spaced, met again through generated enum variants.
     seen: std::collections::HashSet<std::ops::Range<usize>>,
     /// Collected whitespace edits.
     edits: Vec<FormatEdit>,
 }
 
-impl AssignmentSpacing<'_> {
-    /// Applies the existing binary spacing policy to a typed operator.
-    fn consider(&mut self, operator: &impl m2_syn::Spanned) {
+impl OperatorGaps<'_> {
+    /// Writes the same-line gaps on `sides` of `operator` as `spacing` decides
+    /// from its spelling. Compacting needs every gap on the operator's line,
+    /// so an operator beside a line break keeps its neighbours apart.
+    fn space(
+        &mut self,
+        operator: &impl m2_syn::Spanned,
+        sides: &[Side],
+        spacing: impl FnOnce(&str) -> Option<Spacing>,
+    ) {
         let Some(bytes) = self.layout.syntax_range(operator) else {
+            return;
+        };
+        let text = self.layout.text();
+        let Some(spacing) = spacing(&text[bytes.clone()]) else {
             return;
         };
         if !self.seen.insert(bytes.clone()) {
             return;
         }
-        let text = self.layout.text();
-        let spacing = binary_operator_spacing(&text[bytes.clone()]);
-        let before = same_line_horizontal_whitespace_start(text, bytes.start);
-        let after = same_line_horizontal_whitespace_end(text, bytes.end);
-        if spacing == OperatorSpacing::Spaced
-            || (spacing == OperatorSpacing::Compact && before.is_some() && after.is_some())
-        {
-            let replacement = if spacing == OperatorSpacing::Spaced {
-                " "
-            } else {
-                ""
-            };
-            if let Some(start_byte) = before {
-                self.edits.push(FormatEdit {
-                    start_byte,
-                    end_byte: bytes.start,
-                    replacement: replacement.to_string(),
-                });
-            }
-            if let Some(end_byte) = after {
-                self.edits.push(FormatEdit {
-                    start_byte: bytes.end,
-                    end_byte,
-                    replacement: replacement.to_string(),
-                });
-            }
+        let gaps = sides
+            .iter()
+            .map(|side| match side {
+                Side::Before => same_line_horizontal_whitespace_start(text, bytes.start)
+                    .map(|start| start..bytes.start),
+                Side::After => {
+                    same_line_horizontal_whitespace_end(text, bytes.end).map(|end| bytes.end..end)
+                }
+            })
+            .collect::<Vec<_>>();
+        if spacing == Spacing::Compact && gaps.contains(&None) {
+            return;
         }
+        self.edits
+            .extend(gaps.into_iter().flatten().map(|gap| FormatEdit {
+                start_byte: gap.start,
+                end_byte: gap.end,
+                replacement: spacing.padding().to_string(),
+            }));
+    }
+
+    /// Spaces a binary operator whose operands are not adjacent factors.
+    fn space_binary(&mut self, operator: &impl m2_syn::Spanned) {
+        let options = self.options;
+        self.space(operator, Side::BOTH, |text| {
+            options.binary_spacing(text, false)
+        });
+    }
+
+    /// Spaces a unary operator on its operand's side.
+    fn space_unary(&mut self, operator: &impl m2_syn::Spanned, operand: Side) {
+        let options = self.options;
+        self.space(operator, &[operand], |text| options.operators.unary(text));
+    }
+
+    /// Whether an expression can be written as an adjacent factor.
+    fn is_factor(expression: &Expr) -> bool {
+        matches!(
+            expression,
+            Expr::Symbol(_)
+                | Expr::Literal(_)
+                | Expr::Sequence(_)
+                | Expr::List(_)
+                | Expr::Array(_)
+                | Expr::AngleBar(_)
+                | Expr::Paren(_)
+                | Expr::Binary(_)
+                | Expr::Field(_)
+                | Expr::Prefix(_)
+                | Expr::Postfix(_)
+        )
     }
 }
 
-impl<'ast> Visit<'ast> for AssignmentSpacing<'_> {
-    fn visit_expr_op_bin_index(&mut self, node: &'ast m2_syn::nodes::ExprOpBinIndex) {
-        self.consider(&node.operator);
-        visit::visit_expr_op_bin_index(self, node);
-    }
-    fn visit_expr_op_bin_member(&mut self, node: &'ast m2_syn::nodes::ExprOpBinMember) {
-        match node {
-            m2_syn::nodes::ExprOpBinMember::Dot(node) => self.consider(&node.operator),
-            m2_syn::nodes::ExprOpBinMember::Optional(node) => self.consider(&node.operator),
+impl<'ast> Visit<'ast> for OperatorGaps<'_> {
+    fn visit_expr_binary(&mut self, node: &'ast m2_syn::nodes::ExprBinary) {
+        if node.op.spelling() == <Token![#]>::SPELLING {
+            self.space_binary(&node.op);
+        } else if !matches!(node.op, m2_syn::nodes::BinaryOperator::Space(_)) {
+            let options = self.options;
+            let between_factors = Self::is_factor(&node.left) && Self::is_factor(&node.right);
+            self.space(&node.op, Side::BOTH, |text| {
+                options.binary_spacing(text, between_factors)
+            });
         }
-        visit::visit_expr_op_bin_member(self, node);
+        visit::visit_expr_binary(self, node);
+    }
+    fn visit_expr_prefix(&mut self, node: &'ast m2_syn::nodes::ExprPrefix) {
+        self.space_unary(&node.op, Side::After);
+        visit::visit_expr_prefix(self, node);
+    }
+    fn visit_expr_postfix(&mut self, node: &'ast m2_syn::nodes::ExprPostfix) {
+        self.space_unary(&node.op, Side::Before);
+        visit::visit_expr_postfix(self, node);
+    }
+    fn visit_expr_field(&mut self, node: &'ast m2_syn::nodes::ExprField) {
+        self.space_binary(&node.op);
+        visit::visit_expr_field(self, node);
     }
     fn visit_expr_assign(&mut self, node: &'ast m2_syn::nodes::ExprAssign) {
-        if let Some(span) = node.parts().operator_span {
-            self.consider(&span);
-        }
+        self.space_binary(&node.op);
         visit::visit_expr_assign(self, node);
     }
-    fn visit_expr_assign_evaluated(&mut self, node: &'ast m2_syn::nodes::ExprAssignEvaluated) {
-        self.consider(&node.operator);
-        visit::visit_expr_assign_evaluated(self, node);
-    }
     fn visit_expr_option(&mut self, node: &'ast m2_syn::nodes::ExprOption) {
-        self.consider(&node.operator);
+        self.space_binary(&node.fat_arrow_token);
         visit::visit_expr_option(self, node);
     }
-    fn visit_expr_lambda_variadic(&mut self, node: &'ast m2_syn::nodes::ExprLambdaVariadic) {
-        self.consider(&node.operator);
-        visit::visit_expr_lambda_variadic(self, node);
-    }
-    fn visit_expr_lambda_list(&mut self, node: &'ast m2_syn::nodes::ExprLambdaList) {
-        self.consider(&node.operator);
-        visit::visit_expr_lambda_list(self, node);
+    fn visit_expr_function(&mut self, node: &'ast m2_syn::nodes::ExprFunction) {
+        self.space_binary(&node.arrow_token);
+        visit::visit_expr_function(self, node);
     }
 }
 
@@ -2250,263 +2276,21 @@ impl CallSpacing<'_> {
 }
 
 impl<'ast> Visit<'ast> for CallSpacing<'_> {
-    fn visit_expr_op_bin_adj(&mut self, call: &'ast m2_syn::nodes::ExprOpBinAdj) {
-        if matches!(
-            call.right_operand.as_ref(),
-            Expr::Holder(_) | Expr::Collection(m2_syn::nodes::ExprCollection::Sequence(_))
-        ) {
-            self.gap(&call.left_operand, &call.right_operand, "");
+    fn visit_expr_binary(&mut self, call: &'ast m2_syn::nodes::ExprBinary) {
+        if matches!(call.op, m2_syn::nodes::BinaryOperator::Space(_))
+            && matches!(call.right.as_ref(), Expr::Paren(_) | Expr::Sequence(_))
+        {
+            self.gap(&call.left, &call.right, "");
         }
-        visit::visit_expr_op_bin_adj(self, call);
+        visit::visit_expr_binary(self, call);
     }
-    fn visit_expr_assign_install_method(
-        &mut self,
-        installation: &'ast m2_syn::nodes::ExprAssignInstallMethod,
-    ) {
-        self.gap(&installation.method, &installation.signature, " ");
-        visit::visit_expr_assign_install_method(self, installation);
-    }
-}
-
-/// Spacing edits for generated regular binary expressions.
-struct BinarySpacing<'a> {
-    /// Current whitespace coordinates.
-    layout: &'a LayoutSource,
-    /// Whether adjacent factors use compact operators.
-    compact_factors: bool,
-    /// Collected whitespace replacements.
-    edits: Vec<FormatEdit>,
-}
-
-impl BinarySpacing<'_> {
-    /// Whether an expression can be written as an adjacent factor.
-    fn is_factor(expression: &Expr) -> bool {
-        matches!(
-            expression,
-            Expr::Symbol(_)
-                | Expr::Literal(_)
-                | Expr::Collection(_)
-                | Expr::Holder(_)
-                | Expr::Op(_)
-        )
-    }
-}
-
-impl<'ast> Visit<'ast> for BinarySpacing<'_> {
-    fn visit_expr_op_bin_regular(&mut self, expression: &'ast m2_syn::nodes::ExprOpBinRegular) {
-        if let Some(operator) = self.layout.syntax_range(&expression.operator) {
-            let text = self.layout.text();
-            let spacing = match binary_operator_spacing(&text[operator.clone()]) {
-                OperatorSpacing::Factor
-                    if self.compact_factors
-                        && Self::is_factor(&expression.left_operand)
-                        && Self::is_factor(&expression.right_operand) =>
-                {
-                    OperatorSpacing::Compact
-                }
-                OperatorSpacing::Factor => OperatorSpacing::Spaced,
-                spacing => spacing,
-            };
-            let before = same_line_horizontal_whitespace_start(text, operator.start);
-            let after = same_line_horizontal_whitespace_end(text, operator.end);
-            if spacing == OperatorSpacing::Spaced
-                || (spacing == OperatorSpacing::Compact && before.is_some() && after.is_some())
-            {
-                let replacement = if spacing == OperatorSpacing::Spaced {
-                    " "
-                } else {
-                    ""
-                };
-                if let Some(start_byte) = before {
-                    self.edits.push(FormatEdit {
-                        start_byte,
-                        end_byte: operator.start,
-                        replacement: replacement.to_string(),
-                    });
-                }
-                if let Some(end_byte) = after {
-                    self.edits.push(FormatEdit {
-                        start_byte: operator.end,
-                        end_byte,
-                        replacement: replacement.to_string(),
-                    });
-                }
-            }
+    fn visit_expr_assign(&mut self, assignment: &'ast m2_syn::nodes::ExprAssign) {
+        if let crate::syntax::AssignmentTarget::Method { method, signature } =
+            assignment.parts().target
+        {
+            self.gap(method, signature, " ");
         }
-        visit::visit_expr_op_bin_regular(self, expression);
-    }
-}
-
-/// Per-operator spacing rule. Single source of truth consumed by the spacing
-/// walk (`collect_format_edits`) and the indent continuation check
-/// (`is_right_operand_first_token`). Folding the previously separate
-/// `should_space_*`/`is_compact_*`/`is_spaced_line_final_*` tables into one
-/// place removes the drift risk where the spaced and line-final tables forgot
-/// to track each other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OperatorSpacing {
-    /// Always surround with a space on each side (`a + b`, `x := y`).
-    Spaced,
-    /// Always collapse adjacent whitespace (`x^y`, `a#b`).
-    Compact,
-    /// Factor operator (`*`, `/`, `%`, `**`): compact when both operands are
-    /// adjacent factors (`a*b*c`), spaced when a non-factor or continuation
-    /// needs air (`a * f(b)`).
-    Factor,
-    /// Unary prefix form (`-x`, `#x`): collapse only the trailing space.
-    Prefix,
-    /// Unary prefix form read as a command (`<< x`): exactly one trailing space.
-    SpacedPrefix,
-    /// Not a spacing-relevant operator; leave its surrounding whitespace as-is.
-    None,
-}
-
-/// Whether the operator text spells any of the listed token types:
-/// `matches_tokens!(operator, Token![*], Token![/])`.
-macro_rules! matches_tokens {
-    ($text:expr, $($token:ty),+ $(,)?) => {
-        false $(|| matches_token::<$token>($text))+
-    };
-}
-
-/// Operator spacing required by an infix operator in the surrounding expression.
-fn binary_operator_spacing(operator: &str) -> OperatorSpacing {
-    // Factor operators participate in the adjacency rule before the static
-    // spaced/compact tables.
-    if matches_tokens!(operator, Token![*], Token![/], Token![%], Token![**]) {
-        return OperatorSpacing::Factor;
-    }
-    if matches_tokens!(
-        operator,
-        Token![==],
-        Token![!=],
-        Token![===],
-        Token![=!=],
-        Token![<<],
-        Token![<],
-        Token![>],
-        Token![<=],
-        Token![>=],
-        Token![or],
-        Token![??],
-        Token![xor],
-        Token![and],
-        Token![||],
-        Token![|],
-        Token![^^],
-        Token![&],
-        Token![++],
-        Token![+],
-        Token![-],
-        Token!["\\"],
-        Token!["\\\\"],
-        Token![:=],
-        Token![=],
-        Token![<-],
-        Token![=>],
-        Token![->],
-        Token![/ /],
-    ) {
-        return OperatorSpacing::Spaced;
-    }
-    if matches_tokens!(
-        operator,
-        Token!["·"],
-        Token!["⊠"],
-        Token!["⧢"],
-        Token![@],
-        Token![@@],
-        Token![@@?],
-        Token![| _],
-        Token![^],
-        Token![^**],
-        Token![^<],
-        Token![^<=],
-        Token![^>],
-        Token![^>=],
-        Token![_],
-        Token![_ <],
-        Token![_ <=],
-        Token![_ >],
-        Token![_ >=],
-        Token![#],
-        Token![#?],
-    ) {
-        return OperatorSpacing::Compact;
-    }
-    OperatorSpacing::None
-}
-
-/// Operator spacing required by a prefix operator and its operand.
-fn prefix_operator_spacing(operator: &str) -> OperatorSpacing {
-    if matches_token::<Token![<<]>(operator) {
-        return OperatorSpacing::SpacedPrefix;
-    }
-    if matches_tokens!(
-        operator,
-        Token![+],
-        Token![-],
-        Token![*],
-        Token![#],
-        Token![<],
-        Token![<=],
-        Token![>],
-        Token![>=],
-        Token![?],
-        Token![|-],
-        Token![<===],
-        Token![<==],
-        Token![??],
-    ) {
-        return OperatorSpacing::Prefix;
-    }
-    OperatorSpacing::None
-}
-
-/// Whether `operator`, when it dangles at the end of a line, takes a trailing
-/// space and so signals that the following row is an indented continuation.
-/// Used by the tree-driven indenter to decide right-operand indentation. The
-/// line-final set is exactly the binary operators classified `Spaced` above
-/// (Factor operators are excluded: a compact `*` left at line-end `a*\nb` does
-/// not indent). Derived from `binary_operator_spacing` so a new spaced operator
-/// cannot be added to one table and forgotten in the other.
-fn is_spaced_line_final_operator(operator: &str, compact_factor_operators: bool) -> bool {
-    match binary_operator_spacing(operator) {
-        OperatorSpacing::Spaced => true,
-        OperatorSpacing::Factor => !compact_factor_operators,
-        _ => false,
-    }
-}
-
-/// Whitespace after generated prefix operators.
-struct PrefixSpacing<'a> {
-    /// Current whitespace coordinates.
-    layout: &'a LayoutSource,
-    /// Collected whitespace replacements.
-    edits: Vec<FormatEdit>,
-}
-
-impl<'ast> Visit<'ast> for PrefixSpacing<'_> {
-    fn visit_expr_op_prefix(&mut self, expression: &'ast m2_syn::nodes::ExprOpPrefix) {
-        if let Some(operator) = self.layout.syntax_range(&expression.operator) {
-            let text = self.layout.text();
-            let separator = match prefix_operator_spacing(&text[operator.clone()]) {
-                OperatorSpacing::Prefix => Some(""),
-                OperatorSpacing::SpacedPrefix => Some(" "),
-                _ => None,
-            };
-            if let (Some(separator), Some(end_byte)) = (
-                separator,
-                same_line_horizontal_whitespace_end(text, operator.end),
-            ) {
-                self.edits.push(FormatEdit {
-                    start_byte: operator.end,
-                    end_byte,
-                    replacement: separator.to_string(),
-                });
-            }
-        }
-        visit::visit_expr_op_prefix(self, expression);
+        visit::visit_expr_assign(self, assignment);
     }
 }
 
@@ -2525,12 +2309,15 @@ struct SemicolonSpacing<'a> {
 impl<'ast> Visit<'ast> for SemicolonSpacing<'_> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
         let previous = self.in_collection;
-        self.in_collection = matches!(expression, Expr::Collection(_));
+        self.in_collection = matches!(
+            expression,
+            Expr::List(_) | Expr::Array(_) | Expr::Sequence(_) | Expr::AngleBar(_)
+        );
         visit::visit_expr(self, expression);
         self.in_collection = previous;
     }
     fn visit_cell(&mut self, cell: &'ast m2_syn::nodes::Cell) {
-        if let Some(semicolon) = &cell.semicolon {
+        if let Some(semicolon) = &cell.semi_token {
             if let Some(bytes) = self.layout.syntax_range(semicolon) {
                 push_semicolon_whitespace_edits(
                     self.layout.text(),
@@ -2542,8 +2329,8 @@ impl<'ast> Visit<'ast> for SemicolonSpacing<'_> {
         }
         visit::visit_cell(self, cell);
     }
-    fn visit_statement(&mut self, statement: &'ast m2_syn::nodes::Statement) {
-        if let Some(bytes) = self.layout.syntax_range(&statement.semicolon) {
+    fn visit_stmt(&mut self, statement: &'ast m2_syn::nodes::Stmt) {
+        if let Some(bytes) = self.layout.syntax_range(&statement.semi_token) {
             push_semicolon_whitespace_edits(
                 self.layout.text(),
                 bytes,
@@ -2551,7 +2338,7 @@ impl<'ast> Visit<'ast> for SemicolonSpacing<'_> {
                 &mut self.edits,
             );
         }
-        visit::visit_statement(self, statement);
+        visit::visit_stmt(self, statement);
     }
 }
 
@@ -2592,40 +2379,37 @@ fn push_semicolon_whitespace_edits(
     }
 }
 
-/// Spacing just inside typed list braces.
-struct BraceSpacing<'a> {
+/// Spacing just inside bracket pairs, as configured; an empty pair is always
+/// closed up, as `{}`.
+struct BracketSpacing<'a> {
     /// Current whitespace coordinates.
     layout: &'a LayoutSource,
-    /// Configured padding, or none to preserve it.
-    space_in_braces: Option<bool>,
+    /// Brackets written padded or compact.
+    brackets: &'a BracketSpacingSettings,
     /// Collected whitespace replacements.
     edits: Vec<FormatEdit>,
 }
 
-impl<'ast> Visit<'ast> for BraceSpacing<'_> {
-    fn visit_list(&mut self, list: &'ast List) {
-        let delimiter = list.delimiter.delimiter();
-        if let (Some(opener), Some(closer)) = (
+impl BracketSpacing<'_> {
+    /// Pads or compacts one bracket pair without crossing line breaks or
+    /// literal contents.
+    fn consider(&mut self, delimiter: Delimiter) {
+        let (Some(opener), Some(closer)) = (
             self.layout.syntax_range(&delimiter.opening_span()),
             delimiter
                 .closing_span()
                 .and_then(|span| self.layout.syntax_range(&span)),
-        ) {
-            self.space(opener, closer);
-        }
-        visit::visit_list(self, list);
-    }
-}
-
-impl BraceSpacing<'_> {
-    /// Applies brace padding without crossing line breaks or literal contents.
-    fn space(&mut self, opener: std::ops::Range<usize>, closer: std::ops::Range<usize>) {
+        ) else {
+            return;
+        };
         if opener.end > closer.start {
             return;
         }
         let text = self.layout.text();
-        let inside = &text[opener.end..closer.start];
-        if inside.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
+        if text[opener.end..closer.start]
+            .bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t'))
+        {
             self.edits.push(FormatEdit {
                 start_byte: opener.end,
                 end_byte: closer.start,
@@ -2633,24 +2417,20 @@ impl BraceSpacing<'_> {
             });
             return;
         }
-        let Some(space_in_braces) = self.space_in_braces else {
+        let Some(spacing) = self.brackets.spacing(BracketPair(delimiter.kind)) else {
             return;
         };
-        let padding = if space_in_braces { " " } else { "" };
-        if let Some(end_byte) = same_line_horizontal_whitespace_end(text, opener.end) {
-            self.edits.push(FormatEdit {
-                start_byte: opener.end,
-                end_byte,
-                replacement: padding.to_string(),
-            });
-        }
-        if let Some(start_byte) = same_line_horizontal_whitespace_start(text, closer.start) {
-            self.edits.push(FormatEdit {
-                start_byte,
-                end_byte: closer.start,
-                replacement: padding.to_string(),
-            });
-        }
+        let gaps = [
+            same_line_horizontal_whitespace_end(text, opener.end).map(|end| opener.end..end),
+            same_line_horizontal_whitespace_start(text, closer.start)
+                .map(|start| start..closer.start),
+        ];
+        self.edits
+            .extend(gaps.into_iter().flatten().map(|gap| FormatEdit {
+                start_byte: gap.start,
+                end_byte: gap.end,
+                replacement: spacing.padding().to_string(),
+            }));
     }
 }
 
@@ -2684,15 +2464,19 @@ mod tests {
     // Exact-output fixtures specify a fixed style, independent of user defaults.
     fn fixture_options(tab_size: u32, insert_spaces: bool) -> FormatOptions {
         FormatOptions::from(&FormattingSettings {
-            indent: Some(tab_size),
-            use_tabs: Some(!insert_spaces),
+            indent: if insert_spaces {
+                Indent::Spaces(tab_size)
+            } else {
+                Indent::Tab
+            },
+            tab_width: Some(tab_size),
             soft_line_width: Some(100),
             hard_line_width: Some(100),
             control_flow_layout: ControlFlowLayout::MultilineCompactElse,
             compact_factor_operators: false,
             break_after_semicolon: true,
             keep_line_breaks: false,
-            space_in_braces: None,
+            ..ServerSettings::defaults().formatting.clone()
         })
     }
 
@@ -2741,8 +2525,8 @@ mod tests {
 
     #[test]
     fn default_options_follow_configured_defaults() {
-        let settings = FormattingSettings::default();
-        let options = FormatOptions::default();
+        let settings = ServerSettings::defaults().formatting.clone();
+        let options = FormatOptions::from(&ServerSettings::defaults().formatting);
         let (soft, hard) = settings.line_widths();
         assert_eq!(options.soft_line_width, soft.map(|width| width as usize));
         assert_eq!(options.max_line_width, hard.map(|width| width as usize));
@@ -2820,7 +2604,7 @@ mod tests {
         let layout = LayoutSource::new(&tree);
         let mut visitor = OperatorBreaks {
             layout: &layout,
-            compact_factors: false,
+            options: &fixture_options(4, true),
             depth: 0,
             candidates: Vec::new(),
         };
@@ -2847,7 +2631,7 @@ mod tests {
         let layout = LayoutSource::new(&tree);
         let mut visitor = OperatorBreaks {
             layout: &layout,
-            compact_factors: false,
+            options: &fixture_options(4, true),
             depth: 0,
             candidates: Vec::new(),
         };
@@ -3395,7 +3179,6 @@ mod tests {
         let settings = crate::settings::ServerSettings::from_value(&serde_json::json!({
             "formatting": {
                 "indent": 2,
-                "useTabs": false,
                 "compactFactorOperators": true,
                 "breakAfterSemicolon": false
             }
@@ -3684,8 +3467,8 @@ mod tests {
     fn leading_keywords_keep_bodies_after_their_keyword() {
         let options = settings_options(FormattingSettings {
             control_flow_layout: ControlFlowLayout::LeadingKeywords,
-            use_tabs: Some(false),
-            ..FormattingSettings::default()
+            indent: Indent::Spaces(4),
+            ..ServerSettings::defaults().formatting.clone()
         });
         assert_eq!(
             format_fixture_with_options(
@@ -3697,24 +3480,34 @@ mod tests {
     }
 
     #[test]
-    fn space_in_braces_pads_strips_or_keeps_list_braces() {
-        let text = "a = { b, {c}, {  } }\nd = {e,\n    f }\n";
-        let with = |space_in_braces| {
-            format_fixture_with_options(
-                text,
-                &settings_options(FormattingSettings {
-                    space_in_braces,
-                    use_tabs: Some(false),
-                    ..FormattingSettings::default()
-                }),
+    fn bracket_spacing_pads_strips_or_keeps_brackets() {
+        let text = "a = { b, {c}, {  }, ( x) }\nd = {e,\n    f }\n";
+        let with = |formatting: serde_json::Value| {
+            let mut formatting = formatting;
+            formatting["indent"] = 4.into();
+            let settings = crate::settings::ServerSettings::from_value(
+                &serde_json::json!({ "formatting": formatting }),
             )
+            .settings;
+            format_fixture_with_options(text, &settings_options(settings.formatting))
         };
+        let brackets = |brackets| with(serde_json::json!({ "brackets": brackets }));
         assert_eq!(
-            with(Some(true)),
-            "a = { b, { c }, {} }\nd = { e,\n    f }\n"
+            brackets(serde_json::json!({ "spacesInside": ["{}"], "compact": ["()"] })),
+            "a = { b, { c }, {}, (x) }\nd = { e,\n    f }\n"
         );
-        assert_eq!(with(Some(false)), "a = {b, {c}, {}}\nd = {e,\n    f}\n");
-        assert_eq!(with(None), "a = { b, {c}, {} }\nd = {e,\n    f }\n");
+        assert_eq!(
+            brackets(serde_json::json!({ "compact": ["{}"] })),
+            "a = {b, {c}, {}, ( x)}\nd = {e,\n    f}\n"
+        );
+        assert_eq!(
+            with(serde_json::json!({})),
+            "a = { b, {c}, {}, ( x) }\nd = {e,\n    f }\n"
+        );
+        assert_eq!(
+            with(serde_json::json!({ "spaceInBraces": false })),
+            brackets(serde_json::json!({ "compact": ["{}"] }))
+        );
     }
 
     #[test]
@@ -3731,11 +3524,11 @@ mod tests {
         );
         let options = settings_options(FormattingSettings {
             keep_line_breaks: true,
-            use_tabs: Some(false),
+            indent: Indent::Spaces(4),
             control_flow_layout: ControlFlowLayout::Multiline,
             break_after_semicolon: true,
             hard_line_width: Some(10),
-            ..FormattingSettings::default()
+            ..ServerSettings::defaults().formatting.clone()
         });
         let formatted = format_fixture_with_options(text, &options);
         assert_eq!(formatted.lines().count(), text.lines().count());

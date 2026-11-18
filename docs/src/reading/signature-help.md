@@ -24,8 +24,12 @@ Macaulay2 calls do not need parentheses — `gb I` is a call too. Signature help
 reacts to the argument list of any application whose arguments contain the
 cursor, so `f (a, b)` and `f(a, b)` behave alike.
 
-For the options a call accepts, start typing a capitalized name inside it:
-[completion](../writing/completion.md#options) offers the option keys.
+Accepted optional arguments appear after the positional parameters as named
+slots, such as `Limit => ZZ`. While editing `Limit => 4`, the active slot
+follows `Limit`, regardless of the order in which options are passed. Source
+option declarations and catalog metadata supply the accepted types and
+symbolic values; forwarded options use the selected installation when known.
+[Completion](../writing/completion.md#options) also offers the option keys.
 
 ## Reading the active signature
 

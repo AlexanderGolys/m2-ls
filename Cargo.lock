@@ -509,19 +509,19 @@ dependencies = [
 
 [[package]]
 name = "m2-syn"
-version = "0.7.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3e29bf26e6a8c64d4343c3db817c2f90113bddc42b29e963ea29eec93749e11"
+checksum = "ce8833ef71e81e6f9c9a5d43fdafaca75d542a40f5916e2502aa974b27ece5a2"
 dependencies = [
  "m2-syn-macros",
- "these-macros-should-be-illegal 0.7.0",
+ "these-macros-should-be-illegal 0.14.2",
 ]
 
 [[package]]
 name = "m2-syn-macros"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "939a88314c8b96d83958f19158fa9630c3f46a2dd50b748c1c8d99da694b09cd"
+checksum = "b72fdc94bb0e1ecef1eab27bc34ba5454a80dc8300644c26a09a8700b4fd5070"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -981,21 +981,21 @@ dependencies = [
 
 [[package]]
 name = "these-macros-should-be-illegal"
-version = "0.7.0"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7342201a1f40821438ee4f0bda627d5ea96f5529a0eccc79858bbfc7427984be"
+checksum = "cb1714d6a9a016b3f2417d974fb0039e1a558f93f6b7635b3f49c47cc5824fbb"
 dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.5",
 ]
 
 [[package]]
 name = "these-macros-should-be-illegal"
-version = "0.12.2"
+version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb1714d6a9a016b3f2417d974fb0039e1a558f93f6b7635b3f49c47cc5824fbb"
+checksum = "1c1c8589e93bb9290714890db14473a1ddb2bd2031203e70675480de0781b3a8"
 dependencies = [
  "heck",
  "proc-macro2",

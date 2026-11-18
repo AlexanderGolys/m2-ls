@@ -437,13 +437,13 @@ struct TestContexts<'a> {
 
 impl<'ast> Visit<'ast> for TestContexts<'_> {
     fn visit_expr_debug(&mut self, expression: &'ast ExprDebug) {
-        if matches!(expression, ExprDebug::Test(_)) {
+        if matches!(expression.keyword, m2_syn::nodes::DebugKeyword::Test(_)) {
             if let Some(bytes) = self.document.syntax_bytes(expression) {
                 self.contexts.push((bytes, M2SemanticTokenModifier::Test));
             }
-            if let ExprDebug::Test(test) = expression {
-                if let Some(body) = test
-                    .value
+            {
+                if let Some(body) = expression
+                    .expr
                     .as_deref()
                     .and_then(|value| value.literal_content_bytes(self.document.source()))
                 {
@@ -805,6 +805,9 @@ where
     }
 
     /// Classifies indexed library bindings without transferring their origin to local shadows.
+    /// A package name is reassignable like any unprotected global, but it names a
+    /// namespace, not a setting, so it never carries
+    /// [`LibraryConfigParam`](M2SemanticTokenModifier::LibraryConfigParam).
     fn with_indexed_library_modifiers(
         &self,
         token: M2SemanticToken,
@@ -824,7 +827,8 @@ where
             )
             .with_modifier_state(
                 M2SemanticTokenModifier::LibraryConfigParam,
-                record.is_some_and(|record| !record.protected),
+                token.token_type != M2SemanticTokenType::Package
+                    && record.is_some_and(|record| !record.protected),
             )
     }
 
@@ -899,6 +903,7 @@ mod tests {
         local_symbol_semantic_token, M2SemanticToken, M2SemanticTokenModifier,
         M2SemanticTokenModifiers, M2SemanticTokenType,
     };
+    use crate::settings::ServerSettings;
     use crate::typesystem::TypeKnowledge;
     use crate::workspace_index::WorkspaceIndex;
     use strum::IntoEnumIterator;
@@ -920,7 +925,7 @@ mod tests {
         let builtins = ObjectRegistry::default();
         let document = document("x = \"é\"\n", &builtins);
         let workspace = WorkspaceIndex::default();
-        let settings = SemanticTokenSettings::default();
+        let settings = ServerSettings::defaults().semantic_tokens.clone();
         let uri = Url::parse("file:///invalid-spans.m2").expect("valid fixture URI");
         let classifier = SemanticTokenClassifier {
             document: &document,
@@ -958,7 +963,7 @@ mod tests {
     fn invalid_semantic_coordinates_are_skipped() {
         let builtins = ObjectRegistry::default();
         let document = document("x = 1\nx\n", &builtins);
-        let settings = SemanticTokenSettings::default();
+        let settings = ServerSettings::defaults().semantic_tokens.clone();
         let mut emitter = SemanticTokenEmitter::new(&document, &settings);
         let token = M2SemanticToken::new(M2SemanticTokenType::Variable);
         assert!(emitter.push_ranges(vec![TextRange::new(pos!(1, 0), pos!(1, 1))], token));
@@ -1023,7 +1028,7 @@ mod tests {
             builtins,
             &workspace_index,
             &uri,
-            &SemanticTokenSettings::default(),
+            &ServerSettings::defaults().semantic_tokens.clone(),
             augments_syntax_tokens,
         )
     }
@@ -1117,7 +1122,7 @@ mod tests {
             &builtins,
             &workspace_index,
             &main_uri,
-            &SemanticTokenSettings::default(),
+            &ServerSettings::defaults().semantic_tokens.clone(),
             false,
         );
 
@@ -1608,7 +1613,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             &builtins,
             &workspace_index,
             &main_uri,
-            &SemanticTokenSettings::default(),
+            &ServerSettings::defaults().semantic_tokens.clone(),
             false,
         );
 
@@ -1812,7 +1817,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             &builtins,
             &workspace,
             &Url::parse("file:///Pkg.m2").unwrap(),
-            &SemanticTokenSettings::default(),
+            &ServerSettings::defaults().semantic_tokens.clone(),
             true,
         );
         let token = token_at(&tokens, 1, 8).unwrap();
@@ -1999,7 +2004,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             document.object_registry(),
             &workspace_index,
             &uri,
-            &SemanticTokenSettings::default(),
+            &ServerSettings::defaults().semantic_tokens.clone(),
             true,
         );
         let token = token_at(&tokens, 1, 0).expect("imported pkgFn should be highlighted");
@@ -2013,7 +2018,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             document.object_registry(),
             &workspace_index,
             &uri,
-            &SemanticTokenSettings::default(),
+            &ServerSettings::defaults().semantic_tokens.clone(),
             true,
         );
         let token = token_at(&tokens, 0, 0).expect("unassigned pkgFn should be highlighted");
@@ -2320,7 +2325,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             &Url::parse("file:///fixture.m2").unwrap(),
             &SemanticTokenSettings {
                 standard_only: true,
-                ..SemanticTokenSettings::default()
+                ..ServerSettings::defaults().semantic_tokens.clone()
             },
             false,
         );
@@ -2692,7 +2697,7 @@ Description
         use M2SemanticTokenModifier::*;
         let settings = SemanticTokenSettings {
             standard_only: true,
-            ..SemanticTokenSettings::default()
+            ..ServerSettings::defaults().semantic_tokens.clone()
         };
         for modifier in M2SemanticTokenModifier::iter() {
             let expected = match modifier {
@@ -2712,7 +2717,7 @@ Description
     fn standard_only_sends_only_standard_modifiers() {
         let standard_only = SemanticTokenSettings {
             standard_only: true,
-            ..SemanticTokenSettings::default()
+            ..ServerSettings::defaults().semantic_tokens.clone()
         };
         let legend = M2SemanticToken::legend();
         let token = M2SemanticToken::new(M2SemanticTokenType::Function)
@@ -2721,7 +2726,7 @@ Description
             .with_modifier(M2SemanticTokenModifier::Readonly);
 
         assert_eq!(
-            token.encode(&SemanticTokenSettings::default()),
+            token.encode(&ServerSettings::defaults().semantic_tokens.clone()),
             (
                 M2SemanticTokenType::Function as u32,
                 DEFAULT_LIBRARY_MODIFIER | READONLY_MODIFIER | OPTION_MODIFIER

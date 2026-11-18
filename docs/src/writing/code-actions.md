@@ -36,7 +36,7 @@ Each of these fixes the diagnostic it is attached to:
 : Changes `verbose` to `Verbose` in an option declaration or call, when
   capitalizing the first letter is enough to produce a PascalCase name.
 
-**Use `??` coalescence**, **Use `??=` coalescing assignment** — `S04`
+**Use `??` coalescence**, **Use `??=` coalescing assignment** — `S04`, `S32`
 : `if x === null then 0 else x` becomes `x ?? 0`; an `if` that only assigns a
   fallback, `if t === null then t = v`, becomes `t ??= v`.
   A conditional update, `if stop =!= null then i = stop`, becomes
@@ -48,7 +48,10 @@ Each of these fixes the diagnostic it is attached to:
   Statements before a branch's final assignment stay in that branch's block,
   so collecting a match or updating a table still happens only on that path.
   A branch declaring its own local target or lacking a final value keeps the
-  original conditional.
+  original conditional. A null test on a value that may fail, such as `h.k`,
+  is rewritten only under `S32`, which
+  [`diagnostics.errorCatchingRewrites`](../getting-started/configuration.md#diagnostics)
+  enables.
 
 **Omit `from 0`** — `S30`
 : Removes a numeric `for` loop's explicit zero start: `for i from 0 to n do …`
@@ -172,7 +175,9 @@ metaclass can normalize the argument differently from direct `new` construction.
   `not linkStyles#?style` is left alone.
 
 **Remove redundant parentheses**
-: `if (ready) then value` → `if ready then value`.
+: `if (ready) then value` → `if ready then value`. For every redundant pair
+  in the file, not only those of control expressions, see
+  [below](#redundant-parentheses).
 
 **Flatten nested if into else-if chain** — `S17`
 : `if a then x else (if b then y else z)` → `if a then x else if b then y else z`.
@@ -188,6 +193,18 @@ label = §parameter.declaration|n§ -> if §parameter|n§ < 0 then "negative" el
 ```m2,pane="After"
 label = §parameter.declaration|n§ -> if §parameter|n§ < 0 then "negative" else if §parameter|n§ == 0 then "zero" else "positive"
 ```
+
+## Redundant parentheses in the file { #redundant-parentheses }
+
+**Remove redundant parentheses in file** is a source action
+(`source.removeRedundantParentheses`) removing every pair of parentheses the
+file parses the same without: `x = (a*b) + c` becomes `x = a*b + c` and
+`f(x)` becomes `f x`, while `(a + b)*c` keeps them. Only the parentheses and the
+whitespace inside them go; the rest of the line is left as written. How a pair
+is judged redundant is described under
+[formatting](formatting.md#parentheses), which can also remove them on every
+format. [`formatting.redundantParentheses`](../getting-started/configuration.md#formatting)
+set to `"off"` hides the action.
 
 ## Declaring library code { #primary-code }
 
@@ -225,6 +242,24 @@ Place the cursor on a declaration and choose **Generate SimpleDoc documentation
 for …** to insert a `doc /// … ///` placeholder immediately above it.
 The action fills the documentation key and adds explanatory text for sections
 that need your input.
+
+Documentation only has readers when a package exports what it describes, so the
+action is offered for the package itself on its `newPackage` line and for the
+declarations the package exports, under their own name or a synonym, and never
+in a plain script. A file the package `load`s counts its exports from the
+package's own file. An installation is offered when its method is exported or,
+for a method the package does not define, such as an operator or `net`, when
+one of the types it is installed on is:
+
+```m2
+newPackage "Shapes"
+export {"Square", "area"}
+Square = new Type of HashTable  -- offered: Square
+area = method()                 -- offered: area
+area Square := s -> s.side^2    -- offered: (area, Square)
+net Square := s -> "square"     -- offered: (net, Square)
+helper = s -> s.side            -- not offered: helper is private
+```
 
 The full templates translate Macaulay2's
 [function](https://macaulay2.com/doc/Macaulay2/share/doc/Macaulay2/Macaulay2Doc/html/_function_spdocumentation_sptemplate.html),

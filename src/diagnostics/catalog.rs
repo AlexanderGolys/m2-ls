@@ -149,6 +149,19 @@ UNRESOLVED_VALUE {
         severity: ERROR,
     }
 
+    /// A source lambda with a fixed parameter list receives the wrong number
+    /// of arguments. Variadic functions and unknown sequence values are exempt.
+    ///
+    /// ```m2
+    /// f = (x, y) -> x
+    /// f 1
+    /// ```
+CALL_ARITY_MISMATCH {
+        code: "T07",
+        name: "call-arity-mismatch",
+        severity: WARNING,
+    }
+
     /// A type or a declared optional argument does not use PascalCase or
     /// uppercase. Functions and locals are not constrained.
     ///
@@ -174,8 +187,8 @@ BOUND_OPTION_KEY {
         severity: WARNING,
     }
 
-    /// A conversion method named after a known type should declare a typical
-    /// value, shared or per installation, naming that type or a variant of it.
+    /// A source-owned constructor for a source-owned type must declare that
+    /// type as its global typical value. Installations may narrow the result.
     ///
     /// ```m2
     /// toWidget = method()
@@ -185,6 +198,18 @@ CONSTRUCTOR_TYPICAL_VALUE {
         code: "S10",
         name: "constructor-typical-value",
         severity: HINT,
+    }
+
+    /// A bare symbol is first used without a binding or earlier protection.
+    /// Explicit quoted symbols and member names do not read bindings.
+    ///
+    /// ```m2
+    /// defaults = {Strategy => MissingValue}
+    /// ```
+UNINTRODUCED_SYMBOL {
+        code: "S31",
+        name: "unintroduced-symbol",
+        severity: WARNING,
     }
 
     /// A local binding that is never read. Names starting with `_` are exempt.
@@ -242,6 +267,20 @@ PREFER_COALESCENCE {
 INLINE_NULL_BINDING {
         code: "S24",
         name: "inline-null-binding",
+        severity: HINT,
+    }
+
+    /// A `??` rewrite of a null test whose tested value may fail. `??` turns an
+    /// error in its left side into the fallback, so `h.Text ?? "..."` yields
+    /// `"..."` where this conditional fails for an `h` without the key `Text`.
+    /// Published only under `diagnostics.errorCatchingRewrites`.
+    ///
+    /// ```m2
+    /// f = h -> if h.Text =!= null then h.Text else "..."
+    /// ```
+ERROR_CATCHING_REWRITE {
+        code: "S32",
+        name: "error-catching-rewrite",
         severity: HINT,
     }
 
@@ -621,6 +660,34 @@ EXPLICIT_INSTALL_REQUIRED {
 PROTECTED_ASSIGNMENT {
         code: "E13",
         name: "protected-assignment",
+        severity: ERROR,
+    }
+
+    /// Rebinding a package's name. Macaulay2 leaves package names unprotected,
+    /// but the name is how the interpreter finds the package: after the
+    /// assignment below, `package` returns `null` for everything `Core`
+    /// defines.
+    ///
+    /// ```m2
+    /// Core = 3
+    /// ```
+PACKAGE_REBINDING {
+        code: "E25",
+        name: "package-rebinding",
+        severity: ERROR,
+    }
+
+    /// A library setting Macaulay2 lets a program rebind, given a value it
+    /// cannot hold: another class than the index records for it, or an
+    /// integer outside the range its assignment hook accepts.
+    ///
+    /// ```m2
+    /// allowableThreads = matrix {{1}}
+    /// allowableThreads = 0
+    /// ```
+LIBRARY_GLOBAL_VALUE {
+        code: "E26",
+        name: "library-global-value",
         severity: ERROR,
     }
 

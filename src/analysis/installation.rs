@@ -7,8 +7,7 @@
 //! generated fields; none searches enclosing syntax.
 
 use m2_syn::nodes::{
-    Expr, ExprAssign, ExprCollection, ExprLambda, ExprNew, ExprOp, ExprOpBin, ExprOpBinAdj,
-    ExprOpBinRegular, List,
+    BinaryOperator, Expr, ExprAssign, ExprBinary, ExprFunction, ExprList, ExprNew,
 };
 use m2_syn::{Span, Spanned, Token};
 
@@ -32,14 +31,14 @@ const METHOD_CONSTRUCTOR: &str = "method";
 #[derive(Debug, Clone, Copy)]
 pub(super) enum InstalledFunction<'ast> {
     /// `x -> …`, or `o -> x -> …` receiving an option table.
-    Lambda(&'ast ExprLambda),
+    Lambda(&'ast ExprFunction),
     /// `{…} >> o -> …`: a function declaring its own options, whose handler
     /// `o -> …` receives them.
     OptionDeclaring {
         /// The whole `{…} >> o -> …` expression.
-        declaration: &'ast ExprOpBinRegular,
+        declaration: &'ast ExprBinary,
         /// Function receiving the option table before ordinary call arguments.
-        handler: &'ast ExprLambda,
+        handler: &'ast ExprFunction,
     },
     /// Any other value, such as a named function.
     Other(&'ast Expr),
@@ -51,28 +50,26 @@ impl<'ast> InstalledFunction<'ast> {
     pub(super) fn of(value: &'ast Expr) -> Option<Self> {
         let value = value.unparenthesized()?;
         Some(match value {
-            Expr::Lambda(lambda) => Self::Lambda(lambda),
+            Expr::Function(lambda) => Self::Lambda(lambda),
             Expr::Option(annotated) => return Self::of(&annotated.value),
-            Expr::Op(ExprOp::Bin(ExprOpBin::Regular(declaration))) => {
-                match Self::option_declaring_handler(declaration) {
-                    Some(handler) => Self::OptionDeclaring {
-                        declaration,
-                        handler,
-                    },
-                    None => Self::Other(value),
-                }
-            }
+            Expr::Binary(declaration) => match Self::option_declaring_handler(declaration) {
+                Some(handler) => Self::OptionDeclaring {
+                    declaration,
+                    handler,
+                },
+                None => Self::Other(value),
+            },
             _ => Self::Other(value),
         })
     }
 
     /// The handler `o -> …` of `{…} >> o -> …`.
-    fn option_declaring_handler(declaration: &'ast ExprOpBinRegular) -> Option<&'ast ExprLambda> {
-        if declaration.operator.spelling() != <Token![>>]>::SPELLING {
+    fn option_declaring_handler(declaration: &'ast ExprBinary) -> Option<&'ast ExprFunction> {
+        if declaration.op.spelling() != <Token![>>]>::SPELLING {
             return None;
         }
-        match declaration.right_operand.unparenthesized()? {
-            Expr::Lambda(handler) => Some(handler),
+        match declaration.right.unparenthesized()? {
+            Expr::Function(handler) => Some(handler),
             _ => None,
         }
     }
@@ -88,9 +85,9 @@ impl<'ast> InstalledFunction<'ast> {
 }
 
 /// The lambda a lambda returns directly, as `x -> …` in `o -> x -> …`.
-fn returned_lambda(lambda: &ExprLambda) -> Option<&ExprLambda> {
+fn returned_lambda(lambda: &ExprFunction) -> Option<&ExprFunction> {
     match lambda.body().unparenthesized()? {
-        Expr::Lambda(returned) => Some(returned),
+        Expr::Function(returned) => Some(returned),
         _ => None,
     }
 }
@@ -100,7 +97,7 @@ impl MethodOptions {
     /// function of the form these options expect, or `None` when the form
     /// does not fit. With unrecorded options a lambda returning another lambda
     /// could be either form, so only one that does not is taken.
-    pub(super) fn argument_lambda(self, installed: InstalledFunction<'_>) -> Option<&ExprLambda> {
+    pub(super) fn argument_lambda(self, installed: InstalledFunction<'_>) -> Option<&ExprFunction> {
         match (self, installed) {
             (Self::Absent, InstalledFunction::Lambda(lambda)) => Some(lambda),
             (Self::Unrecorded, InstalledFunction::Lambda(lambda)) => {
@@ -117,8 +114,10 @@ impl MethodOptions {
 }
 
 /// The options of Macaulay2's `method` that shape the method function it creates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MethodDeclarationOption {
+/// For example, `TypicalValue => Widget` declares the family of returned values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum MethodDeclarationOption {
     /// Selects binary method dispatch behavior.
     Binary,
     /// Infer the result from applicable callable method domains.
@@ -131,7 +130,7 @@ pub(crate) enum MethodDeclarationOption {
 
 impl MethodDeclarationOption {
     /// Name used to identify this value in source and catalog lookups.
-    pub(crate) fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Binary => "Binary",
             Self::Dispatch => "Dispatch",
@@ -148,15 +147,16 @@ impl MethodDeclarationOption {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct MethodDeclaration<'ast> {
     /// Call supplying the declaration's options.
-    call: &'ast ExprOpBinAdj,
+    call: &'ast ExprBinary,
 }
 
 impl<'ast> MethodDeclaration<'ast> {
     /// Recognizes a `method(...)` call.
     pub(super) fn of(value: &'ast Expr) -> Option<Self> {
         match value {
-            Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call)))
-                if call.left_operand.symbol_name() == Some(METHOD_CONSTRUCTOR) =>
+            Expr::Binary(call)
+                if matches!(call.op, BinaryOperator::Space(_))
+                    && call.left.symbol_name() == Some(METHOD_CONSTRUCTOR) =>
             {
                 Some(Self { call })
             }
@@ -210,7 +210,7 @@ impl OptionDeclaration {
     /// The options a literal `{key => default, …}` list declares, or `None`
     /// when `list` is no such list.
     pub fn declared_options(list: &Expr) -> Option<Vec<CallableOption>> {
-        let list @ Expr::Collection(ExprCollection::List(_)) = list.unparenthesized()? else {
+        let list @ Expr::List(_) = list.unparenthesized()? else {
             return None;
         };
         list.collection_elements()?
@@ -228,16 +228,16 @@ impl OptionDeclaration {
 
     /// The list of option declarations `expression` makes: the `{…}` of
     /// `{…} >> o -> …`, or of `method(Options => {…})`.
-    pub fn declared_list(expression: &Expr) -> Option<(Self, &List)> {
-        fn list(value: &Expr) -> Option<&List> {
+    pub fn declared_list(expression: &Expr) -> Option<(Self, &ExprList)> {
+        fn list(value: &Expr) -> Option<&ExprList> {
             match value {
-                Expr::Collection(ExprCollection::List(list)) => Some(list),
+                Expr::List(list) => Some(list),
                 _ => None,
             }
         }
-        if let Expr::Op(ExprOp::Bin(ExprOpBin::Regular(declaration))) = expression {
+        if let Expr::Binary(declaration) = expression {
             InstalledFunction::option_declaring_handler(declaration)?;
-            return Some((Self::Function, list(&declaration.left_operand)?));
+            return Some((Self::Function, list(&declaration.left)?));
         }
         let options =
             MethodDeclaration::of(expression)?.option(MethodDeclarationOption::Options)?;
@@ -270,7 +270,7 @@ struct ClassifiedInstallation<'ast> {
 fn installation_domain(signature: &Expr) -> Option<Vec<&Expr>> {
     let signature = signature.unparenthesized()?;
     match signature {
-        Expr::Collection(ExprCollection::Sequence(_) | ExprCollection::List(_)) => {
+        Expr::Sequence(_) | Expr::List(_) => {
             let domain = signature
                 .collection_elements()?
                 .into_iter()
@@ -284,15 +284,16 @@ fn installation_domain(signature: &Expr) -> Option<Vec<&Expr>> {
 
 impl Operator {
     /// The operator an operation applies, with its form.
-    pub fn of_operation(operation: &ExprOp) -> Option<Self> {
+    pub fn of_operation(operation: &Expr) -> Option<Self> {
         let (token, form) = match operation {
-            ExprOp::Bin(ExprOpBin::Adj(_)) => (
+            Expr::Binary(binary) if matches!(binary.op, BinaryOperator::Space(_)) => (
                 Macaulay2Conventions::APPLICATION_OPERATOR,
                 OperatorForm::Binary,
             ),
-            ExprOp::Bin(binary) => (binary.infix_operands()?.operator, OperatorForm::Binary),
-            ExprOp::Prefix(prefix) => (prefix.operator.spelling(), OperatorForm::Prefix),
-            ExprOp::Postfix(postfix) => (postfix.operator.spelling(), OperatorForm::Postfix),
+            Expr::Binary(binary) => (binary.op.spelling(), OperatorForm::Binary),
+            Expr::Prefix(prefix) => (prefix.op.spelling(), OperatorForm::Prefix),
+            Expr::Postfix(postfix) => (postfix.op.spelling(), OperatorForm::Postfix),
+            _ => return None,
         };
         Some(Self {
             token: ObjectName::new(token),
@@ -305,7 +306,7 @@ impl Analysis {
     /// The domain of the installation whose arguments `lambda` receives.
     pub(super) fn argument_lambda_domain(
         &self,
-        lambda: &ExprLambda,
+        lambda: &ExprFunction,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<&Vec<ObjectName>> {
         Some(
@@ -319,7 +320,7 @@ impl Analysis {
     /// The installation whose method arguments `lambda` receives.
     pub fn installation_receiving_arguments(
         &self,
-        lambda: &ExprLambda,
+        lambda: &ExprFunction,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<&MethodInstallation> {
         let id = self
@@ -384,33 +385,33 @@ impl Analysis {
     /// `T S`, `T op S`, `op T`, or `T op`.
     fn operation_shape<'ast>(
         &self,
-        operation: &'ast ExprOp,
+        operation: &'ast Expr,
         position: Position,
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<InstallationShape<'ast>> {
         let operator = Operator::of_operation(operation)?;
         match operation {
-            ExprOp::Bin(ExprOpBin::Adj(call)) => {
+            Expr::Binary(call) if matches!(call.op, BinaryOperator::Space(_)) => {
                 // `A B` (juxtaposition = the SPACE operator): a method on the
                 // named function `A` when `A` is a function, or a SPACE
                 // operator method on the type pair when `A` is a type.
-                let left_name = call.left_operand.symbol_name()?;
+                let left_name = call.left.symbol_name()?;
                 if self.operand_is_type(left_name, position, knowledge) {
-                    call.right_operand.symbol_name()?;
+                    call.right.symbol_name()?;
                     Some(InstallationShape {
                         head: MethodHead::Operator(operator),
-                        domain: vec![&call.left_operand, &call.right_operand],
-                        head_span: call.operator.try_span(),
+                        domain: vec![&call.left, &call.right],
+                        head_span: call.op.try_span(),
                     })
                 } else {
                     Some(InstallationShape {
                         head: MethodHead::Function(ObjectName::new(left_name)),
-                        domain: installation_domain(&call.right_operand)?,
-                        head_span: call.left_operand.try_span(),
+                        domain: installation_domain(&call.right)?,
+                        head_span: call.left.try_span(),
                     })
                 }
             }
-            ExprOp::Bin(binary) => {
+            Expr::Binary(binary) => {
                 // `X op Y`: an explicit binary-operator method.
                 if operator.is_assignment() || operator.is_option_assignment() {
                     return None;
@@ -421,25 +422,26 @@ impl Analysis {
                 Some(InstallationShape {
                     head: MethodHead::Operator(operator),
                     domain: vec![operands.left, operands.right],
-                    head_span: binary_operator_span(binary),
+                    head_span: binary.op.try_span(),
                 })
             }
-            ExprOp::Prefix(prefix) => {
-                prefix.operand.symbol_name()?;
+            Expr::Prefix(prefix) => {
+                prefix.expr.symbol_name()?;
                 Some(InstallationShape {
                     head: MethodHead::Operator(operator),
-                    domain: vec![&prefix.operand],
-                    head_span: prefix.operator.try_span(),
+                    domain: vec![&prefix.expr],
+                    head_span: prefix.op.try_span(),
                 })
             }
-            ExprOp::Postfix(postfix) => {
-                postfix.operand.symbol_name()?;
+            Expr::Postfix(postfix) => {
+                postfix.expr.symbol_name()?;
                 Some(InstallationShape {
                     head: MethodHead::Operator(operator),
-                    domain: vec![&postfix.operand],
-                    head_span: postfix.operator.try_span(),
+                    domain: vec![&postfix.expr],
+                    head_span: postfix.op.try_span(),
                 })
             }
+            _ => None,
         }
     }
 
@@ -448,10 +450,10 @@ impl Analysis {
     fn new_shape(new: &ExprNew) -> Option<InstallationShape<'_>> {
         new.class.symbol_name()?;
         let mut domain = vec![new.class.as_ref()];
-        if let Some(parent) = &new.parent_class {
+        if let Some(parent) = &new.of_clause {
             domain.extend(installation_domain(parent.clause_value())?);
         }
-        if let Some(instance) = &new.instance {
+        if let Some(instance) = &new.from_clause {
             domain.extend(installation_domain(instance.clause_value())?);
         }
         Some(InstallationShape {
@@ -574,15 +576,15 @@ impl Analysis {
     fn classify_install_method<'ast>(
         &self,
         id: MethodInstallationId,
-        call: &'ast ExprOpBinAdj,
+        call: &'ast ExprBinary,
         source: &(impl SourceNavigation + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<ClassifiedInstallation<'ast>> {
-        if call.left_operand.symbol_name() != Some(INSTALL_METHOD_FUNCTION) {
+        if call.left.symbol_name() != Some(INSTALL_METHOD_FUNCTION) {
             return None;
         }
         let mut arguments = call
-            .right_operand
+            .right
             .collection_elements()?
             .into_iter()
             .collect::<Option<Vec<_>>>()?;
@@ -677,7 +679,7 @@ impl Analysis {
     /// Records an `installMethod` call for later semantic or editor queries.
     pub(super) fn record_install_method_call(
         &mut self,
-        call: &ExprOpBinAdj,
+        call: &ExprBinary,
         source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<MethodInstallationId> {
@@ -738,7 +740,7 @@ impl Analysis {
     fn deduce_installation_codomain(
         &mut self,
         id: MethodInstallationId,
-        argument_lambda: &ExprLambda,
+        argument_lambda: &ExprFunction,
         position: Position,
         source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -762,7 +764,7 @@ impl Analysis {
     /// the method runs.
     fn deducible_codomain(
         &self,
-        argument_lambda: &ExprLambda,
+        argument_lambda: &ExprFunction,
         position: Position,
         source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
@@ -904,21 +906,6 @@ impl Analysis {
             diagnostic_range,
             edit,
         })
-    }
-}
-
-/// Where the operator of an explicit binary operation is written.
-fn binary_operator_span(binary: &ExprOpBin) -> Option<Span> {
-    match binary {
-        ExprOpBin::Adj(call) => call.operator.try_span(),
-        ExprOpBin::Regular(regular) => regular.operator.try_span(),
-        ExprOpBin::Index(index) => index.operator.try_span(),
-        ExprOpBin::Member(m2_syn::nodes::ExprOpBinMember::Dot(member)) => {
-            member.operator.try_span()
-        }
-        ExprOpBin::Member(m2_syn::nodes::ExprOpBinMember::Optional(member)) => {
-            member.operator.try_span()
-        }
     }
 }
 

@@ -90,3 +90,7 @@ stays an ordinary comment.
   [highlighted](../reading/semantic-highlighting.md#embedded), and shown in hover.
 - Documentation comments are for reading in the editor; Macaulay2's own help
   system does not see them.
+
+Backticks inside ordinary strings, including raw strings, remain string data.
+Legacy backtick references are recognized only inside the raw-string argument
+of a `doc` call; they do not turn arbitrary strings into documentation.

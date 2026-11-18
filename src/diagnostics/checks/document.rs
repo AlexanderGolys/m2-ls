@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use m2_syn::nodes::{Expr, ExprCollection, ExprOpBinRegular, ExprOption, Symbol};
+use m2_syn::nodes::{Expr, ExprBinary, ExprOption, Symbol};
 use m2_syn::visit::{self, Visit};
 use m2_syn::Token;
 use tower_lsp::lsp_types::SymbolKind;
@@ -21,8 +21,8 @@ const OPTIONS_KEY: &str = "Options";
 /// Spawns every diagnostic that needs the whole document.
 pub(super) fn spawn(context: &DocumentContext, sink: &mut DiagnosticSink) {
     unused_binding(context, sink);
-    super::method_typical_value::MethodTypicalValue::spawn(context, sink);
     super::predicate_declaration::PredicateDeclaration::spawn(context, sink);
+    super::symbol_introduction::SymbolIntroductions::spawn(context, sink);
 }
 
 /// Checks the names of types and of optional arguments. A type is PascalCase
@@ -79,7 +79,7 @@ struct OptionDeclarations<'ast> {
 impl<'ast> OptionDeclarations<'ast> {
     /// Records the keys of the `key => value` entries of the list `declared`.
     fn declare(&mut self, declared: &'ast Expr) {
-        let Some(Expr::Collection(ExprCollection::List(_))) = declared.unparenthesized() else {
+        let Some(Expr::List(_)) = declared.unparenthesized() else {
             return;
         };
         for entry in declared
@@ -104,11 +104,11 @@ impl<'ast> Visit<'ast> for OptionDeclarations<'ast> {
         visit::visit_expr_option(self, option);
     }
 
-    fn visit_expr_op_bin_regular(&mut self, operation: &'ast ExprOpBinRegular) {
-        if operation.operator.spelling() == <Token![>>]>::SPELLING {
-            self.declare(&operation.left_operand);
+    fn visit_expr_binary(&mut self, operation: &'ast ExprBinary) {
+        if operation.op.spelling() == <Token![>>]>::SPELLING {
+            self.declare(&operation.left);
         }
-        visit::visit_expr_op_bin_regular(self, operation);
+        visit::visit_expr_binary(self, operation);
     }
 }
 
@@ -118,6 +118,7 @@ fn unused_binding(context: &DocumentContext, sink: &mut DiagnosticSink) {
         analysis,
         syntax,
         source,
+        ..
     } = context;
     let mut references = BindingReferences::default();
     for cell in syntax.cells().iter().filter_map(ParsedCell::syntax) {

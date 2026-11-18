@@ -236,7 +236,8 @@ impl PackageSources {
                 let mut progress = self.progress.lock().expect("package progress lock");
                 if progress.visited.len() >= MAX_PACKAGE_FILES {
                     progress.pending.clear();
-                    crate::telemetry::event(
+                    crate::telemetry::event_at(
+                        crate::settings::LogLevel::Warn,
                         serde_json::json!({"operation": "library.limit", "limit": "files", "files": progress.visited.len()}),
                     );
                     return;

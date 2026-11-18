@@ -14,7 +14,7 @@ use std::io::{self, ErrorKind};
 use std::iter;
 use std::path::{Component, Path, PathBuf};
 
-use m2_syn::nodes::ExprOpBinAdj;
+use m2_syn::nodes::ExprBinary;
 use m2_syn::visit::{self, Visit};
 use tower_lsp::lsp_types::{Position, Range as TextRange, Url};
 
@@ -304,14 +304,17 @@ struct FileLoadCollector<'source, S: ?Sized> {
 }
 
 impl<'ast, S: SourceNavigation + ?Sized> Visit<'ast> for FileLoadCollector<'_, S> {
-    fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
+    fn visit_expr_binary(&mut self, call: &'ast ExprBinary) {
+        if !matches!(call.op, m2_syn::nodes::BinaryOperator::Space(_)) {
+            return visit::visit_expr_binary(self, call);
+        }
         if call
-            .left_operand
+            .left
             .symbol_name()
             .is_some_and(FileLoad::is_load_function)
         {
             let load = (|| {
-                let literal = call.right_operand.arguments().into_iter().next()??;
+                let literal = call.right.arguments().into_iter().next()??;
                 let delimiter = StringDelimiter::of_expression(literal)?;
                 let name = delimiter.decode(literal.literal_source(self.source)?)?;
                 Some(FileLoad {
@@ -323,7 +326,7 @@ impl<'ast, S: SourceNavigation + ?Sized> Visit<'ast> for FileLoadCollector<'_, S
             })();
             self.loads.extend(load);
         }
-        visit::visit_expr_op_bin_adj(self, call);
+        visit::visit_expr_binary(self, call);
     }
 }
 

@@ -300,7 +300,7 @@ fn lint_warning_policy_and_formatter_configuration() {
     );
     fs::write(
         workspace.0.join("settings.json"),
-        r#"{"diagnostics":{"disabled":["X03"]},"formatting":{"indent":2,"useTabs":false}}"#,
+        r#"{"diagnostics":{"disabled":["X03"]},"formatting":{"indent":2}}"#,
     )
     .unwrap();
     assert!(workspace
@@ -341,7 +341,7 @@ fn grouped_toml_configuration_controls_formatting_and_diagnostic_emission() {
     let workspace = Workspace::new();
     fs::write(
         workspace.0.join("settings.toml"),
-        include_str!("fixtures/configuration.toml"),
+        include_str!("../src/settings/defaults.toml"),
     )
     .unwrap();
     let formatted = workspace.run(

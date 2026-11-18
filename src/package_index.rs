@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{env, iter, str, thread};
 
-use m2_syn::nodes::{Expr, ExprOpBinAdj};
+use m2_syn::nodes::{Expr, ExprBinary};
 use m2_syn::visit::{self, Visit};
 use tower_lsp::lsp_types::{Location, Position, Range as TextRange, Url};
 
@@ -710,13 +710,13 @@ impl PackageLoadingOption {
     /// Literal package names listed by this option on a typed constructor call.
     pub fn typed_package_names<'ast>(
         self,
-        call: &'ast ExprOpBinAdj,
+        call: &'ast ExprBinary,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Vec<&'ast Expr> {
-        if call.left_operand.symbol_name() != Some(Macaulay2Conventions::PACKAGE_CONSTRUCTOR) {
+        if call.left.symbol_name() != Some(Macaulay2Conventions::PACKAGE_CONSTRUCTOR) {
             return Vec::new();
         }
-        let arguments = call.right_operand.arguments();
+        let arguments = call.right.arguments();
         if arguments
             .first()
             .copied()
@@ -787,15 +787,17 @@ impl<S: SourceNavigation + ?Sized> PackageImportCollector<'_, S> {
 }
 
 impl<'ast, S: SourceNavigation + ?Sized> Visit<'ast> for PackageImportCollector<'_, S> {
-    fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
-        if let (Some(head), Some(range)) = (
-            call.left_operand.symbol_name(),
-            self.source.range_for_syntax(call),
-        ) {
+    fn visit_expr_binary(&mut self, call: &'ast ExprBinary) {
+        if !matches!(call.op, m2_syn::nodes::BinaryOperator::Space(_)) {
+            return visit::visit_expr_binary(self, call);
+        }
+        if let (Some(head), Some(range)) =
+            (call.left.symbol_name(), self.source.range_for_syntax(call))
+        {
             let effective_from = range.end;
             if is_package_import_trigger(head) {
                 if let Some(name) = call
-                    .right_operand
+                    .right
                     .arguments()
                     .first()
                     .copied()
@@ -821,7 +823,7 @@ impl<'ast, S: SourceNavigation + ?Sized> Visit<'ast> for PackageImportCollector<
                 }
             }
         }
-        visit::visit_expr_op_bin_adj(self, call);
+        visit::visit_expr_binary(self, call);
     }
 }
 
@@ -1109,7 +1111,7 @@ mod import_trigger_tests {
             executable_search_path: vec![executable.parent().unwrap().to_path_buf()],
             ..Macaulay2Environment::default()
         };
-        let mut settings = crate::settings::ServerSettings::default();
+        let mut settings = crate::settings::ServerSettings::defaults().clone();
         settings.macaulay2.runtime_discovery = false;
         let resolver = SourceResolver::for_settings(&environment, &settings);
         assert_eq!(resolver.resolve_package_file("Text"), None);

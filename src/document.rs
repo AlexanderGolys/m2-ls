@@ -17,10 +17,9 @@ use crate::source::{ByteRange, DocumentSource, SourceNavigation, SymbolMention, 
 use crate::source_package::{PackageSessionCode, SourcePackages};
 use crate::string_literal::LiteralSource;
 use crate::syntax::{
-    AssignmentOperator, AssignmentSyntax, AssignmentTarget, CursorSyntax, ExpressionSyntax,
-    QuotedNames,
+    AssignmentSyntax, AssignmentTarget, CursorSyntax, ExpressionSyntax, QuotedNames,
 };
-use m2_syn::nodes::{Expr, ExprAssign, ExprOp, ExprOpBin, Symbol};
+use m2_syn::nodes::{Expr, ExprAssign, Symbol};
 use m2_syn::visit::{self, Visit};
 use std::ops::BitOr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -63,7 +62,7 @@ struct LambdaRanges<'a> {
 
 impl<'ast> Visit<'ast> for LambdaRanges<'_> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
-        if matches!(expression.unparenthesized(), Some(Expr::Lambda(_))) {
+        if matches!(expression.unparenthesized(), Some(Expr::Function(_))) {
             self.ranges.extend(self.source.range_for_syntax(expression));
         }
         visit::visit_expr(self, expression);
@@ -142,7 +141,7 @@ impl FileProperties {
                 .cells()
                 .iter()
                 .flat_map(|cell| cell.trivia())
-                .filter(|comment| comment.kind() == m2_syn::TriviaKind::LineComment)
+                .filter(|comment| comment.kind() == m2_syn::CommentKind::Line)
                 .flat_map(|comment| comment.text().lines())
                 .any(|line| {
                     line.trim_start_matches([' ', '\t'])
@@ -861,7 +860,7 @@ impl DocumentSnapshot {
     fn statement_code_at(&self, position: Position) -> Option<&str> {
         let byte = self.byte_for_position(position)?;
         self.syntax().cells_at(byte).find_map(|cell| {
-            let bytes = self.syntax_bytes(&cell.content)?;
+            let bytes = self.syntax_bytes(&cell.elems)?;
             bytes
                 .contains(&byte)
                 .then(|| self.text().get(bytes))
@@ -980,11 +979,6 @@ impl DocumentSnapshot {
                 let parts = assignment.parts();
                 let method = match parts.target {
                     AssignmentTarget::Method { method, .. } => method,
-                    AssignmentTarget::Operator(ExprOp::Bin(ExprOpBin::Adj(call)))
-                        if parts.operator == AssignmentOperator::Local =>
-                    {
-                        call.left_operand.as_ref()
-                    }
                     _ => return None,
                 };
                 self.syntax_bytes(method)

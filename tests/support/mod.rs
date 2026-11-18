@@ -72,7 +72,7 @@ impl LspProcess {
     pub(crate) async fn initialize(&mut self, root_uri: &str) -> Value {
         self.initialize_with_options(
             root_uri,
-            json!({ "inlayHints": base_inlay_hint_settings(), "formatting": {"indent": null, "useTabs": null} }),
+            json!({ "inlayHints": base_inlay_hint_settings(), "formatting": {"indent": "editor"} }),
         )
         .await
     }

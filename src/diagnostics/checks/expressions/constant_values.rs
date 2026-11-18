@@ -3,7 +3,7 @@
 //! matrices whose dimensions cannot combine, a division by zero, or a
 //! condition that has one value whatever else happens.
 
-use m2_syn::nodes::{Expr, ExprLiteral, ExprOp, ExprOpBin};
+use m2_syn::nodes::{BinaryOperator, Expr, Literal};
 use m2_syn::visit::{self, Visit};
 use m2_syn::Token;
 
@@ -57,9 +57,9 @@ impl<'a> ExpressionChecks<'a, '_> {
         knowledge: &ObjectRegistryView<'_>,
     ) {
         match expression {
-            Expr::If(node) => self.constant_condition("if", &node.condition, knowledge),
-            Expr::While(node) => self.constant_condition("while", &node.condition, knowledge),
-            Expr::Op(ExprOp::Bin(binary)) if !matches!(binary, ExprOpBin::Adj(_)) => {
+            Expr::If(node) => self.constant_condition("if", &node.cond, knowledge),
+            Expr::While(node) => self.constant_condition("while", &node.cond, knowledge),
+            Expr::Binary(binary) if !matches!(binary.op, BinaryOperator::Space(_)) => {
                 let Some(operands) = binary.infix_operands() else {
                     return;
                 };
@@ -86,13 +86,14 @@ impl<'a> ExpressionChecks<'a, '_> {
     }
 
     /// The value `expression` certainly has, if the program determines it.
-    fn determined_value(
+    pub fn determined_value(
         &self,
         expression: &'a Expr,
         knowledge: &ObjectRegistryView<'_>,
     ) -> Option<KnownValue> {
         let checker = TypeChecker::new(self.context.analysis, knowledge);
         let session = InferenceSession::new(&checker, self.context.source, self.snapshot);
+        // Bound first: the tail temporary would outlive `session`.
         let value = session.ring_values(0).constant(expression);
         value
     }
@@ -108,12 +109,12 @@ impl<'a> ExpressionChecks<'a, '_> {
     ) {
         let writes_exact_zero = matches!(
             divisor.unparenthesized(),
-            Some(literal @ Expr::Literal(ExprLiteral::Integer(_)))
+            Some(literal @ Expr::Literal(Literal::Integer(_)))
                 if self.text(literal).trim() == "0"
         );
         let is_number = matches!(
             dividend.unparenthesized(),
-            Some(Expr::Literal(ExprLiteral::Float(_)))
+            Some(Expr::Literal(Literal::Float(_)))
         ) || matches!(
             self.determined_value(dividend, knowledge),
             Some(KnownValue::Number(_))
@@ -131,8 +132,8 @@ impl<'a> ExpressionChecks<'a, '_> {
     /// Whether `operand` is a matrix the syntax or its binding's type says so.
     fn may_be_matrix(&self, operand: &Expr) -> bool {
         match operand.unparenthesized() {
-            Some(Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call)))) => call
-                .left_operand
+            Some(Expr::Binary(call)) if matches!(call.op, BinaryOperator::Space(_)) => call
+                .left
                 .symbol_name()
                 .is_some_and(|name| MATRIX_BUILDERS.contains(&name)),
             Some(Expr::Symbol(symbol)) => self
@@ -209,7 +210,15 @@ impl<'a> ExpressionChecks<'a, '_> {
     ) {
         let computes = matches!(
             condition.unparenthesized(),
-            Some(Expr::Op(_) | Expr::Control(_))
+            Some(
+                Expr::Binary(_)
+                    | Expr::Field(_)
+                    | Expr::Prefix(_)
+                    | Expr::Postfix(_)
+                    | Expr::Break(_)
+                    | Expr::Continue(_)
+                    | Expr::Return(_)
+            )
         );
         // A condition on a name the program defines is a setting, `not DEBUG`,
         // however constant that name is.

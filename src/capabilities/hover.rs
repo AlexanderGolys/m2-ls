@@ -9,7 +9,7 @@ const HOVER_DEBUG_ENV: &str = "M2_LS_HOVER_DEBUG";
 /// What follows a signature in hover whose codomain is deduced, not stated.
 const DEDUCED_CODOMAIN_COMMENT: &str = "  -- deduced";
 
-use m2_syn::nodes::{Expr, ExprOp, ExprOpBin};
+use m2_syn::nodes::{BinaryOperator, Expr};
 use m2_syn::{Span, Spanned};
 use tower_lsp::lsp_types::*;
 
@@ -206,13 +206,9 @@ impl<'a> HoveredSyntax<'a> {
         };
         let innermost = *document.enclosing_expressions(position).last()?;
         match innermost {
-            Expr::Op(ExprOp::Prefix(prefix)) => prefix
-                .operator
-                .try_span()
-                .filter(covers)
-                .map(Self::UnaryOperator),
-            Expr::Op(ExprOp::Postfix(postfix)) => postfix
-                .operator
+            Expr::Prefix(prefix) => prefix.op.try_span().filter(covers).map(Self::UnaryOperator),
+            Expr::Postfix(postfix) => postfix
+                .op
                 .try_span()
                 .filter(covers)
                 .map(Self::UnaryOperator),
@@ -343,12 +339,16 @@ fn call_evidence_for_hover(
     let (facts, context): (_, &dyn Spanned) = match *hovered {
         HoveredSyntax::Symbol(SymbolAt {
             expression: Some(symbol),
-            parent: Some(call @ Expr::Op(ExprOp::Bin(ExprOpBin::Adj(application)))),
+            parent: Some(call @ Expr::Binary(application)),
             ..
-        }) if std::ptr::eq(application.left_operand.as_ref(), symbol) => (
-            analysis.infer_call_static_facts(application, document, knowledge),
-            call,
-        ),
+        }) if matches!(application.op, BinaryOperator::Space(_))
+            && std::ptr::eq(application.left.as_ref(), symbol) =>
+        {
+            (
+                analysis.infer_call_static_facts(application, document, knowledge),
+                call,
+            )
+        }
         HoveredSyntax::BinaryOperator { operation, .. } => {
             let operands = operation.infix_operands()?;
             (

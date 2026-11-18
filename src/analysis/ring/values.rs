@@ -228,12 +228,15 @@ where
     /// A polynomial constructor's typed variable specification, checked against its head type.
     pub(super) fn constructor_variables(
         &self,
-        application: &'ast ExprOpBinAdj,
+        application: &'ast ExprBinary,
     ) -> Option<&'ast Expr> {
+        if !matches!(application.op, BinaryOperator::Space(_)) {
+            return None;
+        }
         let variables = RingSyntax::constructor_variables(application)?;
         let position = self.position(application)?;
         let knowledge = self.checker.knowledge_at(position);
-        (self.infer)(&application.left_operand, self.scope)
+        (self.infer)(&application.left, self.scope)
             .single()
             .is_some_and(|class| {
                 knowledge.has_type_role(class, TypeRole::Ring)
@@ -245,10 +248,10 @@ where
     /// Known constructor, quotient, forwarded ring, or basic ring value.
     pub fn value(&self, expression: &'ast Expr) -> Option<RingValue> {
         let expression = expression.unparenthesized()?;
-        if let Expr::Op(ExprOp::Bin(ExprOpBin::Adj(application))) = expression {
+        if let Expr::Binary(application) = expression {
             if let Some(variables) = self.constructor_variables(application) {
                 return Some(RingValue::Polynomial {
-                    coefficient_ring: self.value(&application.left_operand).map(Box::new),
+                    coefficient_ring: self.value(&application.left).map(Box::new),
                     variables: RingSyntax::generators(variables, &|symbol| {
                         self.bare_symbol(symbol)
                     })
@@ -338,7 +341,7 @@ where
         if operator == "_"
             && matches!(
                 left.unparenthesized()?,
-                Expr::Literal(ExprLiteral::Integer(_) | ExprLiteral::Float(_))
+                Expr::Literal(Literal::Integer(_) | Literal::Float(_))
             )
         {
             let ring = right.unparenthesized()?;
@@ -451,8 +454,8 @@ where
             return true;
         }
         let operand = match expression {
-            Expr::Op(ExprOp::Bin(ExprOpBin::Adj(application))) => {
-                Some(application.left_operand.as_ref())
+            Expr::Binary(application) if matches!(application.op, BinaryOperator::Space(_)) => {
+                Some(application.left.as_ref())
             }
             _ => RingSyntax::operands(expression, "/").map(|(left, _)| left),
         };

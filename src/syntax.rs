@@ -24,24 +24,24 @@ pub trait ExpressionSyntax {
     fn contained_expressions(&self) -> Vec<&Expr>;
     /// The function an assigned value supplies, seen through parentheses and a
     /// codomain annotation: the `x -> …` of `T => x -> …`.
-    fn assigned_function(&self) -> Option<&ExprLambda>;
+    fn assigned_function(&self) -> Option<&ExprFunction>;
 }
 
 impl ExpressionSyntax for Expr {
     fn delimiter(&self) -> Option<Delimiter> {
         match self {
-            Expr::Collection(ExprCollection::Array(node)) => Some(node.delimiter.delimiter()),
-            Expr::Collection(ExprCollection::List(node)) => Some(node.delimiter.delimiter()),
-            Expr::Collection(ExprCollection::Sequence(node)) => Some(node.delimiter.delimiter()),
-            Expr::Collection(ExprCollection::AngleBar(node)) => Some(node.delimiter.delimiter()),
-            Expr::Holder(node) => Some(node.delimiter.delimiter()),
+            Expr::Array(node) => Some(node.delimiter.delimiter()),
+            Expr::List(node) => Some(node.delimiter.delimiter()),
+            Expr::Sequence(node) => Some(node.delimiter.delimiter()),
+            Expr::AngleBar(node) => Some(node.delimiter.delimiter()),
+            Expr::Paren(node) => Some(node.delimiter.delimiter()),
             _ => None,
         }
     }
     fn unparenthesized(&self) -> Option<&Expr> {
         let mut expression = self;
-        while let Self::Holder(holder) = expression {
-            expression = holder.value.as_deref()?;
+        while let Self::Paren(holder) = expression {
+            expression = holder.expr.as_deref()?;
         }
         Some(expression)
     }
@@ -56,8 +56,8 @@ impl ExpressionSyntax for Expr {
     fn arguments(&self) -> Vec<Option<&Expr>> {
         let expression = self.unparenthesized().unwrap_or(self);
         match expression {
-            Self::Collection(ExprCollection::Sequence(sequence)) => sequence
-                .elements
+            Self::Sequence(sequence) => sequence
+                .elems
                 .as_ref()
                 .map_or_else(Vec::new, PackedArguments::arguments),
             _ => vec![Some(expression)],
@@ -66,10 +66,10 @@ impl ExpressionSyntax for Expr {
 
     fn collection_elements(&self) -> Option<Vec<Option<&Expr>>> {
         let contents = match self {
-            Self::Collection(ExprCollection::Sequence(node)) => &node.elements,
-            Self::Collection(ExprCollection::List(node)) => &node.elements,
-            Self::Collection(ExprCollection::Array(node)) => &node.elements,
-            Self::Collection(ExprCollection::AngleBar(node)) => &node.elements,
+            Self::Sequence(node) => &node.elems,
+            Self::List(node) => &node.elems,
+            Self::Array(node) => &node.elems,
+            Self::AngleBar(node) => &node.elems,
             _ => return None,
         };
         Some(
@@ -81,7 +81,7 @@ impl ExpressionSyntax for Expr {
 
     fn contained_expressions(&self) -> Vec<&Expr> {
         match self {
-            Self::Holder(holder) => holder.value.as_deref().into_iter().collect(),
+            Self::Paren(holder) => holder.expr.as_deref().into_iter().collect(),
             _ => self
                 .collection_elements()
                 .into_iter()
@@ -91,9 +91,9 @@ impl ExpressionSyntax for Expr {
         }
     }
 
-    fn assigned_function(&self) -> Option<&ExprLambda> {
+    fn assigned_function(&self) -> Option<&ExprFunction> {
         match self.unparenthesized()? {
-            Self::Lambda(lambda) => Some(lambda),
+            Self::Function(lambda) => Some(lambda),
             Self::Option(annotation) => annotation.value.assigned_function(),
             _ => None,
         }
@@ -105,16 +105,16 @@ pub trait PackedArguments {
     /// Returns expressions and explicit empty slots, excluding muted statements.
     fn arguments(&self) -> Vec<Option<&Expr>>;
 }
-impl PackedArguments for PackedContent {
+impl PackedArguments for Elements {
     fn arguments(&self) -> Vec<Option<&Expr>> {
         match self {
-            Self::Expr(expression) => vec![Some(expression)],
+            Self::Single(expression) => vec![Some(expression)],
             Self::Pack(pack) => pack
-                .pack
+                .elems
                 .iter()
                 .map(|component| match component {
-                    Component::Expr(expression) => Some(expression.as_ref()),
-                    Component::Empty(_) => None,
+                    Element::Expr(expression) => Some(expression.as_ref()),
+                    Element::Empty(_) => None,
                 })
                 .collect(),
         }
@@ -129,17 +129,14 @@ pub trait LambdaSyntax {
     fn dispatch(&self) -> Dispatch;
 }
 
-impl LambdaSyntax for ExprLambda {
+impl LambdaSyntax for ExprFunction {
     fn body(&self) -> &Expr {
-        match self {
-            Self::Variadic(lambda) => &lambda.body,
-            Self::List(lambda) => &lambda.body,
-        }
+        &self.body
     }
     fn dispatch(&self) -> Dispatch {
-        match self {
-            Self::Variadic(_) => Dispatch::Variadic,
-            Self::List(_) => Dispatch::Fixed(self.bound_symbols().len()),
+        match &self.params {
+            FunctionParams::Variadic(_) => Dispatch::Variadic,
+            FunctionParams::List(_) => Dispatch::Fixed(self.bound_symbols().len()),
         }
     }
 }
@@ -165,7 +162,7 @@ pub enum AssignmentTarget<'ast> {
     /// `x = …` and `x := …`.
     Symbol(&'ast Symbol),
     /// `(a, b) = …`.
-    List(&'ast AssignmentList),
+    List(&'ast ExprSequence),
     /// The expression whose value names the target of `<-`.
     Evaluated(&'ast Expr),
     /// The target of a compound assignment such as `x += …`.
@@ -178,7 +175,9 @@ pub enum AssignmentTarget<'ast> {
         signature: &'ast Expr,
     },
     /// `T + S := …` or `x_i = …`: an operator expression.
-    Operator(&'ast ExprOp),
+    Operator(&'ast Expr),
+    /// An assignment target that does not match a known shape.
+    Expression(&'ast Expr),
     /// `new T of P from I := …`.
     New(&'ast ExprNew),
 }
@@ -206,96 +205,48 @@ pub trait AssignmentSyntax {
 
 impl AssignmentSyntax for ExprAssign {
     fn parts(&self) -> AssignmentParts<'_> {
-        fn parts<'ast>(
-            target: AssignmentTarget<'ast>,
-            operator: AssignmentOperator,
-            token: &'ast impl Spanned,
-            value: &'ast Expr,
-        ) -> AssignmentParts<'ast> {
-            AssignmentParts {
-                target,
-                operator,
-                operator_span: token.try_span(),
-                value,
-                codomain: None,
+        let operator = match &self.op {
+            AssignOperator::Global(_) => AssignmentOperator::Global,
+            AssignOperator::Local(_) => AssignmentOperator::Local,
+            AssignOperator::Evaluated(_) => AssignmentOperator::Evaluated,
+            AssignOperator::Augmented(_) => AssignmentOperator::Augmented,
+        };
+        let left = self.left.unparenthesized().unwrap_or(&self.left);
+        let target = match (operator, left) {
+            (AssignmentOperator::Evaluated, _) => AssignmentTarget::Evaluated(left),
+            (AssignmentOperator::Augmented, _) => AssignmentTarget::Augmented(left),
+            (_, Expr::Symbol(symbol)) => AssignmentTarget::Symbol(symbol),
+            (_, Expr::Sequence(sequence)) => AssignmentTarget::List(sequence),
+            (AssignmentOperator::Local, Expr::Binary(binary))
+                if matches!(binary.op, BinaryOperator::Space(_)) =>
+            {
+                AssignmentTarget::Method {
+                    method: &binary.left,
+                    signature: &binary.right,
+                }
             }
-        }
-        match self {
-            Self::Simple(ExprAssignSimple::Global(node)) => parts(
-                AssignmentTarget::Symbol(&node.variable),
-                AssignmentOperator::Global,
-                &node.operator,
-                &node.value,
-            ),
-            Self::Simple(ExprAssignSimple::Local(node)) => parts(
-                AssignmentTarget::Symbol(&node.variable),
-                AssignmentOperator::Local,
-                &node.operator,
-                &node.value,
-            ),
-            Self::Parallel(ExprAssignParallel::Global(node)) => parts(
-                AssignmentTarget::List(&node.argument_list),
-                AssignmentOperator::Global,
-                &node.operator,
-                &node.value,
-            ),
-            Self::Parallel(ExprAssignParallel::Local(node)) => parts(
-                AssignmentTarget::List(&node.argument_list),
-                AssignmentOperator::Local,
-                &node.operator,
-                &node.value,
-            ),
-            Self::Evaluated(node) => parts(
-                AssignmentTarget::Evaluated(&node.evaluated_domain),
-                AssignmentOperator::Evaluated,
-                &node.operator,
-                &node.value,
-            ),
-            Self::Augmented(node) => parts(
-                AssignmentTarget::Augmented(&node.target),
-                AssignmentOperator::Augmented,
-                &node.operator,
-                &node.value,
-            ),
-            Self::Install(ExprAssignInstall::Method(node)) => AssignmentParts {
-                codomain: node
-                    .typical_value
-                    .as_ref()
-                    .map(|annotation| annotation.typical_value.as_ref()),
-                ..parts(
-                    AssignmentTarget::Method {
-                        method: &node.method,
-                        signature: &node.signature,
-                    },
-                    AssignmentOperator::Local,
-                    &node.assign_op,
-                    &node.function,
-                )
-            },
-            Self::Install(ExprAssignInstall::Op(node)) => AssignmentParts {
-                codomain: node
-                    .typical_value
-                    .as_ref()
-                    .map(|annotation| annotation.typical_value.as_ref()),
-                ..parts(
-                    AssignmentTarget::Operator(&node.domain_expr),
-                    AssignmentOperator::Local,
-                    &node.assign_op,
-                    &node.function,
-                )
-            },
-            Self::Install(ExprAssignInstall::New(node)) => parts(
-                AssignmentTarget::New(&node.new_statement),
-                AssignmentOperator::Local,
-                &node.operator,
-                &node.function,
-            ),
-            Self::Op(node) => parts(
-                AssignmentTarget::Operator(&node.argument_expr),
-                AssignmentOperator::Global,
-                &node.operator,
-                &node.value_expr,
-            ),
+            (AssignmentOperator::Local, Expr::New(new)) => AssignmentTarget::New(new),
+            (_, Expr::Binary(_) | Expr::Field(_)) => AssignmentTarget::Operator(left),
+            _ => AssignmentTarget::Expression(left),
+        };
+        let installation = matches!(
+            target,
+            AssignmentTarget::Method { .. }
+                | AssignmentTarget::Operator(_)
+                | AssignmentTarget::New(_)
+        ) && operator == AssignmentOperator::Local;
+        let (value, codomain) = match (installation, self.right.as_ref()) {
+            (true, Expr::Option(annotation)) => {
+                (annotation.value.as_ref(), Some(annotation.key.as_ref()))
+            }
+            _ => (self.right.as_ref(), None),
+        };
+        AssignmentParts {
+            target,
+            operator,
+            operator_span: self.op.try_span(),
+            value,
+            codomain,
         }
     }
 }
@@ -311,7 +262,9 @@ impl<'ast> AssignmentTarget<'ast> {
             }
             Self::Symbol(symbol) => symbol,
             Self::List(list) => list,
-            Self::Evaluated(expression) | Self::Augmented(expression) => expression,
+            Self::Evaluated(expression)
+            | Self::Augmented(expression)
+            | Self::Expression(expression) => expression,
             Self::Operator(operation) => operation,
             Self::New(new) => new,
         };
@@ -335,54 +288,37 @@ pub trait BoundSymbols {
     fn bound_symbols(&self) -> Vec<&Symbol>;
 }
 
-impl BoundSymbols for ExprLambda {
-    /// The parameters: `x` of `x -> …`, and `a`, `b` of `(a, b) -> …`.
+impl BoundSymbols for ExprFunction {
     fn bound_symbols(&self) -> Vec<&Symbol> {
-        match self {
-            Self::Variadic(lambda) => vec![&lambda.argument],
-            Self::List(lambda) => match &lambda.arguments.contents {
+        match &self.params {
+            FunctionParams::Variadic(symbol) => vec![symbol],
+            FunctionParams::List(list) => match &list.params.contents {
                 None => Vec::new(),
-                Some(ArgumentListContent::Symbol(symbol)) => vec![symbol],
-                Some(ArgumentListContent::Pack(arguments)) => arguments.arguments.iter().collect(),
+                Some(Params::Single(symbol)) => vec![symbol],
+                Some(Params::Pack(pack)) => pack.params.iter().collect(),
             },
         }
     }
 }
 
-/// The targets of a parallel assignment list.
-pub trait AssignmentListSyntax {
-    /// The immediate targets, in source order: `a` and `(b, c)` of `(a, (b, c))`.
-    fn targets(&self) -> Vec<&AssignmentArgument>;
-}
-
-impl AssignmentListSyntax for AssignmentList {
-    fn targets(&self) -> Vec<&AssignmentArgument> {
-        match &self.contents.contents {
-            None => Vec::new(),
-            Some(AssignmentListContent::Argument(argument)) => vec![argument],
-            Some(AssignmentListContent::Pack(arguments)) => arguments.arguments.iter().collect(),
-        }
-    }
-}
-
-impl BoundSymbols for AssignmentList {
-    /// The symbols of a parallel assignment target such as `(a, (b, c))`,
-    /// flattened through nested lists.
+impl BoundSymbols for ExprSequence {
     fn bound_symbols(&self) -> Vec<&Symbol> {
-        self.targets()
+        self.elems
+            .as_ref()
             .into_iter()
+            .flat_map(PackedArguments::arguments)
+            .flatten()
             .flat_map(BoundSymbols::bound_symbols)
             .collect()
     }
 }
 
-impl BoundSymbols for AssignmentArgument {
-    /// Empty slots and operator or evaluated targets bind no symbol.
+impl BoundSymbols for Expr {
     fn bound_symbols(&self) -> Vec<&Symbol> {
-        match self {
-            Self::Symbol(symbol) => vec![symbol],
-            Self::List(list) => list.bound_symbols(),
-            Self::Empty(_) | Self::Op(_) | Self::Evaluated(_) => Vec::new(),
+        match self.unparenthesized() {
+            Some(Expr::Symbol(symbol)) => vec![symbol],
+            Some(Expr::Sequence(sequence)) => sequence.bound_symbols(),
+            _ => Vec::new(),
         }
     }
 }
@@ -403,14 +339,14 @@ impl ClauseSyntax for ElseClause {
         &self.expr
     }
 }
-impl ClauseSyntax for OfClass {
+impl ClauseSyntax for OfClause {
     fn clause_value(&self) -> &Expr {
-        &self.parent
+        &self.expr
     }
 }
-impl ClauseSyntax for FromInstance {
+impl ClauseSyntax for FromClause {
     fn clause_value(&self) -> &Expr {
-        &self.instance
+        &self.expr
     }
 }
 
@@ -420,24 +356,27 @@ pub trait ControlSyntax {
     fn transferred_value(&self) -> Option<&Expr>;
 }
 
-impl ControlSyntax for ExprControl {
+impl ControlSyntax for Expr {
     fn transferred_value(&self) -> Option<&Expr> {
         match self {
-            Self::Break(node) => node.value.as_deref(),
-            Self::Continue(node) => node.value.as_deref(),
-            Self::Return(node) => node.value.as_deref(),
+            Self::Break(node) => node.expr.as_deref(),
+            Self::Continue(node) => node.expr.as_deref(),
+            Self::Return(node) => node.expr.as_deref(),
+            _ => None,
         }
     }
 }
 
 /// The applications within visited syntax, in preorder.
 #[derive(Debug, Default)]
-pub struct Applications<'ast>(pub Vec<&'ast ExprOpBinAdj>);
+pub struct Applications<'ast>(pub Vec<&'ast ExprBinary>);
 
 impl<'ast> Visit<'ast> for Applications<'ast> {
-    fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
-        self.0.push(call);
-        visit::visit_expr_op_bin_adj(self, call);
+    fn visit_expr_binary(&mut self, call: &'ast ExprBinary) {
+        if matches!(call.op, BinaryOperator::Space(_)) {
+            self.0.push(call);
+        }
+        visit::visit_expr_binary(self, call);
     }
 }
 
@@ -454,15 +393,8 @@ impl<'ast> Visit<'ast> for BindingReferences<'ast> {
 
     fn visit_expr_quote(&mut self, _quote: &'ast ExprQuote) {}
 
-    fn visit_expr_op_bin_member(&mut self, access: &'ast ExprOpBinMember) {
-        let (receiver, member) = match access {
-            ExprOpBinMember::Dot(access) => (&access.receiver, &access.member),
-            ExprOpBinMember::Optional(access) => (&access.receiver, &access.member),
-        };
-        self.visit_expr(receiver);
-        if !matches!(member.as_ref(), Expr::Symbol(_)) {
-            self.visit_expr(member);
-        }
+    fn visit_expr_field(&mut self, access: &'ast ExprField) {
+        self.visit_expr(&access.base);
     }
 }
 
@@ -541,17 +473,11 @@ impl<Source: SourceNavigation + ?Sized> CursorVisitor<'_, '_, Source> {
 }
 
 impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for CursorVisitor<'ast, '_, Source> {
-    fn visit_expr_op_bin_member(&mut self, access: &'ast ExprOpBinMember) {
-        let member = match access {
-            ExprOpBinMember::Dot(access) => &access.member,
-            ExprOpBinMember::Optional(access) => &access.member,
-        };
-        if let Expr::Symbol(symbol) = member.as_ref() {
-            if self.encloses(symbol) {
-                self.found.member_key = true;
-            }
+    fn visit_expr_field(&mut self, access: &'ast ExprField) {
+        if self.encloses(&access.member) {
+            self.found.member_key = true;
         }
-        visit::visit_expr_op_bin_member(self, access);
+        visit::visit_expr_field(self, access);
     }
     fn visit_expr(&mut self, expression: &'ast Expr) {
         if self.encloses(expression) {
@@ -602,34 +528,31 @@ impl StatementKeywords for ExprIf {
 
 impl StatementKeywords for ExprFor {
     fn keywords(&self) -> Vec<Span> {
-        let (body, mut tokens): (_, Vec<&dyn Spanned>) = match self {
-            Self::Bare(node) => {
-                let mut tokens: Vec<&dyn Spanned> = vec![&node.for_token];
-                tokens.extend(when_keyword(&node.condition));
-                (&node.body, tokens)
-            }
-            Self::Range(node) => {
-                let mut tokens: Vec<&dyn Spanned> = vec![&node.for_token];
+        let mut tokens: Vec<&dyn Spanned> = vec![&self.for_token];
+        match &self.iter {
+            Some(ForIter::In(clause)) => tokens.push(&clause.in_token),
+            Some(ForIter::Range(range)) => {
                 tokens.extend(
-                    node.lower_bound
+                    range
+                        .from_clause
                         .as_ref()
-                        .map(|bound| &bound.from_token as &dyn Spanned),
+                        .map(|clause| &clause.from_token as &dyn Spanned),
                 );
                 tokens.extend(
-                    node.upper_bound
+                    range
+                        .to_clause
                         .as_ref()
-                        .map(|bound| &bound.to_token as &dyn Spanned),
+                        .map(|clause| &clause.to_token as &dyn Spanned),
                 );
-                tokens.extend(when_keyword(&node.condition));
-                (&node.body, tokens)
             }
-            Self::In(node) => {
-                let mut tokens: Vec<&dyn Spanned> = vec![&node.for_token, &node.in_token];
-                tokens.extend(when_keyword(&node.condition));
-                (&node.body, tokens)
-            }
-        };
-        tokens.extend(loop_keywords(body));
+            None => {}
+        }
+        tokens.extend(
+            self.when_clause
+                .as_ref()
+                .map(|clause| &clause.when_token as &dyn Spanned),
+        );
+        tokens.extend(loop_keywords(&self.body));
         spans(tokens)
     }
 }
@@ -646,12 +569,12 @@ impl StatementKeywords for ExprNew {
     fn keywords(&self) -> Vec<Span> {
         let mut tokens: Vec<&dyn Spanned> = vec![&self.new_token];
         tokens.extend(
-            self.parent_class
+            self.of_clause
                 .as_ref()
                 .map(|clause| &clause.of_token as &dyn Spanned),
         );
         tokens.extend(
-            self.instance
+            self.from_clause
                 .as_ref()
                 .map(|clause| &clause.from_token as &dyn Spanned),
         );
@@ -663,7 +586,7 @@ impl StatementKeywords for ExprTry {
     fn keywords(&self) -> Vec<Span> {
         let mut tokens: Vec<&dyn Spanned> = vec![&self.try_token];
         tokens.extend(
-            self.on_success
+            self.then_clause
                 .as_ref()
                 .map(|clause| &clause.then_token as &dyn Spanned),
         );
@@ -683,23 +606,16 @@ fn spans(tokens: Vec<&dyn Spanned>) -> Vec<Span> {
     tokens.into_iter().filter_map(Spanned::try_span).collect()
 }
 
-/// The `when` keyword of a loop's filter.
-fn when_keyword(condition: &Option<WhenCondition>) -> Option<&dyn Spanned> {
-    condition
-        .as_ref()
-        .map(|condition| &condition.when_token as &dyn Spanned)
-}
-
 /// The `list` and `do` keywords of a loop body.
 fn loop_keywords(body: &LoopBody) -> Vec<&dyn Spanned> {
     let mut tokens: Vec<&dyn Spanned> = Vec::new();
     tokens.extend(
-        body.list_step
+        body.list_clause
             .as_ref()
             .map(|step| &step.list_token as &dyn Spanned),
     );
     tokens.extend(
-        body.do_step
+        body.do_clause
             .as_ref()
             .map(|step| &step.do_token as &dyn Spanned),
     );
@@ -715,14 +631,14 @@ mod tests {
 
     /// The divisions within visited syntax.
     #[derive(Default)]
-    struct Divisions<'ast>(Vec<&'ast ExprOpBinRegular>);
+    struct Divisions<'ast>(Vec<&'ast ExprBinary>);
 
     impl<'ast> Visit<'ast> for Divisions<'ast> {
-        fn visit_expr_op_bin_regular(&mut self, operation: &'ast ExprOpBinRegular) {
-            if operation.operator.spelling() == <Token![/]>::SPELLING {
+        fn visit_expr_binary(&mut self, operation: &'ast ExprBinary) {
+            if operation.op.spelling() == <Token![/]>::SPELLING {
                 self.0.push(operation);
             }
-            visit::visit_expr_op_bin_regular(self, operation);
+            visit::visit_expr_binary(self, operation);
         }
     }
 
@@ -764,14 +680,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing division in {source:?}"));
             assert!(
                 matches!(
-                    division.left_operand.unparenthesized(),
-                    Some(Expr::Op(ExprOp::Bin(ExprOpBin::Adj(_))))
+                    division.left.unparenthesized(),
+                    Some(Expr::Binary(call)) if matches!(call.op, BinaryOperator::Space(_))
                 ),
                 "division must follow application in {source:?}"
             );
             assert!(
                 matches!(
-                    text.text_for_syntax(division.right_operand.as_ref()),
+                    text.text_for_syntax(division.right.as_ref()),
                     Some("I" | "g")
                 ),
                 "division must keep its RHS in {source:?}"
@@ -796,9 +712,9 @@ mod tests {
             );
             assert!(
                 matches!(
-                    application.right_operand.unparenthesized(),
-                    Some(Expr::Op(ExprOp::Bin(ExprOpBin::Regular(operation))))
-                        if operation.operator.spelling() == <Token![/]>::SPELLING
+                    application.right.unparenthesized(),
+                    Some(Expr::Binary(operation))
+                        if operation.op.spelling() == <Token![/]>::SPELLING
                 ),
                 "explicit grouping controls precedence in {source:?}"
             );

@@ -35,7 +35,7 @@
 mod hypertext;
 mod simple_doc;
 
-use m2_syn::nodes::{Expr, ExprCollection, ExprOpBinAdj, ExprQuote, PackedContent, Symbol};
+use m2_syn::nodes::{Elements, Expr, ExprBinary, ExprQuote, Symbol};
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Lex, Spanned, TokenTree};
 use strum::{Display, EnumString, IntoStaticStr};
@@ -352,13 +352,13 @@ impl PackageDocumentation {
         syntax.visit(&mut applications);
         for call in applications.0 {
             let Some(function) = call
-                .left_operand
+                .left
                 .symbol_name()
                 .and_then(|name| name.parse::<DocumentationFunction>().ok())
             else {
                 continue;
             };
-            collector.read_call(call, function, &call.right_operand);
+            collector.read_call(call, function, &call.right);
         }
         let mut documentation = collector.documentation;
         for fragment in collector.evaluated_examples {
@@ -515,7 +515,7 @@ impl DocumentedSubject {
                 option: ObjectName::new(option.text()),
             };
         }
-        if let Expr::Collection(ExprCollection::Sequence(_)) = expression {
+        if let Expr::Sequence(_) = expression {
             let mut elements = expression.contained_expressions().into_iter();
             let function = elements.next().and_then(Self::symbol);
             let domain = elements.map(Self::symbol).collect::<Option<Vec<_>>>();
@@ -545,7 +545,7 @@ impl DocumentedSubject {
     /// The function and the option of `expression` when it is a key of an
     /// optional argument, the array `[f, Limit]`.
     fn optional_argument_parts(expression: &Expr) -> Option<(&Symbol, &Symbol)> {
-        let Expr::Collection(ExprCollection::Array(_)) = expression else {
+        let Expr::Array(_) = expression else {
             return None;
         };
         match expression.contained_expressions()[..] {
@@ -751,7 +751,7 @@ struct DocumentationCollector<'source, S: SourceNavigation + ?Sized> {
 
 impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// Read one call of a documentation `function` on `argument`.
-    fn read_call(&mut self, call: &ExprOpBinAdj, function: DocumentationFunction, argument: &Expr) {
+    fn read_call(&mut self, call: &ExprBinary, function: DocumentationFunction, argument: &Expr) {
         let source = self.source;
         let code = Code::in_document(source);
         if function != DocumentationFunction::Undocumented {
@@ -759,7 +759,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 .documentation_ranges
                 .push(code.bytes(call));
         }
-        let argument = if matches!(argument, Expr::Holder(_)) {
+        let argument = if matches!(argument, Expr::Paren(_)) {
             let Some(inner) = argument.contained_expressions().into_iter().next() else {
                 return;
             };
@@ -771,7 +771,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             function,
             DocumentationFunction::Doc | DocumentationFunction::Multidoc
         ) {
-            let range = source.range_for_bytes(code.bytes(&*call.left_operand));
+            let range = source.range_for_bytes(code.bytes(&*call.left));
             self.documentation.simple_doc_functions.push(range);
         }
         match function {
@@ -805,14 +805,10 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 }
                 self.read_simple_doc(call, body);
             }
-            DocumentationFunction::Document
-                if matches!(argument, Expr::Collection(ExprCollection::List(_))) =>
-            {
+            DocumentationFunction::Document if matches!(argument, Expr::List(_)) => {
                 self.read_hypertext_list(call, argument);
             }
-            DocumentationFunction::Document
-                if matches!(argument, Expr::Collection(ExprCollection::Sequence(_))) =>
-            {
+            DocumentationFunction::Document if matches!(argument, Expr::Sequence(_)) => {
                 if argument
                     .contained_expressions()
                     .into_iter()
@@ -882,7 +878,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         });
         self.reference_code_names(&code, expression, NameSite::SimpleDoc);
         let inner = match expression.contained_expressions()[..] {
-            [inner] if matches!(expression, Expr::Holder(_)) => inner,
+            [inner] if matches!(expression, Expr::Paren(_)) => inner,
             _ => expression,
         };
         let key = (role == EvaluatedExpression::Key).then_some(inner);
@@ -993,8 +989,8 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         if cell.parse_error().is_some() || !cell.lexer_diagnostics().is_empty() {
             return false;
         }
-        matches!(cell.syntax().map(|cell| &cell.content),
-            Some(m2_syn::nodes::PackedContent::Expr(expression))
+        matches!(cell.syntax().map(|cell| &cell.elems),
+            Some(m2_syn::nodes::Elements::Single(expression))
                 if matches!(expression.as_ref(), m2_syn::nodes::Expr::Symbol(symbol) if symbol.text() == text))
     }
 }
@@ -1062,9 +1058,9 @@ impl EmbeddedCode {
         if !self.parsed_cleanly() {
             return None;
         }
-        match &cell.syntax()?.content {
-            PackedContent::Expr(expression) => Some(expression),
-            PackedContent::Pack(_) => None,
+        match &cell.syntax()?.elems {
+            Elements::Single(expression) => Some(expression),
+            Elements::Pack(_) => None,
         }
     }
 

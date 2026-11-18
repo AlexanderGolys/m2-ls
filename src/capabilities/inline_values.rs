@@ -83,7 +83,7 @@ impl<'ast, K: TypeKnowledge + ?Sized> Visit<'ast> for InlineValueCollector<'ast,
         if range.start > self.range.end || range.end < self.range.start {
             return;
         }
-        if !matches!(expression, Expr::Holder(_))
+        if !matches!(expression, Expr::Paren(_))
             && self.range.start <= range.start
             && range.end <= self.range.end
         {

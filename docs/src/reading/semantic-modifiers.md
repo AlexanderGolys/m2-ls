@@ -22,7 +22,9 @@ has `algebraic`. A method installation keeps its `method` type and adds
   For example, `ZZ` carries `libraryConst`, while `allowableThreads` carries
   `libraryConfigParam`. Protection describes reassignment of the binding,
   independently of whether its value can be mutated. Local aliases and shadows
-  carry neither modifier. Both are independent of `defaultLibrary` and are
+  carry neither modifier, and a package name such as `Core` never carries
+  `libraryConfigParam`: it is reassignable, but it names a namespace, not a
+  setting. Both are independent of `defaultLibrary` and are
   removed in standard-only mode.
 
 `readonly`

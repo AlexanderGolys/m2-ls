@@ -51,6 +51,7 @@ mod document;
 mod documentation;
 mod file_load;
 mod init_file;
+mod library_globals;
 mod library_index;
 mod macaulay2;
 mod meta;
@@ -74,7 +75,7 @@ mod typesystem;
 mod usage_log;
 mod workspace_index;
 
-use capabilities::code_actions::available_code_actions;
+use capabilities::code_actions::{available_code_actions, REMOVE_REDUNDANT_PARENTHESES};
 use capabilities::completion::{completion_options, completion_response};
 use capabilities::document_highlight::{
     document_highlight_provider_capability, document_highlights,
@@ -113,11 +114,12 @@ use session::{ClientInput, ExitNotificationService, SessionEnd};
 
 use crate::catalog::CatalogSource;
 use crate::diagnostics::DiagnosticCode;
+use crate::macaulay2::Macaulay2Conventions;
 use crate::object_hierarchy::{HierarchySnapshot, WorkspaceHierarchy};
 use crate::object_registry::ObjectRegistry;
 use crate::semantic_token::M2SemanticToken;
 use crate::settings::{
-    ParsedSettings, ProjectConfiguration, ServerSettings, SettingProblem, SettingsStore,
+    LogLevel, ParsedSettings, ProjectConfiguration, ServerSettings, SettingProblem, SettingsStore,
 };
 use crate::workspace_index::{
     WorkspaceDefinitionKnowledge, WorkspaceIndex, WorkspaceSymbolKnowledge, WorkspaceView,
@@ -175,7 +177,8 @@ impl Backend {
     fn new(client: Client) -> Self {
         let environment = Macaulay2Environment::current();
         let registry = ObjectRegistry::load("");
-        let library = configured_library(&environment, &registry, &ServerSettings::default());
+        let library =
+            configured_library(&environment, &registry, &ServerSettings::defaults().clone());
         let workspace_index = Arc::new(WorkspaceIndex::default());
         if !registry.has_catalog() {
             workspace_index.configure_fallback_sources(Some(library.source_resolver().clone()));
@@ -189,7 +192,7 @@ impl Backend {
             document_versions: DashMap::new(),
             workspace_index,
             workspace_updates: tokio::sync::Mutex::new(()),
-            settings: SettingsStore::default(),
+            settings: SettingsStore::new(ServerSettings::defaults().clone()),
             client_settings: SettingsStore::new(serde_json::Value::Null),
             semantic_tokens_augment_syntax: ClientSupport::default(),
             type_hierarchy_dynamic_registration: ClientSupport::default(),
@@ -824,6 +827,7 @@ impl Backend {
               + ?Sized),
     ) -> Result<()> {
         let previous = self.settings.replace(settings.clone());
+        telemetry::set_level(settings.logging.level);
         if previous.catalog != settings.catalog {
             self.client
                 .log_message(MessageType::WARNING, "Changing catalog settings requires a server restart; set it in initializationOptions.")
@@ -1111,10 +1115,13 @@ impl Backend {
 fn install_panic_logging() {
     let previous_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
-        telemetry::event(serde_json::json!({
-            "operation": "panic", "message": panic_info.to_string(),
-            "backtrace": Backtrace::force_capture().to_string(),
-        }));
+        telemetry::event_at(
+            LogLevel::Error,
+            serde_json::json!({
+                "operation": "panic", "message": panic_info.to_string(),
+                "backtrace": Backtrace::force_capture().to_string(),
+            }),
+        );
         previous_hook(panic_info);
     }));
     telemetry::event(
@@ -1167,8 +1174,14 @@ impl Backend {
             }
             _ => format!("input {}", quote(&path.to_string_lossy())),
         };
-        let child = tokio::process::Command::new("M2")
-            .args(["--silent", "--no-readline", "--no-prompts", "--stop", "-e"])
+        let executable = self
+            .settings
+            .snapshot()
+            .macaulay2
+            .executable
+            .unwrap_or_else(|| PathBuf::from(Macaulay2Conventions::EXECUTABLE));
+        let child = tokio::process::Command::new(executable)
+            .args(Macaulay2Conventions::EXECUTION_ARGUMENTS)
             .arg(format!("{code}\nexit 0"))
             .current_dir(directory)
             .stdin(std::process::Stdio::null())
@@ -1213,6 +1226,7 @@ impl LanguageServer for Backend {
             .unwrap_or(serde_json::Value::Null);
         self.client_settings.replace(client_settings.clone());
         let parsed = self.project_configuration();
+        telemetry::set_level(parsed.settings.logging.level);
         let corpus = if parsed.settings.catalog.enabled {
             let corpus = CatalogSource::load_configured(&parsed.settings.catalog);
             if !corpus.is_empty() {
@@ -1293,6 +1307,7 @@ impl LanguageServer for Backend {
                             CodeActionKind::QUICKFIX,
                             CodeActionKind::REFACTOR_REWRITE,
                             CodeActionKind::SOURCE_FIX_ALL,
+                            REMOVE_REDUNDANT_PARENTHESES,
                         ]),
                         ..CodeActionOptions::default()
                     },
@@ -1677,6 +1692,7 @@ impl LanguageServer for Backend {
                     position,
                     &diagnostics,
                     &settings.formatting,
+                    Some(&self.workspace_index),
                 )?;
                 if let Some(only) = &params.context.only {
                     actions.retain(|action| match action {

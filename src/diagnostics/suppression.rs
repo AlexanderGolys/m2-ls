@@ -7,11 +7,27 @@
 //! ```
 //!
 //! A `disable` directive silences the rules it names in the whole file,
-//! wherever it is written; a `disable-next-line` directive, only on the line
-//! after it. Rules are named by code or by name, as in the settings; a
-//! directive naming none silences every rule.
+//! wherever it is written; a `disable-next-line` directive, only in the
+//! expression on the line after it: the outermost one starting there, on
+//! every line it spans, or that line alone when no expression starts on it.
+//! Stacked `disable-next-line` directives all apply to the line after the
+//! stack:
+//!
+//! ```m2
+//! -- m2-ls: disable-next-line T01
+//! -- m2-ls: disable-next-line T05
+//! (lo, hi) := concentration(
+//!     source, map)
+//! ```
+//!
+//! Rules are named by code or by name, as in the settings; a directive
+//! naming none silences every rule.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
+
+use m2_syn::nodes::Expr;
+use m2_syn::visit::{self, Visit};
 
 use strum::{Display, EnumString, IntoStaticStr};
 use tower_lsp::lsp_types::Position;
@@ -34,7 +50,8 @@ pub enum SuppressionScope {
     /// The whole file.
     #[strum(serialize = "disable")]
     File,
-    /// The line after the directive.
+    /// The expression on the line after the directive and the
+    /// `disable-next-line` directives stacked below it.
     #[strum(serialize = "disable-next-line")]
     NextLine,
 }
@@ -53,8 +70,30 @@ enum SilencedRules {
 pub struct DiagnosticSuppressions {
     /// What `disable` directives silence in the whole file.
     file: Option<SilencedRules>,
-    /// What `disable-next-line` directives silence, by the line they apply to.
-    lines: HashMap<u32, SilencedRules>,
+    /// What `disable-next-line` directives silence, by the lines of the
+    /// expression they apply to.
+    expressions: Vec<(RangeInclusive<u32>, SilencedRules)>,
+}
+
+/// The last line of the outermost expression starting on each line, of the
+/// visited syntax.
+struct ExpressionLines<'source, S: ?Sized> {
+    /// Text and coordinates of the visited syntax.
+    source: &'source S,
+    /// The last line by the starting line.
+    last_lines: HashMap<u32, u32>,
+}
+
+impl<'ast, S: SourceNavigation + ?Sized> Visit<'ast> for ExpressionLines<'_, S> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if let Some(bytes) = self.source.syntax_bytes(expression) {
+            let last = self.source.position_for_byte(bytes.end).line;
+            let first = self.source.position_for_byte(bytes.start).line;
+            let entry = self.last_lines.entry(first).or_insert(last);
+            *entry = last.max(*entry);
+        }
+        visit::visit_expr(self, expression);
+    }
 }
 
 impl SilencedRules {
@@ -82,8 +121,9 @@ impl DiagnosticSuppressions {
     /// The directives in the retained comments of `syntax`, including failed cells.
     pub fn collect(syntax: &SyntaxSnapshot, source: &(impl SourceNavigation + ?Sized)) -> Self {
         let mut suppressions = Self::default();
+        let mut next_line_directives = Vec::new();
         for comment in syntax.cells().iter().flat_map(|cell| cell.trivia()) {
-            if comment.kind() != m2_syn::TriviaKind::LineComment {
+            if comment.kind() != m2_syn::CommentKind::Line {
                 continue;
             }
             let Some(text) = source.text_for_syntax(comment) else {
@@ -107,17 +147,38 @@ impl DiagnosticSuppressions {
                             None => rules,
                         });
                     }
-                    SuppressionScope::NextLine => {
-                        let line = source.position_for_byte(line_start).line + 1;
-                        let silenced = match suppressions.lines.remove(&line) {
-                            Some(silenced) => silenced.join(rules),
-                            None => rules,
-                        };
-                        suppressions.lines.insert(line, silenced);
-                    }
+                    SuppressionScope::NextLine => next_line_directives
+                        .push((source.position_for_byte(line_start).line, rules)),
                 }
             }
         }
+        let directive_lines = next_line_directives
+            .iter()
+            .map(|(line, _)| *line)
+            .collect::<HashSet<_>>();
+        let mut targets = HashMap::<u32, SilencedRules>::new();
+        for (line, rules) in next_line_directives {
+            let target = (line + 1..)
+                .find(|line| !directive_lines.contains(line))
+                .expect("finitely many directives precede an unbounded range");
+            let silenced = match targets.remove(&target) {
+                Some(silenced) => silenced.join(rules),
+                None => rules,
+            };
+            targets.insert(target, silenced);
+        }
+        let mut expressions = ExpressionLines {
+            source,
+            last_lines: HashMap::new(),
+        };
+        syntax.visit(&mut expressions);
+        suppressions.expressions = targets
+            .into_iter()
+            .map(|(first, rules)| {
+                let last = expressions.last_lines.get(&first).copied().unwrap_or(first);
+                (first..=last, rules)
+            })
+            .collect();
         suppressions
     }
 
@@ -150,10 +211,9 @@ impl DiagnosticSuppressions {
     pub fn suppresses(&self, diagnostic: &M2Diagnostic) -> bool {
         let code = diagnostic.rule.code;
         self.file.as_ref().is_some_and(|rules| rules.covers(code))
-            || self
-                .lines
-                .get(&diagnostic.finding.range.start.line)
-                .is_some_and(|rules| rules.covers(code))
+            || self.expressions.iter().any(|(lines, rules)| {
+                lines.contains(&diagnostic.finding.range.start.line) && rules.covers(code)
+            })
     }
 
     /// The comment silencing the rule `code` in `scope`, as a quick fix
@@ -258,10 +318,13 @@ mod tests {
             &registry,
         )
         .expect("the document retains invalid cells");
-        let collect = |document: &DocumentSnapshot| {
+        let silenced_on = |document: &DocumentSnapshot, line: u32| {
             DiagnosticSuppressions::collect(document.syntax(), document)
+                .expressions
+                .iter()
+                .any(|(lines, _)| lines.contains(&line))
         };
-        assert!(collect(&document).lines.contains_key(&2));
+        assert!(silenced_on(&document, 2));
         document
             .apply_changes(
                 &[TextDocumentContentChangeEvent {
@@ -272,8 +335,7 @@ mod tests {
                 &registry,
             )
             .expect("the edit is valid");
-        let suppressions = collect(&document);
-        assert!(suppressions.lines.contains_key(&3));
-        assert!(!suppressions.lines.contains_key(&2));
+        assert!(silenced_on(&document, 3));
+        assert!(!silenced_on(&document, 2));
     }
 }

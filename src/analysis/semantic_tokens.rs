@@ -11,11 +11,10 @@
 use std::collections::HashSet;
 
 use m2_syn::nodes::{
-    Expr, ExprAssign, ExprAssignEvaluated, ExprIf, ExprOpBinAdj, ExprOpBinIndex, ExprOpBinMember,
-    ExprOpBinRegular, ExprQuote, ExprWhile, Symbol,
+    Expr, ExprAssign, ExprBinary, ExprField, ExprIf, ExprQuote, ExprWhile, Symbol,
 };
 use m2_syn::visit::{self, Visit};
-use m2_syn::{Lex, Spanned, Token, TokenStream, TokenTree, Trivia};
+use m2_syn::{Comment, Lex, Spanned, Token, TokenStream, TokenTree};
 
 use super::*;
 use crate::macaulay2::Macaulay2Conventions;
@@ -222,7 +221,7 @@ where
     /// Records the first parameter of `function`, when it is a lambda, as an
     /// option table visible in its body.
     fn register_option_table(&mut self, function: &Expr) {
-        if let Expr::Lambda(lambda) = function {
+        if let Expr::Function(lambda) = function {
             if let (Some(parameter), Some(body)) = (
                 lambda.bound_symbols().first(),
                 self.source.syntax_bytes(lambda.body()),
@@ -235,7 +234,7 @@ where
 
     /// Whether `table` is the option-table parameter of a function whose
     /// body contains `key`.
-    fn is_option_table(&self, table: &Expr, key: &Expr) -> bool {
+    fn is_option_table(&self, table: &Expr, key: &(impl Spanned + ?Sized)) -> bool {
         let (Some(name), Some(position)) = (table.symbol_name(), self.source.syntax_bytes(key))
         else {
             return false;
@@ -262,7 +261,7 @@ where
     ) where
         'source: 'ast,
     {
-        if !matches!(right, Expr::Literal(m2_syn::nodes::ExprLiteral::Integer(_))) {
+        if !matches!(right, Expr::Literal(m2_syn::nodes::Literal::Integer(_))) {
             return;
         }
         let Some(range) = self.source.range_for_syntax(owner) else {
@@ -300,21 +299,67 @@ where
         visit::visit_expr_option(self, node);
     }
 
-    fn visit_expr_op_bin_regular(&mut self, node: &'ast BinaryExpr) {
-        let operator = node.operator.spelling();
+    fn visit_expr_binary(&mut self, node: &'ast ExprBinary) {
+        let operator = node.op.spelling();
         if operator == <Token![>>]>::SPELLING {
-            self.register_option_table(&node.right_operand);
+            self.register_option_table(&node.right);
         }
-        self.register_property(node, &node.left_operand);
+        self.register_property(node, &node.left);
         let subscript = operator == <Token![_]>::SPELLING;
-        if operator == <Token![#?]>::SPELLING {
-            self.register_type_key(&node.right_operand);
+        let index = operator == <Token![#]>::SPELLING;
+        if index {
+            self.register_option_table_key(&node.left, &node.right);
         }
-        if subscript || operator == <Token![#?]>::SPELLING {
-            self.register_access_operator(&node.operator);
-            self.register_selector(node, &node.left_operand, &node.right_operand, subscript);
+        if index || operator == <Token![#?]>::SPELLING {
+            self.register_type_key(&node.right);
         }
-        visit::visit_expr_op_bin_regular(self, node);
+        if index || subscript || operator == <Token![#?]>::SPELLING {
+            self.register_access_operator(&node.op);
+            self.register_selector(node, &node.left, &node.right, subscript);
+        }
+        if matches!(node.op, m2_syn::nodes::BinaryOperator::Space(_)) {
+            if let Some(head) = node.left.symbol_name() {
+                let arguments = node
+                    .right
+                    .arguments()
+                    .into_iter()
+                    .filter(|argument| !matches!(argument, Some(Expr::Option(_))))
+                    .collect::<Vec<_>>();
+                if let Some(argument) = arguments.first().copied().flatten() {
+                    if argument.literal_source(self.source).is_some() {
+                        if let Some(range) = self.source.range_for_syntax(argument) {
+                            let knowledge = self.knowledge_provider.at_position(range.start);
+                            let role = if Macaulay2Conventions::PACKAGE_NAME_FUNCTIONS
+                                .contains(&head)
+                                && knowledge.get_record(&ObjectName::new(head)).is_some()
+                                && self.analysis.get_binding_at(head, range.start).is_none()
+                            {
+                                Some(SourceSemanticRole::NamespaceArgument)
+                            } else if Macaulay2Conventions::REGEXP_FUNCTIONS.contains(&head)
+                                && knowledge.get_record(&ObjectName::new(head)).is_some()
+                                && self.analysis.get_binding_at(head, range.start).is_none()
+                                && (head != "separate" || arguments.len() > 1)
+                            {
+                                Some(SourceSemanticRole::RegularExpression)
+                            } else if FileLoad::is_load_function(head) {
+                                Some(SourceSemanticRole::LoadedFilePath)
+                            } else {
+                                None
+                            };
+                            if let Some(role) = role {
+                                self.register_role(argument, role);
+                            }
+                        }
+                    }
+                }
+                for option in PackageLoadingOption::ALL {
+                    for package in option.typed_package_names(node, self.source) {
+                        self.register_role(package, SourceSemanticRole::NamespaceArgument);
+                    }
+                }
+            }
+        }
+        visit::visit_expr_binary(self, node);
     }
 
     fn visit_expr_assign(&mut self, assignment: &'ast ExprAssign) {
@@ -332,74 +377,15 @@ where
         visit::visit_expr_assign(self, assignment);
     }
 
-    fn visit_expr_op_bin_member(&mut self, node: &'ast ExprOpBinMember) {
-        let table = match node {
-            ExprOpBinMember::Dot(access) => access.receiver.as_ref(),
-            ExprOpBinMember::Optional(access) => access.receiver.as_ref(),
-        };
-        self.register_property(node, table);
-        match node {
-            ExprOpBinMember::Dot(access) => self.register_access_operator(&access.operator),
-            ExprOpBinMember::Optional(access) => self.register_access_operator(&access.operator),
-        }
-        visit::visit_expr_op_bin_member(self, node);
-    }
-
-    fn visit_expr_op_bin_index(&mut self, node: &'ast ExprOpBinIndex) {
-        self.register_option_table_key(&node.receiver, &node.index);
-        self.register_type_key(&node.index);
-        self.register_property(node, &node.receiver);
-        self.register_access_operator(&node.operator);
-        self.register_selector(node, &node.receiver, &node.index, false);
-        visit::visit_expr_op_bin_index(self, node);
+    fn visit_expr_field(&mut self, node: &'ast ExprField) {
+        self.register_property(node, &node.base);
+        self.register_access_operator(&node.op);
+        visit::visit_expr_field(self, node);
     }
 
     fn visit_expr_quote(&mut self, node: &'ast QuoteExpression) {
         self.register_role(node.quoted_name(), SourceSemanticRole::QuotedSymbol);
         visit::visit_expr_quote(self, node);
-    }
-
-    fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
-        if let Some(head) = call.left_operand.symbol_name() {
-            let arguments = call
-                .right_operand
-                .arguments()
-                .into_iter()
-                .filter(|argument| !matches!(argument, Some(Expr::Option(_))))
-                .collect::<Vec<_>>();
-            if let Some(argument) = arguments.first().copied().flatten() {
-                if argument.literal_source(self.source).is_some() {
-                    if let Some(range) = self.source.range_for_syntax(argument) {
-                        let knowledge = self.knowledge_provider.at_position(range.start);
-                        let role = if Macaulay2Conventions::PACKAGE_NAME_FUNCTIONS.contains(&head)
-                            && knowledge.get_record(&ObjectName::new(head)).is_some()
-                            && self.analysis.get_binding_at(head, range.start).is_none()
-                        {
-                            Some(SourceSemanticRole::NamespaceArgument)
-                        } else if Macaulay2Conventions::REGEXP_FUNCTIONS.contains(&head)
-                            && knowledge.get_record(&ObjectName::new(head)).is_some()
-                            && self.analysis.get_binding_at(head, range.start).is_none()
-                            && (head != "separate" || arguments.len() > 1)
-                        {
-                            Some(SourceSemanticRole::RegularExpression)
-                        } else if FileLoad::is_load_function(head) {
-                            Some(SourceSemanticRole::LoadedFilePath)
-                        } else {
-                            None
-                        };
-                        if let Some(role) = role {
-                            self.register_role(argument, role);
-                        }
-                    }
-                }
-            }
-            for option in PackageLoadingOption::ALL {
-                for package in option.typed_package_names(call, self.source) {
-                    self.register_role(package, SourceSemanticRole::NamespaceArgument);
-                }
-            }
-        }
-        visit::visit_expr_op_bin_adj(self, call);
     }
 }
 
@@ -498,7 +484,7 @@ where
         });
     }
 
-    fn visit_expr_op_bin_regular(&mut self, access: &'ast ExprOpBinRegular) {
+    fn visit_expr_binary(&mut self, access: &'ast ExprBinary) {
         if let Some(position) = self.source.position_for_syntax(access) {
             let knowledge = self.knowledge_provider.at_position(position);
             if self
@@ -524,13 +510,26 @@ where
                 }
             }
         }
-        visit::visit_expr_op_bin_regular(self, access);
+        if matches!(access.op, m2_syn::nodes::BinaryOperator::Space(_)) {
+            self.within(
+                |context| {
+                    context.application_head = matches!(access.left.as_ref(), Expr::Symbol(_))
+                },
+                |this| this.visit_expr(&access.left),
+            );
+            self.within(
+                |context| context.application_head = false,
+                |this| this.visit_expr(&access.right),
+            );
+        } else {
+            visit::visit_expr_binary(self, access);
+        }
     }
 
     fn visit_expr_if(&mut self, node: &'ast ExprIf) {
         self.within(
             |context| context.condition = true,
-            |this| this.visit_expr(&node.condition),
+            |this| this.visit_expr(&node.cond),
         );
         self.within(
             |context| context.condition = false,
@@ -546,24 +545,11 @@ where
     fn visit_expr_while(&mut self, node: &'ast ExprWhile) {
         self.within(
             |context| context.condition = true,
-            |this| this.visit_expr(&node.condition),
+            |this| this.visit_expr(&node.cond),
         );
         self.within(
             |context| context.condition = false,
             |this| this.visit_loop_body(&node.body),
-        );
-    }
-
-    fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
-        self.within(
-            |context| {
-                context.application_head = matches!(call.left_operand.as_ref(), Expr::Symbol(_))
-            },
-            |this| this.visit_expr(&call.left_operand),
-        );
-        self.within(
-            |context| context.application_head = false,
-            |this| this.visit_expr(&call.right_operand),
         );
     }
 
@@ -574,32 +560,20 @@ where
         );
     }
 
-    fn visit_expr_assign_evaluated(&mut self, node: &'ast ExprAssignEvaluated) {
-        self.within(
-            |context| context.assignment_target = true,
-            |this| this.visit_expr(&node.evaluated_domain),
-        );
-        self.within(
-            |context| context.assignment_target = false,
-            |this| this.visit_expr(&node.value),
-        );
-    }
-
     fn visit_expr_assign(&mut self, assignment: &'ast ExprAssign) {
-        if let ExprAssign::Evaluated(node) = assignment {
-            return self.visit_expr_assign_evaluated(node);
-        }
         let parts = assignment.parts();
         self.within(
             |context| context.assignment_target = true,
             |this| match parts.target {
                 AssignmentTarget::Symbol(symbol) => this.visit_symbol(symbol),
-                AssignmentTarget::List(list) => this.visit_assignment_list(list),
+                AssignmentTarget::List(list) => this.visit_expr_sequence(list),
                 AssignmentTarget::Evaluated(target) | AssignmentTarget::Augmented(target) => {
                     this.visit_expr(target)
                 }
                 AssignmentTarget::Method { method, .. } => this.visit_expr(method),
-                AssignmentTarget::Operator(operation) => this.visit_expr_op(operation),
+                AssignmentTarget::Operator(operation) | AssignmentTarget::Expression(operation) => {
+                    this.visit_expr(operation)
+                }
                 AssignmentTarget::New(new) => this.visit_expr_new(new),
             },
         );
@@ -655,7 +629,7 @@ impl<Source: SourceNavigation + ?Sized> LexicalTokens<'_, '_, '_, Source> {
 
     /// Classifies the comments of a cell, without surrounding blanks or the
     /// line ending.
-    fn comments(&mut self, trivia: &[Trivia]) {
+    fn comments(&mut self, trivia: &[Comment]) {
         for comment in trivia {
             let Some(mut bytes) = self.source.syntax_bytes(comment) else {
                 continue;

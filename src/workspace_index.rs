@@ -583,9 +583,12 @@ impl WorkspaceIndex {
     /// the refusal is recorded in telemetry.
     fn scanned(root: &Path) -> Vec<Url> {
         RepositorySources::files(root).unwrap_or_else(|refusal| {
-            crate::telemetry::event(serde_json::json!({
-                "operation": "repository_scan_refused", "message": refusal.to_string(),
-            }));
+            crate::telemetry::event_at(
+                crate::settings::LogLevel::Warn,
+                serde_json::json!({
+                    "operation": "repository_scan_refused", "message": refusal.to_string(),
+                }),
+            );
             Vec::new()
         })
     }
@@ -1294,6 +1297,25 @@ impl WorkspaceIndex {
         }
     }
 
+    /// Whether a package owning `position` of `uri` exports its global
+    /// `definition`, under its own name or a synonym, from any of its files.
+    pub fn exports_definition(&self, uri: &Url, position: Position, definition: &str) -> bool {
+        let packages = self.packages_at(uri, position);
+        let exports = |export: &PackageExport| export.definition.name() == definition;
+        self.declared_packages_by_file.iter().any(|declarations| {
+            declarations.value().iter().any(|declaration| {
+                packages.contains(&declaration.name) && declaration.exports.iter().any(exports)
+            })
+        }) || self.fragment_exports_by_file.iter().any(|fragment| {
+            fragment.value().iter().any(|export| {
+                exports(export)
+                    && !self
+                        .packages_at(fragment.key(), export.range.start)
+                        .is_disjoint(&packages)
+            })
+        })
+    }
+
     /// Whether `uri` is one of the files of `package`: the file declaring
     /// it, or a file loaded from inside its section.
     fn belongs_to_package(&self, uri: &Url, package: &ObjectName) -> bool {
@@ -1402,8 +1424,10 @@ impl WorkspaceIndex {
 
     /// The definitions of `name` that `viewer` sees and `include` accepts. A
     /// name a package exports as a synonym resolves to the definitions of
-    /// the global it stands for; an exported name without a global definition
-    /// is a symbol created by the export itself, which then defines it.
+    /// the global it stands for. An export entry itself only references its
+    /// name: `export {"concentration"}` neither declares nor defines it, so
+    /// navigation reaches `concentration = method()` in whichever file of the
+    /// package binds it.
     fn locations(
         &self,
         name: &str,
@@ -1432,26 +1456,15 @@ impl WorkspaceIndex {
                 .unwrap_or_default()
         };
         let mut locations = defined_in(name, None);
-        let exports = self
-            .exports_named(name)
-            .into_iter()
-            .filter(|indexed| self.is_visible(viewer, name, &indexed.file, indexed.export.range))
-            .collect::<Vec<_>>();
-        for indexed in &exports {
-            if indexed.export.definition.name() != name {
+        for indexed in self.exports_named(name) {
+            if indexed.export.definition.name() != name
+                && self.is_visible(viewer, name, &indexed.file, indexed.export.range)
+            {
                 locations.extend(defined_in(
                     indexed.export.definition.name(),
                     Some(&indexed.package),
                 ));
             }
-        }
-        if locations.is_empty() {
-            locations.extend(
-                exports
-                    .into_iter()
-                    .filter(|indexed| !Self::answers_for_itself(viewer, &indexed.file))
-                    .map(|indexed| Location::new(indexed.file, indexed.export.range)),
-            );
         }
         locations
     }
@@ -2046,10 +2059,9 @@ mod tests {
             index.definitions("pub", &script),
             "a synonym resolves to the global it stands for"
         );
-        assert_eq!(
-            index.definitions("Flag", &script)[0].range.start,
-            pos!(1, 31),
-            "an export without a definition is defined by the export"
+        assert!(
+            index.definitions("Flag", &script).is_empty(),
+            "an export entry only references its name"
         );
         assert_eq!(
             index

@@ -78,7 +78,7 @@ impl ProjectConfiguration {
     }
 
     /// Recursive object overlay; scalar and list values replace the old value.
-    fn merge(base: &mut Value, overlay: &Value) {
+    pub fn merge(base: &mut Value, overlay: &Value) {
         if let (Some(base), Some(overlay)) = (base.as_object_mut(), overlay.as_object()) {
             for (key, value) in overlay {
                 Self::merge(base.entry(key.clone()).or_insert(Value::Null), value);

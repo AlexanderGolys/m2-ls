@@ -87,12 +87,16 @@ next.
 | `E22` | `unresolved-value` | error | an unbound callable, constructor type, Boolean operand or condition, or indexed receiver; declare or explicitly import the value |
 | `E23` | `matrix-shape-mismatch` | error | a sum, difference or product of matrices written out whose dimensions cannot combine: `A * A` for a 2×3 `A` |
 | `E24` | `division-by-zero` | error | a number divided by an exact zero written out: `1/0`, `1.5/0`; `1/0.` is valid and gives infinity |
+| `E25` | `package-rebinding` | error | assigning to a package's name, such as `Core = 3`: Macaulay2 accepts it, after which `package` returns `null` for everything the package defines |
+| `E26` | `library-global-value` | error | giving a library setting Macaulay2 lets you rebind a value it cannot hold: another class than it holds, `allowableThreads = matrix {{1}}`, or an integer outside its accepted range, `allowableThreads = 0` |
 | `T01` | `parallel-assignment-type` | error | `(a, b) = 5` |
 | `T02` | `condition-type` | warning | an `if` or `while` condition known not to be `Boolean` |
 | `T03` | `install-codomain-missing` | hint | an installation other than `new` without a codomain that inference can deduce; fix: insert `ZZ =>` |
 | `T04` | `install-codomain-mismatch` | warning | a declared codomain contradicting the inferred result: `g ZZ := String => n -> n + 1` |
 | `T05` | `call-domain-mismatch` | warning | no known method domain can accept the inferred argument types; uncertain matches remain valid |
+| `T07` | `call-arity-mismatch` | warning | a fixed-parameter source lambda called with the wrong argument count; computed sequences of unknown length remain unchecked |
 | `T06` | `option-value-mismatch` | warning | an option value of none of the documented types, or a symbol outside the values the option accepts |
+| `S31` | `unintroduced-symbol` | warning | the first use of an unbound bare symbol in a scope, before assignment or protection; quoted symbols and member keys are excluded |
 | `S01` | `option-key-convention` | hint | an option name or unbound symbol value that does not use PascalCase in an option declaration or a call |
 | `S02` | `unused-binding` | warning | a local that is never read; names starting with `_` are exempt |
 | `S03` | `redundant-control-parentheses` | hint | parentheses the keyword already delimits: `if (n > 0) then` |
@@ -102,7 +106,7 @@ next.
 | `S07` | `shared-method-codomain` | hint | at least five method installations, with more than 75% explicitly annotating the same result type; consider declaring a shared `TypicalValue` |
 | `S08` | `naming-convention` | hint | a type name or a declared optional argument (`Options => {…}`, `{…} >> f`) outside PascalCase or uppercase |
 | `S09` | `bound-option-key` | warning | an option key whose existing source binding is evaluated instead of supplying the name as a symbol; bound values are allowed |
-| `S10` | `constructor-typical-value` | hint | an installation of a method named after a known type, such as `matrix` or `toMatrix`, declaring no typical value at all |
+| `S10` | `constructor-typical-value` | hint | a source-owned constructor for a source-owned type missing that global typical value, or an installation annotating a result outside that type family |
 | `S11` | `null-return-guard` | hint | an unused `if x === null then return y` guard expressible as `x ?? return y` |
 | `S12` | `mapped-composition` | hint | `apply(rows, x -> f(g(x)))` expressible as `rows / f @@ g` |
 | `S13` | `redundant-boolean-comparison` | hint | a known Boolean strictly compared with `true` or `false` |
@@ -117,6 +121,7 @@ next.
 | `S22` | `predicate-typical-value` | warning | a predicate (`is` and an uppercase letter, as in `isPrime`) whose `method()` declaration does not set `TypicalValue => Boolean`, or an installation of one that annotates another result type |
 | `S23` | `predicate-function-closure` | hint | a predicate defined as a function closure rather than as a method |
 | `S24` | `inline-null-binding` | hint | `v := e; if v =!= null then y = v else y = w` expressible as `y = e ?? w`, dropping the local |
+| `S32` | `error-catching-rewrite` | hint | a `??` rewrite of `S04`, `S11` or `S24` whose tested value may fail, which `??` would turn into the fallback; only with [`errorCatchingRewrites`](../getting-started/configuration.md#diagnostics) |
 | `S25` | `prefer-augmented-assignment` | hint | `prefix = prefix \| "X"` expressible as `prefix \|= "X"`, for a symbol target and an operator with an augmented form |
 | `S26` | `constant-condition` | hint | an `if` or `while` condition computed from literals alone, as `if 2^10 > 1000`, so one branch never runs |
 | `S27` | `redundant-method-codomain` | hint | an installation annotation repeats its method declaration’s `TypicalValue`; fix: remove the annotation and inherit the default |
@@ -218,8 +223,25 @@ against the real interpreter by the probe in `tests/native_dispatch`.
 
 `S24` is the neighbour of `S04` for the pattern with an intermediate local. It
 reports the binding and the conditional together and is not reported twice by
-`S04`. `??` also falls back when its left side raises an error, which only
-matters if the code sits inside a `try` that relied on that error escaping.
+`S04`.
+
+### Rewrites that catch errors { #error-catching }
+
+`??` also falls back when its left side raises an error. `S04`, `S11` and
+`S24` are therefore reported only where the tested value cannot fail: a
+symbol, or a value under a bare `try`. Any other value, such as `h.Text` or
+`f x`, is reported as `S32` instead, and only when
+[`diagnostics.errorCatchingRewrites`](../getting-started/configuration.md#diagnostics)
+is on:
+
+```m2
+render = h -> if h.Text =!= null then h.Text else "..."
+```
+
+With the setting on, the hint offers `h.Text ?? "..."`. The original fails
+when `h` has no key `Text`, while the rewrite yields `"..."`. That is fine
+when every `h` carries the key (with `null` meaning absent), but it can hide
+a bug otherwise.
 
 Where a finding points at another place — `f` defined as a plain function on
 an earlier line — the diagnostic carries it as related information, which
@@ -255,11 +277,11 @@ render = §function.readonly|method§(§enumMember.option.readonly|Options§ => 
 Ordinary hash-table entries are not option declarations. `S01` leaves known
 library symbols and bound values alone.
 
-`S10` recognizes conversion methods named after known types, such as `widget`
-or `toWidget` for `Widget`. Declare the result with `TypicalValue => Widget`
-on the method or a `Widget =>` annotation on each installation. Any declared
-typical value satisfies the hint, so installations may narrow or differ from
-the method's, for instance to a subclass:
+`S10` checks constructors and conversions you declare for your own types:
+`widget` and `toWidget` for `Widget`. Declare `TypicalValue => Widget`
+globally on `method(...)`. Individual installations may narrow that result
+to a subtype of `Widget`; unrelated result types are reported. Calling an
+existing constructor does not trigger this rule:
 
 ```m2
 Widget = new §type.readonly|Type§ of §type.readonly|HashTable§
@@ -297,7 +319,8 @@ R = §type.readonly|QQ§[§variable.declaration.algebraic|x0§, §variable.decla
 : Silences the listed rules in the whole file, wherever the comment stands.
 
 `-- m2-ls: disable-next-line …`
-: Silences them on the following line only.
+: Silences them in the expression on the following line, on every line it
+  spans; stacked directives all apply to the expression below the stack.
 
 Rules are named by code or name, as in the settings; a directive that names
 none silences every rule. You rarely need to type these:
@@ -410,3 +433,16 @@ an unknown name as a Symbol.
 `specNet SpecNet := SpecNet => identity` can be simplified to
 `specNet SpecNet := identity`. Differing annotations remain as overrides.
 The removal fix preserves the implementation and retains annotations containing comments.
+
+## Introducing symbolic constants { #symbol-introductions }
+
+`S31` catches the first unbound bare name in each lexical scope, including
+option values and hash-table entries. Assign a value before reading it, or
+use `protect Strategy` before using `Strategy` as a symbolic constant.
+Explicit `symbol Strategy` quotes a symbol instead of reading its binding;
+member names such as `object.Strategy` likewise do not read a local binding.
+
+A required value gets the more specific `E22` instead. This includes the
+type in `method(TypicalValue => MissingType)`. An unknown environment is
+still unknown: declare imports and source dependencies so these checks can
+resolve names from other files.

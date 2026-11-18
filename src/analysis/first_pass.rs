@@ -46,10 +46,10 @@
 //! that contains it.
 
 use m2_syn::nodes::{
-    Cell, Expr, ExprAssign as Assignment, ExprAssignParallel as ParallelAssignment,
-    ExprAssignSimple as SimpleBinding, ExprFor as ForLoop, ExprIf as IfStatement,
-    ExprLambda as LambdaExpression, ExprOpBinAdj as AdjacentExpr, ExprTry as TryStatement,
-    ExprWhile as WhileLoop, LoopBody, Symbol, TryFallback, WhenCondition,
+    BinaryOperator, Cell, Expr, ExprAssign as Assignment, ExprBinary as AdjacentExpr,
+    ExprFor as ForLoop, ExprFunction as LambdaExpression, ExprIf as IfStatement,
+    ExprTry as TryStatement, ExprWhile as WhileLoop, ForIter, LoopBody, Symbol, TryFallback,
+    WhenClause,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::Spanned;
@@ -63,7 +63,7 @@ use crate::source::{ByteRange, SourceNavigation, SyntaxSource};
 use crate::string_literal::LiteralSource;
 use crate::util::TextRangeExt;
 
-use crate::syntax::{BoundSymbols, ExpressionSyntax};
+use crate::syntax::{AssignmentOperator, AssignmentSyntax, BoundSymbols, ExpressionSyntax};
 
 /// Index of a scope inside its [`ScopeTree`].
 pub type ScopeId = usize;
@@ -127,7 +127,7 @@ impl BindingFact {
             .iter()
             .find(|cell| cell.document_range().contains(&bytes.start));
         let definition = match cell.map(|cell| (cell, cell.syntax())) {
-            Some((_, Some(syntax))) if syntax.semicolon.is_none() => {
+            Some((_, Some(syntax))) if syntax.semi_token.is_none() => {
                 source.range_for_syntax(syntax)
             }
             Some((cell, None)) => Some(source.range_for_bytes(cell.document_range())),
@@ -152,10 +152,10 @@ impl BindingFact {
         call: &AdjacentExpr,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<ByteRange> {
-        if call.left_operand.symbol_name() != Some(Macaulay2Conventions::PACKAGE_CONSTRUCTOR) {
+        if call.left.symbol_name() != Some(Macaulay2Conventions::PACKAGE_CONSTRUCTOR) {
             return None;
         }
-        let argument = call.right_operand.arguments().into_iter().next()??;
+        let argument = call.right.arguments().into_iter().next()??;
         argument
             .literal_content_bytes(source)
             .filter(|content| !content.is_empty())
@@ -460,7 +460,7 @@ impl<'source, Source: SourceNavigation + ?Sized> TypedWalker<'source, Source> {
         &mut self,
         node: &ForLoop,
         variable: &Symbol,
-        condition: Option<&WhenCondition>,
+        condition: Option<&WhenClause>,
         body: &LoopBody,
         visit_domain: impl FnOnce(&mut Self),
     ) {
@@ -476,7 +476,7 @@ impl<'source, Source: SourceNavigation + ?Sized> TypedWalker<'source, Source> {
                 walker.enter_scope(
                     walker.range_of(condition),
                     ScopeKind::LoopClause,
-                    |walker| walker.visit_when_condition(condition),
+                    |walker| walker.visit_when_clause(condition),
                 );
             }
             walker.enter_scope(walker.range_of(body), ScopeKind::LoopClause, |walker| {
@@ -492,51 +492,35 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, So
     }
 
     fn visit_expr_assign(&mut self, node: &'ast Assignment) {
-        let ordinary = BindingRole::Ordinary;
-        match node {
-            Assignment::Simple(SimpleBinding::Global(binding)) => self.bind(
-                [&binding.variable],
-                Some(&binding.value),
-                ordinary,
-                BindingEffect::Assign,
-            ),
-            Assignment::Simple(SimpleBinding::Local(binding)) => self.bind(
-                [&binding.variable],
-                Some(&binding.value),
-                ordinary,
-                BindingEffect::Declare,
-            ),
-            Assignment::Parallel(ParallelAssignment::Global(assignment)) => self.bind(
-                assignment.argument_list.bound_symbols(),
-                Some(&assignment.value),
-                ordinary,
-                BindingEffect::Assign,
-            ),
-            Assignment::Parallel(ParallelAssignment::Local(assignment)) => self.bind(
-                assignment.argument_list.bound_symbols(),
-                Some(&assignment.value),
-                ordinary,
-                BindingEffect::Declare,
-            ),
-            // These update an existing object or install a method; none binds
-            // a plain symbol.
-            Assignment::Evaluated(_)
-            | Assignment::Augmented(_)
-            | Assignment::Install(_)
-            | Assignment::Op(_) => {}
+        let parts = node.parts();
+        let effect = match parts.operator {
+            AssignmentOperator::Global => Some(BindingEffect::Assign),
+            AssignmentOperator::Local => Some(BindingEffect::Declare),
+            _ => None,
+        };
+        if let Some(effect) = effect {
+            self.bind(
+                parts.target.bound_symbols(),
+                Some(parts.value),
+                BindingRole::Ordinary,
+                effect,
+            );
         }
         visit::visit_expr_assign(self, node);
     }
 
     /// Juxtaposition covers calls such as `newPackage "P"`, which bind `P`.
-    fn visit_expr_op_bin_adj(&mut self, node: &'ast AdjacentExpr) {
-        if let Some(fact) = BindingFact::package_declaration(node, self.definition, self.source) {
-            self.bindings.push(fact);
+    fn visit_expr_binary(&mut self, node: &'ast AdjacentExpr) {
+        if matches!(node.op, BinaryOperator::Space(_)) {
+            if let Some(fact) = BindingFact::package_declaration(node, self.definition, self.source)
+            {
+                self.bindings.push(fact);
+            }
         }
-        visit::visit_expr_op_bin_adj(self, node);
+        visit::visit_expr_binary(self, node);
     }
 
-    fn visit_expr_lambda(&mut self, node: &'ast LambdaExpression) {
+    fn visit_expr_function(&mut self, node: &'ast LambdaExpression) {
         let parameters = node.bound_symbols();
         self.enter_scope(self.range_of(node), ScopeKind::Function, |walker| {
             walker.bind(
@@ -545,12 +529,12 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, So
                 BindingRole::Parameter,
                 BindingEffect::Declare,
             );
-            visit::visit_expr_lambda(walker, node);
+            visit::visit_expr_function(walker, node);
         });
     }
 
     fn visit_expr_if(&mut self, node: &'ast IfStatement) {
-        self.visit_clause(&node.condition, &node.condition, ScopeKind::Branch);
+        self.visit_clause(&node.cond, &node.cond, ScopeKind::Branch);
         self.visit_clause(&node.then_clause, &node.then_clause.expr, ScopeKind::Branch);
         if let Some(clause) = &node.else_clause {
             self.visit_clause(clause, &clause.expr, ScopeKind::Branch);
@@ -558,28 +542,22 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, So
     }
 
     fn visit_expr_for(&mut self, node: &'ast ForLoop) {
-        match node {
-            ForLoop::Bare(for_loop) => self.visit_for_loop(
-                node,
-                &for_loop.variable,
-                for_loop.condition.as_ref(),
-                &for_loop.body,
-                |_| {},
-            ),
-            // `from a to b`: both bounds share one clause spanning from the
-            // first present bound to the last.
-            ForLoop::Range(for_loop) => self.visit_for_loop(
-                node,
-                &for_loop.variable,
-                for_loop.condition.as_ref(),
-                &for_loop.body,
-                |walker| {
-                    let lower = for_loop
-                        .lower_bound
+        self.visit_for_loop(
+            node,
+            &node.var,
+            node.when_clause.as_ref(),
+            &node.body,
+            |walker| match &node.iter {
+                Some(ForIter::In(clause)) => {
+                    walker.visit_clause(clause, &clause.expr, ScopeKind::LoopClause)
+                }
+                Some(ForIter::Range(range)) => {
+                    let lower = range
+                        .from_clause
                         .as_ref()
                         .and_then(|bound| walker.range_of(bound));
-                    let upper = for_loop
-                        .upper_bound
+                    let upper = range
+                        .to_clause
                         .as_ref()
                         .and_then(|bound| walker.range_of(bound));
                     let domain = lower
@@ -587,46 +565,34 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for TypedWalker<'_, So
                         .chain(upper)
                         .reduce(|lower, upper| TextRange::new(lower.start, upper.end));
                     walker.enter_scope(domain, ScopeKind::LoopClause, |walker| {
-                        if let Some(bound) = &for_loop.lower_bound {
-                            walker.visit_range_bound_from(bound);
+                        if let Some(bound) = &range.from_clause {
+                            walker.visit_from_clause(bound);
                         }
-                        if let Some(bound) = &for_loop.upper_bound {
-                            walker.visit_range_bound_to(bound);
+                        if let Some(bound) = &range.to_clause {
+                            walker.visit_to_clause(bound);
                         }
                     });
-                },
-            ),
-            ForLoop::In(for_loop) => self.visit_for_loop(
-                node,
-                &for_loop.variable,
-                for_loop.condition.as_ref(),
-                &for_loop.body,
-                |walker| {
-                    walker.visit_clause(
-                        &for_loop.collection,
-                        &for_loop.collection,
-                        ScopeKind::LoopClause,
-                    )
-                },
-            ),
-        }
+                }
+                None => {}
+            },
+        );
     }
 
     fn visit_expr_while(&mut self, node: &'ast WhileLoop) {
-        self.visit_clause(&node.condition, &node.condition, ScopeKind::LoopClause);
+        self.visit_clause(&node.cond, &node.cond, ScopeKind::LoopClause);
         self.enter_scope(self.range_of(&node.body), ScopeKind::LoopClause, |walker| {
             visit::visit_loop_body(walker, &node.body)
         });
     }
 
     fn visit_expr_try(&mut self, node: &'ast TryStatement) {
-        self.visit_clause(&node.value, &node.value, ScopeKind::Branch);
-        if let Some(clause) = &node.on_success {
+        self.visit_clause(&node.expr, &node.expr, ScopeKind::Branch);
+        if let Some(clause) = &node.then_clause {
             self.visit_clause(clause, &clause.expr, ScopeKind::Branch);
         }
         match &node.fallback {
             Some(TryFallback::Except(clause)) => {
-                self.visit_clause(clause, &clause.value, ScopeKind::Branch)
+                self.visit_clause(clause, &clause.expr, ScopeKind::Branch)
             }
             Some(TryFallback::Else(clause)) => {
                 self.visit_clause(clause, &clause.expr, ScopeKind::Branch)

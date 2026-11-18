@@ -8,10 +8,11 @@ use super::native_dispatch::NativeEvaluation;
 use super::{naming, DiagnosticSink, InstallationContext};
 use crate::analysis::{
     CallableHeadKind, CodomainOrigin, Dispatch, InstalledValue, MethodHead,
-    MethodInstallationSyntax, MethodOptions, Operator,
+    MethodInstallationSyntax, MethodOptions, Operator, TypeChecker,
 };
 use crate::diagnostics::{catalog, Finding};
-use crate::object_registry::{ObjectKnowledge, ObjectName, OperatorForm};
+use crate::macaulay2::Macaulay2Conventions;
+use crate::object_registry::{ObjectName, OperatorForm};
 use crate::typesystem::{TypeKnowledge, TypeRole};
 
 /// Spawns every diagnostic found for the context's installation.
@@ -20,8 +21,50 @@ pub(super) fn spawn(context: &InstallationContext, sink: &mut DiagnosticSink) {
     operator_not_flexible(context, sink);
     install_arity(context, sink);
     install_option_form(context, sink);
-    constructor_typical_value(context, sink);
     predicate_result(context, sink);
+    constructor_result(context, sink);
+}
+
+/// A source-owned constructor's annotated result must remain inside its
+/// source-owned type family, even when narrowing the global typical value.
+fn constructor_result(context: &InstallationContext, sink: &mut DiagnosticSink) {
+    let installation = context.installation;
+    let MethodHead::Function(name) = &installation.method.head else {
+        return;
+    };
+    let Some(target) = Macaulay2Conventions::constructed_type_name(name.name()) else {
+        return;
+    };
+    let position = installation.span.start;
+    if context
+        .analysis
+        .function_at(name.name(), position)
+        .is_none()
+        || !context
+            .analysis
+            .get_binding_at(&target, position)
+            .is_some_and(|binding| binding.state.presentation_kind == SymbolKind::CLASS)
+    {
+        return;
+    }
+    let Some(codomain) = installation
+        .method
+        .codomain
+        .as_ref()
+        .filter(|_| installation.codomain_origin == Some(CodomainOrigin::Annotation))
+    else {
+        return;
+    };
+    if TypeChecker::new(context.analysis, context.knowledge).is_subtype(
+        codomain,
+        &ObjectName::new(&target),
+        position,
+        context.knowledge,
+    ) {
+        return;
+    }
+    sink.spawn(&catalog::CONSTRUCTOR_TYPICAL_VALUE, Finding::new(installation.span,
+        format!("`{name}` constructs instances of `{target}`, but this installation annotates `{codomain}`; use `{target}` or a subtype")));
 }
 
 /// Warns when an installation of a predicate annotates a result other than
@@ -55,50 +98,6 @@ fn predicate_result(context: &InstallationContext, sink: &mut DiagnosticSink) {
             ),
         ),
     );
-}
-
-/// Hints when a conversion named for a known type declares no typical value,
-/// neither for its installation nor for its method function.
-fn constructor_typical_value(context: &InstallationContext, sink: &mut DiagnosticSink) {
-    let installation = context.installation;
-    let MethodHead::Function(name) = &installation.method.head else {
-        return;
-    };
-    let name = name.name();
-    let target = if let Some(rest) = name
-        .strip_prefix("to")
-        .filter(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
-    {
-        rest.to_string()
-    } else {
-        let mut target = name.to_string();
-        if !target.starts_with(|c: char| c.is_ascii_lowercase()) {
-            return;
-        }
-        target[..1].make_ascii_uppercase();
-        target
-    };
-    let position = installation.span.start;
-    let source_type = context
-        .analysis
-        .get_binding_at(&target, position)
-        .is_some_and(|binding| binding.state.presentation_kind == SymbolKind::CLASS);
-    let indexed_type = context
-        .knowledge
-        .get_record(&ObjectName::new(&target))
-        .is_some_and(|record| record.type_info().is_some());
-    if !source_type && !indexed_type {
-        return;
-    }
-    // Any declared typical value is a decision: a method often keeps a general
-    // one and narrows it per installation to a subclass, or the reverse.
-    if matches!(
-        installation.codomain_origin,
-        Some(CodomainOrigin::Annotation | CodomainOrigin::TypicalValue)
-    ) {
-        return;
-    }
-    sink.spawn(&catalog::CONSTRUCTOR_TYPICAL_VALUE, Finding::new(installation.span, format!("`{name}` names the type `{target}`; declare `{target}` as the method or installation's typical value")));
 }
 
 /// Reports method installations that cannot affect the callable they target.

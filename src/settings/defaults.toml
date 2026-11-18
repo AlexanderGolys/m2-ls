@@ -1,0 +1,129 @@
+[catalog]
+enabled = true
+version = "0.1.*"
+
+[logging]
+level = "info"
+
+[diagnostics]
+enabled = true
+disabled = []
+warningsAsHint = []
+warningsAsInfo = []
+# Also suggest rewrites that turn an error into a fallback value: `h.k ?? v`
+# for `if h.k =!= null then h.k else v`, yielding `v` where `h` lacks `k`.
+errorCatchingRewrites = false
+
+[diagnostics.emitAs]
+error = []
+warning = []
+info = []
+hint = []
+fixActionOnly = []
+
+
+[formatting]
+indent = "editor"   # "tab", or a number of spaces; standalone tools use tabs
+# tabWidth = 4      # columns a tab counts as; the editor's tab size when unset
+softWrapWidth = 78
+hardLineWidth = 90
+controlFlowLayout = "multilineCompactElse"
+compactFactorOperators = true
+breakAfterSemicolon = false
+keepLineBreaks = false
+# Parentheses the syntax does not need, as in `(a*b) + c`: "off", "action"
+# (the "Remove redundant parentheses in file" source action), or "format" (also
+# removed whenever the document is formatted).
+redundantParentheses = "action"
+# "keep" spares call arguments: `f(x)` stays instead of becoming `f x`.
+callParentheses = "remove"
+
+# Operators written `a + b` and `<< x`. A unary operator is spaced on its
+# operand's side. Setting only one of the two lists below removes what it
+# names from the other's defaults; operators in neither keep their spacing.
+# Word operators (`or`, `and`, `xor`, `not`, `SPACE`, `Core$or`, ...) are
+# always spaced, listed or not.
+[formatting.operators.spacesAround]
+binary = [
+    "==", "!=", "===", "=!=", "<<", "<", ">", "<=", ">=", "??", "||", "|",
+    "^^", "&", "++", "+", "-", "\\", "\\\\", ":=", "=", "<-", "=>", "->", "//",
+    "*", "/", "%", "**", # compacted between adjacent factors by compactFactorOperators
+]
+unary = ["<<"]
+
+# Operators written `a^b`, `-x` and `n!`.
+[formatting.operators.compact]
+binary = [
+    "·", "⊠", "⧢", "@", "@@", "@@?", "|_", "^", "^**", "^<", "^<=", "^>", "^>=",
+    "_", "_<", "_<=", "_>", "_>=", "#", "#?",
+]
+unary = [
+    "+", "-", "*", "#", "<", "<=", ">", ">=", "?", "|-", "<===", "<==", "??",
+    "!", "^!", "_!", "^*", "_*", "^~", "_~", "(*)",
+]
+
+# Brackets written `{ x }` and `{x}`: any of "{}", "()", "[]", "<||>".
+# Unlisted brackets keep their inner spacing; empty ones always close up.
+[formatting.brackets]
+spacesInside = []
+compact = []
+
+
+[inlayHints]
+argTypes = false
+everywhere = false
+
+[inlayHints.argNames]
+enabled = true
+requireBracket = true
+ignoreVariadic = true
+maxLength = 15
+
+[inlayHints.types]
+enabled = true
+after = {
+    call = true,
+    endOfLine = true,
+    endOfCell = true,
+    assignment = true,
+    brackets = ["parentheses"], # "array" | "list" | "angle bar" | "holder"
+    return = false
+}
+
+[inlayHints.hide]
+types = ["Thing", "Nothing"]
+calls = ["toString", "net", "toList"]
+nonExactMark = false
+literal = true
+trivial = true
+sequential = true
+beforeSemicolon = false
+operatorCalls = true
+
+[semanticTokens]
+standardOnly = false
+defaultLibrary = ["CompiledFunction"]
+
+
+# These paths are discovered automatically. Uncomment an override only when
+# discovery misses an installation or a source checkout.
+[macaulay2]
+runtimeDiscovery = true
+ # executable = "/path/to/M2"
+# prefix = "/path/to/installation"
+# applicationDirectory = "~/.Macaulay2"
+
+# Discovery may query M2; the server also works without a usable executable.
+
+[sources]
+enabled = true
+
+# Additional package directories, in search order. These can be used without M2.
+packagePaths = []
+
+# Core sources are discovered automatically and have special analysis rules.
+corePath = "auto"
+primaryCodePaths = []
+
+[initialization]
+files = ["${applicationDirectory}/init.m2"]

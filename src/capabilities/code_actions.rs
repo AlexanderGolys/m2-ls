@@ -8,21 +8,23 @@
 
 use std::collections::HashMap;
 
-use m2_syn::nodes::{Expr, ExprLiteral};
+use m2_syn::nodes::{Expr, Literal};
 use m2_syn::visit::{self, Visit};
 use tower_lsp::lsp_types::Range as TextRange;
 use tower_lsp::lsp_types::*;
 
+use crate::analysis::{Method, MethodHead};
 use crate::diagnostics::rewrites::{RewriteKind, RewriteSite, RewriteSites};
 use crate::diagnostics::suppression::{DiagnosticSuppressions, SuppressionScope};
 use crate::diagnostics::{catalog, DiagnosticCode, DiagnosticRule, FindingFix};
 use crate::document::{DocumentSnapshot, FileProperties};
-use crate::node_metadata::ParsedCell;
+use crate::node_metadata::{CallParentheses, ParsedCell};
 use crate::settings::FormattingSettings;
 use crate::source::{SourceNavigation, SyntaxSource};
 use crate::string_literal::LiteralSource;
 use crate::syntax::CursorSyntax;
 use crate::util::TextRangeExt;
+use crate::workspace_index::{WorkspaceDefinitionKnowledge, WorkspaceIndex};
 
 use super::formatting::{format_action_edit, FormatOptions};
 
@@ -31,6 +33,10 @@ const RAW_STRING_MIN_ESCAPES: usize = 3;
 
 /// The delimiter of a raw string literal, on both sides.
 const RAW_STRING_DELIMITER: &str = "///";
+
+/// The source action removing the parentheses the syntax does not need.
+pub const REMOVE_REDUNDANT_PARENTHESES: CodeActionKind =
+    CodeActionKind::new("source.removeRedundantParentheses");
 
 /// Declaration category selecting the applicable documentation sections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +86,12 @@ impl DocumentationTemplate {
             output: None,
             kind: DocumentationItemKind::Value,
         }
+    }
+
+    /// The call of `head` on the template's input names, as in `f(x, y)`.
+    fn call_usage(&self, head: &str) -> String {
+        let inputs = self.inputs.iter().map(|(name, _)| name.as_str());
+        format!("{head}({})", inputs.collect::<Vec<_>>().join(", "))
     }
 
     /// Translates the function, optional-argument, package, and overview templates
@@ -146,6 +158,8 @@ struct CodeActionContext<'a, 'request> {
     sites: Vec<RewriteSite<'a>>,
     /// Diagnostics the client reports for the document.
     diagnostics: &'request [Diagnostic],
+    /// The workspace, telling which package a file loaded by another belongs to.
+    workspace: Option<&'request WorkspaceIndex>,
 }
 
 /// A rewrite offered for the hint reporting it, with its action title.
@@ -173,16 +187,17 @@ fn rewrite_title(site: &RewriteSite<'_>) -> &'static str {
     }
 }
 
-/// Whether a rewrite of `kind` is offered only as the fix of its reported
-/// hint, never as a refactor of its own.
-fn requires_diagnostic(kind: RewriteKind) -> bool {
-    matches!(
-        kind,
-        RewriteKind::AmbiguousFloatMemberAccess
-            | RewriteKind::CoalescingAssignment
-            | RewriteKind::Coalescence
-            | RewriteKind::InlinedNullBinding
-    )
+/// Whether `site` is offered only as the fix of its reported hint, never as a
+/// refactor of its own: a rewrite catching errors needs the user's opt-in.
+fn requires_diagnostic(site: &RewriteSite<'_>) -> bool {
+    site.catches_errors
+        || matches!(
+            site.kind,
+            RewriteKind::AmbiguousFloatMemberAccess
+                | RewriteKind::CoalescingAssignment
+                | RewriteKind::Coalescence
+                | RewriteKind::InlinedNullBinding
+        )
 }
 
 impl<'a> CodeActionContext<'a, '_> {
@@ -193,6 +208,7 @@ impl<'a> CodeActionContext<'a, '_> {
         uri: &'request Url,
         position: Position,
         diagnostics: &'request [Diagnostic],
+        workspace: Option<&'request WorkspaceIndex>,
     ) -> Option<CodeActionContext<'a, 'request>> {
         let byte = document.byte_for_position(position)?;
         let cells = document
@@ -212,20 +228,66 @@ impl<'a> CodeActionContext<'a, '_> {
                 document.object_registry(),
             ),
             diagnostics,
+            workspace,
         })
     }
 
-    /// Documentation placeholders for declarations enclosing the cursor and their options.
+    /// Whether the package owning `position` exports the global `name`, so
+    /// that documentation of it has a reader.
+    fn is_exported(&self, name: &str, position: Position) -> bool {
+        let exports = self.document.packages().exports_at(position);
+        exports
+            .iter()
+            .any(|export| export.definition.name() == name)
+            || self
+                .workspace
+                .is_some_and(|workspace| workspace.exports_definition(self.uri, position, name))
+    }
+
+    /// Whether `name` is a global of the workspace's own code rather than of
+    /// Macaulay2 or a library package.
+    fn is_source_global(&self, name: &str) -> bool {
+        self.document
+            .analysis()
+            .binding_states()
+            .any(|binding| binding.name.name() == name)
+            || self
+                .workspace
+                .is_some_and(|workspace| workspace.is_defined(name, self.uri))
+    }
+
+    /// Whether the documentation of `installation` has a reader: its method
+    /// is exported or, for a method the package does not own, such as an
+    /// operator or `net`, one of the types it is installed on is.
+    fn is_public_installation(&self, method: &Method, position: Position) -> bool {
+        let domain_exported = method
+            .domain
+            .iter()
+            .any(|ty| self.is_exported(ty.name(), position));
+        match &method.head {
+            MethodHead::Function(name) => {
+                self.is_exported(name.name(), position)
+                    || domain_exported && !self.is_source_global(name.name())
+            }
+            MethodHead::Operator(_) => domain_exported,
+        }
+    }
+
+    /// Documentation placeholders for the package declared on the cursor's
+    /// line and for the exported declarations enclosing the cursor and their
+    /// options; documentation of anything else would have no reader.
     fn documentation_placeholders(&self) -> Vec<CodeAction> {
         let mut targets = Vec::new();
         for installation in self.document.analysis().installations() {
-            if !installation.span.contains_position(self.position) {
+            let method = &installation.method;
+            if !installation.span.contains_position(self.position)
+                || !self.is_public_installation(method, installation.span.start)
+            {
                 continue;
             }
-            let method = &installation.method;
             let head = match &method.head {
-                crate::analysis::MethodHead::Function(name) => name.name().to_string(),
-                crate::analysis::MethodHead::Operator(operator) => {
+                MethodHead::Function(name) => name.name().to_string(),
+                MethodHead::Operator(operator) => {
                     format!("symbol {}", operator.token.name())
                 }
             };
@@ -250,16 +312,7 @@ impl<'a> CodeActionContext<'a, '_> {
                     )
                 })
                 .collect();
-            template.usage = Some(format!(
-                "{}({})",
-                method.head.name().name(),
-                template
-                    .inputs
-                    .iter()
-                    .map(|(name, _)| name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            template.usage = Some(template.call_usage(method.head.name().name()));
             template.kind = DocumentationItemKind::Installation;
             template.output = method.codomain.as_ref().map(|ty| ty.name().to_string());
             targets.push(template);
@@ -271,6 +324,7 @@ impl<'a> CodeActionContext<'a, '_> {
                     .definition_range
                     .contains_position(self.position)
                     || self.document.declaration_code(binding).is_none()
+                    || !self.is_exported(binding.name.name(), binding.state.definition_range.start)
                 {
                     continue;
                 }
@@ -291,15 +345,7 @@ impl<'a> CodeActionContext<'a, '_> {
                         .into_iter()
                         .map(|name| (name, None))
                         .collect();
-                    template.usage = Some(format!(
-                        "{name}({})",
-                        template
-                            .inputs
-                            .iter()
-                            .map(|(name, _)| name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
+                    template.usage = Some(template.call_usage(name));
                     template.output = function
                         .typical_value
                         .as_ref()
@@ -458,8 +504,8 @@ impl<'a> CodeActionContext<'a, '_> {
             Some(extent) => self.document.range_for_bytes(extent.clone()),
             None => self.document.range_for_syntax(site.expression)?,
         };
-        let diagnostic = self.diagnostic_covering(site.kind.rule(), range);
-        if diagnostic.is_none() && requires_diagnostic(site.kind) {
+        let diagnostic = self.diagnostic_covering(site.rule(), range);
+        if diagnostic.is_none() && requires_diagnostic(site) {
             return None;
         }
         Some(
@@ -562,7 +608,7 @@ impl<'a> CodeActionContext<'a, '_> {
         let literal = self
             .enclosing
             .last()
-            .filter(|expression| matches!(expression, Expr::Literal(ExprLiteral::String(_))))?;
+            .filter(|expression| matches!(expression, Expr::Literal(Literal::String(_))))?;
         raw_string_edit(self.document, self.uri, literal)
     }
 }
@@ -605,8 +651,9 @@ pub fn available_code_actions(
     position: Position,
     diagnostics: &[Diagnostic],
     formatting: &FormattingSettings,
+    workspace: Option<&WorkspaceIndex>,
 ) -> Option<CodeActionResponse> {
-    let context = CodeActionContext::new(document, uri, position, diagnostics)?;
+    let context = CodeActionContext::new(document, uri, position, diagnostics, workspace)?;
     let options = FormatOptions::from(formatting);
     let mut actions: CodeActionResponse = context
         .finding_fixes()
@@ -629,7 +676,41 @@ pub fn available_code_actions(
     if let Some(action) = fix_all_action(document, uri, diagnostics, &options) {
         actions.push(CodeActionOrCommand::CodeAction(action));
     }
+    if formatting.redundant_parentheses.offers_action() {
+        actions.extend(
+            redundant_parentheses_action(document, uri, formatting.call_parentheses)
+                .map(CodeActionOrCommand::CodeAction),
+        );
+    }
     (!actions.is_empty()).then_some(actions)
+}
+
+/// Removes the document's redundant parentheses, replacing each cell holding
+/// some. The edits are not reformatted: only the parentheses and the
+/// whitespace inside them go.
+fn redundant_parentheses_action(
+    document: &DocumentSnapshot,
+    uri: &Url,
+    calls: CallParentheses,
+) -> Option<CodeAction> {
+    let edits = document
+        .syntax()
+        .redundant_parentheses(calls)
+        .into_iter()
+        .map(|(bytes, new_text)| TextEdit {
+            range: document.range_for_bytes(bytes),
+            new_text,
+        })
+        .collect::<Vec<_>>();
+    (!edits.is_empty()).then(|| CodeAction {
+        title: "Remove redundant parentheses in file".into(),
+        kind: Some(REMOVE_REDUNDANT_PARENTHESES),
+        edit: Some(WorkspaceEdit {
+            changes: Some(HashMap::from([(uri.clone(), edits)])),
+            ..WorkspaceEdit::default()
+        }),
+        ..CodeAction::default()
+    })
 }
 
 /// The string literals of visited syntax.
@@ -638,7 +719,7 @@ struct StringLiterals<'ast>(Vec<&'ast Expr>);
 
 impl<'ast> Visit<'ast> for StringLiterals<'ast> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
-        if let Expr::Literal(ExprLiteral::String(_)) = expression {
+        if let Expr::Literal(Literal::String(_)) = expression {
             self.0.push(expression);
         }
         visit::visit_expr(self, expression);
@@ -675,6 +756,7 @@ fn fix_all_action(
         enclosing: Vec::new(),
         sites: Vec::new(),
         diagnostics,
+        workspace: None,
     };
     // Only the outermost conditional of a nest flattens into one chain.
     let chain_bytes = sites
@@ -911,12 +993,14 @@ fn unescape_string_literal_content(content: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capabilities::formatting::{format_document_with_options, ControlFlowLayout};
+    use crate::capabilities::formatting::{
+        format_document_with_options, ControlFlowLayout, RedundantParentheses,
+    };
     use crate::diagnostics::visible_diagnostics;
     use crate::node_metadata::SyntaxSnapshot;
     use crate::object_registry::ObjectRegistry;
     use crate::package_index::SourceResolver;
-    use crate::settings::DiagnosticSettings;
+    use crate::settings::{Indent, ServerSettings};
 
     fn formatted(text: &str, settings: &FormattingSettings) -> String {
         let syntax = SyntaxSnapshot::parse(text, None);
@@ -933,12 +1017,17 @@ mod tests {
         let diagnostics = visible_diagnostics(
             &document,
             &uri,
-            &DiagnosticSettings::default(),
+            &ServerSettings::defaults().diagnostics.clone(),
             &SourceResolver::default(),
             None,
         );
-        let action = fix_all_action(&document, &uri, &diagnostics, &FormatOptions::default())
-            .expect("file-wide fixes should be offered");
+        let action = fix_all_action(
+            &document,
+            &uri,
+            &diagnostics,
+            &FormatOptions::from(&ServerSettings::defaults().formatting),
+        )
+        .expect("file-wide fixes should be offered");
         assert_eq!(action.kind, Some(CodeActionKind::SOURCE_FIX_ALL));
         let changes = action.edit.unwrap().changes.unwrap();
         let edits = &changes[&uri];
@@ -958,12 +1047,88 @@ mod tests {
         let diagnostics = visible_diagnostics(
             &rewritten,
             &uri,
-            &DiagnosticSettings::default(),
+            &ServerSettings::defaults().diagnostics.clone(),
             &SourceResolver::default(),
             None,
         );
-        assert!(
-            fix_all_action(&rewritten, &uri, &diagnostics, &FormatOptions::default()).is_none()
+        assert!(fix_all_action(
+            &rewritten,
+            &uri,
+            &diagnostics,
+            &FormatOptions::from(&ServerSettings::defaults().formatting)
+        )
+        .is_none());
+    }
+
+    /// `redundantParentheses` decides whether the source action is offered,
+    /// which replaces only the cells holding such parentheses, and whether
+    /// formatting removes them too; `callParentheses` whether call arguments
+    /// count.
+    #[test]
+    fn redundant_parentheses_follow_their_setting() {
+        let source = "x = (a*b) + c\ny = f(x)\n";
+        let document =
+            DocumentSnapshot::from_text(source.into(), &ObjectRegistry::default()).unwrap();
+        let uri = Url::parse("file:///test.m2").unwrap();
+        let with = |redundant_parentheses, call_parentheses| FormattingSettings {
+            redundant_parentheses,
+            call_parentheses,
+            ..ServerSettings::defaults().formatting.clone()
+        };
+        let edits = |settings: &FormattingSettings| {
+            available_code_actions(&document, &uri, Position::default(), &[], settings, None)
+                .into_iter()
+                .flatten()
+                .find_map(|action| match action {
+                    CodeActionOrCommand::CodeAction(action)
+                        if action.kind == Some(REMOVE_REDUNDANT_PARENTHESES) =>
+                    {
+                        action.edit?.changes?.remove(&uri)
+                    }
+                    _ => None,
+                })
+        };
+        let first_cell = TextEdit {
+            range: document.range_for_bytes(0..14),
+            new_text: "x = a*b + c\n".into(),
+        };
+        let second_cell = TextEdit {
+            range: document.range_for_bytes(14..23),
+            new_text: "y = f x\n".into(),
+        };
+
+        assert_eq!(
+            edits(&with(RedundantParentheses::Action, CallParentheses::Remove)),
+            Some(vec![first_cell.clone(), second_cell])
+        );
+        assert_eq!(
+            edits(&with(RedundantParentheses::Action, CallParentheses::Keep)),
+            Some(vec![first_cell])
+        );
+        assert_eq!(
+            edits(&with(RedundantParentheses::Off, CallParentheses::Remove)),
+            None
+        );
+        assert_eq!(
+            formatted(
+                source,
+                &with(RedundantParentheses::Action, CallParentheses::Remove)
+            ),
+            source
+        );
+        assert_eq!(
+            formatted(
+                source,
+                &with(RedundantParentheses::Format, CallParentheses::Remove)
+            ),
+            "x = a*b + c\ny = f x\n"
+        );
+        assert_eq!(
+            formatted(
+                source,
+                &with(RedundantParentheses::Format, CallParentheses::Keep)
+            ),
+            "x = a*b + c\ny = f(x)\n"
         );
     }
 
@@ -976,12 +1141,17 @@ mod tests {
         let diagnostics = visible_diagnostics(
             &document,
             &uri,
-            &DiagnosticSettings::default(),
+            &ServerSettings::defaults().diagnostics.clone(),
             &SourceResolver::default(),
             None,
         );
-        let action =
-            fix_all_action(&document, &uri, &diagnostics, &FormatOptions::default()).unwrap();
+        let action = fix_all_action(
+            &document,
+            &uri,
+            &diagnostics,
+            &FormatOptions::from(&ServerSettings::defaults().formatting),
+        )
+        .unwrap();
         let changes = action.edit.unwrap().changes.unwrap();
         let edits = &changes[&uri];
         assert!(edits
@@ -999,19 +1169,26 @@ mod tests {
         let document =
             DocumentSnapshot::from_text(source.into(), &ObjectRegistry::default()).unwrap();
         let uri = Url::parse("file:///test.m2").unwrap();
-        let diagnostics = visible_diagnostics(
+        let mut diagnostics = visible_diagnostics(
             &document,
             &uri,
-            &DiagnosticSettings::default(),
+            &ServerSettings::defaults().diagnostics.clone(),
             &SourceResolver::default(),
             None,
         );
+        diagnostics.retain(|diagnostic| {
+            diagnostic.code
+                != Some(NumberOrString::String(
+                    catalog::UNINTRODUCED_SYMBOL.code.as_str().to_owned(),
+                ))
+        });
         assert!(available_code_actions(
             &document,
             &uri,
             Position::new(0, 7),
             &diagnostics,
-            &FormattingSettings::default(),
+            &ServerSettings::defaults().formatting.clone(),
+            None,
         )
         .is_none());
     }
@@ -1056,17 +1233,17 @@ mod tests {
         ];
         let uri = Url::parse("file:///test.m2").unwrap();
         for settings in [
-            FormattingSettings::default(),
+            ServerSettings::defaults().formatting.clone(),
             FormattingSettings {
-                indent: Some(2),
+                indent: Indent::Spaces(2),
                 soft_line_width: Some(40),
                 control_flow_layout: ControlFlowLayout::Compact,
-                ..FormattingSettings::default()
+                ..ServerSettings::defaults().formatting.clone()
             },
             FormattingSettings {
-                use_tabs: Some(true),
+                indent: Indent::Tab,
                 control_flow_layout: ControlFlowLayout::Multiline,
-                ..FormattingSettings::default()
+                ..ServerSettings::defaults().formatting.clone()
             },
         ] {
             for (expression, title) in cases {
@@ -1082,7 +1259,7 @@ mod tests {
                     let diagnostics = visible_diagnostics(
                         &document,
                         &uri,
-                        &DiagnosticSettings::default(),
+                        &ServerSettings::defaults().diagnostics.clone(),
                         &SourceResolver::default(),
                         None,
                     );
@@ -1093,6 +1270,7 @@ mod tests {
                         expression_start,
                         &diagnostics,
                         &settings,
+                        None,
                     )
                     .unwrap_or_else(|| panic!("missing {title}: {source}"));
                     let action = actions
@@ -1122,6 +1300,7 @@ mod tests {
                         rewritten_expression_start(&rewritten),
                         &[],
                         &settings,
+                        None,
                     )
                     .into_iter()
                     .flatten()

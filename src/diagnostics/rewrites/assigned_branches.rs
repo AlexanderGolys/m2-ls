@@ -5,7 +5,7 @@
 //! null test assign once with `target = subject ?? (fallback)`. Every path must
 //! assign the same symbol, and no branch may introduce a local with that name.
 
-use m2_syn::nodes::{Expr, ExprAssign, ExprAssignSimple};
+use m2_syn::nodes::{AssignOperator, Expr, ExprAssign};
 use m2_syn::visit::{self, Visit};
 use m2_syn::Token;
 
@@ -82,22 +82,26 @@ impl<'ast, Source: SourceNavigation + ?Sized> RewriteSites<'ast, '_, Source> {
                     prefixes,
                 )
             }
-            Expr::Holder(block) => {
-                self.branch_assignment_tokens(block.value.as_deref()?, target, prefixes)
+            Expr::Paren(block) => {
+                self.branch_assignment_tokens(block.expr.as_deref()?, target, prefixes)
             }
             _ => {
-                let Expr::Assign(ExprAssign::Simple(ExprAssignSimple::Global(assignment))) = branch
+                let Expr::Assign(assignment) = branch else {
+                    return None;
+                };
+                let (AssignOperator::Global(operator), Expr::Symbol(symbol)) =
+                    (&assignment.op, assignment.left.as_ref())
                 else {
                     return None;
                 };
-                if assignment.variable.text() != target {
+                if symbol.text() != target {
                     return None;
                 }
-                let target_start = self.source.syntax_bytes(&assignment.variable)?.start;
-                let operator_start = self.source.syntax_bytes(&assignment.operator)?.start;
+                let target_start = self.source.syntax_bytes(symbol)?.start;
+                let operator_start = self.source.syntax_bytes(operator)?.start;
                 // Native token spans can include trailing comments. Remove only
                 // each token's spelling so that its trivia remains in the branch.
-                prefixes.push(target_start..target_start + assignment.variable.text().len());
+                prefixes.push(target_start..target_start + symbol.text().len());
                 prefixes.push(operator_start..operator_start + <Token![=]>::SPELLING.len());
                 Some(())
             }

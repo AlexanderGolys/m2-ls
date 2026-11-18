@@ -17,8 +17,8 @@ mod first_pass;
 mod installation;
 
 pub use control_flow::{ControlTransfer, ControlTransferTarget, LoopStatement};
-pub use inference::syntax::InfixSyntax;
-pub(crate) use installation::MethodDeclarationOption;
+pub use inference::syntax::{InfixSyntax, MethodConstructor};
+pub use installation::MethodDeclarationOption;
 mod inference;
 mod known_value;
 mod ring;
@@ -30,8 +30,7 @@ pub use known_value::{KnownValue, MatrixShape};
 pub use ring::RingVariableError;
 
 use m2_syn::nodes::{
-    Expr, ExprAssign, ExprOpBinAdj, ExprOpBinRegular as BinaryExpr, ExprOption as OptionExpression,
-    ExprQuote as QuoteExpression,
+    Expr, ExprAssign, ExprBinary, ExprOption as OptionExpression, ExprQuote as QuoteExpression,
 };
 use m2_syn::Token;
 use std::collections::{HashMap, HashSet};
@@ -1551,7 +1550,7 @@ impl Analysis {
     /// Argument types and literal options of a call, in the scope where it is written.
     pub fn infer_call_static_facts(
         &self,
-        call: &ExprOpBinAdj,
+        call: &ExprBinary,
         source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> CallStaticFacts {
@@ -1566,7 +1565,7 @@ impl Analysis {
     pub fn local_call_installations<'a>(
         &'a self,
         function: &'a FunctionInfo,
-        call: &ExprOpBinAdj,
+        call: &ExprBinary,
         position: Position,
         source: &(impl SyntaxSource + ?Sized),
         knowledge: &(impl TypeKnowledge + ?Sized),

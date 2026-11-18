@@ -12,3 +12,5 @@ randomPlanePoints = (delta, R) -> (
 K = ZZ/101;
 ideal(gens Ip2 * random(source gens Ip2, R^{-d}))
 res(coker b, DegreeLimit=>0, SyzygyLimit=>60, LengthLimit=>3)
+
+M = dual (tangentSheaf (Proj(ZZ/2137[x_-1, xy_2,y_2]/(xy_2^2*y_2^3-xy_2^5+x_-1^2*y_2^3))))(-1)

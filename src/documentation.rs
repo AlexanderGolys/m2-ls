@@ -2,9 +2,9 @@
 
 use std::ops::Range;
 
-use m2_syn::nodes::{Expr, ExprCollection, ExprLiteral, PackedContent, Statement};
+use m2_syn::nodes::{BinaryOperator, Elements, Expr, Literal, Stmt};
 use m2_syn::visit::{self, Visit};
-use m2_syn::{Trivia, TriviaKind};
+use m2_syn::{Comment as SyntaxComment, CommentKind};
 use tower_lsp::lsp_types::Range as TextRange;
 
 use crate::analysis::{Analysis, AssignmentFactKind, BindingId, BindingView, MethodInstallationId};
@@ -409,7 +409,7 @@ fn collect_line_documentation(
     index: &mut DocumentationIndex,
 ) {
     let full_line_comment = |site: &CommentSite<'_>| {
-        site.comment.kind == TriviaKind::LineComment && site.comment.takes_full_line(source.text())
+        site.comment.kind == CommentKind::Line && site.comment.takes_full_line(source.text())
     };
     let row = |byte: usize| source.point_for_byte(byte).row;
     let mut cursor = 0;
@@ -467,7 +467,7 @@ fn collect_inner_documentation(
 ) {
     for site in sites
         .iter()
-        .filter(|site| site.comment.kind == TriviaKind::BlockComment)
+        .filter(|site| site.comment.kind == CommentKind::Block)
     {
         let list = &lists.lists[site.list];
         let Some(following) = lists.following_item(site) else {
@@ -584,7 +584,8 @@ fn collect_mapped_m2_references(
     }
 }
 
-/// Visits raw strings that may contain legacy documentation snippets.
+/// Visits documentation calls whose raw-string argument contains legacy
+/// snippets. Ordinary string values never acquire documentation semantics.
 struct LegacySnippets<'a, Source: ?Sized> {
     /// Source coordinates of the current revision.
     source: &'a Source,
@@ -594,9 +595,16 @@ struct LegacySnippets<'a, Source: ?Sized> {
 
 impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for LegacySnippets<'_, Source> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
-        if matches!(expression, Expr::Literal(ExprLiteral::RawString(_))) {
-            if let Some(bytes) = self.source.syntax_bytes(expression) {
-                collect_legacy_backtick_snippets(bytes, self.source, self.index);
+        if let Expr::Binary(call) = expression {
+            if matches!(call.op, BinaryOperator::Space(_)) && call.left.symbol_name() == Some("doc")
+            {
+                if let Some(argument @ Expr::Literal(Literal::RawString(_))) =
+                    call.right.unparenthesized()
+                {
+                    if let Some(bytes) = self.source.syntax_bytes(argument) {
+                        collect_legacy_backtick_snippets(bytes, self.source, self.index);
+                    }
+                }
             }
         }
         visit::visit_expr(self, expression);
@@ -722,8 +730,8 @@ fn targets_for_item(
 /// Whether this expression is a new package declaration.
 fn is_new_package_declaration(item: &Expr) -> bool {
     matches!(item,
-        Expr::Op(m2_syn::nodes::ExprOp::Bin(m2_syn::nodes::ExprOpBin::Adj(call)))
-            if call.left_operand.symbol_name() == Some(Macaulay2Conventions::PACKAGE_CONSTRUCTOR))
+        Expr::Binary(call)
+            if matches!(call.op, BinaryOperator::Space(_)) && call.left.symbol_name() == Some(Macaulay2Conventions::PACKAGE_CONSTRUCTOR))
 }
 
 /// Tests whether the outer source range covers the complete inner range.
@@ -766,7 +774,7 @@ fn enclosing_scope_target(
 #[derive(Debug, Clone)]
 struct Comment<'a> {
     /// Whether this is a line or a block comment.
-    kind: TriviaKind,
+    kind: CommentKind,
     /// Extent of the comment in the document.
     bytes: ByteRange,
     /// Comment source text, including its markers.
@@ -835,7 +843,7 @@ impl<'ast> ItemLists<'ast> {
             .cells()
             .iter()
             .filter_map(|cell| cell.syntax())
-            .flat_map(|cell| cell.content.arguments())
+            .flat_map(|cell| cell.elems.arguments())
             .flatten()
             .filter_map(|expression| ListItem::of(expression, source))
             .collect();
@@ -877,7 +885,7 @@ impl<'ast> ItemLists<'ast> {
     /// and attached line by line.
     fn sites_of<'text>(
         &self,
-        trivia: &Trivia,
+        trivia: &SyntaxComment,
         source: &'text (impl SourceNavigation + ?Sized),
     ) -> Vec<CommentSite<'text>> {
         let Some(bytes) = source.syntax_bytes(trivia) else {
@@ -909,14 +917,14 @@ impl<'ast> ItemLists<'ast> {
             list,
         };
         match trivia.kind() {
-            TriviaKind::BlockComment => vec![comment(TriviaKind::BlockComment, bytes)],
+            CommentKind::Block => vec![comment(CommentKind::Block, bytes)],
             _ => {
                 let mut offset = bytes.start;
                 text.split_inclusive('\n')
                     .map(|line| {
                         let line_bytes = offset..offset + line.trim_end_matches(['\n', '\r']).len();
                         offset += line.len();
-                        comment(TriviaKind::LineComment, line_bytes)
+                        comment(CommentKind::Line, line_bytes)
                     })
                     .collect()
             }
@@ -959,7 +967,7 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for ListCollector<'_, 
             self.source.syntax_bytes(expression),
         ) {
             let lambda = match self.ancestors.last() {
-                Some(Expr::Lambda(lambda)) if std::ptr::eq(lambda.body(), expression) => self
+                Some(Expr::Function(lambda)) if std::ptr::eq(lambda.body(), expression) => self
                     .ancestors
                     .last()
                     .and_then(|parent| self.source.syntax_bytes(*parent)),
@@ -985,40 +993,29 @@ impl<'ast, Source: SourceNavigation + ?Sized> Visit<'ast> for ListCollector<'_, 
 
 /// Statement and trailing expressions of a delimited expression, in source order.
 fn delimited_items(expression: &Expr) -> Option<Vec<&Expr>> {
-    fn items<'ast>(
-        statements: &'ast [Statement],
-        elements: &'ast Option<PackedContent>,
-    ) -> Vec<&'ast Expr> {
+    fn items<'ast>(statements: &'ast [Stmt], elements: &'ast Option<Elements>) -> Vec<&'ast Expr> {
         statements
             .iter()
-            .map(|statement| &statement.content)
+            .map(|statement| &statement.elems)
             .chain(elements)
             .flat_map(|content| content.arguments())
             .flatten()
             .collect()
     }
     match expression {
-        Expr::Holder(holder) => Some(
+        Expr::Paren(holder) => Some(
             holder
-                .muted
+                .stmts
                 .iter()
-                .flat_map(|statement| statement.content.arguments())
+                .flat_map(|statement| statement.elems.arguments())
                 .flatten()
-                .chain(holder.value.as_deref())
+                .chain(holder.expr.as_deref())
                 .collect(),
         ),
-        Expr::Collection(ExprCollection::Array(node)) => {
-            Some(items(&node.statements, &node.elements))
-        }
-        Expr::Collection(ExprCollection::List(node)) => {
-            Some(items(&node.statements, &node.elements))
-        }
-        Expr::Collection(ExprCollection::Sequence(node)) => {
-            Some(items(&node.statements, &node.elements))
-        }
-        Expr::Collection(ExprCollection::AngleBar(node)) => {
-            Some(items(&node.statements, &node.elements))
-        }
+        Expr::Array(node) => Some(items(&node.stmts, &node.elems)),
+        Expr::List(node) => Some(items(&node.stmts, &node.elems)),
+        Expr::Sequence(node) => Some(items(&node.stmts, &node.elems)),
+        Expr::AngleBar(node) => Some(items(&node.stmts, &node.elems)),
         _ => None,
     }
 }

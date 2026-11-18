@@ -7,7 +7,7 @@ not change how the interpreter runs the file.
 | Directive | Scope | Purpose |
 | --- | --- | --- |
 | `-- m2-ls: disable [rules]` | Entire file | Suppresses selected diagnostics. |
-| `-- m2-ls: disable-next-line [rules]` | Immediately following physical line | Suppresses selected diagnostics starting on that line. |
+| `-- m2-ls: disable-next-line [rules]` | Expression on the following line | Suppresses selected diagnostics starting in that expression. |
 | `-- m2-ls: primaryCode` | Entire file | Analyzes library implementation code without automatic prelude imports or symbol-protection checks. |
 | `-- m2-ls: initFile none` or `-- m2-ls: initFile <path>` | Entire file | Starts the file without an init file, or with another one than the configured. |
 
@@ -52,11 +52,24 @@ R = §type.readonly|QQ§[§variable.declaration.algebraic|x0§]
 S = §type.readonly|QQ§[§variable.declaration.algebraic|y0§]
 ```
 
-Only the `R` line is suppressed. The next line means the next physical line,
-not the next nonblank statement: a blank line or comment consumes that slot.
-For multi-line diagnostics, the diagnostic's starting line determines whether
-it is hidden. A trailing directive comment still targets the following line,
-not the line containing the comment.
+Only the `R` line is suppressed. The directive covers the expression on the
+next line: the outermost expression starting there, on every line it spans,
+even inside a function body. When no expression starts on that line, the line
+alone is covered.
+
+```m2
+-- m2-ls: disable-next-line T01
+-- m2-ls: disable-next-line T05
+(lo, hi) := concentration(
+    source, map)
+```
+
+Stacked `disable-next-line` directives all skip one another and apply to the
+same expression, so both rules above are hidden on both lines. Any other line
+in between, blank or a plain comment, still consumes the slot. For
+multi-line diagnostics, the diagnostic's starting line determines whether it
+is hidden. A trailing directive comment still targets the following line, not
+the line containing the comment.
 
 ### Omitting selectors and handling mistakes
 

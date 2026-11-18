@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use m2_syn::nodes::{Expr, ExprOp, ExprOpBin, ExprOpBinAdj};
+use m2_syn::nodes::{BinaryOperator, Expr, ExprBinary};
 use m2_syn::visit::{self, Visit};
 use tower_lsp::lsp_types::request::{
     GotoDeclarationResponse, GotoImplementationResponse, GotoTypeDefinitionResponse,
@@ -341,13 +341,14 @@ pub fn goto_implementation_response(
     let call_installations = function.and_then(|function| {
         let SymbolAt {
             expression: Some(callable),
-            parent: Some(Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call)))),
+            parent: Some(Expr::Binary(call)),
             ..
         } = document.reference_symbol_at(position)?
         else {
             return None;
         };
-        if !std::ptr::eq(call.left_operand.as_ref(), callable)
+        if !matches!(call.op, BinaryOperator::Space(_))
+            || !std::ptr::eq(call.left.as_ref(), callable)
             || document.installing_assignment_at(position).is_some()
         {
             return None;
@@ -558,13 +559,16 @@ impl PackageLinks<'_> {
 }
 
 impl<'ast> Visit<'ast> for PackageLinks<'_> {
-    fn visit_expr_op_bin_adj(&mut self, call: &'ast ExprOpBinAdj) {
+    fn visit_expr_binary(&mut self, call: &'ast ExprBinary) {
+        if !matches!(call.op, BinaryOperator::Space(_)) {
+            return visit::visit_expr_binary(self, call);
+        }
         if call
-            .left_operand
+            .left
             .symbol_name()
             .is_some_and(is_package_import_trigger)
         {
-            if let Some(literal) = call.right_operand.arguments().into_iter().next().flatten() {
+            if let Some(literal) = call.right.arguments().into_iter().next().flatten() {
                 self.add(literal);
             }
         }
@@ -573,7 +577,7 @@ impl<'ast> Visit<'ast> for PackageLinks<'_> {
                 self.add(literal);
             }
         }
-        visit::visit_expr_op_bin_adj(self, call);
+        visit::visit_expr_binary(self, call);
     }
 }
 

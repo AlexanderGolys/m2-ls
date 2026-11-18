@@ -20,7 +20,7 @@
 //! renders as Markdown. `@…@` expressions in SimpleDoc text evaluate to the
 //! same hypertext.
 
-use m2_syn::nodes::{Expr, ExprCollection, ExprOp, ExprOpBin, ExprOpBinAdj};
+use m2_syn::nodes::{BinaryOperator, Expr, ExprBinary};
 use m2_syn::visit::{self, Visit};
 use strum::{Display, EnumIter, EnumString, IntoStaticStr};
 
@@ -321,28 +321,26 @@ impl HypertextMarkdown {
     }
 
     /// Code argument of a recognized example constructor, when present.
-    pub(super) fn example_argument(call: &ExprOpBinAdj) -> Option<&Expr> {
+    pub(super) fn example_argument(call: &ExprBinary) -> Option<&Expr> {
         let (function, argument) = markup_call(call)?;
         matches!(function.rendering(), MarkupRendering::Example).then_some(argument)
     }
 
     /// The key `call` links to, when it is a `TO`, `TOH`, or `TO2` link.
-    pub(super) fn link_key(call: &ExprOpBinAdj) -> Option<&Expr> {
+    pub(super) fn link_key(call: &ExprBinary) -> Option<&Expr> {
         Self::link_parts(call)?.first().copied()
     }
 
     /// The parts of a `TO`, `TOH`, or `TO2` link: the key it links to and, for
     /// `TO2`, the text it shows instead. `TO2` takes them as a sequence,
     /// `TO2(key, "text")`, or as a list, `TO2 {key, "text"}`.
-    fn link_parts(call: &ExprOpBinAdj) -> Option<Vec<&Expr>> {
+    fn link_parts(call: &ExprBinary) -> Option<Vec<&Expr>> {
         let (function, argument) = markup_call(call)?;
         if !matches!(function.rendering(), MarkupRendering::Link) {
             return None;
         }
         Some(match Self::arguments(argument)[..] {
-            [list @ Expr::Collection(ExprCollection::List(_))]
-                if function == MarkupFunction::TO2 =>
-            {
+            [list @ Expr::List(_)] if function == MarkupFunction::TO2 => {
                 list.contained_expressions()
             }
             ref parts => parts.to_vec(),
@@ -351,14 +349,14 @@ impl HypertextMarkdown {
 
     /// The text a `TO2` link shows in place of its key's name.
     fn link_alias(expression: &Expr) -> Option<&Expr> {
-        let Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) = expression else {
+        let Expr::Binary(call) = expression else {
             return None;
         };
         Self::link_text(call)
     }
 
     /// The text `call` shows in place of its key's name, when it is a `TO2` link.
-    pub(super) fn link_text(call: &ExprOpBinAdj) -> Option<&Expr> {
+    pub(super) fn link_text(call: &ExprBinary) -> Option<&Expr> {
         let (function, _) = markup_call(call)?;
         (function == MarkupFunction::TO2)
             .then(|| Self::link_parts(call)?.get(1).copied())
@@ -369,10 +367,7 @@ impl HypertextMarkdown {
     /// parenthesized argument, or the argument itself, a list among them.
     /// Options, such as `"class" => "x"`, set attributes and are skipped.
     fn arguments(argument: &Expr) -> Vec<&Expr> {
-        if matches!(
-            argument,
-            Expr::Collection(ExprCollection::Sequence(_)) | Expr::Holder(_)
-        ) {
+        if matches!(argument, Expr::Sequence(_) | Expr::Paren(_)) {
             argument
                 .contained_expressions()
                 .into_iter()
@@ -394,7 +389,7 @@ impl HypertextMarkdown {
 
     /// The elements of a list, or the expression alone.
     fn list_elements_if_list(value: &Expr) -> Vec<&Expr> {
-        if matches!(value, Expr::Collection(ExprCollection::List(_))) {
+        if matches!(value, Expr::List(_)) {
             value.contained_expressions()
         } else {
             vec![value]
@@ -403,15 +398,18 @@ impl HypertextMarkdown {
 }
 
 /// The markup function `call` applies, and its argument.
-fn markup_call(call: &ExprOpBinAdj) -> Option<(MarkupFunction, &Expr)> {
-    let function = call.left_operand.symbol_name()?.parse().ok()?;
-    Some((function, &call.right_operand))
+fn markup_call(call: &ExprBinary) -> Option<(MarkupFunction, &Expr)> {
+    if !matches!(call.op, BinaryOperator::Space(_)) {
+        return None;
+    }
+    let function = call.left.symbol_name()?.parse().ok()?;
+    Some((function, &call.right))
 }
 
 /// The markup function `expression` applies, and its argument.
 fn markup_application(expression: &Expr) -> Option<(MarkupFunction, &Expr)> {
     match expression {
-        Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call))) => markup_call(call),
+        Expr::Binary(call) => markup_call(call),
         _ => None,
     }
 }
@@ -553,7 +551,7 @@ impl<N: SourceNavigation + ?Sized> Code<'_, N> {
         if self.content_bytes(expression).is_some() {
             return self.string_value(expression);
         }
-        if matches!(expression, Expr::Holder(_)) || expression.collection_elements().is_some() {
+        if matches!(expression, Expr::Paren(_)) || expression.collection_elements().is_some() {
             return expression
                 .contained_expressions()
                 .into_iter()
@@ -627,8 +625,7 @@ impl<N: SourceNavigation + ?Sized> Code<'_, N> {
         if markup_application(key).is_some() {
             return self.render(key);
         }
-        if let (Expr::Holder(_), Some(inner)) =
-            (key, key.contained_expressions().into_iter().next())
+        if let (Expr::Paren(_), Some(inner)) = (key, key.contained_expressions().into_iter().next())
         {
             return self.link_text(inner);
         }
@@ -685,7 +682,7 @@ struct HypertextPage {
 
 impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// Read the hypertext `list` passed to the `document` `call`.
-    pub(super) fn read_hypertext_list(&mut self, call: &ExprOpBinAdj, list: &Expr) {
+    pub(super) fn read_hypertext_list(&mut self, call: &ExprBinary, list: &Expr) {
         let source = self.source;
         let code = Code::in_document(source);
         let mut page = HypertextPage::default();
@@ -736,7 +733,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
 
         if !page.seen.contains(&DocumentOption::Key) {
             self.fault(
-                source.range_for_bytes(code.bytes(&*call.left_operand)),
+                source.range_for_bytes(code.bytes(&*call.left)),
                 DocumentationFaultKind::MissingKey,
             );
         }
@@ -932,14 +929,15 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         source: &S,
     ) -> Vec<CodeFragment> {
         let lines_argument = match argument {
-            Expr::Op(ExprOp::Bin(ExprOpBin::Adj(call)))
-                if call.left_operand.symbol_name() == Some("lines") =>
+            Expr::Binary(call)
+                if matches!(call.op, BinaryOperator::Space(_))
+                    && call.left.symbol_name() == Some("lines") =>
             {
-                Some(&*call.right_operand)
+                Some(&*call.right)
             }
             _ => None,
         };
-        let strings = if matches!(argument, Expr::Collection(ExprCollection::List(_))) {
+        let strings = if matches!(argument, Expr::List(_)) {
             argument.contained_expressions()
         } else {
             vec![lines_argument.unwrap_or(argument)]

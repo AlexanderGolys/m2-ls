@@ -40,7 +40,7 @@ the second column — that is the name your editor and theme see.
 | Property | `property` | a key rather than a binding: the left side of `=>`, a member an access selects | `verbose` in `{verbose => false} >> o -> …`, `Strategy` in `f(Strategy => 1)`, `key` in `H.key`, `0` in `L_0` |
 | Namespace | `namespace` | a package, including package names in strings, and the file a `load`, `needs` or `input` call runs | `Core`, `"JSON"` in `needsPackage "JSON"`, `"lib/helper.m2"` in `load "lib/helper.m2"` |
 | Symbol | `enumMember` | a name used as a `Symbol` rather than for its value | `Strategy`, `Linear`, `g` in `symbol g` |
-| Table | `struct` | a library object that is a table of the interpreter's own data: a `Dictionary`, `HashTable`, `MutableHashTable` or `NumberedVerticalList` | `OutputDictionary`, `typicalValues` |
+| Table | `struct` | a library object that is a table of the interpreter's own data: a `Dictionary`, `HashTable`, `MutableHashTable` or `NumberedVerticalList`, or a list `Core` keeps as its state | `OutputDictionary`, `typicalValues`, `loadedPackages` |
 | Domain | `typeParameter` | the types an installation is made on | `Matrix` in `area Matrix := ZZ => …` |
 | Annotation | `decorator` | the codomain an installation annotates, and the `TO`, `TOH` and `TO2` constructors of documentation links | `ZZ` in `area Matrix := ZZ => …`, `TO` in `@TO f@` |
 | Markup | `macro` | markup around documentation text | `{\tt`, `}`, `PARA`, `TT` |
@@ -90,7 +90,7 @@ makes `area` a method, `twice = n -> …` a function.
 | `declaration` | <i class="fa-solid fa-check"></i> | where a name is bound, or what an installation installs on | `R =`, `n :=`, `x` in `QQ[x]`, `area` in `area Matrix :=` |
 | `defaultLibrary` | <i class="fa-solid fa-check"></i> | a value selected by `semanticTokens.defaultLibrary` | by default, compiled functions such as `apply` and `scan` |
 | `libraryConst` | | an indexed library binding exported as protected | `ZZ` |
-| `libraryConfigParam` | | an indexed library binding exported as mutable | `allowableThreads` |
+| `libraryConfigParam` | | an indexed library binding exported as mutable, other than a package | `allowableThreads` |
 | `readonly` | <i class="fa-solid fa-check"></i> | a binding protected from reassignment, independently of value mutability | `ZZ`, a protected package export |
 | `documentation` | <i class="fa-solid fa-check"></i> | standard-only fallback for documentation style modifiers; not inherited by embedded code | compatibility output for styled prose |
 | `algebraic` | | a ring generator or a known nonnumeric value living over a ring | `x`, an ideal, a module, a matrix |
@@ -118,7 +118,7 @@ The complete list of `defaultLibrary` policies and their alias behavior is in
 compiled policies describe the value; package policies describe the binding's
 origin. `readonly` independently describes symbol protection. Local aliases and
 shadows remain assignable. Indexed protected exports carry `libraryConst`; indexed
-mutable exports carry `libraryConfigParam`. These modifiers describe the library
+mutable exports other than package names carry `libraryConfigParam`. These modifiers describe the library
 binding, never local aliases or shadows, and do not depend on `defaultLibrary`.
 
 ## Standard-only compatibility { #standard-only }
