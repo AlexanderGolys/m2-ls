@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.8.1 - 2026-11-18
+
+- References and rename include documentation code: `Usage` lines, and the
+  `Example` code and TEST blocks of a package exporting the name, also when
+  the documentation lives in a separate file the package loads, such as
+  `Package/documentation.m2`.
+- D05 counts a name the package exports as defined, even when the package's
+  code never assigns it.
+
 ## 2.8.0 - 2026-11-18
 
 - Add code lenses for the runtime commands: **▶ Run file** on every file and

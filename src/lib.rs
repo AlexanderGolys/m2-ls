@@ -464,6 +464,13 @@ impl Backend {
         unreachable!("navigation returns at its indexing limit")
     }
 
+    /// Whether the package loading `file`, a file that declares no package of
+    /// its own, exports `name` to the sessions running its examples and tests.
+    fn exported_by_loader(&self, file: &Url, name: &str) -> bool {
+        self.workspace_index
+            .exports_definition(file, Position::default(), name)
+    }
+
     /// Collect occurrences of a global symbol across every indexed file
     /// other than `exclude`. Prefers a live open buffer (so unsaved edits are
     /// reflected) and falls back to parsing the on-disk file. Used by both
@@ -483,8 +490,9 @@ impl Backend {
                         .shares_global_binding(name, exclude, file_uri)
             })
             .flat_map(move |file_uri| {
+                let exported_by_loader = self.exported_by_loader(&file_uri, name);
                 self.inspect_file(&file_uri, |document| {
-                    global_reference_ranges(document, name)
+                    global_reference_ranges(document, name, exported_by_loader)
                 })
                 .unwrap_or_default()
                 .into_iter()
@@ -1951,13 +1959,15 @@ impl LanguageServer for Backend {
                     )));
                 }
                 Some(ReferenceTarget::Global(name)) => {
-                    let locations = global_reference_ranges(document.value(), &name)
-                        .into_iter()
-                        .map(|range| Location {
-                            uri: uri.clone(),
-                            range,
-                        })
-                        .collect::<Vec<_>>();
+                    let exported_by_loader = self.exported_by_loader(uri, &name);
+                    let locations =
+                        global_reference_ranges(document.value(), &name, exported_by_loader)
+                            .into_iter()
+                            .map(|range| Location {
+                                uri: uri.clone(),
+                                range,
+                            })
+                            .collect::<Vec<_>>();
                     (name, locations)
                 }
             }
@@ -2024,13 +2034,15 @@ impl LanguageServer for Backend {
                     return Ok(rename_edits(source, uri, position, new_name));
                 }
                 Some(ReferenceTarget::Global(name)) => {
-                    let edits = global_reference_ranges(document.value(), &name)
-                        .into_iter()
-                        .map(|range| TextEdit {
-                            range,
-                            new_text: new_name.to_string(),
-                        })
-                        .collect::<Vec<_>>();
+                    let exported_by_loader = self.exported_by_loader(uri, &name);
+                    let edits =
+                        global_reference_ranges(document.value(), &name, exported_by_loader)
+                            .into_iter()
+                            .map(|range| TextEdit {
+                                range,
+                                new_text: new_name.to_string(),
+                            })
+                            .collect::<Vec<_>>();
                     (name, HashMap::from([(uri.clone(), edits)]))
                 }
             }

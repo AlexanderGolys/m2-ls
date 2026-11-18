@@ -14,6 +14,7 @@ use tower_lsp::lsp_types::*;
 use crate::document::{DocumentSnapshot, SymbolAt, TargetSymbol};
 use crate::library_index::LibrarySources;
 use crate::object_registry::ObjectName;
+use crate::package_documentation::DocumentationMarkupKind;
 use crate::package_index::{is_package_import_trigger, PackageLoadingOption, SourceResolver};
 use crate::record_lsp::LspKnowledge;
 use crate::source::{SourceNavigation, SyntaxSource};
@@ -788,7 +789,17 @@ pub fn reference_target(
 /// Every occurrence of `name` in `document` that refers to a global (top-level)
 /// definition — i.e. one not shadowed by a local binding at that point. Used to
 /// gather a workspace-global symbol's references file by file.
-pub fn global_reference_ranges(document: &DocumentSnapshot, name: &str) -> Vec<TextRange> {
+///
+/// TEST blocks and documentation examples run in a session loading the
+/// package, so they share the name only when the package exports it: the
+/// package `document` declares, or for a file declaring none, such as the
+/// `Package/documentation.m2` a package loads, the package loading it, whose
+/// export of `name` is `exported_by_loader`.
+pub fn global_reference_ranges(
+    document: &DocumentSnapshot,
+    name: &str,
+    exported_by_loader: bool,
+) -> Vec<TextRange> {
     let analysis = document.analysis();
     let mut references = Vec::new();
     for range in binding_reference_ranges(document, name) {
@@ -813,15 +824,30 @@ pub fn global_reference_ranges(document: &DocumentSnapshot, name: &str) -> Vec<T
             references.push(range);
         }
     }
+    // Code documentation only shows, as its `Usage` lines, names the global
+    // without evaluating it.
+    references.extend(
+        document
+            .package_documentation()
+            .markup()
+            .iter()
+            .filter(|markup| {
+                markup.kind == DocumentationMarkupKind::Name
+                    && document.text().get(markup.bytes.clone()) == Some(name)
+            })
+            .map(|markup| document.range_for_bytes(markup.bytes.clone())),
+    );
     // Package-session code sees the document's globals only through its
     // package's exports, so it shares only the exported ones.
     for session in document.package_sessions() {
-        let package_exports_name = document.packages().declarations().iter().any(|package| {
-            session.code.package.as_ref() == Some(&package.name)
-                && package.export_named(name).is_some()
-        });
+        let package_exports_name = match &session.code.package {
+            Some(session_package) => document.packages().declarations().iter().any(|package| {
+                &package.name == session_package && package.export_named(name).is_some()
+            }),
+            None => exported_by_loader,
+        };
         if package_exports_name {
-            references.extend(global_reference_ranges(&session.snapshot, name));
+            references.extend(global_reference_ranges(&session.snapshot, name, false));
         }
     }
     references.sort_by_key(|range| (range.start, range.end));
@@ -1299,7 +1325,7 @@ mod tests {
     fn global_reference_ranges_skip_local_shadows() {
         // `g` is a top-level global; `f`'s parameter `g` shadows it inside `f`.
         let document = document("g = 1\nf := g -> (g + g)\nh = g + g");
-        let ranges = global_reference_ranges(&document, "g");
+        let ranges = global_reference_ranges(&document, "g", false);
         // The global definition and its top-level uses, not the shadowed uses.
         assert_eq!(
             ranges,

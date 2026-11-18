@@ -132,7 +132,7 @@ next.
 | `D02` | `malformed-documentation` | error | documentation SimpleDoc or `document` rejects: a repeated section, a multi-line headline, `Inputs` without `Usage`, … |
 | `D03` | `missing-documentation-key` | error | a documentation page without a `Key` |
 | `D04` | `long-headline` | warning | a headline over 100 characters |
-| `D05` | `undefined-documentation-key` | error | a key, `@TO@` link or `SeeAlso` entry nothing defines — `endPackage` would reject it |
+| `D05` | `undefined-documentation-key` | error | a key, `@TO@` link or `SeeAlso` entry nothing defines — `endPackage` would reject it; a name the package exports counts as defined |
 | `D06` | `duplicate-documentation` | error | a key documented twice, or both documented and listed in `undocumented` |
 | `D07` | `undocumented-export` | warning | a public export without a direct documentation key in its package, including loaded files |
 | `D08` | `documentation-outside-package` | error | documentation after `endPackage`, where no package can hold it |

@@ -28,7 +28,12 @@ Documentation
   `TO`, `TOH`, `TO2`, `SeeAlso`, and `Subnodes` targets refer to matching `Key`
   entries across workspace files, in both SimpleDoc and hypertext documentation.
   Link display labels and ordinary prose strings are excluded. The include
-  declaration flag controls whether `Key` entries are listed.
+  declaration flag controls whether `Key` entries are listed. Code on a page
+  counts too: its `Usage` lines, and the `Example` code and TEST blocks that
+  run in a session loading the package, when the package exports the name.
+  This holds for documentation in a separate file the package loads, such as
+  `Package/documentation.m2`, as for documentation in the package file itself.
+  [Rename](rename.md) edits the same places.
 
 Indexed ring generators
 : Each index is its own variable. After `R = RR[x, y_1, z_0 .. z_2]`,

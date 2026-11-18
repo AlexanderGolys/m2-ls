@@ -345,17 +345,17 @@ fn undefined_documentation_key(
         let range = referenced.span.range();
         let declaration = file.self_contained_at(range.start);
         let name = &context.source.text()[referenced.span.bytes()];
-        let defined = file.code_symbols.contains(name)
-            || context
-                .packages
-                .declarations()
-                .iter()
-                .any(|package| package.name.name() == name)
-            || declaration.is_some_and(|declaration| declaration.export_named(name).is_some())
-            || context
-                .knowledge
-                .object_id_at(&ObjectName::new(name), range.start)
-                .is_some();
+        // A package's `export` list creates the symbols it names, whether or
+        // not the package's code assigns them.
+        let defined =
+            file.code_symbols.contains(name)
+                || context.packages.declarations().iter().any(|package| {
+                    package.name.name() == name || package.export_named(name).is_some()
+                })
+                || context
+                    .knowledge
+                    .object_id_at(&ObjectName::new(name), range.start)
+                    .is_some();
         if defined {
             continue;
         }
