@@ -56,6 +56,7 @@ use crate::source::DocumentSpan;
 use crate::typesystem::TypeKnowledge;
 use m2_syn::{LiteralKind, Token, TokenTree};
 use serde::Deserialize;
+use std::ops::{BitOr, BitOrAssign};
 use strum::{EnumIter, IntoEnumIterator};
 use these_macros_should_be_illegal::enum_fn;
 use tower_lsp::lsp_types::{
@@ -158,7 +159,7 @@ pub enum M2SemanticTokenType {
     TypeAnnotation = SemanticTokenType::TYPE_PARAMETER,
     /// Markup around documentation text: a TeX delimiter, the `{\tt` and
     /// `}` of `{\tt x}`, or a hypertext constructor such as `TT` or `PARA`.
-    /// The text it styles stays [`Docs`](Self::Docs) carrying the
+    /// The text it styles stays a [`String`](Self::String) carrying the
     /// style's modifier.
     Macro = SemanticTokenType::MACRO,
     /// An annotation attached to what it decorates: the codomain of an
@@ -175,8 +176,6 @@ pub enum M2SemanticTokenType {
     Delimiter = SemanticTokenType::new("delimiter"),
     /// Embedded code separators, such as commas and semicolons.
     Punctuation = SemanticTokenType::new("punctuation"),
-    /// Documentation prose, styled independently from source string literals.
-    Docs = SemanticTokenType::new("docs"),
 }
 
 impl M2SemanticTokenType {
@@ -253,8 +252,10 @@ pub enum M2SemanticTokenModifier {
     /// A binding protected from reassignment, independently of value mutability.
     Readonly = SemanticTokenModifier::READONLY,
 
-    /// Standard compatibility fallback for custom documentation style modifiers.
-    /// Documentation code does not inherit this modifier automatically.
+    /// Everything written inside documentation — a documentation string or
+    /// comment — whatever its type: its prose (a `string` or `comment`), its
+    /// markup, and the code it embeds. Also the standard fallback of the
+    /// documentation style modifiers.
     Documentation = SemanticTokenModifier::DOCUMENTATION,
     /// An algebraic object that is not itself a type: a generator such as
     /// the `x` of `QQ[x]`, or a value whose class `ring` is installed on,
@@ -402,6 +403,22 @@ impl M2SemanticTokenModifiers {
     }
 }
 
+/// The union of two modifier sets: a token both a document tag and link
+/// text carries `documentTag | url`.
+impl BitOr for M2SemanticTokenModifiers {
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl BitOrAssign for M2SemanticTokenModifiers {
+    fn bitor_assign(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
 /// Runtime implementation facts retained across local aliases and workspace
 /// indexing so a configuration refresh can choose highlighting without
 /// repeating type analysis.
@@ -504,9 +521,7 @@ impl M2SemanticToken {
                 M2SemanticTokenModifiers::with,
             );
         let token_type = match self.token_type {
-            M2SemanticTokenType::EscapeSequence | M2SemanticTokenType::Docs => {
-                M2SemanticTokenType::String
-            }
+            M2SemanticTokenType::EscapeSequence => M2SemanticTokenType::String,
             M2SemanticTokenType::Delimiter | M2SemanticTokenType::Punctuation => {
                 M2SemanticTokenType::Operator
             }
@@ -520,7 +535,7 @@ impl M2SemanticToken {
 /// its position changes how it should be highlighted. Unlike an inferred
 /// runtime class, this describes the use of a name: `f` in `symbol f` is a
 /// quoted symbol even if its binding holds a function.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceSemanticRole {
     /// A variable introduced by a ring constructor.
     RingGenerator,
@@ -542,11 +557,18 @@ pub enum SourceSemanticRole {
     /// `f ZZ := List => x -> …`: Macaulay2's syntax for stating the
     /// installation's typical value.
     CodomainAnnotation,
-    /// A name denoting a symbol that serves as an option name.
+    /// A name denoting a symbol, or a string, that serves as an option name.
     OptionKey,
+    /// An option name an option list declares, the `Limit` of
+    /// `method(Options => {Limit => 1})`: the [`OptionKey`](Self::OptionKey)
+    /// a call reads.
+    OptionKeyDeclaration,
     /// What an access selects by name or position: the `key` of `H.key`,
     /// the `0` of `L_0` or `L#0`.
     PropertyKey,
+    /// The key an entry writes, the `"name"` of `{"name" => v}`: the
+    /// [`PropertyKey`](Self::PropertyKey) that `H#"name"` reads.
+    PropertyKeyDeclaration,
     /// The operator of an access, the `_` of `L_0` or the `.` of `H.key`:
     /// it joins what is selected to what it is selected from.
     AccessOperator,
@@ -766,7 +788,15 @@ fn source_role_semantic_token(
             M2SemanticToken::new(M2SemanticTokenType::TypeAnnotation)
         }
         SourceSemanticRole::OptionKey => M2SemanticToken::option_name(source_text, knowledge),
+        SourceSemanticRole::OptionKeyDeclaration => {
+            M2SemanticToken::option_name(source_text, knowledge)
+                .with_modifier(M2SemanticTokenModifier::Declaration)
+        }
         SourceSemanticRole::PropertyKey => M2SemanticToken::new(M2SemanticTokenType::Property),
+        SourceSemanticRole::PropertyKeyDeclaration => {
+            M2SemanticToken::new(M2SemanticTokenType::Property)
+                .with_modifier(M2SemanticTokenModifier::Declaration)
+        }
         SourceSemanticRole::AccessOperator => M2SemanticToken::new(M2SemanticTokenType::Operator)
             .with_modifier(M2SemanticTokenModifier::MemberAccess),
         SourceSemanticRole::QuotedSymbol => M2SemanticToken::new(M2SemanticTokenType::Symbol),

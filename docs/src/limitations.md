@@ -15,8 +15,9 @@ that also sets its boundary.
   source, found next to `M2` or configured in `sources.packagePaths`; without it, the
   rest of the package knowledge remains available. Functions compiled into
   Macaulay2 have no source definition, so jumps to them return nothing.
-- **Discovery and visibility differ.** The server indexes repository `.m2`
-  files below the editor's workspace roots, alongside explicit dependencies and
+- **Discovery and visibility differ.** The server indexes the repository `.m2`
+  files below the editor's workspace roots nearest to the files you open (up
+  to `workspace.indexFileLimit`), alongside explicit dependencies and
   initialization files. A definition in an unrelated file does not enter your
   environment. Package fragments inherit earlier loader bindings; ordinary
   fragments need explicit dependencies. Computed imports and contradictory

@@ -65,7 +65,10 @@ serve as file hints and are checked against the installed source.
 
 > [!NOTE]
 > Functions compiled into the interpreter, such as `apply`, have no Macaulay2
-> source. Their jumps return nothing rather than a guessed location.
+> source. **Go to definition** opens their documentation page instead, at its
+> `doc ///` line, when the catalog records one and the documentation sources
+> are installed; otherwise it returns nothing rather than a guessed location.
+> Source always wins: a name with Macaulay2 code never jumps to its docs.
 
 ## Fine print
 

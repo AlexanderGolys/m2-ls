@@ -35,8 +35,8 @@ the second column — that is the name your editor and theme see.
 | Type | `type` | any object whose class is a `Type`: builtin, package or your own | `ZZ`, `Matrix`, `R` in `R = QQ[x]`, `T = new Type` |
 | Function | `function` | anything applied that is not a method function: closures, compiled functions, scripted functors, commands | `twice`, `print`, `apply`, `Ext`, `exit` |
 | Method | `method` | a method function, made by `method()`, which dispatches to its installations | `area`, `det`, `gb`, `source` |
-| Variable | `variable` | every other value | `G`, `stdio`, a local |
-| Parameter | `parameter` | a function parameter, or an input named on a documentation page | `m` in `m -> rank m` |
+| Variable | `variable` | every other value, and an output named on a documentation page wherever the page names it | `G`, `stdio`, a local |
+| Parameter | `parameter` | a function parameter, or an input named on a documentation page wherever the page names it | `m` in `m -> rank m`, both `x` in `Inputs => {"x"}, TT "x"` |
 | Property | `property` | a key rather than a binding: the left side of `=>`, a member an access selects | `verbose` in `{verbose => false} >> o -> …`, `Strategy` in `f(Strategy => 1)`, `key` in `H.key`, `0` in `L_0` |
 | Namespace | `namespace` | a package, including package names in strings, and the file a `load`, `needs` or `input` call runs | `Core`, `"JSON"` in `needsPackage "JSON"`, `"lib/helper.m2"` in `load "lib/helper.m2"` |
 | Symbol | `enumMember` | a name used as a `Symbol` rather than for its value | `Strategy`, `Linear`, `g` in `symbol g` |
@@ -46,7 +46,6 @@ the second column — that is the name your editor and theme see.
 | Markup | `macro` | markup around documentation text | `{\tt`, `}`, `PARA`, `TT` |
 | Modifier keyword | `modifier` | the quoting keywords | `symbol`, `local`, `global`, `threadVariable` |
 | Keyword | `keyword` | language keywords, SimpleDoc section keywords, and document option names | `if`, `then`, `for`, `TEST`, `Key`, `Description` |
-| Documentation prose | `docs` | documentation text, independently styled from source strings | explanatory paragraphs and styled text |
 | String | `string` | string literals | `"done"`, `///…///` |
 | Regular expression | `regexp` | special syntax within literal patterns of `match`, `regex`, `replace`, `select`, and `separate`; delimiters and plain text stay `string` | `+` in `replace(///a+///, "b", text)` |
 | Escape sequence | `escapeSequence` | escaped characters in patterns, retaining their source spelling | `\d`, `\.`, `\\d` in quoted strings |
@@ -130,7 +129,7 @@ stable; emitted tokens use these fallbacks:
 
 | Full vocabulary | Standard-only output |
 | --- | --- |
-| `escapeSequence`, `docs` types | `string` |
+| `escapeSequence` type | `string` |
 | `delimiter`, `punctuation` types | `operator` |
 | All other token types | unchanged |
 | `algebraic`, the seven kind modifiers, `nonsense` | `abstract` |
@@ -139,7 +138,7 @@ stable; emitted tokens use these fallbacks:
 | `declaration`, `defaultLibrary`, `readonly`, `documentation`, `abstract` modifiers | unchanged |
 
 Fallbacks combine without duplicating modifiers: a
-`docs+monospace` token becomes `string+documentation`.
+`string+documentation+monospace` token becomes `string+documentation`.
 An ideal classified as `variable+algebraic` becomes `variable+abstract`.
 Compatibility mode sacrifices visual distinctions; it does not change name
 resolution or type inference.
@@ -242,7 +241,8 @@ assert(§variable.test|double§ 2 == 4)           -- assert method+test, 2 numbe
 The code of `TEST` blocks and documentation examples is analyzed as real code,
 so its names resolve against the package exactly as they would when the tests
 run. Code names retain their semantic categories, including `variable` for
-unresolved names. Documentation prose uses `docs`, separate from string literals.
+unresolved names. Everything inside documentation also carries the
+`documentation` modifier.
 
 SimpleDoc section names such as `Key`, `Description`, and `Example`
 receive `keyword`. Hypertext link constructors such as `TO`
@@ -352,7 +352,10 @@ escapes, so `"\\d"` highlights `\\d` as one escape sequence.
 Only literal pattern arguments are refined. Replacement strings, input text,
 and calls through a locally shadowed function keep their ordinary classification.
 
-Documentation prose uses the custom `docs` token type. Embedded names, operators,
-brackets, and literals retain their code classifications without a blanket
-`documentation` modifier. In standard-only mode, `docs` falls back to `string`.
-For Neovim, style `@lsp.type.docs.macaulay2` independently from `@string`.
+Documentation is a modifier, not a type: its prose is a `string` (or a
+`comment`, in a documentation comment), and the names, operators, brackets and
+literals it embeds keep their code classifications. Every token inside
+documentation carries the `documentation` modifier on top, so a theme can style
+documentation as a whole and still type what is inside it. For Neovim, style
+prose with `@lsp.typemod.string.documentation.macaulay2`, and everything
+inside documentation with `@lsp.mod.documentation.macaulay2`.

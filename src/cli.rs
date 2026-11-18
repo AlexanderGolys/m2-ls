@@ -302,7 +302,11 @@ impl Tool {
                     })
                 });
             if let Some(root) = root {
-                loaded.extend(index.repository_files(&uri, &[root.to_path_buf()]));
+                loaded.extend(index.repository_files(
+                    &uri,
+                    &[root.to_path_buf()],
+                    settings.workspace,
+                ));
             }
             index.index_files_from_disk_where(loaded, &directed, |file| {
                 !registry.has_catalog()

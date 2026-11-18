@@ -1,38 +1,25 @@
 //! Repository source discovery, separate from import and package visibility.
 
-use std::fmt;
 use std::path::{Path, PathBuf};
 
 use tower_lsp::lsp_types::Url;
 use walkdir::WalkDir;
 
 use crate::macaulay2::Macaulay2Conventions;
+use crate::settings::WorkspaceSettings;
 
 /// Build output is not repository source, even when it contains copied fixtures.
 const BUILD_DIRECTORY: &str = "target";
 
-/// Directory entries a repository scan may visit. A root above this is a home
-/// directory or a filesystem, not a project, and is not indexed.
-const MAX_SCANNED_ENTRIES: usize = 100_000;
-
-/// A root holding more entries than [`MAX_SCANNED_ENTRIES`] to scan.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepositoryTooLarge {
-    /// The directory whose scan was abandoned.
-    pub root: PathBuf,
+/// The `.m2` files one discovery found, nearest first, and whether it stopped
+/// before seeing every file of its root.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveredSources {
+    /// The files, the ones nearest to where discovery started first.
+    pub files: Vec<Url>,
+    /// Whether one of the [`WorkspaceSettings`] limits ended the walk.
+    pub truncated: bool,
 }
-
-impl fmt::Display for RepositoryTooLarge {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} holds more than {MAX_SCANNED_ENTRIES} entries; not indexing it as a repository",
-            self.root.display()
-        )
-    }
-}
-
-impl std::error::Error for RepositoryTooLarge {}
 
 /// The source files available to a repository's import graph.
 pub struct RepositorySources;
@@ -49,37 +36,55 @@ impl RepositorySources {
             .cloned()
     }
 
-    /// Every ordinary `.m2` file below the root, excluding hidden directories
-    /// and build output. Symlinked directories are not followed, preventing cycles.
-    /// A root with more than [`MAX_SCANNED_ENTRIES`] entries is refused whole
-    /// rather than indexed partially.
-    pub fn files(root: &Path) -> Result<Vec<Url>, RepositoryTooLarge> {
-        let entries = WalkDir::new(root)
-            .into_iter()
-            .filter_entry(|entry| {
-                entry.depth() == 0
-                    || entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| !name.starts_with('.') && name != BUILD_DIRECTORY)
-            })
-            .filter_map(Result::ok)
-            .take(MAX_SCANNED_ENTRIES + 1)
-            .collect::<Vec<_>>();
-        if entries.len() > MAX_SCANNED_ENTRIES {
-            return Err(RepositoryTooLarge {
-                root: root.to_path_buf(),
-            });
-        }
-        Ok(entries
-            .into_iter()
-            .filter(|entry| {
-                entry.file_type().is_file()
+    /// Ordinary `.m2` files below `root` within the `limits`, nearest to
+    /// `start` first: those under `start`, then those under each parent directory up
+    /// to `root` that were not seen yet. Opening `Core/m2/ring.m2` in a
+    /// checkout thus takes Core's sources before the packages beside it.
+    /// Hidden directories and build output are skipped, and symlinked
+    /// directories are not followed, preventing cycles.
+    pub fn nearest_files(
+        start: &Path,
+        root: &Path,
+        limits: WorkspaceSettings,
+    ) -> DiscoveredSources {
+        let mut discovered = DiscoveredSources::default();
+        let mut entries = 0;
+        let mut seen: Option<&Path> = None;
+        for directory in start
+            .ancestors()
+            .take_while(|directory| directory.starts_with(root))
+        {
+            let walk = WalkDir::new(directory)
+                .sort_by_file_name()
+                .into_iter()
+                .filter_entry(|entry| {
+                    entry.depth() == 0
+                        || Some(entry.path()) != seen
+                            && entry.file_name().to_str().is_some_and(|name| {
+                                !name.starts_with('.') && name != BUILD_DIRECTORY
+                            })
+                })
+                .filter_map(Result::ok);
+            for entry in walk {
+                entries += 1;
+                if discovered.files.len() == limits.index_file_limit
+                    || entries > limits.scan_entry_limit
+                {
+                    discovered.truncated = true;
+                    return discovered;
+                }
+                let is_source = entry.file_type().is_file()
                     && entry.path().extension().is_some_and(|extension| {
                         extension == Macaulay2Conventions::SOURCE_EXTENSION
-                    })
-            })
-            .filter_map(|entry| Url::from_file_path(entry.path()).ok())
-            .collect())
+                    });
+                if is_source {
+                    discovered
+                        .files
+                        .extend(Url::from_file_path(entry.path()).ok());
+                }
+            }
+            seen = Some(directory);
+        }
+        discovered
     }
 }

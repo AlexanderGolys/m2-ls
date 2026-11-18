@@ -20,14 +20,16 @@
 //! renders as Markdown. `@…@` expressions in SimpleDoc text evaluate to the
 //! same hypertext.
 
+use std::ops::Range;
+
 use m2_syn::nodes::{BinaryOperator, Expr, ExprBinary};
 use m2_syn::visit::{self, Visit};
 use strum::{Display, EnumIter, EnumString, IntoStaticStr};
 
 use super::{
     Code, DocumentationCollector, DocumentationFaultKind, DocumentationKey, DocumentationMarkup,
-    DocumentationMarkupKind, DocumentationNode, DocumentedSubject, NameSite, NodeMarkdown,
-    TextStyle,
+    DocumentationMarkupKind, DocumentationNode, DocumentedSubject, ItemRole, NameSite,
+    NodeMarkdown, TextStyle,
 };
 use crate::macaulay2::Macaulay2Conventions;
 use crate::source::{ByteRange, SourceNavigation};
@@ -72,6 +74,17 @@ pub enum DocumentOption {
     SourceCode,
     /// External source examples associated with this documentation.
     ExampleFiles,
+}
+
+impl DocumentOption {
+    /// What the items of this option describe, when it lists items.
+    pub fn item_role(self) -> Option<ItemRole> {
+        match self {
+            Self::Inputs => Some(ItemRole::Input),
+            Self::Outputs => Some(ItemRole::Output),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -678,6 +691,9 @@ struct HypertextPage {
     seen: Vec<DocumentOption>,
     /// Human-readable description accumulated for this node.
     description: String,
+    /// The positions in the document's markup of the marks of the page's
+    /// `Usage` code.
+    usage_markup: Range<usize>,
 }
 
 impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
@@ -686,6 +702,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         let source = self.source;
         let code = Code::in_document(source);
         let mut page = HypertextPage::default();
+        let first_mark = self.documentation.markup.len();
         let mut tex_strings = TexStrings::new(&code);
         tex_strings.visit_expr(list);
         for bytes in tex_strings.strings {
@@ -723,13 +740,14 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 );
             }
             page.seen.push(known);
-            self.documentation.markup.push(DocumentationMarkup {
-                bytes: code.bytes(option),
-                kind: DocumentationMarkupKind::SectionKeyword,
-            });
+            self.mark(code.bytes(option), DocumentationMarkupKind::SectionKeyword);
             self.read_document_option(&code, &mut page, known, value);
         }
         self.read_hypertext_links(&code, list, &mut page);
+        self.link_items(
+            first_mark..self.documentation.markup.len(),
+            page.usage_markup,
+        );
 
         if !page.seen.contains(&DocumentOption::Key) {
             self.fault(
@@ -773,10 +791,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             }
             Headline => {
                 if let Some(bytes) = code.content_bytes(value) {
-                    self.documentation.markup.push(DocumentationMarkup {
-                        bytes,
-                        kind: DocumentationMarkupKind::Styled(TextStyle::Strong),
-                    });
+                    self.mark(bytes, DocumentationMarkupKind::Styled(TextStyle::Strong));
                     let headline = code.string_value(value);
                     let length = headline.chars().count();
                     if length > Macaulay2Conventions::HEADLINE_WARNING_LENGTH {
@@ -794,7 +809,9 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                         StringDelimiter::of_expression(value) != Some(StringDelimiter::Quote)
                             || !source.text()[bytes.clone()].contains('\\')
                     }) {
+                        let first_mark = self.documentation.markup.len();
                         self.mark_shown_code(bytes);
+                        page.usage_markup = first_mark..self.documentation.markup.len();
                     }
                     page.markdown.usage.extend(
                         code.string_value(value)
@@ -858,16 +875,12 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         option: DocumentOption,
         markdown: &mut NodeMarkdown,
     ) {
+        let role = option.item_role();
         let (rendered, names_option) = match item {
             Expr::Option(assignment) => {
                 let (name, description) = (&*assignment.key, &*assignment.value);
-                if matches!(option, DocumentOption::Inputs | DocumentOption::Outputs) {
-                    if let Some(bytes) = code.content_bytes(name) {
-                        self.documentation.markup.push(DocumentationMarkup {
-                            bytes,
-                            kind: DocumentationMarkupKind::ItemName,
-                        });
-                    }
+                if let (Some(role), Some(bytes)) = (role, code.content_bytes(name)) {
+                    self.mark(bytes, DocumentationMarkupKind::ItemName(role));
                 }
                 self.reference_code_names(code, description, NameSite::Code);
                 let description = HypertextMarkdown::list_elements_if_list(description)
@@ -889,7 +902,16 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 let item = NodeMarkdown::item(Some(&rendered_name), [item_type, text]);
                 (item, matches!(name, Expr::Symbol(_)))
             }
-            _ => (code.render(item).trim().to_string(), false),
+            _ => {
+                // Core reads a bare name, `Inputs => {"x"}`, as the item's name.
+                let is_name = code
+                    .content_text(item)
+                    .is_some_and(Macaulay2Conventions::is_item_name);
+                if let (Some(role), Some(bytes), true) = (role, code.content_bytes(item), is_name) {
+                    self.mark(bytes, DocumentationMarkupKind::ItemName(role));
+                }
+                (code.render(item).trim().to_string(), false)
+            }
         };
         match (option, names_option) {
             (DocumentOption::Inputs, true) => markdown.options.push(rendered),

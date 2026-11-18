@@ -136,6 +136,11 @@ Workspace folders and file watching
   The inspection command needs no arguments; runtime commands require the
   argument object documented on their page.
 
+`textDocument/codeLens`
+: Offers the runtime commands where they apply: **▶ Run file** on the first
+  line of every file and **▶ Run tests** on the `newPackage` line of a package
+  that registers TESTs. Lenses appear only when an M2 executable is found.
+
 Configuration
 : Initialization settings and subsequent configuration updates control analysis
   and presentation. See the [configuration reference](getting-started/configuration.md)

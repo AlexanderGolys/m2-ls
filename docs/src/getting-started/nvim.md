@@ -57,6 +57,12 @@ mappings:
 `:lua vim.lsp.inlay_hint.enable(true)`
 : [Inlay type hints](../reading/inlay-hints.md); they are off in Neovim until enabled.
 
+`:lua vim.lsp.codelens.enable(true)` (Neovim 0.12+), then `:lua vim.lsp.codelens.run()`
+: [Code lenses](../beyond/runtime-commands.md#code-lenses) running the file or a
+  package's tests; off until enabled. On Neovim 0.11, refresh them with an
+  autocommand instead:
+  `vim.api.nvim_create_autocmd({ 'BufEnter', 'BufWritePost' }, { pattern = '*.m2', callback = function() vim.lsp.codelens.refresh({ bufnr = 0 }) end })`.
+
 Semantic highlighting is on by default. The groups Neovim derives from the
 token names are listed in
 [Semantic highlighting](../reading/semantic-highlighting.md#neovim).

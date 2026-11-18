@@ -16,6 +16,10 @@ pub trait ExpressionSyntax {
     fn unparenthesized(&self) -> Option<&Expr>;
     /// Symbol spelling when this exact expression is a symbol, without peeling holders.
     fn symbol_name(&self) -> Option<&str>;
+    /// How an option key is spelled: a symbol by its name, `Eps`, a string
+    /// literal with its delimiters, `"Eps"`. Macaulay2 keeps the two apart,
+    /// so the spellings of distinct keys never coincide.
+    fn option_key_spelling(&self) -> Option<String>;
     /// Positional arguments, retaining empty components as `None`.
     fn arguments(&self) -> Vec<Option<&Expr>>;
     /// Immediate elements of a collection, retaining empty slots.
@@ -49,6 +53,16 @@ impl ExpressionSyntax for Expr {
     fn symbol_name(&self) -> Option<&str> {
         match self {
             Self::Symbol(symbol) => Some(symbol.text()),
+            _ => None,
+        }
+    }
+
+    fn option_key_spelling(&self) -> Option<String> {
+        match self {
+            Self::Symbol(symbol) => Some(symbol.text().to_string()),
+            Self::Literal(Literal::String(_) | Literal::RawString(_)) => {
+                Some(self.try_span()?.text()?.to_string())
+            }
             _ => None,
         }
     }
@@ -161,8 +175,8 @@ pub enum AssignmentOperator {
 pub enum AssignmentTarget<'ast> {
     /// `x = …` and `x := …`.
     Symbol(&'ast Symbol),
-    /// `(a, b) = …`.
-    List(&'ast ExprSequence),
+    /// `(a, b) = …`, `[a, {b, c}] := …`.
+    List(Destructuring<'ast>),
     /// The expression whose value names the target of `<-`.
     Evaluated(&'ast Expr),
     /// The target of a compound assignment such as `x += …`.
@@ -174,7 +188,7 @@ pub enum AssignmentTarget<'ast> {
         /// The domain written after the method function.
         signature: &'ast Expr,
     },
-    /// `T + S := …` or `x_i = …`: an operator expression.
+    /// `T + S := …`, `- T := …`, `T ^~ := …` or `x_i = …`: an operator expression.
     Operator(&'ast Expr),
     /// An assignment target that does not match a known shape.
     Expression(&'ast Expr),
@@ -216,7 +230,9 @@ impl AssignmentSyntax for ExprAssign {
             (AssignmentOperator::Evaluated, _) => AssignmentTarget::Evaluated(left),
             (AssignmentOperator::Augmented, _) => AssignmentTarget::Augmented(left),
             (_, Expr::Symbol(symbol)) => AssignmentTarget::Symbol(symbol),
-            (_, Expr::Sequence(sequence)) => AssignmentTarget::List(sequence),
+            (_, pattern) if Destructuring::of(pattern).is_some() => {
+                AssignmentTarget::List(Destructuring(pattern))
+            }
             (AssignmentOperator::Local, Expr::Binary(binary))
                 if matches!(binary.op, BinaryOperator::Space(_)) =>
             {
@@ -226,7 +242,9 @@ impl AssignmentSyntax for ExprAssign {
                 }
             }
             (AssignmentOperator::Local, Expr::New(new)) => AssignmentTarget::New(new),
-            (_, Expr::Binary(_) | Expr::Field(_)) => AssignmentTarget::Operator(left),
+            (_, Expr::Binary(_) | Expr::Prefix(_) | Expr::Postfix(_) | Expr::Field(_)) => {
+                AssignmentTarget::Operator(left)
+            }
             _ => AssignmentTarget::Expression(left),
         };
         let installation = matches!(
@@ -251,6 +269,26 @@ impl AssignmentSyntax for ExprAssign {
     }
 }
 
+/// Traversal of an assignment that reads its target as Macaulay2 does.
+pub trait AssignmentTraversal<'ast> {
+    /// Visits the assignment like [`visit::visit_expr_assign`], except that
+    /// the `f ZZ` of `f ZZ := …` names an installation and is no call: its
+    /// method and signature are visited, the adjacency joining them is not.
+    fn visit_installing<V: Visit<'ast> + ?Sized>(&'ast self, visitor: &mut V);
+}
+
+impl<'ast> AssignmentTraversal<'ast> for ExprAssign {
+    fn visit_installing<V: Visit<'ast> + ?Sized>(&'ast self, visitor: &mut V) {
+        let AssignmentTarget::Method { method, signature } = self.parts().target else {
+            return visit::visit_expr_assign(visitor, self);
+        };
+        visitor.visit_expr(method);
+        visitor.visit_expr(signature);
+        visitor.visit_assign_operator(&self.op);
+        visitor.visit_expr(&self.right);
+    }
+}
+
 impl<'ast> AssignmentTarget<'ast> {
     /// Document bytes the target covers; a method target spans its function
     /// and signature.
@@ -261,7 +299,7 @@ impl<'ast> AssignmentTarget<'ast> {
                 return Some(start..source.syntax_bytes(signature)?.end);
             }
             Self::Symbol(symbol) => symbol,
-            Self::List(list) => list,
+            Self::List(pattern) => pattern.0,
             Self::Evaluated(expression)
             | Self::Augmented(expression)
             | Self::Expression(expression) => expression,
@@ -276,7 +314,7 @@ impl<'ast> AssignmentTarget<'ast> {
     pub fn bound_symbols(self) -> Vec<&'ast Symbol> {
         match self {
             Self::Symbol(symbol) => vec![symbol],
-            Self::List(list) => list.bound_symbols(),
+            Self::List(pattern) => pattern.bound_symbols(),
             _ => Vec::new(),
         }
     }
@@ -301,25 +339,47 @@ impl BoundSymbols for ExprFunction {
     }
 }
 
-impl BoundSymbols for ExprSequence {
-    fn bound_symbols(&self) -> Vec<&Symbol> {
-        self.elems
-            .as_ref()
-            .into_iter()
-            .flat_map(PackedArguments::arguments)
-            .flatten()
-            .flat_map(BoundSymbols::bound_symbols)
-            .collect()
-    }
-}
-
 impl BoundSymbols for Expr {
     fn bound_symbols(&self) -> Vec<&Symbol> {
         match self.unparenthesized() {
             Some(Expr::Symbol(symbol)) => vec![symbol],
-            Some(Expr::Sequence(sequence)) => sequence.bound_symbols(),
-            _ => Vec::new(),
+            _ => Destructuring::of(self).map_or_else(Vec::new, Destructuring::bound_symbols),
         }
+    }
+}
+
+/// The written targets of a parallel assignment: a collection of any
+/// delimiter whose elements are targets themselves, so `[p, {q, r}] := …`
+/// binds `p`, `q` and `r` — M2 destructures `()`, `[]`, `{}` and `<|…|>` alike.
+#[derive(Debug, Clone, Copy)]
+pub struct Destructuring<'ast>(pub &'ast Expr);
+
+impl<'ast> Destructuring<'ast> {
+    /// The pattern `expression` writes when it is a collection, seen through
+    /// parentheses: `(x, y)` and `([x, y])` are patterns, `x` and `f x` are not.
+    pub fn of(expression: &'ast Expr) -> Option<Self> {
+        let collection = expression.unparenthesized()?;
+        collection.collection_elements().map(|_| Self(collection))
+    }
+
+    /// The targets in the pattern, retaining empty slots as `None`.
+    pub fn targets(self) -> Vec<Option<&'ast Expr>> {
+        self.0.collection_elements().unwrap_or_default()
+    }
+
+    /// The symbols the pattern binds, at any nesting depth, in source order.
+    pub fn bound_symbols(self) -> Vec<&'ast Symbol> {
+        self.targets()
+            .into_iter()
+            .flatten()
+            .flat_map(Expr::bound_symbols)
+            .collect()
+    }
+}
+
+impl Spanned for Destructuring<'_> {
+    fn try_span(&self) -> Option<Span> {
+        self.0.try_span()
     }
 }
 

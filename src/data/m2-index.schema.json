@@ -173,6 +173,17 @@
             }
           ]
         },
+        "documentation_location": {
+          "description": "The span of the documentation page documenting the object, starting at its doc /// or document { line; null when undocumented.",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SourceLocation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "source": {
           "type": [
             "string",

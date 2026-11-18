@@ -10,7 +10,7 @@ use crate::analysis::BindingView;
 use crate::document::{DocumentSnapshot, PackageSession};
 use crate::documentation::DocumentationSnippet;
 use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry};
-use crate::package_documentation::{DocumentationMarkupKind, TextStyle};
+use crate::package_documentation::{DocumentationMarkupKind, ItemRole, TextStyle};
 use crate::semantic_token::{
     classify_source_semantic_token, local_symbol_semantic_token, CompiledCallableKind,
     M2SemanticToken, M2SemanticTokenModifier, M2SemanticTokenType, SemanticTokenKnowledge,
@@ -268,16 +268,7 @@ impl<'a> SemanticTokenEmitter<'a> {
                 .map(|snippet| documentation_snippet_semantic_span(self.document, snippet)),
         );
         let is_documentation = self.has_context(&source_bytes);
-        let prose = self.contexts.iter().any(|(context, modifier)| {
-            *modifier == M2SemanticTokenModifier::Documentation
-                && context.start <= source_bytes.start
-                && source_bytes.end <= context.end
-        });
-        let base_token = M2SemanticToken::new(if prose {
-            M2SemanticTokenType::Docs
-        } else {
-            base_type
-        });
+        let base_token = M2SemanticToken::new(base_type);
         if spans.is_empty() && !is_documentation {
             return false;
         }
@@ -288,6 +279,16 @@ impl<'a> SemanticTokenEmitter<'a> {
                 bytes.end,
                 span.token.token_type == M2SemanticTokenType::String,
             )
+        });
+        // Two readings of the same text with one type — a document tag that
+        // is also link text — are one token carrying both readings' modifiers.
+        spans.dedup_by(|later, earlier| {
+            let same = later.bytes() == earlier.bytes()
+                && later.token.token_type == earlier.token.token_type;
+            if same {
+                earlier.token.modifiers |= later.token.modifiers;
+            }
+            same
         });
 
         let emit_base = !augments_syntax_tokens
@@ -304,7 +305,9 @@ impl<'a> SemanticTokenEmitter<'a> {
         // Prefer the most specific span where markup nests or contains code.
         let mut active = BinaryHeap::new();
         let mut next_span = 0;
-        let mut run: Option<(ByteRange, M2SemanticToken)> = None;
+        // A run is extended only by the same token from the same source, so
+        // code embedded in prose never absorbs the text beside it.
+        let mut run: Option<(ByteRange, (M2SemanticToken, Option<usize>))> = None;
         let mut emitted = false;
         for segment in boundaries.windows(2) {
             let bytes = segment[0]..segment[1];
@@ -320,15 +323,15 @@ impl<'a> SemanticTokenEmitter<'a> {
             }
             let token = active
                 .peek()
-                .map(|Reverse((_, index))| spans[*index].token)
-                .or_else(|| emit_base.then_some(base_token));
+                .map(|Reverse((_, index))| (spans[*index].token, Some(*index)))
+                .or_else(|| emit_base.then_some((base_token, None)));
             if let (Some((previous, previous_token)), Some(token)) = (&mut run, token) {
                 if previous.end == bytes.start && *previous_token == token {
                     previous.end = bytes.end;
                     continue;
                 }
             }
-            if let Some((previous, token)) = run.take() {
+            if let Some((previous, (token, _))) = run.take() {
                 emitted |= self.push(SemanticSpan {
                     source: self.document.span_for_bytes(previous),
                     token,
@@ -336,7 +339,7 @@ impl<'a> SemanticTokenEmitter<'a> {
             }
             run = token.map(|token| (bytes, token));
         }
-        if let Some((bytes, token)) = run {
+        if let Some((bytes, (token, _))) = run {
             emitted |= self.push(SemanticSpan {
                 source: self.document.span_for_bytes(bytes),
                 token,
@@ -378,11 +381,7 @@ impl<'a> SemanticTokenEmitter<'a> {
                 .iter()
                 .filter(|(context, _)| context.start <= bytes.start && bytes.end <= context.end)
                 .fold(span.token, |token, (_, modifier)| {
-                    if *modifier == M2SemanticTokenModifier::Documentation {
-                        token
-                    } else {
-                        token.with_modifier(*modifier)
-                    }
+                    token.with_modifier(*modifier)
                 });
             let source = self.document.span_for_bytes(bytes);
             emitted |= self.push_ranges(self.document.visible_ranges(&source), token);
@@ -712,7 +711,8 @@ where
                         )
                     }
                     DocumentationMarkupKind::Styled(style) => {
-                        M2SemanticToken::new(M2SemanticTokenType::Docs).with_modifier(match style {
+                        M2SemanticToken::new(M2SemanticTokenType::String).with_modifier(match style
+                        {
                             TextStyle::Strong => M2SemanticTokenModifier::Strong,
                             TextStyle::Emphasis => M2SemanticTokenModifier::Emphasis,
                             TextStyle::Monospace => M2SemanticTokenModifier::Monospace,
@@ -735,8 +735,11 @@ where
                         &SymbolMention::new(self.document.span_for_bytes(start..end)),
                         is_tag,
                     )?,
-                    DocumentationMarkupKind::ItemName => {
+                    DocumentationMarkupKind::ItemName(ItemRole::Input) => {
                         M2SemanticToken::new(M2SemanticTokenType::Parameter)
+                    }
+                    DocumentationMarkupKind::ItemName(ItemRole::Output) => {
+                        M2SemanticToken::new(M2SemanticTokenType::Variable)
                     }
                     DocumentationMarkupKind::Syntax(token_type) => M2SemanticToken::new(token_type),
                 };
@@ -1261,7 +1264,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         assert_eq!(local.token_type, M2SemanticTokenType::Property as u32);
         assert_eq!(
             local.token_modifiers_bitset,
-            M2SemanticTokenModifier::Wikilink.bit()
+            M2SemanticTokenModifier::Wikilink.bit() | M2SemanticTokenModifier::Documentation.bit()
         );
 
         let builtin =
@@ -1269,12 +1272,12 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         assert_eq!(builtin.token_type, M2SemanticTokenType::Property as u32);
         assert_eq!(
             builtin.token_modifiers_bitset,
-            M2SemanticTokenModifier::Wikilink.bit()
+            M2SemanticTokenModifier::Wikilink.bit() | M2SemanticTokenModifier::Documentation.bit()
         );
 
         assert_eq!(
             token_at(&tokens, 1, 8).map(|token| token.token_type),
-            Some(M2SemanticTokenType::Docs as u32),
+            Some(M2SemanticTokenType::Comment as u32),
             "the wiki-link delimiter remains comment-colored"
         );
     }
@@ -1291,8 +1294,11 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             Some(M2SemanticTokenType::Property as u32)
         );
         let comment = token_at(&tokens, 1, 8).expect("documentation comment is highlighted");
-        assert_eq!(comment.token_type, M2SemanticTokenType::Docs as u32);
-        assert_eq!(comment.token_modifiers_bitset, 0);
+        assert_eq!(comment.token_type, M2SemanticTokenType::Comment as u32);
+        assert_eq!(
+            comment.token_modifiers_bitset,
+            M2SemanticTokenModifier::Documentation.bit()
+        );
     }
 
     #[test]
@@ -2399,14 +2405,19 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                     M2SemanticTokenType::Keyword as u32,
                     "{option}"
                 );
-                assert_eq!(tag.token_modifiers_bitset, 0, "{option}");
+                assert_eq!(
+                    tag.token_modifiers_bitset,
+                    M2SemanticTokenModifier::Documentation.bit(),
+                    "{option}"
+                );
                 let value = token_at(&tokens, 0, text.find("value").unwrap() as u32).unwrap();
-                let expected_type =
-                    if matches!(option, DocumentOption::Key | DocumentOption::SeeAlso) {
-                        M2SemanticTokenType::String
-                    } else {
-                        M2SemanticTokenType::Docs
-                    };
+                // A bare name in an item list names the item.
+                let expected_type = match option {
+                    DocumentOption::Key | DocumentOption::SeeAlso => M2SemanticTokenType::String,
+                    DocumentOption::Inputs => M2SemanticTokenType::Parameter,
+                    DocumentOption::Outputs => M2SemanticTokenType::Variable,
+                    _ => M2SemanticTokenType::String,
+                };
                 assert_eq!(value.token_type, expected_type as u32, "{option}");
                 let tag_modifier =
                     if matches!(option, DocumentOption::Key | DocumentOption::SeeAlso) {
@@ -2414,7 +2425,11 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                     } else {
                         0
                     };
-                assert_eq!(value.token_modifiers_bitset, tag_modifier, "{option}");
+                assert_eq!(
+                    value.token_modifiers_bitset,
+                    tag_modifier | M2SemanticTokenModifier::Documentation.bit(),
+                    "{option}"
+                );
             }
         }
     }
@@ -2458,7 +2473,11 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
                 M2SemanticTokenType::Keyword as u32,
                 "{keyword}"
             );
-            assert_eq!(token.token_modifiers_bitset & documentation, 0, "{keyword}");
+            assert_eq!(
+                token.token_modifiers_bitset & documentation,
+                documentation,
+                "{keyword}"
+            );
         }
     }
 
@@ -2478,7 +2497,7 @@ Description
         let tokens = collect_tokens(&document, &builtins, true);
         for (literal, kind) in [
             (r#""Matrix""#, M2SemanticTokenType::Type),
-            (r#""code""#, M2SemanticTokenType::Docs),
+            (r#""code""#, M2SemanticTokenType::String),
         ] {
             let position = document.position_for_byte(text.find(literal).unwrap());
             let token = token_at(&tokens, position.line, position.character).unwrap();
@@ -2511,10 +2530,10 @@ Description
                 ("@TO", M2SemanticTokenType::Macro),
                 ("@ and", M2SemanticTokenType::Macro),
                 (r"{\tt", M2SemanticTokenType::Macro),
-                ("curated", M2SemanticTokenType::Docs),
-                ("i1 :", M2SemanticTokenType::Docs),
-                ("o1 =", M2SemanticTokenType::Docs),
-                ("456", M2SemanticTokenType::Docs),
+                ("curated", M2SemanticTokenType::String),
+                ("i1 :", M2SemanticTokenType::String),
+                ("o1 =", M2SemanticTokenType::String),
+                ("456", M2SemanticTokenType::String),
                 ("{{", M2SemanticTokenType::Delimiter),
                 (",2", M2SemanticTokenType::Punctuation),
                 ("(3", M2SemanticTokenType::Delimiter),
@@ -2539,7 +2558,7 @@ Description
         let builtins = ObjectRegistry::default();
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, true);
-        let markup = 0;
+        let markup = M2SemanticTokenModifier::Documentation.bit();
         for (needle, style) in [
             ("bold", M2SemanticTokenModifier::Strong),
             ("italic", M2SemanticTokenModifier::Emphasis),
@@ -2550,7 +2569,7 @@ Description
             let token = token_at(&tokens, position.line, position.character).unwrap();
             assert_eq!(
                 token.token_type,
-                M2SemanticTokenType::Docs as u32,
+                M2SemanticTokenType::String as u32,
                 "{needle}"
             );
             assert_eq!(
@@ -2572,7 +2591,9 @@ Description
         assert_eq!(token.token_type, M2SemanticTokenType::Number as u32);
         assert_eq!(
             token.token_modifiers_bitset,
-            M2SemanticTokenModifier::Example.bit() | M2SemanticTokenModifier::InjectedCode.bit()
+            M2SemanticTokenModifier::Documentation.bit()
+                | M2SemanticTokenModifier::Example.bit()
+                | M2SemanticTokenModifier::InjectedCode.bit()
         );
     }
 
@@ -2599,7 +2620,7 @@ Description
         let document = document(text, &builtins);
         for augments_syntax in [false, true] {
             let tokens = collect_tokens(&document, &builtins, augments_syntax);
-            let documentation = 0;
+            let documentation = M2SemanticTokenModifier::Documentation.bit();
             let example = M2SemanticTokenModifier::Example.bit()
                 | M2SemanticTokenModifier::InjectedCode.bit();
             let test = M2SemanticTokenModifier::Test.bit();
@@ -2751,10 +2772,7 @@ Description
         for token_type in M2SemanticTokenType::iter() {
             assert_eq!(
                 M2SemanticToken::new(token_type).encode(&standard_only).0,
-                if matches!(
-                    token_type,
-                    M2SemanticTokenType::EscapeSequence | M2SemanticTokenType::Docs
-                ) {
+                if matches!(token_type, M2SemanticTokenType::EscapeSequence) {
                     M2SemanticTokenType::String as u32
                 } else if matches!(
                     token_type,

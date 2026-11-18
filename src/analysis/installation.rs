@@ -217,7 +217,7 @@ impl OptionDeclaration {
             .into_iter()
             .map(|entry| match entry? {
                 Expr::Option(option) => Some(CallableOption {
-                    name: ObjectName::new(option.key.symbol_name()?),
+                    name: ObjectName::new(option.key.option_key_spelling()?),
                     possible_values: Vec::new(),
                     accepted_types: Vec::new(),
                 }),
@@ -235,9 +235,12 @@ impl OptionDeclaration {
                 _ => None,
             }
         }
+        // `method(…)` is an adjacency, a binary operation too: only `>>`
+        // declarations take the function branch.
         if let Expr::Binary(declaration) = expression {
-            InstalledFunction::option_declaring_handler(declaration)?;
-            return Some((Self::Function, list(&declaration.left)?));
+            if InstalledFunction::option_declaring_handler(declaration).is_some() {
+                return Some((Self::Function, list(&declaration.left)?));
+            }
         }
         let options =
             MethodDeclaration::of(expression)?.option(MethodDeclarationOption::Options)?;

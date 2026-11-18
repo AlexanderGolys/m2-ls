@@ -11,9 +11,7 @@
 use std::collections::HashMap;
 use std::ptr;
 
-use m2_syn::nodes::{
-    AssignOperator, Elements, Expr, ExprAssign, ExprBinary, ExprIf, ExprSequence, Literal, Symbol,
-};
+use m2_syn::nodes::{AssignOperator, Expr, ExprAssign, ExprBinary, ExprIf, Literal, Symbol};
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Delimiter, DelimiterValue, Span, Spanned, Token};
 
@@ -34,8 +32,8 @@ use crate::node_metadata::{ParsedCell, SyntaxSnapshot};
 use crate::object_registry::{ObjectKnowledge, ObjectName, ObjectRegistry, ObjectRegistryView};
 use crate::source::{DocumentSource, SourceNavigation, SyntaxNavigation, SyntaxSource};
 use crate::syntax::{
-    AssignmentOperator, AssignmentParts, AssignmentSyntax, AssignmentTarget, ControlSyntax,
-    ExpressionSyntax, PackedArguments,
+    AssignmentOperator, AssignmentParts, AssignmentSyntax, AssignmentTarget, AssignmentTraversal,
+    ControlSyntax, Destructuring, ExpressionSyntax, PackedArguments,
 };
 use crate::typesystem::{SubtypeEvidence, TypeKnowledge, TypeRole};
 
@@ -143,6 +141,10 @@ impl<'a> Visit<'a> for ExpressionChecks<'a, '_> {
             }
         }
         visit::visit_expr(self, expression);
+    }
+
+    fn visit_expr_assign(&mut self, assignment: &'a ExprAssign) {
+        assignment.visit_installing(self);
     }
 }
 
@@ -669,7 +671,7 @@ impl<'a> ExpressionChecks<'a, '_> {
         }
         self.spawn(
             &catalog::MULTIPLE_ASSIGNMENT_TARGETS,
-            targets,
+            targets.0,
             format!(
                 "{spelling} parallel assignment targets must be symbols, installation \
                  targets such as `T + T` or `f ZZ`, parts such as `x#i` (with `=`), or \
@@ -687,28 +689,28 @@ impl<'a> ExpressionChecks<'a, '_> {
     /// that installs nothing or a literal operand (`x + 1`) is rejected.
     fn targets_are_assignable(
         &self,
-        targets: &ExprSequence,
+        targets: Destructuring<'_>,
         operator: AssignmentOperator,
         knowledge: &ObjectRegistryView<'_>,
     ) -> bool {
-        sequence_targets(targets)
-            .into_iter()
-            .flatten()
-            .all(|target| match target.unparenthesized() {
-                Some(Expr::Sequence(nested)) => {
-                    self.targets_are_assignable(nested, operator, knowledge)
-                }
-                Some(
-                    operation @ (Expr::Binary(_)
-                    | Expr::Prefix(_)
-                    | Expr::Postfix(_)
-                    | Expr::Field(_)),
+        targets.targets().into_iter().flatten().all(|target| {
+            match (Destructuring::of(target), target.unparenthesized()) {
+                (Some(nested), _) => self.targets_are_assignable(nested, operator, knowledge),
+                (
+                    _,
+                    Some(
+                        operation @ (Expr::Binary(_)
+                        | Expr::Prefix(_)
+                        | Expr::Postfix(_)
+                        | Expr::Field(_)),
+                    ),
                 ) => {
                     operator == AssignmentOperator::Global
                         || self.is_installation_target(operation, knowledge)
                 }
                 _ => true,
-            })
+            }
+        })
     }
 
     /// Whether `target` can receive a `:=` installation: it has an
@@ -788,11 +790,11 @@ impl<'a> ExpressionChecks<'a, '_> {
     /// into nested lists of equal length.
     fn match_parallel_assignment(
         &mut self,
-        targets: &ExprSequence,
+        targets: Destructuring<'a>,
         value: &'a Expr,
         knowledge: &ObjectRegistryView<'_>,
     ) {
-        let targets_written = sequence_targets(targets);
+        let targets_written = targets.targets();
         let Some(values) = value.collection_elements() else {
             self.parallel_assignment_value_type(targets_written.len(), value, knowledge);
             return;
@@ -800,7 +802,7 @@ impl<'a> ExpressionChecks<'a, '_> {
         if targets_written.len() != values.len() {
             self.spawn(
                 &catalog::PARALLEL_ASSIGNMENT_ARITY,
-                targets,
+                targets.0,
                 format!(
                     "parallel assignment binds {} targets but the right-hand side lists {}; their lengths must match",
                     targets_written.len(),
@@ -810,9 +812,7 @@ impl<'a> ExpressionChecks<'a, '_> {
             return;
         }
         for (target, value) in targets_written.into_iter().zip(values) {
-            if let (Some(Expr::Sequence(nested)), Some(value)) =
-                (target.and_then(Expr::unparenthesized), value)
-            {
+            if let (Some(nested), Some(value)) = (target.and_then(Destructuring::of), value) {
                 self.match_parallel_assignment(nested, value, knowledge);
             }
         }
@@ -1230,9 +1230,6 @@ impl<'a> ExpressionChecks<'a, '_> {
         let AssignmentTarget::List(list) = parts.target else {
             return;
         };
-        if !matches!(list.elems, Some(Elements::Pack(_))) {
-            return;
-        }
         for target in left_arrow_targets(list) {
             self.spawn(
                 &catalog::EXPLICIT_INSTALL_REQUIRED,
@@ -1479,15 +1476,9 @@ impl<'a> ExpressionChecks<'a, '_> {
 }
 
 /// The `x <- y` targets of a parallel assignment list, at any nesting depth.
-fn sequence_targets(list: &ExprSequence) -> Vec<Option<&Expr>> {
-    list.elems
-        .as_ref()
-        .map_or_else(Vec::new, PackedArguments::arguments)
-}
-
 /// The `x <- y` targets of a parallel assignment list, at any nesting depth.
-fn left_arrow_targets(list: &ExprSequence) -> Vec<&Expr> {
-    sequence_targets(list)
+fn left_arrow_targets(list: Destructuring<'_>) -> Vec<&Expr> {
+    list.targets()
         .into_iter()
         .flatten()
         .flat_map(|target| match target.unparenthesized() {
@@ -1496,8 +1487,7 @@ fn left_arrow_targets(list: &ExprSequence) -> Vec<&Expr> {
             {
                 vec![target]
             }
-            Some(Expr::Sequence(nested)) => left_arrow_targets(nested),
-            _ => Vec::new(),
+            _ => Destructuring::of(target).map_or_else(Vec::new, left_arrow_targets),
         })
         .collect()
 }

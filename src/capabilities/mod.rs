@@ -11,6 +11,7 @@ pub mod hover;
 pub mod inlay_hints;
 pub mod inline_values;
 pub mod navigation;
+pub mod runtime_commands;
 pub mod semantic_tokens;
 pub mod signature_help;
 pub mod type_hierarchy;

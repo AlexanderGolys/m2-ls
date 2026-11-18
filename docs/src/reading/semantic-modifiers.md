@@ -10,6 +10,9 @@ has `algebraic`. A method installation keeps its `method` type and adds
 `declaration`
 : Marks the place a binding is introduced, including ring variables and method
   installation heads. Use it to make definitions stand out among their uses.
+  On a `property` it marks the side that writes a key: the `"pkgname"` of
+  `{"pkgname" => name}`, or an option an option list declares. The
+  `h#"pkgname"` that reads the key back is a `property` without it.
 
 `defaultLibrary`
 : Marks objects selected by `semanticTokens.defaultLibrary`. The default policy
@@ -48,8 +51,12 @@ has `algebraic`. A method installation keeps its `method` type and adds
 `optionalParameter`
 : Marks an option key, which is a `property`. Only a name denoting a
   `Symbol` is a key: a protected symbol such as `Strategy`, or a name nothing
-  binds. A string, or a name bound to a function or variable, is a value and
-  keeps its own token. Inside a function that receives an option table,
+  binds. A name bound to a function or variable is a value and keeps its own
+  token. A string is a key where an option list declares it,
+  `method(Options => {"Eps" => 1})`, and where a call passes it to a function
+  declaring that string option, `f(x, "Eps" => 2)`; Macaulay2 keeps `"Eps"`
+  and `Eps` apart, so `"Degree" => 2` passed to a function declaring `Degree`
+  stays a string. Inside a function that receives an option table,
   `{…} >> o -> …` or an installation of a method declaring `Options`, the keys
   read from the table, `o.verbose` and `o#verbose`, carry it too. Its value
   retains its own token classification.
@@ -62,9 +69,13 @@ has `algebraic`. A method installation keeps its `method` type and adds
 ## Documentation and embedded code
 
 `documentation`
-: The standard-only fallback for custom documentation style modifiers.
-  Prose uses the `docs` token type; embedded code does not inherit a blanket
-  documentation modifier, so its own token styles remain visible.
+: Marks everything written inside documentation — a documentation string,
+  `doc ///…///` or `document {…}`, or a documentation comment — whatever its
+  type: the prose keeps `string` or `comment`, section keywords stay
+  `keyword`, and embedded code keeps its own types, so `x` in an example is a
+  `variable` that is also `documentation`. Style the modifier to tint
+  documentation as a whole without losing what is inside it. It is also the
+  standard-only fallback of the documentation style modifiers.
 
 `documentTag`
 : Marks the parts of a documentation tag: the key a `Key` entry documents or a

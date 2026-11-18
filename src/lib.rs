@@ -15,7 +15,7 @@
 //! ```
 
 use std::backtrace::Backtrace;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::panic;
@@ -26,7 +26,7 @@ use std::thread;
 use dashmap::{DashMap, DashSet};
 use tokio::{io, task};
 use tower_lsp::{
-    jsonrpc::Result,
+    jsonrpc::{self, Result},
     lsp_types::request::{
         GotoDeclarationParams, GotoDeclarationResponse, GotoImplementationParams,
         GotoImplementationResponse, GotoTypeDefinitionParams, GotoTypeDefinitionResponse,
@@ -96,6 +96,7 @@ use capabilities::navigation::{
     references_response, rename_edits, resolve_document_link, workspace_symbols_response,
     ReferenceTarget,
 };
+use capabilities::runtime_commands::RuntimeCommand;
 use capabilities::semantic_tokens::collect_semantic_tokens;
 use capabilities::signature_help::signature_help_response;
 use capabilities::type_hierarchy::{
@@ -103,7 +104,8 @@ use capabilities::type_hierarchy::{
 };
 use client_capabilities::{
     refresh_if_changed, ClientSupport, InlayHintRefresh, SemanticTokensAugmentSyntax,
-    SemanticTokensRefresh, TypeHierarchyDynamicRegistration, WorkspaceRefresh,
+    SemanticTokensRefresh, TypeHierarchyDynamicRegistration, WorkspaceEditFileRenames,
+    WorkspaceRefresh,
 };
 use diagnostics::{publish_diagnostics, visible_diagnostics};
 use document::{DocumentSnapshot, FileProperties};
@@ -111,6 +113,7 @@ use init_file::{InitFile, InitFileDirective, InitFileStart, InitFiles};
 use library_index::{LibraryIndex, LibrarySources};
 use package_index::{Macaulay2Environment, SourceResolver};
 use session::{ClientInput, ExitNotificationService, SessionEnd};
+use strum::IntoEnumIterator;
 
 use crate::catalog::CatalogSource;
 use crate::diagnostics::DiagnosticCode;
@@ -164,6 +167,8 @@ struct Backend {
     inlay_hint_refresh: ClientSupport<InlayHintRefresh>,
     /// Whether the client accepts requests to refresh semantic tokens.
     semantic_tokens_refresh: ClientSupport<SemanticTokensRefresh>,
+    /// Whether the client applies workspace edits that rename files.
+    workspace_edit_file_renames: ClientSupport<WorkspaceEditFileRenames>,
     /// The init files the documents' sessions start with, which Macaulay2
     /// runs before any document. `registry` itself starts without one.
     init_files: InitFiles,
@@ -198,6 +203,7 @@ impl Backend {
             type_hierarchy_dynamic_registration: ClientSupport::default(),
             inlay_hint_refresh: ClientSupport::default(),
             semantic_tokens_refresh: ClientSupport::default(),
+            workspace_edit_file_renames: ClientSupport::default(),
             init_files: InitFiles::default(),
             workspace_folders: DashSet::new(),
         }
@@ -292,7 +298,8 @@ impl Backend {
             .iter()
             .any(|root| path.starts_with(root))
         {
-            self.index_loaded_in_background(self.workspace_index.sources_under(path))
+            let limits = self.settings.snapshot().workspace;
+            self.index_loaded_in_background(self.workspace_index.sources_under(path, limits))
                 .await;
         }
         self.refresh_loaders_of(path).await;
@@ -476,23 +483,135 @@ impl Backend {
                         .shares_global_binding(name, exclude, file_uri)
             })
             .flat_map(move |file_uri| {
-                let ranges = if let Some(open) = self.documents.get(&file_uri) {
-                    global_reference_ranges(open.value(), name)
-                } else if let Ok(path) = file_uri.to_file_path() {
-                    fs::read_to_string(path)
-                        .ok()
-                        .and_then(|text| {
-                            DocumentSnapshot::from_text(text, &self.workspace_registry())
-                        })
-                        .map(|snapshot| global_reference_ranges(&snapshot, name))
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                ranges
-                    .into_iter()
-                    .map(move |range| (file_uri.clone(), range))
+                self.inspect_file(&file_uri, |document| {
+                    global_reference_ranges(document, name)
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .map(move |range| (file_uri.clone(), range))
             })
+    }
+
+    /// What `inspect` finds in the file at `file`: in its open buffer, so
+    /// unsaved edits count, or else in the file parsed from disk.
+    fn inspect_file<T>(
+        &self,
+        file: &Url,
+        inspect: impl FnOnce(&DocumentSnapshot) -> T,
+    ) -> Option<T> {
+        if let Some(open) = self.documents.get(file) {
+            return Some(inspect(open.value()));
+        }
+        let text = fs::read_to_string(file.to_file_path().ok()?).ok()?;
+        DocumentSnapshot::from_text(text, &self.workspace_registry())
+            .map(|snapshot| inspect(&snapshot))
+    }
+
+    /// The edits keeping every load of what `moves` moves running the file
+    /// it ran before: the loads the index knows and those on disk.
+    async fn load_edits(&self, moves: FileMoves) -> HashMap<Url, Vec<TextEdit>> {
+        let index = Arc::clone(&self.workspace_index);
+        let folders = self.workspace_folder_paths();
+        task::spawn_blocking(move || {
+            let on_disk = moves.loaders_on_disk(&folders, |file| index.is_indexed(file));
+            moves.load_edits(index.file_loads().into_iter().chain(on_disk))
+        })
+        .await
+        .expect("load edit task panicked")
+    }
+
+    /// The edit renaming the package `name`, which a workspace file declares
+    /// with `newPackage`, to `new_name`. Every file naming the package by a
+    /// string, declaring it, or running in its session has its names of the
+    /// package rewritten; the package's own `name.m2` and `name/` move along,
+    /// with the loads reaching them.
+    async fn package_rename(&self, name: &str, new_name: &str) -> Result<WorkspaceEdit> {
+        /// How one file names the package.
+        struct PackageNaming {
+            /// Whether its `newPackage` declares the package.
+            declares: bool,
+            /// Whether a package-name string names it, as `needsPackage` does.
+            by_string: bool,
+            /// Every place the file names it.
+            ranges: Vec<TextRange>,
+        }
+        let files = self
+            .workspace_index
+            .indexed_file_uris()
+            .into_iter()
+            .chain(self.documents.iter().map(|document| document.key().clone()))
+            .collect::<BTreeSet<_>>();
+        let namings = files
+            .into_iter()
+            .filter_map(|file| {
+                let naming = self.inspect_file(&file, |document| PackageNaming {
+                    declares: document
+                        .packages()
+                        .declarations()
+                        .iter()
+                        .any(|declaration| declaration.name.name() == name),
+                    by_string: document.names_package_by_string(name),
+                    ranges: document.package_name_ranges(name),
+                })?;
+                Some((file, naming))
+            })
+            .collect::<Vec<_>>();
+        let declaring = namings
+            .iter()
+            .find(|(_, naming)| naming.declares)
+            .map(|(file, _)| file.clone())
+            .ok_or_else(|| {
+                jsonrpc::Error::invalid_params(format!(
+                    "no workspace file declares the package `{name}` with `newPackage`; only \
+                     packages written in the workspace can be renamed"
+                ))
+            })?;
+        let mut changes = namings
+            .into_iter()
+            .filter(|(file, naming)| {
+                naming.declares
+                    || naming.by_string
+                    || self
+                        .workspace_index
+                        .shares_global_binding(name, &declaring, file)
+            })
+            .map(|(file, naming)| {
+                let edits = naming
+                    .ranges
+                    .into_iter()
+                    .map(|range| TextEdit::new(range, new_name.to_string()))
+                    .collect::<Vec<_>>();
+                (file, edits)
+            })
+            .collect::<HashMap<_, _>>();
+        let path = declaring
+            .to_file_path()
+            .map_err(|()| jsonrpc::Error::invalid_params("the package's file is not on disk"))?;
+        let moves = FileMoves::renaming_package(&path, name, new_name);
+        if moves.is_empty() {
+            return Ok(WorkspaceEdit::new(changes));
+        }
+        if !self.workspace_edit_file_renames.is_supported() {
+            return Err(jsonrpc::Error::invalid_params(format!(
+                "renaming `{name}` must rename its file `{name}.m2`, which this editor cannot do \
+                 in a rename; rename the file first, then the package"
+            )));
+        }
+        for (file, edits) in self.load_edits(moves.clone()).await {
+            changes.entry(file).or_default().extend(edits);
+        }
+        let text_edits = changes.into_iter().map(|(uri, edits)| {
+            DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier { uri, version: None },
+                edits: edits.into_iter().map(OneOf::Left).collect(),
+            })
+        });
+        Ok(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(
+                text_edits.chain(moves.rename_operations()).collect(),
+            )),
+            ..WorkspaceEdit::default()
+        })
     }
 
     /// Materializes the common hierarchy from retained indexed and open analyses.
@@ -913,10 +1032,11 @@ impl Backend {
         let mut loaded = self
             .workspace_index
             .index_snapshot(&uri, &document, self.registry());
-        loaded.extend(
-            self.workspace_index
-                .repository_files(&uri, &self.workspace_folder_paths()),
-        );
+        loaded.extend(self.workspace_index.repository_files(
+            &uri,
+            &self.workspace_folder_paths(),
+            self.settings.snapshot().workspace,
+        ));
         self.document_versions.insert(uri.clone(), params.version);
         self.documents.insert(uri.clone(), document);
         self.index_loaded_in_background(loaded).await;
@@ -1130,9 +1250,20 @@ fn install_panic_logging() {
 }
 
 impl Backend {
+    /// The Macaulay2 the runtime commands start: `macaulay2.executable` when
+    /// configured, otherwise the first `M2` on `PATH`.
+    fn macaulay2_executable(&self) -> Option<PathBuf> {
+        self.settings
+            .snapshot()
+            .macaulay2
+            .executable
+            .or_else(|| self.environment.executable())
+    }
+
     /// Runs an explicitly requested operation in a fresh M2 process.
     async fn execute_runtime_command(
         &self,
+        command: RuntimeCommand,
         params: ExecuteCommandParams,
     ) -> Result<serde_json::Value> {
         let invalid =
@@ -1155,13 +1286,13 @@ impl Backend {
             .parent()
             .ok_or_else(|| invalid("file has no parent directory"))?;
         let quote = |text: &str| serde_json::to_string(text).expect("string serialization");
-        let code = match params.command.as_str() {
-            "m2-ls.executeCell" => argument
+        let code = match command {
+            RuntimeCommand::ExecuteCell => argument
                 .get("code")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| invalid("executeCell requires code containing the selected cell"))?
                 .to_string(),
-            "m2-ls.runTests" => {
+            RuntimeCommand::RunTests => {
                 let package = argument
                     .get("package")
                     .and_then(serde_json::Value::as_str)
@@ -1172,14 +1303,11 @@ impl Backend {
                     quote(&path.to_string_lossy())
                 )
             }
-            _ => format!("input {}", quote(&path.to_string_lossy())),
+            RuntimeCommand::ExecuteFile => format!("input {}", quote(&path.to_string_lossy())),
         };
         let executable = self
-            .settings
-            .snapshot()
-            .macaulay2
-            .executable
-            .unwrap_or_else(|| PathBuf::from(Macaulay2Conventions::EXECUTABLE));
+            .macaulay2_executable()
+            .ok_or_else(|| invalid("no M2 to run: set macaulay2.executable or put M2 on PATH"))?;
         let child = tokio::process::Command::new(executable)
             .args(Macaulay2Conventions::EXECUTION_ARGUMENTS)
             .arg(format!("{code}\nexit 0"))
@@ -1220,6 +1348,8 @@ impl LanguageServer for Backend {
             .negotiate(&params.capabilities);
         self.inlay_hint_refresh.negotiate(&params.capabilities);
         self.semantic_tokens_refresh.negotiate(&params.capabilities);
+        self.workspace_edit_file_renames
+            .negotiate(&params.capabilities);
 
         let client_settings = params
             .initialization_options
@@ -1268,12 +1398,10 @@ impl LanguageServer for Backend {
                     },
                 )),
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec![
-                        WorkspaceHierarchy::COMMAND.to_string(),
-                        "m2-ls.executeFile".into(),
-                        "m2-ls.executeCell".into(),
-                        "m2-ls.runTests".into(),
-                    ],
+                    commands: std::iter::once(WorkspaceHierarchy::COMMAND)
+                        .chain(RuntimeCommand::iter().map(RuntimeCommand::name))
+                        .map(String::from)
+                        .collect(),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
@@ -1300,6 +1428,9 @@ impl LanguageServer for Backend {
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(false),
+                }),
                 document_highlight_provider: document_highlight_provider_capability(),
                 code_action_provider: Some(CodeActionProviderCapability::Options(
                     CodeActionOptions {
@@ -1559,19 +1690,8 @@ impl LanguageServer for Backend {
     }
 
     async fn will_rename_files(&self, params: RenameFilesParams) -> Result<Option<WorkspaceEdit>> {
-        let moves = params.files.into_iter().collect::<FileMoves>();
-        let index = Arc::clone(&self.workspace_index);
-        let folders = self.workspace_folder_paths();
-        let edits = task::spawn_blocking(move || {
-            let on_disk = moves.loaders_on_disk(&folders, |file| index.is_indexed(file));
-            moves.load_edits(index.file_loads().into_iter().chain(on_disk))
-        })
-        .await
-        .expect("rename edit task panicked");
-        Ok((!edits.is_empty()).then(|| WorkspaceEdit {
-            changes: Some(edits),
-            ..WorkspaceEdit::default()
-        }))
+        let edits = self.load_edits(params.files.into_iter().collect()).await;
+        Ok((!edits.is_empty()).then(|| WorkspaceEdit::new(edits)))
     }
 
     async fn did_rename_files(&self, params: RenameFilesParams) {
@@ -1656,6 +1776,15 @@ impl LanguageServer for Backend {
         Ok(self.with_document(&uri, |document| {
             DocumentSymbolResponse::Nested(collect_document_symbols(document))
         }))
+    }
+
+    /// Offers the runtime commands as lenses, only when there is an M2 to run.
+    async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        let uri = params.text_document.uri;
+        if self.macaulay2_executable().is_none() {
+            return Ok(None);
+        }
+        Ok(self.with_document(&uri, |document| RuntimeCommand::code_lenses(document, &uri)))
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
@@ -1766,6 +1895,14 @@ impl LanguageServer for Backend {
         let include_declaration = params.context.include_declaration;
 
         if let Some(document) = self.documents.get(uri) {
+            if let Some(item) = document.package_documentation().item_at(position) {
+                let ranges = item.occurrences().skip(usize::from(!include_declaration));
+                return Ok(Some(
+                    ranges
+                        .map(|range| Location::new(uri.clone(), range))
+                        .collect(),
+                ));
+            }
             if let Some(tag) = document.documentation_text_tag_at(position) {
                 return Ok(Some(self.workspace_index.documentation_text_locations(
                     uri,
@@ -1843,8 +1980,9 @@ impl LanguageServer for Backend {
         let uri = &params.text_document.uri;
         let position = params.position;
         Ok(self
-            .with_source_at(uri, position, |document, _, _| {
-                prepare_rename_range(document, position).map(PrepareRenameResponse::Range)
+            .with_source_at(uri, position, |document, knowledge, _| {
+                prepare_rename_range(document, position, &knowledge.at(position))
+                    .map(PrepareRenameResponse::Range)
             })
             .flatten())
     }
@@ -1858,6 +1996,15 @@ impl LanguageServer for Backend {
             // unparsable code; refuse instead.
             return Ok(None);
         }
+        let package = self
+            .with_source_at(uri, position, |document, knowledge, _| {
+                let (name, _) = document.package_name_at(position, &knowledge.at(position))?;
+                Some(name.to_string())
+            })
+            .flatten();
+        if let Some(package) = package {
+            return self.package_rename(&package, new_name).await.map(Some);
+        }
 
         // Resolve the target and the current file's edits first, then drop the
         // document guard before scanning other files (mirrors `references`).
@@ -1866,6 +2013,9 @@ impl LanguageServer for Backend {
                 Some(document) => document,
                 None => return Ok(None),
             };
+            if let Some(item) = document.package_documentation().item_at(position) {
+                return Ok(Some(item.renamed(uri, new_name)));
+            }
             match self.reference_target_at(document.value(), uri, position) {
                 None => return Ok(None),
                 Some(ReferenceTarget::Local) => {
@@ -1907,11 +2057,11 @@ impl LanguageServer for Backend {
         &self,
         params: ExecuteCommandParams,
     ) -> Result<Option<serde_json::Value>> {
-        if matches!(
-            params.command.as_str(),
-            "m2-ls.executeFile" | "m2-ls.executeCell" | "m2-ls.runTests"
-        ) {
-            return self.execute_runtime_command(params).await.map(Some);
+        if let Ok(command) = params.command.parse::<RuntimeCommand>() {
+            return self
+                .execute_runtime_command(command, params)
+                .await
+                .map(Some);
         }
         if params.command != WorkspaceHierarchy::COMMAND {
             return Err(tower_lsp::jsonrpc::Error::invalid_params("unknown command"));

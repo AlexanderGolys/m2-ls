@@ -3,9 +3,7 @@
 
 use std::collections::HashSet;
 
-use m2_syn::nodes::{Expr, ExprBinary, ExprOption, Symbol};
-use m2_syn::visit::{self, Visit};
-use m2_syn::Token;
+use m2_syn::visit::Visit;
 use tower_lsp::lsp_types::SymbolKind;
 
 use super::{DiagnosticSink, DocumentContext};
@@ -13,10 +11,7 @@ use crate::diagnostics::{catalog, Finding};
 use crate::meta::BindingRole;
 use crate::node_metadata::ParsedCell;
 use crate::source::SourceNavigation;
-use crate::syntax::{BindingReferences, ExpressionSyntax};
-
-/// The option of `method` holding the options a method function accepts.
-const OPTIONS_KEY: &str = "Options";
+use crate::syntax::BindingReferences;
 
 /// Spawns every diagnostic that needs the whole document.
 pub(super) fn spawn(context: &DocumentContext, sink: &mut DiagnosticSink) {
@@ -25,10 +20,9 @@ pub(super) fn spawn(context: &DocumentContext, sink: &mut DiagnosticSink) {
     super::symbol_introduction::SymbolIntroductions::spawn(context, sink);
 }
 
-/// Checks the names of types and of optional arguments. A type is PascalCase
-/// or uppercase, as is an option declared by `Options => {…}` or `{…} >> f`.
-/// Functions and locals are free: rings, modules and other mathematical
-/// objects keep the names their notation gives them.
+/// Checks that type names are PascalCase or uppercase. Functions and locals
+/// are free: rings, modules and other mathematical objects keep the names
+/// their notation gives them. Option names are S01's.
 pub(super) fn naming_conventions(context: &DocumentContext, sink: &mut DiagnosticSink) {
     for binding in context.analysis.bindings() {
         if binding.role == BindingRole::Parameter || binding.state.is_ring_generator {
@@ -46,69 +40,6 @@ pub(super) fn naming_conventions(context: &DocumentContext, sink: &mut Diagnosti
                 ),
             );
         }
-    }
-    let mut declarations = OptionDeclarations::default();
-    for cell in context.syntax.cells().iter().filter_map(ParsedCell::syntax) {
-        declarations.visit_cell(cell);
-    }
-    for key in declarations.keys {
-        let name = key.text();
-        let Some(range) = context.source.range_for_syntax(key) else {
-            continue;
-        };
-        if !super::naming::follows_case(name, true) {
-            sink.spawn(
-                &catalog::NAMING_CONVENTION,
-                Finding::new(
-                    range,
-                    format!("Optional argument names should use PascalCase: `{name}`"),
-                ),
-            );
-        }
-    }
-}
-
-/// The names of the optional arguments the visited syntax declares: the keys
-/// of the list in `Options => {…}` and in the `{…} >> f` of a function.
-#[derive(Default)]
-struct OptionDeclarations<'ast> {
-    /// The declared names, in source order.
-    keys: Vec<&'ast Symbol>,
-}
-
-impl<'ast> OptionDeclarations<'ast> {
-    /// Records the keys of the `key => value` entries of the list `declared`.
-    fn declare(&mut self, declared: &'ast Expr) {
-        let Some(Expr::List(_)) = declared.unparenthesized() else {
-            return;
-        };
-        for entry in declared
-            .unparenthesized()
-            .into_iter()
-            .flat_map(Expr::contained_expressions)
-        {
-            if let Expr::Option(option) = entry {
-                if let Expr::Symbol(key) = option.key.as_ref() {
-                    self.keys.push(key);
-                }
-            }
-        }
-    }
-}
-
-impl<'ast> Visit<'ast> for OptionDeclarations<'ast> {
-    fn visit_expr_option(&mut self, option: &'ast ExprOption) {
-        if option.key.symbol_name() == Some(OPTIONS_KEY) {
-            self.declare(&option.value);
-        }
-        visit::visit_expr_option(self, option);
-    }
-
-    fn visit_expr_binary(&mut self, operation: &'ast ExprBinary) {
-        if operation.op.spelling() == <Token![>>]>::SPELLING {
-            self.declare(&operation.left);
-        }
-        visit::visit_expr_binary(self, operation);
     }
 }
 

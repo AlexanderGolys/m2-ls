@@ -48,7 +48,7 @@ const TEX_MATH_DELIMITERS: [(&str, &str); 4] =
 
 use super::{
     Code, DocumentationCollector, DocumentationFaultKind, DocumentationKey, DocumentationMarkup,
-    DocumentationMarkupKind, DocumentationNode, DocumentedSubject, EvaluatedExpression,
+    DocumentationMarkupKind, DocumentationNode, DocumentedSubject, EvaluatedExpression, ItemRole,
     NodeMarkdown, TextStyle,
 };
 use crate::macaulay2::Macaulay2Conventions;
@@ -176,6 +176,15 @@ impl SectionContext {
 }
 
 impl SimpleDocKeyword {
+    /// What the items of this section describe, when it lists items.
+    pub fn item_role(self) -> Option<ItemRole> {
+        match self {
+            Self::Inputs => Some(ItemRole::Input),
+            Self::Outputs => Some(ItemRole::Output),
+            _ => None,
+        }
+    }
+
     /// Whether a page may give the section only once: every section becomes
     /// one `document` option, except `Description` and `Synopsis`, which add
     /// to the description, and `Node`, which starts a page.
@@ -290,8 +299,6 @@ struct PageReading {
     /// The positions in the document's markup of the marks of the page's
     /// `Usage` lines.
     usage_markup: Range<usize>,
-    /// The names the page's `Inputs` and `Outputs` give what they describe.
-    item_names: Vec<String>,
 }
 
 impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
@@ -365,10 +372,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                             self.documentation.section_ranges.push(range);
                         }
                     }
-                    self.documentation.markup.push(DocumentationMarkup {
-                        bytes: keyword_bytes,
-                        kind: DocumentationMarkupKind::SectionKeyword,
-                    });
+                    self.mark(keyword_bytes, DocumentationMarkupKind::SectionKeyword);
                     sections.push(section);
                 }
                 _ => self.fault(
@@ -387,6 +391,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// where a fault about the whole page points.
     fn read_page(&mut self, sections: &[Section<'_>], range: TextRange, anchor: TextRange) {
         let mut page = PageReading::default();
+        let first_mark = self.documentation.markup.len();
         for section in sections {
             let keyword = self
                 .keyword(section)
@@ -413,18 +418,10 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         if let (Some(items), false) = (page.described_items, page.has_usage) {
             self.fault(items, DocumentationFaultKind::UsageRequired);
         }
-        // A `Usage` line writes the inputs by the names the items give them.
-        let source = self.source;
-        for markup in &mut self.documentation.markup[page.usage_markup.clone()] {
-            if markup.kind == DocumentationMarkupKind::Name
-                && page
-                    .item_names
-                    .iter()
-                    .any(|name| *name == source.text()[markup.bytes.clone()])
-            {
-                markup.kind = DocumentationMarkupKind::ItemName;
-            }
-        }
+        self.link_items(
+            first_mark..self.documentation.markup.len(),
+            page.usage_markup,
+        );
         self.documentation.nodes.push(DocumentationNode {
             range,
             keys: page.keys,
@@ -482,10 +479,10 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                         );
                     }
                     page.markdown.headline = Some(text.to_string());
-                    self.documentation.markup.push(DocumentationMarkup {
-                        bytes: first.text.clone(),
-                        kind: DocumentationMarkupKind::Styled(TextStyle::Strong),
-                    });
+                    self.mark(
+                        first.text.clone(),
+                        DocumentationMarkupKind::Styled(TextStyle::Strong),
+                    );
                 } else {
                     page.markdown.description.push(format!("#### {text}"));
                 }
@@ -513,7 +510,6 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             }
             Inputs | Outputs => {
                 page.described_items.get_or_insert(keyword_range);
-                page.item_names.extend(self.item_names(section));
                 self.read_items(section, keyword, &mut page.markdown);
             }
             Consequences => {
@@ -644,10 +640,10 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             }
             Pre => {
                 for line in part.nonblank() {
-                    self.documentation.markup.push(DocumentationMarkup {
-                        bytes: line.text.clone(),
-                        kind: DocumentationMarkupKind::Styled(TextStyle::Monospace),
-                    });
+                    self.mark(
+                        line.text.clone(),
+                        DocumentationMarkupKind::Styled(TextStyle::Monospace),
+                    );
                 }
                 page.markdown.description.push(NodeMarkdown::fenced_code(
                     "",
@@ -697,26 +693,6 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         );
     }
 
-    /// The names the items of `section`, an `Inputs` or `Outputs` section,
-    /// give what they describe: the `n` of `n:ZZ`.
-    fn item_names(&self, section: &Section<'_>) -> Vec<String> {
-        SimpleDocLine::split_by_indent(section.content)
-            .into_iter()
-            .filter_map(|range| {
-                let line = &section.content[range.start];
-                let item_line = ItemLine {
-                    text: &self.source.text()[line.text.clone()],
-                    origin: line.text.start,
-                };
-                let [(separator_start, ":")] = item_line.separators()[..] else {
-                    return None;
-                };
-                let name = item_line.trimmed(0..separator_start);
-                (!name.is_empty()).then(|| self.source.text()[name].to_string())
-            })
-            .collect()
-    }
-
     /// Read the items of `section`, an `Inputs` or `Outputs` section as
     /// `keyword` says, into the parameters, options, or returns of
     /// `markdown`, as Markdown list items. An item's first line names it and
@@ -745,15 +721,15 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 continue;
             };
             let name_bytes = item_line.trimmed(0..separator_start);
-            self.documentation.markup.push(DocumentationMarkup {
-                bytes: line.text.start + separator_start
+            self.mark(
+                line.text.start + separator_start
                     ..line.text.start + separator_start + separator.len(),
-                kind: DocumentationMarkupKind::Syntax(if separator == ":" {
+                DocumentationMarkupKind::Syntax(if separator == ":" {
                     M2SemanticTokenType::Punctuation
                 } else {
                     M2SemanticTokenType::Operator
                 }),
-            });
+            );
             let rest_start = separator_start + separator.len();
             let (type_end, abbreviation) = item_line.short_description(rest_start);
             let type_bytes = item_line.trimmed(rest_start..type_end);
@@ -776,10 +752,10 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
                 }
                 name
             } else {
-                self.documentation.markup.push(DocumentationMarkup {
-                    bytes: name_bytes.clone(),
-                    kind: DocumentationMarkupKind::ItemName,
-                });
+                let role = keyword
+                    .item_role()
+                    .expect("items are read in Inputs or Outputs");
+                self.mark(name_bytes.clone(), DocumentationMarkupKind::ItemName(role));
                 Some(self.source.text()[name_bytes].to_string())
             };
             let item_type = if type_bytes.is_empty() {
@@ -970,10 +946,10 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             if let Some((length, rendered, marks)) = markup {
                 self.flush_styled_run(run_start..start, style);
                 if marks.is_empty() {
-                    self.documentation.markup.push(DocumentationMarkup {
-                        bytes: start..start + length,
-                        kind: DocumentationMarkupKind::Styled(TextStyle::Tex),
-                    });
+                    self.mark(
+                        start..start + length,
+                        DocumentationMarkupKind::Styled(TextStyle::Tex),
+                    );
                 }
                 for (bytes, kind) in marks {
                     self.documentation
@@ -999,10 +975,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
     /// Mark the plain text at `bytes` of a group of `style`, if any.
     fn flush_styled_run(&mut self, bytes: ByteRange, style: Option<TextStyle>) {
         if let (Some(style), false) = (style, bytes.is_empty()) {
-            self.documentation.markup.push(DocumentationMarkup {
-                bytes,
-                kind: DocumentationMarkupKind::Styled(style),
-            });
+            self.mark(bytes, DocumentationMarkupKind::Styled(style));
         }
     }
 
@@ -1067,10 +1040,7 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
 
     /// Mark the delimiter of TeX markup at `bytes`.
     fn mark_text_markup(&mut self, bytes: ByteRange) {
-        self.documentation.markup.push(DocumentationMarkup {
-            bytes,
-            kind: DocumentationMarkupKind::TextMarkup,
-        });
+        self.mark(bytes, DocumentationMarkupKind::TextMarkup);
     }
 
     /// The entries of a `Subnodes` or `Tree` menu as Markdown list items,

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task;
-use tower_lsp::lsp_types::{Location, Url};
+use tower_lsp::lsp_types::{Location, Range as TextRange, Url};
 
 use crate::builtin_index::IndexedSourceLocation;
 use crate::document::DocumentSnapshot;
@@ -304,6 +304,19 @@ impl PackageSources {
 }
 
 impl LibrarySources<'_> {
+    /// The start of the documentation page a catalog location records, in the
+    /// installed copy of its file.
+    pub fn recorded_documentation(&self, recorded: &IndexedSourceLocation) -> Option<Location> {
+        let file = self
+            .source_resolver()
+            .resolve_indexed_file(&recorded.file)?;
+        let start = recorded.range.start;
+        Some(Location::new(
+            Url::from_file_path(file).ok()?,
+            TextRange::new(start, start),
+        ))
+    }
+
     /// Finds actual bindings in the file suggested by a catalog location.
     ///
     /// Catalog coordinates can denote a reference or belong to a different

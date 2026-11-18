@@ -23,7 +23,9 @@ use site to start from. Selecting a result opens its source location. Use the
 and [go to implementation](go-to.md) to inspect dispatch installations.
 
 Search results reflect the current index, including unsaved open buffers.
-A file outside the dependency graph does not appear merely because it sits
-under a workspace folder. Open it or load it from an indexed file to bring
-its definitions into the workspace. Results identify declarations; they do
+Opening a file indexes the
+[nearest 500](../getting-started/configuration.md#workspace) `.m2` files of
+its workspace folder, so a file there appears even if nothing loads it; in a
+larger folder, open a file or load it from an indexed one to bring its
+definitions in. Results identify declarations; they do
 not search comments, documentation prose, or arbitrary source text.

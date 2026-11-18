@@ -5,6 +5,13 @@ version = "0.1.*"
 [logging]
 level = "info"
 
+# Opening a document indexes this many .m2 files of its workspace folder,
+# nearest first; files it loads are always indexed. A walk also stops after
+# visiting scanEntryLimit directory entries, however few sources it found.
+[workspace]
+indexFileLimit = 500
+scanEntryLimit = 100000
+
 [diagnostics]
 enabled = true
 disabled = []

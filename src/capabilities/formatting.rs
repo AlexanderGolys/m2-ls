@@ -41,7 +41,7 @@ use crate::settings::spacing::{
 };
 use crate::settings::{FormattingSettings, Indent, ServerSettings};
 use crate::source::{SourceNavigation, SyntaxSource};
-use crate::syntax::{AssignmentSyntax, ExpressionSyntax};
+use crate::syntax::{AssignmentSyntax, AssignmentTarget, AssignmentTraversal, ExpressionSyntax};
 use layout::LayoutSource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -2285,12 +2285,10 @@ impl<'ast> Visit<'ast> for CallSpacing<'_> {
         visit::visit_expr_binary(self, call);
     }
     fn visit_expr_assign(&mut self, assignment: &'ast m2_syn::nodes::ExprAssign) {
-        if let crate::syntax::AssignmentTarget::Method { method, signature } =
-            assignment.parts().target
-        {
+        if let AssignmentTarget::Method { method, signature } = assignment.parts().target {
             self.gap(method, signature, " ");
         }
-        visit::visit_expr_assign(self, assignment);
+        assignment.visit_installing(self);
     }
 }
 

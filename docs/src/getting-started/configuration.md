@@ -2,7 +2,7 @@
 
 Settings are grouped by what they control: diagnostic publication, formatting,
 hint contents and placement, highlighting, installation discovery, source
-lookup, initialization, and operational logging. Every field is optional; an omitted field takes
+lookup, initialization, workspace indexing, and operational logging. Every field is optional; an omitted field takes
 its default.
 
 ## Complete default configuration { #defaults }
@@ -466,6 +466,32 @@ path the backup is `/tmp/m2-ls.log.1`. Timing summaries are written every
 verbose logging; values such as `0` are treated as paths, not as an off switch.
 Logs contain paths, timings, and error metadata rather than document contents
 or full request parameters.
+
+## Workspace indexing { #workspace }
+
+`workspace.indexFileLimit` (integer, default `500`)
+: How many `.m2` files of its workspace folder opening a document indexes,
+  besides the files it loads, which are always indexed. Files nearest to the
+  document come first: its own directory, then each parent's remaining files
+  up to the workspace folder. The default holds Core's sources (121 files) or
+  `Macaulay2Doc` (386) whole, while a folder of all 300 installed packages
+  stops after the 500 nearest files instead of indexing all of them. `0`
+  indexes only what the documents load. Indexing costs roughly 2 MB of memory
+  per file; a walk the limit cuts short is logged at `info` as
+  `repository_scan_truncated`. A change applies to documents opened
+  afterwards.
+
+`workspace.scanEntryLimit` (integer, default `100000`)
+: How many directory entries, files and directories alike, one walk visits
+  before it stops, however few sources it has found. It bounds the walk when
+  the workspace folder is a home directory or a whole filesystem, where
+  `.m2` files are too sparse for `indexFileLimit` to stop it.
+
+```toml
+[workspace]
+indexFileLimit = 100   # only the 100 nearest files
+scanEntryLimit = 20000
+```
 
 ## Operational logging { #logging }
 

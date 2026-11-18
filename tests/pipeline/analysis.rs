@@ -1113,9 +1113,10 @@ async fn installation_and_syntax_diagnostics_run_through_the_server_pipeline() {
         ("f = T -> (T = true; T)\n", "S08", false),
         ("f = T -> (Local := T; Local)\n", "S08", false),
         ("D = 3\n", "S08", false),
-        ("f = method(Options => {badOption => 1})\n", "S08", true),
+        ("f = method(Options => {badOption => 1})\n", "S08", false),
+        ("f = method(Options => {badOption => 1})\n", "S01", true),
         ("f = method(Options => {GoodOption => 1, Other => 2})\n", "S08", false),
-        ("f = {badOption => 1} >> o -> x -> x\n", "S08", true),
+        ("f = {badOption => 1} >> o -> x -> x\n", "S08", false),
         ("f = {GoodOption => 1} >> o -> x -> x\n", "S08", false),
         ("f = x -> {badKey => 1}\n", "S08", false),
         ("badType = new Type of HashTable\n", "S08", true),
@@ -4387,7 +4388,7 @@ async fn simple_doc_prose_reads_its_tex_markup_and_the_string_is_documentation()
         let (token_type, modifiers) = token_at(&tokens, source, styled, 0);
         assert_eq!(
             token_type,
-            session.semantic_token_type("docs"),
+            session.semantic_token_type("string"),
             "styled text stays text"
         );
         assert_ne!(
@@ -4398,14 +4399,18 @@ async fn simple_doc_prose_reads_its_tex_markup_and_the_string_is_documentation()
     }
     assert_eq!(
         token_at(&tokens, source, "Text", 0),
-        (session.semantic_token_type("keyword"), 0),
+        (
+            session.semantic_token_type("keyword"),
+            session.semantic_token_modifier("documentation")
+        ),
         "a part of a section is a section keyword like any other"
     );
     let (string_type, modifiers) = token_at(&tokens, source, "///\nKey", 0);
-    assert_eq!(string_type, session.semantic_token_type("docs"));
-    assert_eq!(
+    assert_eq!(string_type, session.semantic_token_type("string"));
+    assert_ne!(
         modifiers & session.semantic_token_modifier("documentation"),
-        0
+        0,
+        "the documentation string is documentation"
     );
     assert_eq!(
         token_at(&tokens, source, "2\n///", 0).0,
@@ -4441,12 +4446,12 @@ async fn documentation_markup_marks_delimiters_links_and_option_keys() {
     let mut session = DocumentSession::open(source).await;
     let tokens = semantic_tokens(&mut session).await;
     let token = |needle: &str, occurrence: usize| token_at(&tokens, source, needle, occurrence);
-    let documentation = 0;
+    let documentation = session.semantic_token_modifier("documentation");
     let option = session.semantic_token_modifier("optionalParameter");
     let example = session.semantic_token_modifier("example");
     let monospace = session.semantic_token_modifier("monospace");
     let macro_type = session.semantic_token_type("macro");
-    let string = session.semantic_token_type("docs");
+    let string = session.semantic_token_type("string");
     let decorator = session.semantic_token_type("decorator");
 
     for occurrence in [2, 3] {
@@ -5603,7 +5608,7 @@ Description
     let tokens = semantic_tokens(&mut session).await;
     let symbol = session.semantic_token_type("enumMember");
     let property = session.semantic_token_type("property");
-    let string = session.semantic_token_type("docs");
+    let string = session.semantic_token_type("string");
     let url = session.semantic_token_modifier("url");
     // Quoted operator names are symbols, in the key and in a link to it.
     for occurrence in [0, 1] {
@@ -6205,8 +6210,11 @@ async fn documentation_prose_and_embedded_code_have_distinct_tokens() {
     );
     let mut session = DocumentSession::open(source).await;
     let tokens = semantic_tokens(&mut session).await;
-    let docs = session.semantic_token_type("docs");
-    assert_eq!(token_at(&tokens, source, "    ordinary prose", 0).0, docs);
+    let documentation = session.semantic_token_modifier("documentation");
+    assert_eq!(
+        token_at(&tokens, source, "    ordinary prose", 0),
+        (session.semantic_token_type("string"), documentation)
+    );
     assert_eq!(
         token_at(&tokens, source, "spare", 0).0,
         session.semantic_token_type("variable")
@@ -6227,10 +6235,10 @@ async fn documentation_prose_and_embedded_code_have_distinct_tokens() {
     ] {
         let (ty, modifiers) = token_at(&tokens, source, text, occurrence);
         assert_eq!(ty, session.semantic_token_type(kind), "{text} {occurrence}");
-        assert_eq!(
-            modifiers & session.semantic_token_modifier("documentation"),
+        assert_ne!(
+            modifiers & documentation,
             0,
-            "{text}"
+            "code written in documentation is documentation: {text}"
         );
     }
     session.shutdown().await;

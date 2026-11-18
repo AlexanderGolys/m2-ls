@@ -15,8 +15,11 @@ input "lib/|             -- completes the .m2 files and folders of lib/
 
 Opening an included implementation file discovers the package entry point even
 when you have never opened it. The server indexes `.m2` files below the workspace
-root and builds their explicit import graph. Hidden directories, build output,
-and symlinked directories are excluded. Open buffers take precedence over disk.
+root, nearest to the opened file first and up to
+[`workspace.indexFileLimit`](../getting-started/configuration.md#workspace)
+(500) of them, and builds their explicit import graph. Hidden directories,
+build output, and symlinked directories are excluded. Open buffers take
+precedence over disk.
 
 For example, a package entry point can declare its package and load its types
 before its implementation:

@@ -46,6 +46,8 @@ pub struct Record {
     markdown: Option<String>,
     /// Where the corpus' extraction machine located the object's definition.
     source_location: Option<IndexedSourceLocation>,
+    /// Where the extraction machine located the object's documentation page.
+    documentation_location: Option<IndexedSourceLocation>,
 }
 
 /// A definition span as the extraction machine's `locate` reported it. The
@@ -134,6 +136,7 @@ impl Record {
             aliases: Vec::new(),
             markdown: None,
             source_location: None,
+            documentation_location: None,
         }
     }
 
@@ -166,6 +169,13 @@ impl Record {
     /// The definition span the corpus recorded, when `locate` found one.
     pub fn source_location(&self) -> Option<&IndexedSourceLocation> {
         self.source_location.as_ref()
+    }
+
+    /// The documentation page the corpus recorded: where go-to-definition
+    /// leads for an object with no Macaulay2 source, such as the compiled
+    /// `append`.
+    pub fn documentation_location(&self) -> Option<&IndexedSourceLocation> {
+        self.documentation_location.as_ref()
     }
 
     /// Rendered Markdown documentation attached to the record, when present.
@@ -574,6 +584,7 @@ impl BuiltinIndex {
                 aliases: Vec::new(),
                 markdown: None,
                 source_location: None,
+                documentation_location: None,
             });
         }
         // User is an implicit runtime package. It has a bare binding, but
@@ -597,6 +608,7 @@ impl BuiltinIndex {
                 aliases: Vec::new(),
                 markdown: None,
                 source_location: None,
+                documentation_location: None,
             });
             class_references.insert(user, ObjectName::new("$Core$Package"));
         }
@@ -640,6 +652,7 @@ impl BuiltinIndex {
                     aliases: Vec::new(),
                     markdown: None,
                     source_location: None,
+                    documentation_location: None,
                 });
                 class_references.insert(id, package_class);
             }
@@ -682,6 +695,7 @@ impl BuiltinIndex {
                     aliases: Vec::new(),
                     markdown: None,
                     source_location: None,
+                    documentation_location: None,
                 });
             }
         }
@@ -772,6 +786,7 @@ impl BuiltinIndex {
             aliases: Vec::new(),
             markdown: None,
             source_location: None,
+            documentation_location: None,
         });
         let type_id = self
             .type_id(&id)
@@ -801,6 +816,7 @@ impl BuiltinIndex {
             aliases: Vec::new(),
             markdown: None,
             source_location: None,
+            documentation_location: None,
         });
         let type_id = self
             .type_id(&id)
@@ -946,6 +962,7 @@ fn base_record(
         aliases,
         markdown: raw.markdown.take().filter(|markdown| !markdown.is_empty()),
         source_location: raw.source_location.take().map(Into::into),
+        documentation_location: raw.documentation_location.take().map(Into::into),
     }
 }
 

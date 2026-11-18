@@ -11,6 +11,7 @@
         - [Nvim without plugins](getting-started/nvim.md)
     - [Emacs](getting-started/emacs.md)
     - [Helix](getting-started/helix.md)
+    - [Claude Code](getting-started/claude-code.md)
     - [Any other LSP client](getting-started/other-editors.md)
 - [Features overview](gettings-started/overview.md)
 - [LSP capability reference](capabilities.md)

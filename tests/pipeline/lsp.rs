@@ -425,7 +425,8 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
             "Disable S16 in this file",
             "Disable S31 on this line",
             "Disable S31 in this file",
-            "Fix all in file"
+            "Fix all in file",
+            "Remove redundant parentheses in file"
         ]
     );
 
@@ -504,7 +505,7 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
         (
             "tryResult",
             "Simplify try",
-            "try tryValue then\n    tryResult",
+            "try tryValue then\n\ttryResult",
         ),
         ("bareTryValue", "Simplify try", "try bareTryValue"),
         (

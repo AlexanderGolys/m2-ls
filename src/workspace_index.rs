@@ -28,6 +28,7 @@ use crate::semantic_token::{
     local_symbol_semantic_token, M2SemanticToken, M2SemanticTokenModifier, M2SemanticTokenType,
 };
 use crate::settings::SettingsStore;
+use crate::settings::WorkspaceSettings;
 use crate::source_package::{ExportAccess, PackageDeclaration, PackageExport};
 use crate::typesystem::{TypeKnowledge, TypeRole};
 
@@ -291,8 +292,9 @@ pub struct WorkspaceIndex {
     /// The package a file belongs to because it is loaded from inside the
     /// package's section.
     package_of_loaded_file: DashMap<Url, BTreeSet<ObjectName>>,
-    /// Repository roots whose source files have been discovered for this session.
-    discovered_repositories: DashSet<PathBuf>,
+    /// Directories from which repository sources have been discovered this
+    /// session, nearest first.
+    discovered_directories: DashSet<PathBuf>,
     /// The indexed files sessions start with, whose globals only those
     /// sessions see.
     init_files: DashSet<Url>,
@@ -579,36 +581,56 @@ impl WorkspaceIndex {
         }
     }
 
-    /// The repository's sources, or none when it is too large to be a project;
-    /// the refusal is recorded in telemetry.
-    fn scanned(root: &Path) -> Vec<Url> {
-        RepositorySources::files(root).unwrap_or_else(|refusal| {
+    /// The sources below `root` within the `limits`, nearest to `start`
+    /// first; a walk the limits cut short is recorded in telemetry.
+    fn discovered(start: &Path, root: &Path, limits: WorkspaceSettings) -> Vec<Url> {
+        let discovered = RepositorySources::nearest_files(start, root, limits);
+        if discovered.truncated {
             crate::telemetry::event_at(
-                crate::settings::LogLevel::Warn,
+                crate::settings::LogLevel::Info,
                 serde_json::json!({
-                    "operation": "repository_scan_refused", "message": refusal.to_string(),
+                    "operation": "repository_scan_truncated",
+                    "root": root, "start": start, "files": discovered.files.len(), "limits": limits,
                 }),
             );
-            Vec::new()
-        })
+        }
+        discovered.files
     }
 
-    /// Discovers a repository once, so opening an included file also discovers
-    /// its unopened package entry point and siblings. Open buffers remain authoritative.
-    pub fn repository_files(&self, file: &Url, folders: &[PathBuf]) -> Vec<Url> {
+    /// The unindexed sources of the repository holding `file` within the
+    /// `limits`, nearest to `file` first, so that opening an included file
+    /// also discovers its unopened package entry point and siblings. Each
+    /// directory is discovered from once; open buffers remain authoritative.
+    pub fn repository_files(
+        &self,
+        file: &Url,
+        folders: &[PathBuf],
+        limits: WorkspaceSettings,
+    ) -> Vec<Url> {
         let Some(root) = RepositorySources::root(file, folders) else {
             return Vec::new();
         };
-        if !self.discovered_repositories.insert(root.clone()) {
+        let Some(start) = file
+            .to_file_path()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+        else {
+            return Vec::new();
+        };
+        if !self.discovered_directories.insert(start.clone()) {
             return Vec::new();
         }
-        Self::scanned(&root)
+        Self::discovered(&start, &root, limits)
+            .into_iter()
+            .filter(|source| !self.is_indexed(source))
+            .collect()
     }
 
-    /// Source files newly created below a workspace path, including a package
-    /// entry point that no open fragment explicitly imports.
-    pub fn sources_under(&self, path: &Path) -> Vec<Url> {
-        Self::scanned(path)
+    /// The source files, within the `limits`, newly created below a workspace path,
+    /// including a package entry point that no open fragment explicitly
+    /// imports.
+    pub fn sources_under(&self, path: &Path, limits: WorkspaceSettings) -> Vec<Url> {
+        Self::discovered(path, path, limits)
     }
 
     /// Reconstructs package ownership through load edges after all files have

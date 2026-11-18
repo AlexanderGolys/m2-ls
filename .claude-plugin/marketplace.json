@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "m2-ls",
+  "description": "The Macaulay2 language server as a Claude Code plugin",
+  "owner": {
+    "name": "Alexander Golys"
+  },
+  "plugins": [
+    {
+      "name": "m2-ls",
+      "description": "Macaulay2 language server for code intelligence and diagnostics",
+      "source": "./claude-plugin",
+      "category": "development"
+    }
+  ]
+}

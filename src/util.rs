@@ -22,24 +22,30 @@ macro_rules! pos_max {
     };
 }
 
-/// Containment operations for LSP ranges using their half-open boundaries.
+/// Containment and extension of LSP ranges using their half-open boundaries.
 pub trait TextRangeExt {
     /// Tests half-open containment of an LSP UTF-16 position.
     fn contains_position(&self, position: Position) -> bool;
+
+    /// Tests closed containment: a cursor just after a word still touches it.
+    fn touches(&self, position: Position) -> bool;
+
+    /// The range from this range's start to `last`'s end: an assignment's
+    /// target `k` through its value `delta - 1` gives the whole `k := delta - 1`.
+    fn through(&self, last: TextRange) -> TextRange;
 }
 
 impl TextRangeExt for TextRange {
     fn contains_position(&self, position: Position) -> bool {
-        if position.line < self.start.line || position.line > self.end.line {
-            return false;
-        }
-        if position.line == self.start.line && position.character < self.start.character {
-            return false;
-        }
-        if position.line == self.end.line && position.character >= self.end.character {
-            return false;
-        }
-        true
+        self.start <= position && position < self.end
+    }
+
+    fn touches(&self, position: Position) -> bool {
+        self.start <= position && position <= self.end
+    }
+
+    fn through(&self, last: TextRange) -> TextRange {
+        TextRange::new(self.start, last.end)
     }
 }
 

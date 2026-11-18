@@ -21,7 +21,7 @@ use std::sync::{LazyLock, RwLock};
 use std::{fmt, mem};
 
 use semver::VersionReq;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use serde_path_to_error::{Path, Segment};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
@@ -98,6 +98,26 @@ pub struct ServerSettings {
     pub initialization: InitializationSettings,
     /// Operational log verbosity; independent of source diagnostic severity.
     pub logging: LoggingSettings,
+    /// `workspace.*`: how much of the workspace is indexed unasked.
+    pub workspace: WorkspaceSettings,
+}
+
+/// `workspace.*`: how much of the workspace the server indexes on its own,
+/// beyond the open documents and the files they load. For example,
+/// `[workspace] indexFileLimit = 100` keeps the walk from each opened file to
+/// its 100 nearest sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceSettings {
+    /// The most `.m2` files opening a document indexes from its workspace
+    /// folder, nearest to the document first. The default, `500`, holds
+    /// Core's sources (121 files) or `Macaulay2Doc` (386) whole; `0`
+    /// indexes only what the documents load.
+    pub index_file_limit: usize,
+    /// The most directory entries, files and directories alike, one walk
+    /// visits before it stops, however few sources it found: a folder holding
+    /// more is a home directory or a filesystem rather than a project.
+    pub scan_entry_limit: usize,
 }
 
 /// Operational logging configuration, for example `[logging] level = "debug"`.

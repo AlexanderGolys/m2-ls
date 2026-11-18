@@ -35,11 +35,15 @@
 mod hypertext;
 mod simple_doc;
 
+use std::collections::HashMap;
+use std::ops::Range;
+
 use m2_syn::nodes::{Elements, Expr, ExprBinary, ExprQuote, Symbol};
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Lex, Spanned, TokenTree};
 use strum::{Display, EnumString, IntoStaticStr};
 use tower_lsp::lsp_types::Range as TextRange;
+use tower_lsp::lsp_types::{Position, TextEdit, Url, WorkspaceEdit};
 
 use crate::analysis::{Analysis, QuotedName};
 use crate::documentation::{DocumentationBlock, DocumentationTarget};
@@ -52,6 +56,7 @@ use crate::source::{ByteRange, DocumentSource, DocumentSpan, SourceNavigation, S
 use crate::source_package::{CodeFragment, PackageSessionCode, SourcePackages};
 use crate::string_literal::{LiteralSource, StringDelimiter};
 use crate::syntax::{Applications, BindingReferences, ExpressionSyntax};
+use crate::util::TextRangeExt;
 
 pub use hypertext::DocumentOption;
 use hypertext::{HypertextMarkdown, SemanticMarkup, TexStrings};
@@ -101,6 +106,8 @@ pub struct PackageDocumentation {
     faults: Vec<DocumentationFault>,
     /// Executable examples paired with their package-loading context.
     example_sessions: Vec<PackageSessionCode>,
+    /// The `Inputs` and `Outputs` items of every page, each with its mentions.
+    items: Vec<DocumentationItem>,
     /// Source extents of functions that contribute SimpleDoc documentation.
     simple_doc_functions: Vec<TextRange>,
 }
@@ -128,6 +135,50 @@ pub struct DocumentationKey {
     pub range: TextRange,
     /// What the key names.
     pub subject: DocumentedSubject,
+}
+
+/// An `Inputs` or `Outputs` item of a page, and the text of the same page
+/// naming it. In
+///
+/// ```m2
+/// document {
+///     Key => (exp, RingElement),
+///     Usage => "exp x",
+///     Inputs => {"x"},
+///     Outputs => {{"the exponential of ", TT "x"}}
+/// }
+/// ```
+///
+/// the `"x"` of `Inputs` declares the item `x`, which the `x` of `Usage` and
+/// the `TT "x"` mention. Monospace text promises nothing about what it names,
+/// so only text spelling exactly an item of its own page is a mention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentationItem {
+    /// The name the item list gives the item.
+    pub declaration: TextRange,
+    /// The `Usage` names and monospace text spelling the name, in no order.
+    pub mentions: Vec<TextRange>,
+}
+
+impl DocumentationItem {
+    /// The declaration followed by every mention.
+    pub fn occurrences(&self) -> impl Iterator<Item = TextRange> + '_ {
+        std::iter::once(self.declaration).chain(self.mentions.iter().copied())
+    }
+
+    /// The occurrence the cursor at `position` touches.
+    pub fn occurrence_at(&self, position: Position) -> Option<TextRange> {
+        self.occurrences().find(|range| range.touches(position))
+    }
+
+    /// The edit writing `new_name` over every occurrence, in the document at `uri`.
+    pub fn renamed(&self, uri: &Url, new_name: &str) -> WorkspaceEdit {
+        let edits = self
+            .occurrences()
+            .map(|range| TextEdit::new(range, new_name.to_string()))
+            .collect();
+        WorkspaceEdit::new(HashMap::from([(uri.clone(), edits)]))
+    }
 }
 
 /// A quoted documentation page title at a definition or a link target.
@@ -226,8 +277,9 @@ pub enum DocumentationMarkupKind {
     /// `Limit` of `[f, Limit]`.
     OptionName,
     /// The name an `Inputs` or `Outputs` item gives the argument or value it
-    /// describes, the `n` of `n:ZZ`.
-    ItemName,
+    /// describes, the `n` of `n:ZZ`, or text of its page naming the item
+    /// (see [`DocumentationItem`]).
+    ItemName(ItemRole),
     /// Markup around documentation text: a delimiter of TeX markup, the
     /// `{\tt` and `}` of `{\tt x}`, or a hypertext constructor such as `TT`
     /// or `PARA`.
@@ -241,6 +293,15 @@ pub enum DocumentationMarkupKind {
     /// A literal, operator, or keyword of embedded code, highlighted as its
     /// syntax.
     Syntax(M2SemanticTokenType),
+}
+
+/// What an `Inputs` or `Outputs` item describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemRole {
+    /// An argument the documented function takes: an `Inputs` item.
+    Input,
+    /// A value the documented function returns: an `Outputs` item.
+    Output,
 }
 
 /// How documentation shows a span of its text.
@@ -434,11 +495,15 @@ impl PackageDocumentation {
         &self.text_tags
     }
 
+    /// The item whose declaration or mention the cursor at `position` touches.
+    pub fn item_at(&self, position: Position) -> Option<&DocumentationItem> {
+        self.items
+            .iter()
+            .find(|item| item.occurrence_at(position).is_some())
+    }
+
     /// The quoted page title under the cursor, including either quote character.
-    pub fn text_tag_at(
-        &self,
-        position: tower_lsp::lsp_types::Position,
-    ) -> Option<&DocumentationTextTag> {
+    pub fn text_tag_at(&self, position: Position) -> Option<&DocumentationTextTag> {
         self.text_tags
             .iter()
             .find(|tag| tag.range.start <= position && position < tag.range.end)
@@ -826,6 +891,57 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
         }
     }
 
+    /// Link each item that the page's marks at `page` declare, the `x` of
+    /// `x:ZZ` or `"x" => ZZ`, to the text of the page naming it: a name of
+    /// its `Usage` code, marked at `usage`, or monospace text spelling the
+    /// name, `TT "x"` or `{\tt x}`. Each mention is then marked as the item;
+    /// a literal's mark keeps its quotes, while the mention, which a rename
+    /// rewrites, is its content.
+    fn link_items(&mut self, page: Range<usize>, usage: Range<usize>) {
+        let text = self.source.text();
+        let marks = &mut self.documentation.markup[page.clone()];
+        let mut items = marks
+            .iter()
+            .filter(|markup| matches!(markup.kind, DocumentationMarkupKind::ItemName(_)))
+            .map(|markup| {
+                let declaration = self.source.range_for_bytes(markup.bytes.clone());
+                let item = DocumentationItem {
+                    declaration,
+                    mentions: Vec::new(),
+                };
+                (&text[markup.bytes.clone()], markup.kind, item)
+            })
+            .collect::<Vec<_>>();
+        for (index, markup) in page.zip(marks.iter_mut()) {
+            let named = match markup.kind {
+                DocumentationMarkupKind::Name if usage.contains(&index) => markup.bytes.clone(),
+                DocumentationMarkupKind::Styled(TextStyle::Monospace) => {
+                    let marked = &text[markup.bytes.clone()];
+                    StringDelimiter::split(marked).map_or(markup.bytes.clone(), |(_, content)| {
+                        markup.bytes.start + content.start..markup.bytes.start + content.end
+                    })
+                }
+                _ => continue,
+            };
+            let name = &text[named.clone()];
+            let Some((_, kind, item)) = items.iter_mut().find(|(item, ..)| *item == name) else {
+                continue;
+            };
+            item.mentions.push(self.source.range_for_bytes(named));
+            markup.kind = *kind;
+        }
+        self.documentation
+            .items
+            .extend(items.into_iter().map(|(.., item)| item));
+    }
+
+    /// Mark the source at `bytes` as `kind`.
+    fn mark(&mut self, bytes: ByteRange, kind: DocumentationMarkupKind) {
+        self.documentation
+            .markup
+            .push(DocumentationMarkup { bytes, kind });
+    }
+
     /// Record `kind` of fault at `range`.
     fn fault(&mut self, range: TextRange, kind: DocumentationFaultKind) {
         self.documentation
@@ -961,22 +1077,14 @@ impl<S: SourceNavigation + ?Sized> DocumentationCollector<'_, S> {
             if !self.names_symbol(&source.text()[bytes.clone()]) {
                 // A string naming no symbol names a page by its title, and is
                 // read as a link's text.
-                self.documentation.markup.push(DocumentationMarkup {
-                    bytes: literal,
-                    kind: DocumentationMarkupKind::Styled(TextStyle::Url),
-                });
+                self.mark(literal, DocumentationMarkupKind::Styled(TextStyle::Url));
                 continue;
             }
             self.documentation
                 .key_strings
                 .push(self.source.span_for_bytes(bytes.clone()));
-            self.documentation.markup.push(DocumentationMarkup {
-                bytes: literal,
-                kind: DocumentationMarkupKind::QuotedName {
-                    start: bytes.start,
-                    end: bytes.end,
-                },
-            });
+            let (start, end) = (bytes.start, bytes.end);
+            self.mark(literal, DocumentationMarkupKind::QuotedName { start, end });
         }
     }
 

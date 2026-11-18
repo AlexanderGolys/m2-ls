@@ -5,6 +5,28 @@ language-server commands. These commands use `macaulay2.executable` when configu
 on `PATH`, and run only
 when you invoke them. Ordinary analysis does not execute your code.
 
+## Code lenses
+
+In editors that show code lenses, the commands are a click away:
+
+```m2
+-- ▶ Run file  ▶ Run tests
+newPackage("Tiny", Headline => "a tiny package")
+export {"double"}
+double = method()
+double ZZ := ZZ => n -> 2 * n
+TEST ///
+assert(double 2 == 4)
+///
+```
+
+**▶ Run file** sits on the first line of every file. **▶ Run tests** sits on
+the `newPackage` line of each package that registers at least one `TEST`.
+When no M2 executable is found, no lenses are shown. Each lens sends the
+command below, and the editor presents the result it returns.
+
+## Commands
+
 Send `workspace/executeCommand` with one object in `arguments`. For example,
 to run the tests for a package from its source checkout:
 
@@ -34,7 +56,8 @@ Each command starts a fresh process in the source file's parent directory,
 using normal M2 initialization. Definitions do not persist between invocations.
 The response contains `success`, `exitCode`, `stdout`, and `stderr`; output is
 returned when the process finishes rather than streamed. A missing executable
-or failure to launch is returned as an LSP error. A failed M2 process returns
+(no `macaulay2.executable` and no `M2` on `PATH`) or a failure to launch is
+returned as an LSP error. A failed M2 process returns
 its captured output and `success: false`.
 
 Clients decide how to present results and bind commands. The server does not

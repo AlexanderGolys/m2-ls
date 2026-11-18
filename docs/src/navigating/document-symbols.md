@@ -31,6 +31,8 @@ Bindings
 : Assignments and `:=` bindings, with their inferred type as detail when one
   is known. The symbol kind follows the value: a function or method function
   is a function, a type — rings included — a class, anything else a variable.
+  A parallel assignment lists every name it binds, in any brackets Macaulay2
+  destructures, at any depth: `[p, {q, r}] := …` lists `p`, `q` and `r`.
 
 Installations
 : Each method installation, named by its pattern — `area Matrix`,

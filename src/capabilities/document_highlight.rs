@@ -8,7 +8,7 @@ use crate::capabilities::navigation::{reference_ranges_resolved, unbound_referen
 use crate::document::DocumentSnapshot;
 use crate::object_registry::ObjectName;
 use crate::source::{SourceNavigation, SyntaxSource};
-use crate::syntax::{BindingReferences, StatementKeywords};
+use crate::syntax::StatementKeywords;
 use crate::typesystem::TypeKnowledge;
 use tower_lsp::lsp_types::{
     DocumentHighlight, DocumentHighlightKind, DocumentHighlightOptions, OneOf, Position,
@@ -33,6 +33,16 @@ pub fn document_highlights(
         .is_some_and(|(name, _)| matches!(name, "null" | "true" | "false"))
     {
         return None;
+    }
+    if let Some(item) = document.package_documentation().item_at(position) {
+        return Some(
+            item.occurrences()
+                .map(|range| DocumentHighlight {
+                    range,
+                    kind: Some(DocumentHighlightKind::TEXT),
+                })
+                .collect(),
+        );
     }
     if let Some(highlights) = quoted_name_highlights(document, position) {
         return Some(highlights);
@@ -87,71 +97,8 @@ fn package_reference_highlights(
     position: Position,
     knowledge: &(impl TypeKnowledge + ?Sized),
 ) -> Option<Vec<DocumentHighlight>> {
-    let name = document
-        .package_mentions()
-        .iter()
-        .find(|mention| mention.contains(position))
-        .map(|mention| mention.name(document.text()))
-        .or_else(|| {
-            let (name, _) = document.symbol_occurrence_at(position)?;
-            let is_package = document.source_binding_at(name, position).map_or_else(
-                || {
-                    document
-                        .package_mentions()
-                        .iter()
-                        .any(|mention| mention.name(document.text()) == name)
-                        || knowledge
-                            .get_record(&ObjectName::new(name))
-                            .is_some_and(|record| {
-                                knowledge.has_type_role(
-                                    &record.class,
-                                    crate::typesystem::TypeRole::Package,
-                                )
-                            })
-                },
-                |binding| {
-                    binding.state.presentation_kind == tower_lsp::lsp_types::SymbolKind::NAMESPACE
-                },
-            );
-            is_package.then_some(name)
-        })?;
-    let mut ranges = document
-        .package_mentions()
-        .iter()
-        .filter(|mention| mention.name(document.text()) == name)
-        .map(|mention| mention.range())
-        .collect::<Vec<_>>();
-    let mut references = BindingReferences::default();
-    document.syntax().visit(&mut references);
-    ranges.extend(
-        references
-            .0
-            .into_iter()
-            .filter(|symbol| symbol.text() == name)
-            .filter_map(|symbol| document.range_for_syntax(symbol))
-            .filter(|range| {
-                document
-                    .source_binding_at(name, range.start)
-                    .is_none_or(|binding| {
-                        binding.state.presentation_kind
-                            == tower_lsp::lsp_types::SymbolKind::NAMESPACE
-                    })
-            }),
-    );
-    ranges.extend(
-        document
-            .symbol_mentions()
-            .iter()
-            .filter(|mention| mention.name(document.text()) == name)
-            .filter(|mention| {
-                document.mention_symbol(mention).is_none_or(|binding| {
-                    binding.state.presentation_kind == tower_lsp::lsp_types::SymbolKind::NAMESPACE
-                })
-            })
-            .map(|mention| mention.range()),
-    );
-    ranges.sort_by_key(|range| (range.start, range.end));
-    ranges.dedup();
+    let (name, _) = document.package_name_at(position, knowledge)?;
+    let ranges = document.package_name_ranges(name);
     (!ranges.is_empty()).then(|| {
         ranges
             .into_iter()

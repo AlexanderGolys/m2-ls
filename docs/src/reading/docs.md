@@ -22,6 +22,28 @@ local function shadowing a library name gets its own description.
   `D` rules cover missing or duplicate keys, invalid links, section structure,
   undocumented exports, and placement relative to package documentation setup.
 
+## Inputs and outputs on a page { #items }
+
+A page's `Inputs` and `Outputs` name what they describe: `n:ZZ` in SimpleDoc,
+`"n" => ZZ` or a bare `"n"` in a `document` list. The page's `Usage` and its
+monospace text — `TT "n"`, `{\tt n}`, `@TT "n"@` — usually name the same
+items, wherever on the page they appear:
+
+```m2
+document {
+    Key => (exp, RingElement),
+    Usage => "exp x",
+    Inputs => {"x"},
+    Outputs => {{"the exponential of ", TT "x", ", provided ", TT "x", " is nilpotent"}}
+    }
+```
+
+Each `x` here is the input: highlighted as a parameter (an output as a
+variable), and go to definition, highlights, references and rename treat
+them as one name. Monospace text only says *typewriter*, not *a name*, so
+only text spelling exactly an item of its own page is linked; `TT "x^2"`
+or a `TT "x"` on another page stays prose.
+
 ## Where the information comes from
 
 Library prose and signatures come from the downloaded catalog. You can read

@@ -1,5 +1,43 @@
 # Changelog
 
+## 2.8.0 - 2026-11-18
+
+- Add code lenses for the runtime commands: **▶ Run file** on every file and
+  **▶ Run tests** on the `newPackage` line of packages registering TESTs,
+  shown only when an M2 executable is found. The commands now find `M2` on
+  `PATH` the same way and report a missing executable plainly.
+- Go to definition on a name without Macaulay2 source, such as the compiled
+  `append`, opens its documentation page when the catalog records one.
+  Source is always preferred.
+- Add S31 `unintroduced-symbol`, E25 `package-rebinding`, E26
+  `library-global-value`, T07 `call-arity-mismatch`, and S32
+  `error-catching-rewrite` (behind `diagnostics.errorCatchingRewrites`).
+  S10 is narrowed to source-owned constructors.
+- S08 checks type names only; option names are reported once, by S01.
+- Recognize destructuring in every bracket Macaulay2 accepts, `()`, `[]`,
+  `{}` and `<|…|>`, nested in any mix, across diagnostics, symbols and hints.
+  Prefix and postfix operator installations, `- T := …` and `T ^~ := …`, are
+  recognized as installations.
+- Installation targets are no longer analyzed as calls, removing false T05
+  reports and a formatter spacing conflict. `method(…)` option declarations
+  are read correctly by S01.
+- Signature help respects which bindings a file's imports make visible.
+- Hover on a local inside a function body shows its own statement rather
+  than the whole enclosing definition.
+- Documentation is a semantic modifier rather than a token type: prose is a
+  `string` or `comment`, and everything inside documentation, embedded code
+  included, carries `documentation`. String keys are properties: the key an
+  entry writes, `{"name" => v}`, carries `declaration`; `h#"name"` reads it.
+  String option names are recorded, so `f(x, "Eps" => 2)` is an option of
+  `method(Options => {"Eps" => 1})`.
+- Formatting gains `formatting.indent` and operator and bracket spacing
+  settings; `logging.level` controls server logs. Setting defaults are
+  compiled in from one file.
+- Suppression directives cover the whole expression below them.
+- Ship the repository as a Claude Code plugin marketplace with an `m2-ls`
+  plugin.
+- Update m2-syn to 0.8 and the user guide for all of the above.
+
 ## 2.7.0 - 2026-11-13
 
 - Prevent semantic-token requests from panicking on invalid byte spans or

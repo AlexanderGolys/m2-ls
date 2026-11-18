@@ -78,6 +78,8 @@ vim.lsp.config('m2_ls', {
 vim.lsp.enable('m2_ls')
 ```
 
+Claude Code: `/plugin install m2-ls --marketplace AlexanderGolys/m2-ls`.
+
 Any other LSP client: run `m2-ls` over stdio for `.m2` files and give it a
 project root, which is the scope of workspace search and cross-file rename.
 Navigation also enters the Macaulay2 library source of the loaded packages when

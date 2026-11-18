@@ -26,16 +26,16 @@ impl LiteralSource for Expr {
         &self,
         source: &(impl SourceNavigation + ?Sized),
     ) -> Option<ByteRange> {
-        let (width, last): (usize, Option<&dyn Spanned>) = match self {
+        let (delimiter, last): (StringDelimiter, Option<&dyn Spanned>) = match self {
             Expr::Literal(Literal::String(literal)) => (
-                1,
+                StringDelimiter::Quote,
                 literal
                     .fragments
                     .last()
                     .map(|element| element as &dyn Spanned),
             ),
             Expr::Literal(Literal::RawString(literal)) => (
-                3,
+                StringDelimiter::TripleSlash,
                 literal
                     .fragments
                     .last()
@@ -43,6 +43,7 @@ impl LiteralSource for Expr {
             ),
             _ => return None,
         };
+        let width = delimiter.marker().len();
         let bytes = source.syntax_bytes(self)?;
         let start = bytes.start.checked_add(width)?;
         let end = match last {
@@ -63,6 +64,8 @@ const OCTAL_ESCAPE_DIGITS: usize = 3;
 const HEX_ESCAPE_DIGITS: usize = 2;
 /// The delimiter of a verbatim string, `///…///`, on both sides.
 const TRIPLE_SLASH: &str = "///";
+/// The delimiter of an escaped string, `"…"`, on both sides.
+const QUOTE: &str = "\"";
 
 /// How a string literal delimits its text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,11 +174,31 @@ impl StringDelimiter {
 
     /// `value` as a whole literal with these delimiters.
     pub fn literal(self, value: &str) -> Option<String> {
-        let content = self.encode(value)?;
-        Some(match self {
-            Self::Quote => format!("\"{content}\""),
-            Self::TripleSlash => format!("{TRIPLE_SLASH}{content}{TRIPLE_SLASH}"),
-        })
+        let marker = self.marker();
+        Some(format!("{marker}{}{marker}", self.encode(value)?))
+    }
+
+    /// What these delimiters write on each side of the content.
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::Quote => QUOTE,
+            Self::TripleSlash => TRIPLE_SLASH,
+        }
+    }
+
+    /// The delimiters of `literal`, the source of a whole string literal, and
+    /// the bytes of its content: `"x"` gives `Quote` and `1..2`. `None` for
+    /// text not delimited on both sides.
+    pub fn split(literal: &str) -> Option<(Self, ByteRange)> {
+        [Self::TripleSlash, Self::Quote]
+            .into_iter()
+            .find_map(|delimiter| {
+                let width = delimiter.marker().len();
+                (literal.len() >= 2 * width
+                    && literal.starts_with(delimiter.marker())
+                    && literal.ends_with(delimiter.marker()))
+                .then(|| (delimiter, width..literal.len() - width))
+            })
     }
 }
 

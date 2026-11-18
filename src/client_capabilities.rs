@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tower_lsp::jsonrpc;
-use tower_lsp::lsp_types::ClientCapabilities;
+use tower_lsp::lsp_types::{ClientCapabilities, ResourceOperationKind};
 use tower_lsp::Client;
 
 /// A negotiated client feature with its request or registration behavior.
@@ -83,6 +83,26 @@ impl ClientCapability for InlayHintRefresh {
 impl WorkspaceRefresh<InlayHintRefresh> for Client {
     fn refresh(&self) -> impl Future<Output = jsonrpc::Result<()>> + Send {
         self.inlay_hint_refresh()
+    }
+}
+
+/// Marker for clients applying workspace edits that rename files, such as
+/// the one renaming a package together with its `P.m2`.
+#[derive(Debug)]
+pub struct WorkspaceEditFileRenames;
+
+impl ClientCapability for WorkspaceEditFileRenames {
+    fn supported_by(capabilities: &ClientCapabilities) -> bool {
+        capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.workspace_edit.as_ref())
+            .is_some_and(|edit| {
+                edit.document_changes == Some(true)
+                    && edit.resource_operations.as_ref().is_some_and(|operations| {
+                        operations.contains(&ResourceOperationKind::Rename)
+                    })
+            })
     }
 }
 

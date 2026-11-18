@@ -13,6 +13,7 @@ use crate::document::DocumentSnapshot;
 use crate::meta::BindingRole;
 use crate::object_registry::ObjectName;
 use crate::typesystem::InferredType;
+use crate::util::TextRangeExt;
 
 /// A source declaration with the location and kind shown in workspace search.
 #[derive(Debug, Clone)]
@@ -43,7 +44,12 @@ pub fn collect_document_symbols(document: &DocumentSnapshot) -> Vec<DocumentSymb
                 .as_ref()
                 .and_then(InferredType::label),
             kind: binding.state.presentation_kind,
-            range: binding.state.definition_range,
+            range: binding
+                .state
+                .value_range
+                .map_or(binding.state.span, |value| {
+                    binding.state.span.through(value)
+                }),
             selection_range: binding.state.span,
             scope_idx: binding.state.scope_idx,
             child_scope_idx: binding

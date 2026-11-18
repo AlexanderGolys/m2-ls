@@ -104,7 +104,7 @@ next.
 | `S05` | `unnecessary-null-branch` | hint | an `if` with a removable `null` branch |
 | `S06` | `ring-variable-naming` | hint | a multi-character ring variable such as `x0` instead of `x_0` |
 | `S07` | `shared-method-codomain` | hint | at least five method installations, with more than 75% explicitly annotating the same result type; consider declaring a shared `TypicalValue` |
-| `S08` | `naming-convention` | hint | a type name or a declared optional argument (`Options => {…}`, `{…} >> f`) outside PascalCase or uppercase |
+| `S08` | `naming-convention` | hint | a type name outside PascalCase or uppercase |
 | `S09` | `bound-option-key` | warning | an option key whose existing source binding is evaluated instead of supplying the name as a symbol; bound values are allowed |
 | `S10` | `constructor-typical-value` | hint | a source-owned constructor for a source-owned type missing that global typical value, or an installation annotating a result outside that type family |
 | `S11` | `null-return-guard` | hint | an unused `if x === null then return y` guard expressible as `x ?? return y` |
@@ -249,8 +249,7 @@ editors show as a clickable note.
 
 ## Naming, options, and constructors { #naming }
 
-`S08` checks that type names and declared optional arguments use PascalCase
-or uppercase. Function and local names are free, since rings, modules and
+`S08` checks that type names use PascalCase or uppercase. Function and local names are free, since rings, modules and
 other mathematical objects keep the names their notation gives them. Function
 parameters, ring generators and ordinary global values are also outside this
 check. Leading underscores are allowed.

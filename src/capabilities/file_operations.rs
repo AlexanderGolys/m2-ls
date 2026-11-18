@@ -7,8 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tower_lsp::lsp_types::{
-    FileOperationFilter, FileOperationPattern, FileOperationPatternKind,
-    FileOperationRegistrationOptions, FileRename, TextEdit, Url,
+    DocumentChangeOperation, FileOperationFilter, FileOperationPattern, FileOperationPatternKind,
+    FileOperationRegistrationOptions, FileRename, RenameFile, ResourceOp, TextEdit, Url,
     WorkspaceFileOperationsServerCapabilities,
 };
 use walkdir::{DirEntry, WalkDir};
@@ -75,6 +75,49 @@ impl FromIterator<FileRename> for FileMoves {
 }
 
 impl FileMoves {
+    /// The moves renaming the package `name`, declared in `file`, to
+    /// `new_name`. Macaulay2 finds package `P` in `P.m2` and its auxiliary
+    /// files in the directory `P/` beside it, so `file`, when it is
+    /// `name.m2`, and a directory `name/` beside it take the new name.
+    pub fn renaming_package(file: &Path, name: &str, new_name: &str) -> Self {
+        let directory = file.parent().expect("a source file lies in a directory");
+        let source = |package: &str| {
+            directory.join(format!(
+                "{package}.{}",
+                Macaulay2Conventions::SOURCE_EXTENSION
+            ))
+        };
+        let moves = [
+            (source(name), source(new_name)),
+            (directory.join(name), directory.join(new_name)),
+        ];
+        Self {
+            moves: moves
+                .into_iter()
+                .filter(|(origin, _)| origin == file || origin.is_dir())
+                .collect(),
+        }
+    }
+
+    /// Whether nothing moves.
+    pub fn is_empty(&self) -> bool {
+        self.moves.is_empty()
+    }
+
+    /// The moves as the operations of a workspace edit renaming files.
+    pub fn rename_operations(&self) -> impl Iterator<Item = DocumentChangeOperation> + '_ {
+        self.moves.iter().filter_map(|(origin, destination)| {
+            Some(DocumentChangeOperation::Op(ResourceOp::Rename(
+                RenameFile {
+                    old_uri: Url::from_file_path(origin).ok()?,
+                    new_uri: Url::from_file_path(destination).ok()?,
+                    options: None,
+                    annotation_id: None,
+                },
+            )))
+        })
+    }
+
     /// Where the moved files and directories were.
     pub fn origins(&self) -> impl Iterator<Item = &Path> {
         self.moves.iter().map(|(origin, _)| origin.as_path())

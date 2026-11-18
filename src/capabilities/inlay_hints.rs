@@ -11,8 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::iter;
 
 use m2_syn::nodes::{
-    BinaryOperator, Cell, Elements, Expr, ExprBinary, ExprFunction, ExprSequence, FunctionParams,
-    Symbol,
+    BinaryOperator, Cell, Elements, Expr, ExprBinary, ExprFunction, FunctionParams, Symbol,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Lex, Spanned, Token, TokenStream, TokenTree};
@@ -30,8 +29,8 @@ use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::settings::{ArgumentNameSettings, HintBracket, InlayHintSettings};
 use crate::source::{ByteRange, SourceNavigation, SyntaxSource};
 use crate::syntax::{
-    AssignmentOperator, AssignmentSyntax, AssignmentTarget, BoundSymbols, ExpressionSyntax,
-    LambdaSyntax, PackedArguments,
+    AssignmentOperator, AssignmentSyntax, AssignmentTarget, BoundSymbols, Destructuring,
+    ExpressionSyntax, LambdaSyntax,
 };
 use crate::typesystem::{InferredType, TypeRole};
 use crate::util::TextRangeExt;
@@ -1399,20 +1398,17 @@ impl AssignmentParts {
 /// The symbols of a parallel assignment's `targets` paired with the values
 /// `value` assigns them, by position.
 fn paired_assignment_values<'a>(
-    targets: &'a ExprSequence,
+    targets: Destructuring<'a>,
     value: &'a Expr,
 ) -> Vec<(&'a Symbol, &'a Expr)> {
-    let targets = targets
-        .elems
-        .as_ref()
-        .map_or_else(Vec::new, PackedArguments::arguments);
+    let targets = targets.targets();
     let Some(value) = value.unparenthesized() else {
         return Vec::new();
     };
     let pair = |target: &'a Expr, value: &'a Expr| match target.unparenthesized() {
         Some(Expr::Symbol(symbol)) => vec![(symbol, value)],
-        Some(Expr::Sequence(nested)) => paired_assignment_values(nested, value),
-        _ => Vec::new(),
+        _ => Destructuring::of(target)
+            .map_or_else(Vec::new, |nested| paired_assignment_values(nested, value)),
     };
     if let Some(values) = value.collection_elements() {
         if targets.len() != values.len() {

@@ -90,6 +90,9 @@ pub struct RawRecord {
     pub markdown: Option<String>,
     /// The span `locate` reports for the object on the extraction machine.
     pub source_location: Option<RawSourceLocation>,
+    /// The span of the documentation page documenting the object, from its
+    /// `doc ///` or `document {` line, on the extraction machine.
+    pub documentation_location: Option<RawSourceLocation>,
 }
 
 /// Wire representation of a `locate` span: one-based rows, zero-based columns,

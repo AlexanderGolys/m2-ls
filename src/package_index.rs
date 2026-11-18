@@ -352,7 +352,7 @@ impl Macaulay2Environment {
     }
 
     /// The `M2` executable that comes first on the executable search path.
-    fn executable(&self) -> Option<PathBuf> {
+    pub fn executable(&self) -> Option<PathBuf> {
         self.executable_search_path
             .iter()
             .map(|directory| directory.join(Macaulay2Conventions::EXECUTABLE))

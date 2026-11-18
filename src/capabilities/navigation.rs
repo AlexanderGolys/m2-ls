@@ -19,6 +19,7 @@ use crate::record_lsp::LspKnowledge;
 use crate::source::{SourceNavigation, SyntaxSource};
 use crate::string_literal::LiteralSource;
 use crate::syntax::{BindingReferences, ExpressionSyntax};
+use crate::typesystem::TypeKnowledge;
 use crate::workspace_index::{
     ImplementationKind, WorkspaceDefinitionKnowledge, WorkspaceImplementationKnowledge,
     WorkspaceSymbolKnowledge,
@@ -142,6 +143,12 @@ fn goto_symbol_response(
     library: &LibrarySources,
     target: NavigationTarget,
 ) -> Option<GotoDefinitionResponse> {
+    if let Some(item) = document.package_documentation().item_at(position) {
+        return Some(GotoDefinitionResponse::Scalar(Location::new(
+            uri.clone(),
+            item.declaration,
+        )));
+    }
     let cursor = document.cursor_syntax(position);
     let mention = document.symbol_mention_at(position);
 
@@ -250,6 +257,15 @@ fn goto_symbol_response(
             if !definitions.is_empty() {
                 return locations_response(definitions);
             }
+        }
+        // Without Macaulay2 source to show, as for a compiled function, the
+        // documentation page is what defines the name to its reader.
+        if let Some(documentation) = library_record
+            .as_ref()
+            .and_then(|(_, record)| record.documentation_location())
+            .and_then(|recorded| library.recorded_documentation(recorded))
+        {
+            return locations_response(vec![documentation]);
         }
     }
     // A library name is defined by its package, so it has a location only in
@@ -688,11 +704,22 @@ pub fn reference_ranges_resolved(
     references
 }
 
-/// The range of the symbol that would be renamed at `position`, or `None` if the
-/// position is not on a renameable symbol. Only user symbols with a resolvable
-/// binding qualify — builtins and package symbols are excluded, since renaming
-/// them in this file alone would silently break the calls they stand for.
-pub fn prepare_rename_range(document: &DocumentSnapshot, position: Position) -> Option<TextRange> {
+/// The range of the name that would be renamed at `position`, or `None` if the
+/// position is not on a renameable name: a documentation item, a package name
+/// (whose rename the workspace decides, refusing library packages), or a user
+/// symbol with a resolvable binding. Builtins are excluded, since renaming them
+/// would silently break the calls they stand for.
+pub fn prepare_rename_range(
+    document: &DocumentSnapshot,
+    position: Position,
+    knowledge: &(impl TypeKnowledge + ?Sized),
+) -> Option<TextRange> {
+    if let Some(item) = document.package_documentation().item_at(position) {
+        return item.occurrence_at(position);
+    }
+    if let Some((_, range)) = document.package_name_at(position, knowledge) {
+        return Some(range);
+    }
     let target = document.target_symbol_at(position)?;
     Some(target.range)
 }
@@ -857,6 +884,7 @@ mod tests {
     use crate::library_index::LibraryIndex;
     use crate::object_registry::ObjectRegistry;
     use crate::package_index::SourceResolver;
+    use crate::test_support::NoTypeKnowledge;
     use crate::workspace_index::WorkspaceIndex;
     use tower_lsp::lsp_types::Range as TextRange;
 
@@ -1160,7 +1188,7 @@ mod tests {
         let text = "f := x -> (x + x)";
         let document = document(text);
         // On the parameter `x`.
-        assert!(prepare_rename_range(&document, pos!(0, 5)).is_some());
+        assert!(prepare_rename_range(&document, pos!(0, 5), &NoTypeKnowledge).is_some());
         // Empty new name is refused.
         let uri = Url::parse("file:///t.m2").expect("uri");
         assert!(rename_edits(&document, &uri, pos!(0, 5), "  ").is_none());
@@ -1189,7 +1217,7 @@ mod tests {
         // `Algorithm` is a global reserved option key, not a user definition.
         let opt = document("g := gens gb(I, Algorithm => Homogeneous)");
         assert!(rename_edits(&opt, &uri, pos!(0, 16), "Z").is_none());
-        assert!(prepare_rename_range(&opt, pos!(0, 16)).is_none());
+        assert!(prepare_rename_range(&opt, pos!(0, 16), &NoTypeKnowledge).is_none());
         // Keywords and punctuation that the grammar resolves into symbols.
         let kw = document("z = a and b");
         assert!(rename_edits(&kw, &uri, pos!(0, 6), "Z").is_none());

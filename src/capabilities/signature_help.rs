@@ -14,7 +14,7 @@ use tower_lsp::lsp_types::{
     ParameterInformation, ParameterLabel, Position, SignatureHelp, SignatureInformation,
 };
 
-use crate::analysis::{Analysis, Dispatch, FunctionInfo, Method, TypeChecker};
+use crate::analysis::{Analysis, BindingView, Dispatch, FunctionInfo, Method, TypeChecker};
 use crate::builtin_index::CallableOption;
 use crate::document::DocumentSnapshot;
 use crate::object_registry::ObjectName;
@@ -280,9 +280,14 @@ fn signature_informations(
     knowledge: &(impl LspKnowledge + ?Sized),
 ) -> Vec<SignatureInformation> {
     let analysis = document.analysis();
-    if let Some(function) = analysis.function_at(callable, position) {
+    // The visible binding, so a package imported after a source definition
+    // takes the name over, as it does for hover.
+    let binding = document.source_binding_at(callable, position);
+    if let Some((binding, function)) =
+        binding.and_then(|binding| Some((binding, analysis.function_for_binding(binding)?)))
+    {
         if !function.is_method_function() {
-            return source_function_signature(callable, document, position)
+            return source_function_signature(callable, binding, document)
                 .into_iter()
                 .collect();
         }
@@ -315,10 +320,9 @@ fn signature_informations(
 /// inner lambda of `{Limit => 1} >> opts -> (value) -> value`.
 fn source_function_signature(
     callable: &str,
+    binding: BindingView<'_>,
     document: &DocumentSnapshot,
-    position: Position,
 ) -> Option<SignatureInformation> {
-    let binding = document.analysis().get_binding_at(callable, position)?;
     let range = binding.state.value_range?;
     let expression = document
         .enclosing_expressions(range.start)

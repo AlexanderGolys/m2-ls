@@ -17,14 +17,18 @@ use crate::source::{ByteRange, DocumentSource, SourceNavigation, SymbolMention, 
 use crate::source_package::{PackageSessionCode, SourcePackages};
 use crate::string_literal::LiteralSource;
 use crate::syntax::{
-    AssignmentSyntax, AssignmentTarget, CursorSyntax, ExpressionSyntax, QuotedNames,
+    AssignmentSyntax, AssignmentTarget, BindingReferences, CursorSyntax, ExpressionSyntax,
+    QuotedNames,
 };
+use crate::typesystem::{TypeKnowledge, TypeRole};
 use m2_syn::nodes::{Expr, ExprAssign, Symbol};
 use m2_syn::visit::{self, Visit};
 use std::ops::BitOr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use tower_lsp::lsp_types::{Position, Range as TextRange, TextDocumentContentChangeEvent, Url};
+use tower_lsp::lsp_types::{
+    Position, Range as TextRange, SymbolKind, TextDocumentContentChangeEvent, Url,
+};
 
 /// Collects the contents of package-name literals identified by analysis.
 struct PackageMentionCollector<'a> {
@@ -819,6 +823,78 @@ impl DocumentSnapshot {
         &self.package_mentions
     }
 
+    /// The package the cursor at `position` names, with the range naming it:
+    /// a package-name string, or a symbol that binds a package, or binds
+    /// nothing where the document names a package of its spelling by string
+    /// or `knowledge` knows one.
+    pub fn package_name_at(
+        &self,
+        position: Position,
+        knowledge: &(impl TypeKnowledge + ?Sized),
+    ) -> Option<(&str, TextRange)> {
+        if let Some(mention) = self
+            .package_mentions
+            .iter()
+            .find(|mention| mention.contains(position))
+        {
+            return Some((mention.name(self.text()), mention.range()));
+        }
+        let (name, range) = self.symbol_occurrence_at(position)?;
+        let is_package = match self.source_binding_at(name, position) {
+            Some(binding) => binding.state.presentation_kind == SymbolKind::NAMESPACE,
+            None => {
+                self.names_package_by_string(name)
+                    || knowledge
+                        .get_record(&ObjectName::new(name))
+                        .is_some_and(|record| {
+                            knowledge.has_type_role(&record.class, TypeRole::Package)
+                        })
+            }
+        };
+        is_package.then_some((name, range))
+    }
+
+    /// Whether a package-name string of the document names `name`.
+    pub fn names_package_by_string(&self, name: &str) -> bool {
+        self.package_mentions
+            .iter()
+            .any(|mention| mention.name(self.text()) == name)
+    }
+
+    /// Every place the document names the package `name`, in source order:
+    /// the strings naming it, and its symbol and documentation mentions where
+    /// `name` binds the package or nothing.
+    pub fn package_name_ranges(&self, name: &str) -> Vec<TextRange> {
+        let is_package = |binding: Option<BindingView<'_>>| {
+            binding.is_none_or(|binding| binding.state.presentation_kind == SymbolKind::NAMESPACE)
+        };
+        let mut references = BindingReferences::default();
+        self.syntax().visit(&mut references);
+        let symbols = references
+            .0
+            .into_iter()
+            .filter(|symbol| symbol.text() == name)
+            .filter_map(|symbol| self.range_for_syntax(symbol))
+            .filter(|range| is_package(self.source_binding_at(name, range.start)));
+        let mentions = self
+            .symbol_mentions
+            .iter()
+            .filter(|mention| mention.name(self.text()) == name)
+            .filter(|mention| is_package(self.mention_symbol(mention)))
+            .map(SymbolMention::range);
+        let mut ranges = self
+            .package_mentions
+            .iter()
+            .filter(|mention| mention.name(self.text()) == name)
+            .map(SymbolMention::range)
+            .chain(symbols)
+            .chain(mentions)
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|range| (range.start, range.end));
+        ranges.dedup();
+        ranges
+    }
+
     /// Comment spans accepted as attached documentation.
     pub fn documentation_comment_ranges(&self) -> &[ByteRange] {
         self.documentation.comment_ranges()
@@ -855,10 +931,23 @@ impl DocumentSnapshot {
         self.statement_code_at(installation.span.start)
     }
 
-    /// The code of the statement at `position`: its cell without the
-    /// comments around it, which document it rather than being its code.
+    /// The code of the statement at `position`: the innermost assignment
+    /// whose target holds it — `x := 1`, not the function body around it —
+    /// or else its cell, without the comments around it, which document it
+    /// rather than being its code.
     fn statement_code_at(&self, position: Position) -> Option<&str> {
         let byte = self.byte_for_position(position)?;
+        let assignment = self
+            .enclosing_expressions(position)
+            .into_iter()
+            .rev()
+            .find(|expression| {
+                matches!(expression, Expr::Assign(assignment)
+                    if self.syntax_bytes(assignment.left.as_ref()).is_some_and(|target| target.contains(&byte)))
+            });
+        if let Some(assignment) = assignment {
+            return self.text().get(self.syntax_bytes(assignment)?);
+        }
         self.syntax().cells_at(byte).find_map(|cell| {
             let bytes = self.syntax_bytes(&cell.elems)?;
             bytes

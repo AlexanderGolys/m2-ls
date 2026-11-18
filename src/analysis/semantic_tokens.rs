@@ -24,6 +24,7 @@ use crate::source::ByteRange;
 use crate::source::SyntaxSource;
 use crate::syntax::{
     AssignmentSyntax, AssignmentTarget, BoundSymbols, ExpressionSyntax, LambdaSyntax,
+    PackedArguments,
 };
 
 impl Analysis {
@@ -38,6 +39,7 @@ impl Analysis {
             source,
             knowledge_provider,
             option_tables: Vec::new(),
+            call_option_keys: HashSet::new(),
         });
         let mut symbols = SymbolTokens {
             analysis: self,
@@ -119,14 +121,13 @@ impl Analysis {
     fn source_role_at(&self, range: TextRange, ring_generator: bool) -> Option<SourceSemanticRole> {
         let generator_role = ring_generator.then(|| self.ring_generator_role(range));
         generator_role
-            .clone()
             .filter(|role| *role == SourceSemanticRole::RingGeneratorDeclaration)
             .or_else(|| {
                 self.registry
                     .pending_source_semantic_roles
                     .iter()
                     .find(|(registered, _)| *registered == range)
-                    .map(|(_, role)| role.clone())
+                    .map(|(_, role)| *role)
             })
             .or(generator_role)
     }
@@ -143,6 +144,9 @@ struct SemanticRoles<'analysis, 'source, 'knowledge, Source: ?Sized, Knowledge: 
     /// The option-table parameters of `{…} >> o -> body` functions, with
     /// the bytes of the body they are visible in.
     option_tables: Vec<(String, ByteRange)>,
+    /// The string keys of options calls pass, which name an option of the
+    /// called function or nothing, never an entry the call writes.
+    call_option_keys: HashSet<ByteRange>,
 }
 
 impl<'source, Source, Knowledge> SemanticRoles<'_, 'source, '_, Source, Knowledge>
@@ -175,6 +179,12 @@ where
     /// evaluates to its own symbol. A name bound to anything else is a value
     /// there, not a key, and keeps its own token.
     fn register_symbol_option_key(&mut self, key: &Expr) {
+        self.register_symbol_key_as(key, SourceSemanticRole::OptionKey);
+    }
+
+    /// Records `key` with `role` when it is a name denoting a `Symbol`, as
+    /// [`Self::register_symbol_option_key`] decides.
+    fn register_symbol_key_as(&mut self, key: &Expr, role: SourceSemanticRole) {
         let (Some(name), Some(range)) = (key.symbol_name(), self.source.range_for_syntax(key))
         else {
             return;
@@ -185,7 +195,53 @@ where
                 .get_record(&ObjectName::new(name))
                 .is_none_or(|record| record.class == TypeRole::Symbol.object_name());
         if denotes_symbol {
-            self.register_role(key, SourceSemanticRole::OptionKey);
+            self.register_role(key, role);
+        }
+    }
+
+    /// Records the key of the option `entry` with `role`, whether a string or
+    /// a name denoting a symbol: the `"Eps"` of `f(x, "Eps" => 2)`.
+    /// Registered before the generic key of [`Self::visit_expr_option`], it
+    /// wins over it.
+    fn register_option_entry_key(&mut self, entry: &Expr, role: SourceSemanticRole) {
+        let Expr::Option(option) = entry else { return };
+        if option.key.literal_source(self.source).is_some() {
+            self.register_role(option.key.as_ref(), role);
+        } else {
+            self.register_symbol_key_as(&option.key, role);
+        }
+    }
+
+    /// Records the string keys of the options `call` passes: an option name
+    /// when the called function declares one so spelled, `f(1, "Eps" => 5)`
+    /// for `f = method(Options => {"Eps" => 1})`; otherwise a plain string,
+    /// as `"Degree" => 2` is no option of a function declaring `Degree`.
+    fn register_call_string_option_keys(&mut self, call: &ExprBinary) {
+        let Some(position) = self.source.position_for_syntax(call) else {
+            return;
+        };
+        let knowledge = self.knowledge_provider.at_position(position);
+        let accepted = TypeChecker::new(self.analysis, &knowledge)
+            .call_options(call, self.source, &knowledge)
+            .unwrap_or_default();
+        for argument in call.right.arguments().into_iter().flatten() {
+            let Expr::Option(option) = argument else {
+                continue;
+            };
+            let (Some(_), Some(bytes), Some(spelling)) = (
+                option.key.literal_source(self.source),
+                self.source.syntax_bytes(option.key.as_ref()),
+                option.key.option_key_spelling(),
+            ) else {
+                continue;
+            };
+            self.call_option_keys.insert(bytes);
+            if accepted
+                .iter()
+                .any(|accepted| accepted.name.name() == spelling)
+            {
+                self.register_role(option.key.as_ref(), SourceSemanticRole::OptionKey);
+            }
         }
     }
 
@@ -294,8 +350,46 @@ where
     Source: SyntaxSource + ?Sized,
     Knowledge: PositionedTypeKnowledge + ?Sized,
 {
+    /// The options an expression declares, `{…} >> o -> …` and
+    /// `method(Options => {…})`, and those a call passes name options.
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        let (options, role) = match (OptionDeclaration::declared_list(expression), expression) {
+            (Some((_, list)), _) => (
+                list.elems
+                    .as_ref()
+                    .map_or_else(Vec::new, PackedArguments::arguments),
+                SourceSemanticRole::OptionKeyDeclaration,
+            ),
+            (None, Expr::Binary(call))
+                if matches!(call.op, m2_syn::nodes::BinaryOperator::Space(_)) =>
+            {
+                self.register_call_string_option_keys(call);
+                (Vec::new(), SourceSemanticRole::OptionKey)
+            }
+            _ => (Vec::new(), SourceSemanticRole::OptionKey),
+        };
+        for option in options.into_iter().flatten() {
+            self.register_option_entry_key(option, role);
+        }
+        visit::visit_expr(self, expression);
+    }
+
+    /// A string key of `=>` writes an entry, as `"pkgname"` in
+    /// `new Package from {"pkgname" => …}`, which `H#"pkgname"` reads: a
+    /// declared property, or an option name where the pair is an option.
     fn visit_expr_option(&mut self, node: &'ast OptionExpression) {
         self.register_symbol_option_key(node.key.as_ref());
+        let written = node.key.literal_source(self.source).is_some()
+            && self
+                .source
+                .syntax_bytes(node.key.as_ref())
+                .is_some_and(|bytes| !self.call_option_keys.contains(&bytes));
+        if written {
+            self.register_role(
+                node.key.as_ref(),
+                SourceSemanticRole::PropertyKeyDeclaration,
+            );
+        }
         visit::visit_expr_option(self, node);
     }
 
@@ -566,7 +660,7 @@ where
             |context| context.assignment_target = true,
             |this| match parts.target {
                 AssignmentTarget::Symbol(symbol) => this.visit_symbol(symbol),
-                AssignmentTarget::List(list) => this.visit_expr_sequence(list),
+                AssignmentTarget::List(pattern) => this.visit_expr(pattern.0),
                 AssignmentTarget::Evaluated(target) | AssignmentTarget::Augmented(target) => {
                     this.visit_expr(target)
                 }

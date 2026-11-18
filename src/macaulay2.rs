@@ -30,6 +30,16 @@ impl Macaulay2Conventions {
         Some(target)
     }
 
+    /// Whether a string given as an `Inputs` or `Outputs` item names the
+    /// item rather than describing it, as Core's `isInputName` decides: only
+    /// letters, digits and primes, so `"x"` and `"f'"` name their items.
+    pub fn is_item_name(text: &str) -> bool {
+        !text.is_empty()
+            && text
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == Self::ITEM_NAME_PRIME)
+    }
+
     /// Runtime operator name used to dispatch application by juxtaposition.
     pub const APPLICATION_OPERATOR: &str = "SPACE";
 
@@ -115,6 +125,10 @@ impl Macaulay2Conventions {
 
     /// The headline length past which `document` rejects the headline.
     pub const HEADLINE_MAXIMUM_LENGTH: usize = 200;
+
+    /// The character besides letters and digits that a string naming an
+    /// `Inputs` or `Outputs` item may hold: `"f'"`.
+    pub const ITEM_NAME_PRIME: char = '\'';
 
     /// The function after whose call a package's documentation starts: what
     /// follows it is skipped when the package loads without documentation.

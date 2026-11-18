@@ -162,8 +162,8 @@ CALL_ARITY_MISMATCH {
         severity: WARNING,
     }
 
-    /// A type or a declared optional argument does not use PascalCase or
-    /// uppercase. Functions and locals are not constrained.
+    /// A type name does not use PascalCase or uppercase. Functions and locals
+    /// are not constrained; option names are checked by S01.
     ///
     /// ```m2
     /// badType = new Type of HashTable
