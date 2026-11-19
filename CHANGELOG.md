@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Add inline refactors: **Inline "f.m2"** replaces a top-level `load` with
+  the file's text, rewriting its relative loads; **Inline this call** and
+  **Inline every call** replace calls of a function bound once with its body,
+  binding arguments that are not literals and renaming locals that would
+  clash. An inline that would change what a name means is offered disabled,
+  with the reason.
+
 ## 2.8.1 - 2026-11-18
 
 - References and rename include documentation code: `Usage` lines, and the

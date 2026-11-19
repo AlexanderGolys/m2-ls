@@ -27,6 +27,7 @@ use crate::util::TextRangeExt;
 use crate::workspace_index::{WorkspaceDefinitionKnowledge, WorkspaceIndex};
 
 use super::formatting::{format_action_edit, FormatOptions};
+use super::inlining::{Inlining, LoadedFiles};
 
 /// The fewest escapes that make a string literal worth writing raw.
 const RAW_STRING_MIN_ESCAPES: usize = 3;
@@ -643,8 +644,9 @@ fn raw_string_edit(document: &DocumentSnapshot, uri: &Url, literal: &Expr) -> Op
 }
 
 /// The code actions offered at `position`: the quick fixes the findings
-/// there record, the rewrites around the cursor, then the directives and the
-/// file-wide fix.
+/// there record, the rewrites and inlines around the cursor, then the
+/// directives and the file-wide fix. An inlined load keeps the file's text
+/// as written, unformatted.
 pub fn available_code_actions(
     document: &DocumentSnapshot,
     uri: &Url,
@@ -652,15 +654,18 @@ pub fn available_code_actions(
     diagnostics: &[Diagnostic],
     formatting: &FormattingSettings,
     workspace: Option<&WorkspaceIndex>,
+    files: &LoadedFiles<'_>,
 ) -> Option<CodeActionResponse> {
     let context = CodeActionContext::new(document, uri, position, diagnostics, workspace)?;
     let options = FormatOptions::from(formatting);
+    let inlining = Inlining::new(document, uri, position);
     let mut actions: CodeActionResponse = context
         .finding_fixes()
         .into_iter()
         .chain(context.documentation_placeholders())
         .chain(context.raw_string())
         .chain(context.rewrites())
+        .chain(inlining.function_actions())
         .chain(primary_code_action(&context))
         .chain(suppression_actions(&context))
         .map(|mut action| {
@@ -671,6 +676,7 @@ pub fn available_code_actions(
             }
             action
         })
+        .chain(inlining.load_action(files))
         .map(CodeActionOrCommand::CodeAction)
         .collect();
     if let Some(action) = fix_all_action(document, uri, diagnostics, &options) {
@@ -1076,17 +1082,25 @@ mod tests {
             ..ServerSettings::defaults().formatting.clone()
         };
         let edits = |settings: &FormattingSettings| {
-            available_code_actions(&document, &uri, Position::default(), &[], settings, None)
-                .into_iter()
-                .flatten()
-                .find_map(|action| match action {
-                    CodeActionOrCommand::CodeAction(action)
-                        if action.kind == Some(REMOVE_REDUNDANT_PARENTHESES) =>
-                    {
-                        action.edit?.changes?.remove(&uri)
-                    }
-                    _ => None,
-                })
+            available_code_actions(
+                &document,
+                &uri,
+                Position::default(),
+                &[],
+                settings,
+                None,
+                &LoadedFiles::NONE,
+            )
+            .into_iter()
+            .flatten()
+            .find_map(|action| match action {
+                CodeActionOrCommand::CodeAction(action)
+                    if action.kind == Some(REMOVE_REDUNDANT_PARENTHESES) =>
+                {
+                    action.edit?.changes?.remove(&uri)
+                }
+                _ => None,
+            })
         };
         let first_cell = TextEdit {
             range: document.range_for_bytes(0..14),
@@ -1189,6 +1203,7 @@ mod tests {
             &diagnostics,
             &ServerSettings::defaults().formatting.clone(),
             None,
+            &LoadedFiles::NONE,
         )
         .is_none());
     }
@@ -1271,6 +1286,7 @@ mod tests {
                         &diagnostics,
                         &settings,
                         None,
+                        &LoadedFiles::NONE,
                     )
                     .unwrap_or_else(|| panic!("missing {title}: {source}"));
                     let action = actions
@@ -1301,6 +1317,7 @@ mod tests {
                         &[],
                         &settings,
                         None,
+                        &LoadedFiles::NONE,
                     )
                     .into_iter()
                     .flatten()

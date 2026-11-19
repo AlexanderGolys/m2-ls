@@ -106,6 +106,22 @@ impl ClientCapability for WorkspaceEditFileRenames {
     }
 }
 
+/// Marker for the client's support of disabled code actions, shown with the
+/// reason they do not apply: the inlines that would change the program.
+#[derive(Debug)]
+pub struct CodeActionDisabledSupport;
+
+impl ClientCapability for CodeActionDisabledSupport {
+    fn supported_by(capabilities: &ClientCapabilities) -> bool {
+        capabilities
+            .text_document
+            .as_ref()
+            .and_then(|text_document| text_document.code_action.as_ref())
+            .and_then(|code_action| code_action.disabled_support)
+            == Some(true)
+    }
+}
+
 /// Marker for the client's semantic-token refresh support.
 #[derive(Debug)]
 pub struct SemanticTokensRefresh;

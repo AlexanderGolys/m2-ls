@@ -96,8 +96,11 @@ editor request them.
   lists every code, severity, and meaning; the same checks power `m2-lint`.
 
 `textDocument/codeAction`
-: Offers `quickfix`, `refactor.rewrite`, and `source.fixAll` actions. See
-  [code actions](writing/code-actions.md) for concrete rewrites and the
+: Offers `quickfix`, `refactor.rewrite`, `refactor.inline`, and
+  `source.fixAll` actions. An inline that would change the program is sent
+  `disabled`, with its reason, to clients advertising `disabledSupport`, and
+  left out for the others. See [code actions](writing/code-actions.md) for
+  concrete rewrites, [inlining](writing/code-actions.md#inlining), and the
   distinction between fixes and explicit suppression actions.
 
 `textDocument/formatting`

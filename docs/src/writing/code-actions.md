@@ -206,6 +206,59 @@ is judged redundant is described under
 format. [`formatting.redundantParentheses`](../getting-started/configuration.md#formatting)
 set to `"off"` hides the action.
 
+## Inlining { #inlining }
+
+Two refactors (`refactor.inline`) replace a name with what it stands for.
+
+**Inline "f.m2"**, on a top-level `load "f.m2"`, replaces that statement with
+the text of the file it runs, the unsaved buffer when the file is open. Nothing
+else changes: the file stays, unformatted text and all. When the file lives in
+another directory, the loads inside it are rewritten to reach the same files
+from here: `load "inner.m2"` in `sub/lib.m2` becomes `load "sub/inner.m2"`.
+
+**Inline this call of `f`** and **Inline every call of `f`** replace calls of
+a function bound once to a function written in place, `f = (a, b) -> …`. Ask
+on a call for either, or on any other mention of `f`, the definition included,
+for every call. The definition stays, as other files may still call it.
+
+```m2,pane="Before"
+helper = (a, b) -> a*b + 1
+r = helper(2, n + 1)
+```
+
+```m2,pane="After"
+helper = (a, b) -> a*b + 1
+r = (b := n + 1; 2*b + 1)
+```
+
+A literal argument, or a name the body never mentions, is written in place of
+the parameter; any other is bound to a local first, so it is still evaluated
+exactly once, before the body. A parameter the body assigns is always bound.
+The body's own locals, and the bound parameters, become locals where the call
+is. One whose name is already used there gets a fresh one, `y'`, `y''`, …, so
+it cannot hide a name the surrounding code uses. A call in the argument of
+another call is inlined inside it.
+
+### When an inline is unsafe
+
+An inline is offered only when the result reads every name as the original
+did. Otherwise the action is shown disabled, with the reason:
+
+| Reason | Example |
+|---|---|
+| A name in the body means another binding at the call | `mul = x -> scale*x` called where a local `scale` hides the global |
+| `return` would return from the caller | `k = a -> (return a; 0)` |
+| The body quotes its own parameter or local | `q = x -> symbol x` |
+| The call passes another number of arguments | `helper 5` for a function of two |
+| The loaded file asks which file it is in | `currentFileDirectory`, `currentFileName`, `currentLineNumber` |
+| A `:=` local of the loaded file shares a name used here | `libLocal := 5` in the file, `libLocal` in the loader |
+| The loaded file uses a global a local hides at the load | `innerValue = 1` in the file after `innerValue := 0` here |
+| A relative load in the file cannot be written from here | no name reaches the same file |
+
+"Inline every call" is all or nothing: the reason names the line of the first
+call it cannot inline. Clients that cannot show disabled actions just don't
+see them.
+
 ## Declaring library code { #primary-code }
 
 Assigning to a protected name, `ZZ = 7` (`E13`), is a mistake in ordinary code

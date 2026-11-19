@@ -10,6 +10,7 @@ pub mod formatting;
 pub mod hover;
 pub mod inlay_hints;
 pub mod inline_values;
+pub mod inlining;
 pub mod navigation;
 pub mod runtime_commands;
 pub mod semantic_tokens;

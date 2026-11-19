@@ -96,6 +96,24 @@ impl Macaulay2Conventions {
     /// Functions whose first string argument identifies a source file to run.
     pub const FILE_LOAD_FUNCTIONS: [&str; 3] = ["load", "needs", "input"];
 
+    /// The function whose call runs a file every time, with the file's
+    /// top-level code as if written in its place: what makes inlining it
+    /// meaningful, unlike `needs` (once) or `input` (echoed).
+    pub const LOAD_FUNCTION: &str = "load";
+
+    /// Globals telling code which file it is read from, so their value
+    /// changes when the code moves to another file.
+    pub const FILE_CONTEXT_NAMES: [&str; 3] = [
+        "currentFileName",
+        "currentFileDirectory",
+        "currentLineNumber",
+    ];
+
+    /// The character M2 allows to end an identifier with, any number of
+    /// times: `x'` and `x''` are names, so a fresh name for a clashing `x`
+    /// keeps its spelling recognizable.
+    pub const PRIME: char = '\'';
+
     /// The first characters of a name `load` opens as a socket (`$`) or a
     /// pipe (`!`) instead of a file.
     pub const NON_FILE_NAME_PREFIXES: [char; 2] = ['$', '!'];

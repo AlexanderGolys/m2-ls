@@ -34,6 +34,7 @@ use m2_syn::nodes::{
 };
 use m2_syn::Token;
 use std::collections::{HashMap, HashSet};
+use std::iter;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use syntax_roles::PropertyAccess;
@@ -1720,5 +1721,45 @@ impl Analysis {
     pub fn binding_id_at(&self, name: &str, pos: Position) -> Option<BindingId> {
         let scope_idx = self.find_scope_at(pos)?;
         self.binding_id_from_scope(name, scope_idx, pos)
+    }
+
+    /// The local `name` refers to at `pos`, a parameter or a `:=` local of a
+    /// function or of the file; `None` where it refers to the global of that
+    /// name, which is one object wherever it is read.
+    pub fn local_binding_at(&self, name: &str, pos: Position) -> Option<BindingId> {
+        self.binding_id_at(name, pos)
+            .filter(|id| self.binding_with_id(*id).is_some_and(BindingInfo::is_local))
+    }
+
+    /// The binding with identity `id`.
+    pub fn binding_with_id(&self, id: BindingId) -> Option<&BindingInfo> {
+        self.binding(id)
+    }
+
+    /// Whether scope `inner` is `outer` or lies inside it.
+    pub fn scope_lies_within(&self, inner: usize, outer: usize) -> bool {
+        iter::successors(Some(inner), |scope| self.parent_scope(*scope)).any(|scope| scope == outer)
+    }
+
+    /// The runtime dictionary holding the locals that a `:=` written at
+    /// `pos` declares: a function's, a loop clause's, or the file's.
+    pub fn dictionary_at(&self, pos: Position) -> Option<usize> {
+        self.dictionary_scope(self.find_scope_at(pos)?)
+    }
+
+    /// The extent of a runtime dictionary; the file's reaches past every
+    /// position.
+    pub fn dictionary_range(&self, dictionary: usize) -> Option<TextRange> {
+        self.scope_ranges()
+            .find_map(|(idx, range, _)| (idx == dictionary).then_some(range))
+    }
+
+    /// Whether the name written at `pos` is a local of a dictionary nested
+    /// inside `dictionary`, so that a local `dictionary` gains cannot change
+    /// what it means.
+    pub fn is_local_inside(&self, name: &str, pos: Position, dictionary: usize) -> bool {
+        self.local_binding_at(name, pos)
+            .and_then(|id| self.dictionary_scope(self.binding_with_id(id)?.scope_idx))
+            .is_some_and(|own| own != dictionary && self.scope_lies_within(own, dictionary))
     }
 }

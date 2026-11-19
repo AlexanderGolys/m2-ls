@@ -89,6 +89,7 @@ use capabilities::formatting::{
 use capabilities::hover::hover_response;
 use capabilities::inlay_hints::{inlay_hint_provider_capability, inlay_hints_response};
 use capabilities::inline_values::{inline_value_provider_capability, inline_values_response};
+use capabilities::inlining::LoadedFiles;
 use capabilities::navigation::{
     document_link_request, document_links_response, global_reference_ranges,
     goto_declaration_response, goto_definition_response, goto_implementation_response,
@@ -103,9 +104,9 @@ use capabilities::type_hierarchy::{
     TypeHierarchyCapabilityService, TypeHierarchyContext, TYPE_HIERARCHY_METHOD,
 };
 use client_capabilities::{
-    refresh_if_changed, ClientSupport, InlayHintRefresh, SemanticTokensAugmentSyntax,
-    SemanticTokensRefresh, TypeHierarchyDynamicRegistration, WorkspaceEditFileRenames,
-    WorkspaceRefresh,
+    refresh_if_changed, ClientSupport, CodeActionDisabledSupport, InlayHintRefresh,
+    SemanticTokensAugmentSyntax, SemanticTokensRefresh, TypeHierarchyDynamicRegistration,
+    WorkspaceEditFileRenames, WorkspaceRefresh,
 };
 use diagnostics::{publish_diagnostics, visible_diagnostics};
 use document::{DocumentSnapshot, FileProperties};
@@ -169,6 +170,8 @@ struct Backend {
     semantic_tokens_refresh: ClientSupport<SemanticTokensRefresh>,
     /// Whether the client applies workspace edits that rename files.
     workspace_edit_file_renames: ClientSupport<WorkspaceEditFileRenames>,
+    /// Whether the client shows disabled code actions with their reason.
+    code_action_disabled: ClientSupport<CodeActionDisabledSupport>,
     /// The init files the documents' sessions start with, which Macaulay2
     /// runs before any document. `registry` itself starts without one.
     init_files: InitFiles,
@@ -204,6 +207,7 @@ impl Backend {
             inlay_hint_refresh: ClientSupport::default(),
             semantic_tokens_refresh: ClientSupport::default(),
             workspace_edit_file_renames: ClientSupport::default(),
+            code_action_disabled: ClientSupport::default(),
             init_files: InitFiles::default(),
             workspace_folders: DashSet::new(),
         }
@@ -1358,6 +1362,7 @@ impl LanguageServer for Backend {
         self.semantic_tokens_refresh.negotiate(&params.capabilities);
         self.workspace_edit_file_renames
             .negotiate(&params.capabilities);
+        self.code_action_disabled.negotiate(&params.capabilities);
 
         let client_settings = params
             .initialization_options
@@ -1823,6 +1828,15 @@ impl LanguageServer for Backend {
                         diagnostics.push(diagnostic);
                     }
                 }
+                let library = self.library.snapshot();
+                let text = |file: &Url| match self.documents.get(file) {
+                    Some(open) => Some(open.text().to_string()),
+                    None => fs::read_to_string(file.to_file_path().ok()?).ok(),
+                };
+                let files = LoadedFiles {
+                    search_path: library.source_resolver().path(),
+                    text: &text,
+                };
                 let mut actions = available_code_actions(
                     document,
                     uri,
@@ -1830,7 +1844,13 @@ impl LanguageServer for Backend {
                     &diagnostics,
                     &settings.formatting,
                     Some(&self.workspace_index),
+                    &files,
                 )?;
+                if !self.code_action_disabled.is_supported() {
+                    actions.retain(|action| {
+                        !matches!(action, CodeActionOrCommand::CodeAction(action) if action.disabled.is_some())
+                    });
+                }
                 if let Some(only) = &params.context.only {
                     actions.retain(|action| match action {
                         CodeActionOrCommand::CodeAction(action) => {
