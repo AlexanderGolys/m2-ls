@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.9.0 - 2026-11-20
 
 - Add inline refactors: **Inline "f.m2"** replaces a top-level `load` with
   the file's text, rewriting its relative loads; **Inline this call** and
