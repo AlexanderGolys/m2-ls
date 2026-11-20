@@ -2253,6 +2253,11 @@ async fn expression_simplifications_are_hints_with_quick_fixes() {
             "Flatten nested if into else-if chain",
         ),
         ("try value then value\n", "S15", "Simplify try"),
+        (
+            "(try f x) ?? 0\n",
+            "S33",
+            "Remove `try` redundant under `??`",
+        ),
     ];
     let mut session = DocumentSession::open(cases[0].0).await;
 

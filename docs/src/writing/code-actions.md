@@ -169,6 +169,12 @@ metaclass can normalize the argument differently from direct `new` construction.
 : `try value then value` → `try value`;
   `try value then result else null` → `try value then result`.
 
+**Remove `try` redundant under `??`** — `S33`
+: `(try f x) ?? y` → `f x ?? y`. An error in `f x` yields `y` in both forms:
+  the `try` turns it into `null`, and `??` itself catches it. A left side
+  looser than `??` keeps its parentheses: `(try (a or b)) ?? 0` →
+  `(a or b) ?? 0`.
+
 **Simplify if condition** — `S16`
 : `if not (left == right) then …` → `if left != right then …`. A negation is
   only pushed inward when the result is genuinely simpler:

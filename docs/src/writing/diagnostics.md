@@ -112,6 +112,7 @@ next.
 | `S13` | `redundant-boolean-comparison` | hint | a known Boolean strictly compared with `true` or `false` |
 | `S14` | `forwarding-lambda` | hint | `c -> inlineOf c` or `c -> inlineOf(c)` expressible as `inlineOf` |
 | `S15` | `simplifiable-try` | hint | a `try` with a repeated success value or redundant `null` fallback |
+| `S33` | `redundant-coalesced-try` | hint | `(try f x) ?? y` expressible as `f x ?? y`, since `??` already turns an error on its left into the fallback |
 | `S16` | `simplifiable-if-condition` | hint | an `if` condition with an invertible comparison or cancellable double negation |
 | `S17` | `flattenable-if-chain` | hint | nested conditionals that can become an `else if` chain |
 | `S18` | `partial-application-lambda` | hint | `y -> f(x, y)` expressible as `f_x`, with a fixed symbol as the first argument |

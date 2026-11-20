@@ -10,6 +10,7 @@ use std::fmt::Write;
 use serde::Serialize;
 use tower_lsp::lsp_types::{Location, Position, Url};
 
+use crate::analysis::TypeChecker;
 use crate::builtin_index::Record;
 use crate::document::DocumentSnapshot;
 use crate::macaulay2::Macaulay2Conventions;
@@ -164,6 +165,10 @@ pub struct HierarchyObject {
     pub parent_of: Option<TypeId>,
     /// Validated type identity when the object itself denotes a type.
     pub type_id: Option<TypeId>,
+    /// Result type of a callable object: the `Boolean` of
+    /// `isFoo = method(TypicalValue => Boolean)`, inherited by the methods
+    /// files loaded after it install.
+    pub typical_value: Option<TypeId>,
     /// Owning dictionary, independent of both type relations.
     pub namespace: NamespaceId,
     /// Associated defining package, independently of the namespace binding its name.
@@ -379,6 +384,9 @@ impl ObjectHierarchy {
             class_of: record.class_id.clone(),
             parent_of: record.type_info().and_then(|data| data.parent.clone()),
             type_id: registry.type_id(&record.id),
+            typical_value: record
+                .callable()
+                .and_then(|callable| callable.typical_value.clone()),
             namespace: if record.id == record.package {
                 NamespaceId::Packages
             } else {
@@ -416,6 +424,7 @@ impl ObjectHierarchy {
                     .and_then(|core| core.class_id.clone()),
                 parent_of: None,
                 type_id: None,
+                typical_value: None,
                 namespace: NamespaceId::Packages,
                 package: None,
                 location: None,
@@ -516,6 +525,16 @@ impl ObjectHierarchy {
                         .as_ref()
                         .and_then(|type_id| relations.parent_type_id(type_id)),
                     type_id: binding.state.source_type.clone(),
+                    typical_value: analysis
+                        .function_for_binding(binding)
+                        .and_then(|function| function.typical_value.as_ref())
+                        .and_then(|name| {
+                            TypeChecker::new(analysis, registry).resolve_type_id_at(
+                                name,
+                                binding.state.span.start,
+                                registry,
+                            )
+                        }),
                     namespace,
                     package: None,
                     location: Some(Location::new(uri.clone(), binding.state.span)),

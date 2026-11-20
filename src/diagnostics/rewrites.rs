@@ -75,6 +75,8 @@ pub enum RewriteKind {
     NullBranch,
     /// A `try` repeating its value or falling back to `null`.
     TrySimplification,
+    /// A bare `try` as the left operand of `??`, which catches errors itself.
+    CoalescedTry,
     /// An `x = x op e` that the augmented assignment `x op= e` shortens.
     AugmentedAssignment,
     /// An `if` whose negated condition simplifies.
@@ -100,6 +102,7 @@ impl RewriteKind {
                 | Self::WrapperConstructor
                 | Self::NullBranch
                 | Self::TrySimplification
+                | Self::CoalescedTry
                 | Self::AugmentedAssignment
                 | Self::IfCondition
                 | Self::ElseIfChain
@@ -125,6 +128,7 @@ impl RewriteKind {
             Self::HeaderConstructor => &catalog::HEADER_CONSTRUCTOR,
             Self::WrapperConstructor => &catalog::WRAPPER_CONSTRUCTOR,
             Self::TrySimplification => &catalog::SIMPLIFIABLE_TRY,
+            Self::CoalescedTry => &catalog::REDUNDANT_COALESCED_TRY,
             Self::IfCondition => &catalog::SIMPLIFIABLE_IF_CONDITION,
             Self::ElseIfChain => &catalog::FLATTENABLE_IF_CHAIN,
         }
@@ -378,6 +382,8 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             None,
             replacement,
         );
+        let replacement = self.coalesced_try(expression);
+        self.push(RewriteKind::CoalescedTry, expression, None, replacement);
         let coalescence = self.coalescence(expression);
         let coalesces = coalescence.is_some();
         if let Some((kind, replacement)) = coalescence {
@@ -655,6 +661,16 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
         let (subject, fallback) = self.coalescence_parts(test)?;
         self.same_expression(fallback, error_fallback.clause_value())
             .then(|| (conditional, self.coalescence_expression(subject, fallback)))
+    }
+
+    /// `e ?? v` for `(try e) ?? v`: an error in `e` yields `v` either way, through
+    /// the `try`'s `null` or directly through `??`.
+    fn coalesced_try(&self, expression: &Expr) -> Option<String> {
+        let operands = expression.infix_operands()?;
+        (operands.operator == <Token![??]>::SPELLING)
+            .then(|| guarded_value(operands.left))
+            .flatten()
+            .map(|subject| self.coalescence_expression(subject, operands.right))
     }
 
     /// `subject ?? fallback`, each side parenthesized where it would otherwise

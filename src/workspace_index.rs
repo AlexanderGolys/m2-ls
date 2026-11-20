@@ -480,7 +480,7 @@ impl WorkspaceIndex {
                     } else {
                         CallableKind::Function
                     },
-                    typical_value: None,
+                    typical_value: object.typical_value.clone(),
                     methods: Vec::new(),
                     options: Vec::new(),
                     option_passing: None,

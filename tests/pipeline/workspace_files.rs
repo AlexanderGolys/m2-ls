@@ -75,6 +75,28 @@ async fn package_fragments_resolve_through_unopened_reverse_includes() {
     server.shutdown().await;
 }
 
+/// A fragment installing methods its loader declared inherits their
+/// `TypicalValue`, builtin or source-defined, so only the method without one
+/// asks for a codomain annotation.
+#[tokio::test]
+async fn fragment_installations_inherit_the_loaders_typical_values() {
+    let main = "newPackage \"Inheriting\"\nTag = new Type of List\nisMark = method(TypicalValue => Boolean)\ntagOf = method(TypicalValue => Tag)\nplain = method()\nload \"impl.m2\"\nendPackage \"Inheriting\"\n";
+    let workspace = TestWorkspace::new(main);
+    let source =
+        "isMark ZZ := n -> true\ntagOf ZZ := n -> new Tag from {n}\nplain ZZ := n -> true\n";
+    let implementation = workspace.write_file("impl.m2", source);
+    let mut server = LspProcess::spawn().await;
+    server.initialize(&workspace.root_uri()).await;
+    let opened = server.open_document(&implementation, source).await;
+    let annotated_lines = response_array(&opened["params"]["diagnostics"])
+        .iter()
+        .filter(|diagnostic| diagnostic["code"] == "T03")
+        .map(|diagnostic| diagnostic["range"]["start"]["line"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(annotated_lines, [json!(2)], "{opened}");
+    server.shutdown().await;
+}
+
 /// The position just after occurrence `occurrence` of `needle` in `source`.
 fn cursor_after(source: &str, needle: &str, occurrence: usize) -> Value {
     let mut cursor = position(source, needle, occurrence);

@@ -400,6 +400,18 @@ SIMPLIFIABLE_TRY {
         severity: HINT,
     }
 
+    /// A bare `try` on the left of `??`, which already turns an error there
+    /// into its fallback, just as the `try` turns it into `null`.
+    ///
+    /// ```m2
+    /// y = (try f x) ?? 0
+    /// ```
+REDUNDANT_COALESCED_TRY {
+        code: "S33",
+        name: "redundant-coalesced-try",
+        severity: HINT,
+    }
+
     /// An `if` condition whose negation can be inverted or cancelled.
     ///
     /// ```m2
