@@ -62,9 +62,10 @@ has `algebraic`. A method installation keeps its `method` type and adds
   retains its own token classification.
 
 `memberAccess`
-: Marks part-selection operators: `_`, `.`, `.?`, binary `#`, and `#?`.
+: Marks part-selection operators: `_`, `.`, and binary `#`.
   A theme can deemphasize them so the base and selected member stand out.
-  Prefix `#`, which computes a length, has no `memberAccess` modifier.
+  Prefix `#`, which computes a length, and the membership tests `.?` and
+  `#?`, which select nothing, have no `memberAccess` modifier.
 
 ## Documentation and embedded code
 

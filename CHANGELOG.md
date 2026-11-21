@@ -16,6 +16,8 @@
   `compactFactorOperators` is reported as removed. Formatting no longer
   follows the editor's `tabSize` and `insertSpaces`.
 
+- The membership tests `.?` and `#?` are plain operators, no longer tagged
+  `memberAccess`: they select nothing.
 - Parentheses spanning lines are never reported as redundant control
   parentheses: without them `new M from (f)` followed by `\ L` on the next
   line would end at the line break.

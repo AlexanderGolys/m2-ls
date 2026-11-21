@@ -284,7 +284,8 @@ pub enum M2SemanticTokenModifier {
     /// A geometric space: a variety, a polyhedron, a fan, a simplicial complex.
     Space = SemanticTokenModifier::new("space"),
     /// An operator selecting a part of its left operand rather than computing
-    /// from both: the `_` of `S_1`, `.` and `.?`, and binary `#` and `#?`.
+    /// from both: the `_` of `S_1`, `.`, and binary `#`. The membership tests
+    /// `.?` and `#?` select nothing, so they stay plain operators.
     MemberAccess = SemanticTokenModifier::new("memberAccess"),
     /// Bold documentation text: `{\bf …}`, `BOLD`, a heading.
     Strong = SemanticTokenModifier::new("strong"),

@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 
 use m2_syn::nodes::{
-    Expr, ExprAssign, ExprBinary, ExprField, ExprIf, ExprQuote, ExprWhile, Symbol,
+    Expr, ExprAssign, ExprBinary, ExprField, ExprIf, ExprQuote, ExprWhile, FieldOperator, Symbol,
 };
 use m2_syn::visit::{self, Visit};
 use m2_syn::{Comment, Lex, Spanned, Token, TokenStream, TokenTree};
@@ -407,7 +407,7 @@ where
         if index || operator == <Token![#?]>::SPELLING {
             self.register_type_key(&node.right);
         }
-        if index || subscript || operator == <Token![#?]>::SPELLING {
+        if index || subscript {
             self.register_access_operator(&node.op);
             self.register_selector(node, &node.left, &node.right, subscript);
         }
@@ -473,7 +473,10 @@ where
 
     fn visit_expr_field(&mut self, node: &'ast ExprField) {
         self.register_property(node, &node.base);
-        self.register_access_operator(&node.op);
+        // `.?` tests whether the member exists, selecting nothing.
+        if let FieldOperator::Dot(dot) = &node.op {
+            self.register_access_operator(dot);
+        }
         visit::visit_expr_field(self, node);
     }
 

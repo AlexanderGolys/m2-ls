@@ -98,7 +98,7 @@ makes `area` a method, `twice = n -> …` a function.
 | `algebraic` | | a ring generator or a known nonnumeric value living over a ring | `x`, an ideal, a module, a matrix |
 | `ring`, `module`, `morphism`, `complex`, `functor`, `structure`, `space` | | an object of that [algebraic kind](#kinds) | `R = QQ[x]`, an ideal, a matrix, `HH`, a variety |
 | `optionalParameter` | | an option key | `Strategy` in `Strategy => Linear` |
-| `memberAccess` | | an operator selecting a part of its left operand | `_` in `S_1`, `.`, `.?`, binary `#` and `#?` |
+| `memberAccess` | | an operator selecting a part of its left operand | `_` in `S_1`, `.` and binary `#` |
 | `example` | | code run as a documentation example | the lines under `Example` |
 | `test` | | code inside a `TEST` block | the body of `TEST ///…///` |
 | `strong` | | bold documentation text | `{\bf …}`, `BOLD`, a headline |
@@ -215,9 +215,10 @@ L#§variable|i§                         -- # operator+access · i variable
 
 A literal selector is colored by what it selects: a generator in `S_1`, a
 member in `L_0`. The `memberAccess` modifier marks the operators that select — `_`,
-`.`, `.?`, binary `#` and `#?` — so a theme can fade them and let the base and
+`.` and binary `#` — so a theme can fade them and let the base and
 the selector stand out, as `x.1` reads in many Rust themes. Prefix `#L`, the
-length, is a computation and stays a plain operator. More on how rings are
+length, is a computation and stays a plain operator, and so do the membership
+tests `.?` and `#?`, which select nothing. More on how rings are
 read in [Rings and their variables](rings.md).
 
 ## Code inside strings and documentation { #embedded }

@@ -2349,10 +2349,11 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
     /// as one token: `3_R` a number, `RR_53` a ring. An access keeps its
     /// parts: the base its own colour, the operator an accessor, a literal
     /// selector what it selects, a generator of `R` in `R_0`, a member in
-    /// `L_0` and `L#0`.
+    /// `L_0` and `L#0`. The membership tests `#?` and `.?` select nothing and
+    /// are plain operators.
     #[test]
     fn constant_subscripts_are_single_tokens_and_accesses_keep_their_parts() {
-        let text = "R = QQ[x, y]\n3_R + R_0\nRR_53\nL = {1, 2}\nL_0\nR_i\nL#0\n";
+        let text = "R = QQ[x, y]\n3_R + R_0\nRR_53\nL = {1, 2}\nL_0\nR_i\nL#0\nL#?0\nL.?k\n";
         let builtins = ObjectRegistry::load(crate::catalog::test_corpus());
         let document = document(text, &builtins);
         let tokens = collect_tokens(&document, &builtins, false);
@@ -2386,6 +2387,12 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
             assert_eq!(token.length, 1, "{line}:{column} is one part");
             assert_eq!(token.token_type, token_type as u32, "{line}:{column}");
             assert_eq!(token.token_modifiers_bitset, modifiers, "{line}:{column}");
+        }
+        for line in [7, 8] {
+            let token = token_at(&tokens, line, 1).expect("membership test is highlighted");
+            assert_eq!(token.length, 2, "{line}: the whole operator");
+            assert_eq!(token.token_type, M2SemanticTokenType::Operator as u32);
+            assert_eq!(token.token_modifiers_bitset, 0, "{line}: no memberAccess");
         }
     }
 

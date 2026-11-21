@@ -187,7 +187,7 @@ modifiers, so themes can inherit the standard type's styling.
 | Other functions, scripted functors (`id`, `Ext`), commands and manipulators (`exit`, `endl`) | `function` | According to `defaultLibrary` policy |
 | File values (`stdio`) | `variable` | |
 | Ring generators | `variable` | `algebraic` |
-| Access operators (`_` of `S_1`, `.`, `.?`, binary `#`, `#?`) | `operator` | `memberAccess` |
+| Access operators (`_` of `S_1`, `.`, binary `#`) | `operator` | `memberAccess` |
 | Literal selectors (`0` of `L_0` or `L#0`) | `property` | |
 | Installation domains and codomains (`ZZ`, `List` in `f ZZ := List => ...`) | `typeParameter` | |
 | SimpleDoc section keywords, `document` option names, and links (`TO`, `TOH`, `TO2`) | `decorator` | |
