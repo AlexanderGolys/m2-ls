@@ -52,6 +52,7 @@
 - [Folding](reading/folding.md)
 - [Completion](writing/completion.md)
 - [Formatting](writing/formatting.md)
+    - [Profiles](writing/formatting-profiles.md)
 - [Rename](navigating/rename.md)
 
 # Managing the filetree

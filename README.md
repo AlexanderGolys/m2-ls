@@ -133,7 +133,7 @@ The [defaults file](src/settings/defaults.toml) is compiled into the server as t
 | `catalog` | `enabled = true`; set to `false` to skip catalog reads, downloads, and updates. `version = "0.1.*"` bounds updates to compatible M2Book releases. The server reads this group from `initializationOptions`; restart to change it. |
 | `diagnostics` | Enabled by default; `disabled` lists rule names or codes. |
 | `diagnostics.emitAs` | `error`, `warning`, `info`, `hint`, and `fixActionOnly` select publication categories; all lists default to empty. `fixActionOnly` retains quick fixes without publishing diagnostics. |
-| `formatting` | The Macaulay2 Core library's layout (`profile = "core"`; `"modern"` for 4 columns with spaces). `indent`, `lines`, `layout`, `spacing` and `comments` group the rules; `"detect"` values follow each file's own majority. Line breaks are kept unless `lines.breaks` is `"wrap"` or `"normalize"`. The flat 2.9 keys still load with a deprecation warning. |
+| `formatting` | The Macaulay2 Core library's layout (`profile = "core"`; `"modern"` for 4 columns with spaces). `indent`, `lines`, `layout`, `spacing` and `comments` group the rules, each one fixed choice. Line breaks are kept unless `lines.breaks` is `"wrap"` or `"normalize"`. The flat 2.9 keys still load with a deprecation warning. |
 | `inlayHints.argNames` | Enabled; requires bracketed arguments, ignores variadic parameter names, and limits names to `15` characters. |
 | `inlayHints.types` | Enables type hints independently of argument names. `after` selects calls, line ends, cell ends, assignments, delimiters, and returns. Return hints default to off. |
 | `logging.level` | Operational verbosity: `off`, `error`, `warn`, `info` (default), `debug`, or `trace`. |

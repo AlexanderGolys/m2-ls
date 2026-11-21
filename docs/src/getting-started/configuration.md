@@ -137,33 +137,22 @@ fixActionOnly = ["install-codomain-missing"]
 ## Formatting { #formatting }
 
 The [formatter](../writing/formatting.md) reproduces the layout of the
-Macaulay2 Core library. Keys a rule splits the Core files on accept
-`"detect"`: the file being formatted decides, by its own majority.
+Macaulay2 Core library. Every key is one fixed choice, applied the same way
+to every file.
 
 `formatting.profile` (`"core"` or `"modern"`, default `"core"`)
-: A preset for every key below. `"modern"` sets `indent.width = 4`,
-  `indent.fallbackWidth = 4`, `indent.whitespace = "spaces"`,
-  `lines.breaks = "wrap"`, `spacing.comma = "space"`,
-  `spacing.lambdaParamComma = "sameAsComma"` and spaces `+ - * / // ..`.
-  Keys set explicitly win over the preset. `formatting.profiles.<name>`
-  defines further presets with the same keys.
+: A built-in preset under every key below: `"core"` is the defaults listed
+  here, `"modern"` four columns with spaces and wrapped lines. Keys set
+  explicitly win over the preset. [Profiles](../writing/formatting-profiles.md)
+  lists the values of each.
 
-`formatting.detect.minSamples` (unsigned integer, default `3`), `formatting.detect.threshold` (number from 0 to 1, default `0.6`)
-: A `"detect"` rule follows the file only when the file shows at least
-  `minSamples` occurrences and its majority reaches `threshold` of them;
-  otherwise the rule's fallback applies.
+`formatting.indent.width` (positive integer, default `5`)
+: Columns per open bracket.
 
-`formatting.indent.width` (`"detect"` or a positive integer, default `"detect"`)
-: Columns per open bracket. `"detect"` takes the step most of the file's
-  indentation steps take, among 2, 4 and 5, each divided by the brackets the
-  line before opens.
-
-`formatting.indent.fallbackWidth` (positive integer, default `5`)
-: The width when detection finds no majority.
-
-`formatting.indent.whitespace` (`"emacsTabs"`, `"spaces"` or `"tabs"`, default `"emacsTabs"`)
-: `"emacsTabs"` writes a tab for every `tabWidth` columns and then spaces, as
-  Emacs does; `"spaces"` only spaces; `"tabs"` one tab per indentation level.
+`formatting.indent.whitespace` (`"tabs"` or `"spaces"`, default `"tabs"`)
+: `"tabs"` writes a tab for every `tabWidth` columns and then spaces, as
+  Emacs does, so `width` equal to `tabWidth` gives one tab per bracket;
+  `"spaces"` writes spaces only.
 
 `formatting.indent.tabWidth` (positive integer, default `8`)
 : Columns a tab counts as, for indentation and line widths.
@@ -219,10 +208,10 @@ Macaulay2 Core library. Keys a rule splits the Core files on accept
 
 The `layout` keys apply only under `lines.breaks = "normalize"`.
 
-`formatting.spacing.comma` (`"detect"`, `"space"` or `"tight"`, default `"detect"`; fallback `"space"`)
+`formatting.spacing.comma` (`"space"` or `"tight"`, default `"space"`)
 : The gap after a comma: `f(a, b)` or `f(a,b)`.
 
-`formatting.spacing.lambdaParamComma` (`"detect"`, `"space"`, `"tight"` or `"sameAsComma"`, default `"detect"`; fallback `"tight"`)
+`formatting.spacing.lambdaParamComma` (`"space"`, `"tight"` or `"sameAsComma"`, default `"tight"`)
 : The gap after a comma between lambda parameters: `(x,y) ->`.
 
 `formatting.spacing.semicolon` (`"space"` or `"tight"`, default `"space"`)
@@ -249,18 +238,21 @@ The `layout` keys apply only under `lines.breaks = "normalize"`.
   before a trailing comment when that token sits at the same column on the
   line above or below.
 
-`formatting.spacing.operators.spaced`, `.tight`, `.detect` (lists of binary operators)
-: Operators written `a := b`, those written `a^b`, and those that follow the
-  file, spaced when it says too little. Defaults: `spaced` holds
-  assignments, arrows, comparisons, `<<`, `>>`, `@@`, `\`, `++`, `?`,
-  `**`, `||`, `%`, `|`, `..<` and `&`; `tight` holds `#`, `.`, `.?`, `#?`,
-  `_`, `^` and `:`; `detect` holds `+ - * / // ..`. An operator in no list
-  keeps its spacing as written. Word operators (`and`, `or`, `xor`, `not`)
-  are always spaced; prefix operators are tight to their operand unless
-  `spaced` lists them, as `<< x`.
+`formatting.spacing.operators.spaced`, `.tight` (lists of binary operators)
+: Operators written `a := b` and those written `a^b`. Defaults: `spaced`
+  holds assignments, arrows, comparisons, `+ - * / // ..`, `<<`, `>>`, `@@`,
+  `\`, `++`, `?`, `**`, `||`, `%`, `|`, `..<` and `&`; `tight` holds `#`,
+  `.`, `.?`, `#?`, `_`, `^` and `:`. An operator in neither list keeps its
+  spacing as written. Word operators (`and`, `or`, `xor`, `not`) are always
+  spaced.
 
-Each list given replaces its default, and an operator a list names leaves the
-other lists' defaults, so `tight = ["+"]` alone takes `+` out of `detect`:
+`formatting.spacing.operators.spacedPrefix` (list of operators, default `["<<"]`)
+: Prefix operators written apart from their operand, `<< x`; every other
+  prefix operator is tight, `-x`, `#L`.
+
+Each list given replaces its default, and an operator `spaced` or `tight`
+names leaves the other's default, so `tight = ["+"]` alone takes `+` out of
+`spaced`:
 
 ```toml
 [formatting.spacing.operators]
@@ -300,13 +292,13 @@ a deprecation warning; a grouped key you also set wins.
 
 | Previous key | Read as |
 | --- | --- |
-| `indent` | `indent.width` with `whitespace = "spaces"`; `"tab"` as `whitespace = "tabs"`; `"editor"` as the defaults |
+| `indent` | `indent.width` with `whitespace = "spaces"`; `"tab"` as `whitespace = "tabs"` with `width` equal to the tab width; `"editor"` as the defaults |
 | `tabWidth` | `indent.tabWidth` |
 | `keepLineBreaks` | `lines.breaks`: `"keep"`, or `"normalize"` when `false` |
 | `softWrapWidth`, `hardLineWidth` | `lines.softWidth`, `lines.hardWidth`, with `lines.breaks = "wrap"` |
 | `breakAfterSemicolon` | `layout.statements` |
 | `controlFlowLayout` | `layout.singleLineIf`, `elsePlacement` and `thenPlacement` |
-| `operators.spacesAround`, `operators.compact` | `spacing.operators.spaced`, `tight` |
+| `operators.spacesAround`, `operators.compact` | `spacing.operators.spaced` and `spacedPrefix`, `tight` |
 | `brackets.spacesInside`, `brackets.compact` | `spacing.bracketsInside`, pair by pair: `spacesInside = ["{}"]` as `{ "{}" = "space" }` |
 | `useTabs`, `softLineWidth`, `spaceInBraces` (2.7) | as above |
 | `compactFactorOperators` | removed, reported and ignored: `spacing.indexContextTight` covers its measured case |

@@ -1,9 +1,9 @@
 # Formatting
 
-The formatter lays a file out the way the Macaulay2 Core library is written.
-Its rules were measured on the Core sources: how far a bracket indents, where
-closing brackets go, which operators get spaces. Where those sources disagree
-among themselves, it follows the file it is formatting.
+The formatter lays a file out the way the Macaulay2 Core library is written:
+how far a bracket indents, where closing brackets go, which operators get
+spaces. Each rule is one choice in your settings, applied the same way to
+every file.
 
 By default it changes indentation and spacing within lines, and keeps every
 line break where you wrote it:
@@ -59,11 +59,10 @@ That one rule gives the layout of Core:
 - Lines inside a multi-line string or block comment are left exactly as they
   are.
 
-`indent.width = "detect"` (the default) measures the file: the width most of
-its indentation steps take, among 2, 4 and 5. A file with too few steps, or no
-clear majority, gets `indent.fallbackWidth`, 5. The indentation is written as
-Emacs writes it: a tab for every 8 columns, then spaces. `indent.whitespace =
-"spaces"` writes spaces only.
+A bracket indents by `indent.width` columns, 5 by default, as Emacs `M2-mode`
+long did. The indentation is written as Emacs writes it: a tab for every
+`indent.tabWidth` columns, 8, then spaces. `indent.whitespace = "spaces"`
+writes spaces only, and `width` equal to `tabWidth` gives one tab per bracket.
 
 ## Spacing { #spacing }
 
@@ -74,22 +73,23 @@ Within a line, every gap between two tokens gets the first rule that applies:
 3. Just inside brackets: none, `(x)`, unless `spacing.bracketsInside` pads
    that kind of pair, as `{ 1, 2 }`; empty brackets close up as `{}`.
 4. Before `,` and `;`: none.
-5. After `,`: one space, or none where the file mostly writes `f(a,b)`;
-   nothing beside an empty slot, `f(a,,b)`. Lambda parameters, `(x,y) ->`, are
-   counted apart and are tight unless the file mostly spaces them.
+5. After `,`: one space, `f(a, b)`, or none under `spacing.comma = "tight"`;
+   nothing beside an empty slot, `f(a,,b)`. Lambda parameters are tight,
+   `(x,y) ->`, as `spacing.lambdaParamComma` says.
 6. After `;` followed by more code: one space.
 7. Between a keyword and a bracket: one space, `then (`.
 8. Between a function and its parenthesized argument: none, `f(x)`, also in
    method installations, `f(ZZ,Ring) := …`.
 9. Around a binary operator: as `spacing.operators` lists it, with `+ - * /`
    tight inside an index, `x#(i+1)`.
-10. Between a prefix operator and its operand: none, `-x`, `#L`.
+10. Between a prefix operator and its operand: none, `-x`, `#L`, unless
+    `spacing.operators.spacedPrefix` lists it, `<< x`.
 
 Anything else keeps the spacing you wrote.
 
-The operator lists say which operators are spaced (`a := b`, `a == b`), which
-are tight (`a^b`, `x_i`, `L#0`), and which follow the file (`+ - * / // ..`):
-spaced unless the file mostly writes them tight. Operators spelled as words,
+The operator lists say which operators are spaced (`a := b`, `a + b`) and
+which are tight (`a^b`, `x_i`, `L#0`); one in neither list keeps the spacing
+you wrote. Operators spelled as words,
 `and`, `or`, `not`, are always spaced. Closing up a gap never runs two tokens
 together: `L#0 .?key` keeps its space, since `0.` would read as a number.
 
@@ -156,8 +156,8 @@ opts = {
 
 `profile = "core"` (default) is the layout described above. `profile =
 "modern"` is the four-column style of the newer Core files and the current
-Emacs `M2-mode`: width 4 with spaces, commas and arithmetic always spaced,
-and long lines wrapped. A key you set yourself wins over the profile:
+Emacs `M2-mode`: width 4 with spaces, and long lines wrapped. A key you set
+yourself wins over the profile:
 
 ```toml
 [formatting]
@@ -167,17 +167,7 @@ profile = "modern"
 width = 2
 ```
 
-You can define your own under `formatting.profiles`, which takes the same
-keys:
-
-```toml
-[formatting]
-profile = "house"
-
-[formatting.profiles.house.indent]
-width = 3
-whitespace = "spaces"
-```
+[Profiles](formatting-profiles.md) lists every value each one sets.
 
 ## Redundant parentheses { #parentheses }
 

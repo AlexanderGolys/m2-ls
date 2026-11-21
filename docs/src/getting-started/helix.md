@@ -24,8 +24,8 @@ to change indentation:
 
 ```toml
 [language-server.m2-ls.config.formatting.indent]
-width = 4               # columns per bracket; "detect" follows the file
-whitespace = "spaces"   # "emacsTabs" (default) or "tabs" otherwise
+width = 4               # columns per bracket
+whitespace = "spaces"   # "tabs" (default): a tab per 8 columns, as Emacs writes
 ```
 
 See [Helix's language configuration documentation](https://docs.helix-editor.com/languages.html)

@@ -4,15 +4,14 @@
 
 - The formatter lays files out as the Macaulay2 Core library is written:
   each line indented from the one above by the brackets it leaves open, a
-  closer keeping its body's indentation, tabs every 8 columns; the indent
-  width, comma spacing and `+ - * / // ..` spacing follow each file's
-  majority; padding that aligns with a neighbouring line stays; line breaks
+  closer keeping its body's indentation, tabs every 8 columns; padding that
+  aligns with a neighbouring line stays; line breaks
   are kept unless `lines.breaks` asks for wrapping or the Core layout of
   multi-line constructs. It refuses output that parses differently from its
   input, and formatting a formatted file changes nothing.
 - The `formatting` settings are grouped into `indent`, `lines`, `layout`,
-  `spacing`, `comments` and `detect`, with `profile = "core"` or `"modern"`
-  and presets of your own under `formatting.profiles`. Every flat key of 2.9
+  `spacing` and `comments`, each key one fixed rule, with the built-in
+  presets `profile = "core"` and `"modern"`. Every flat key of 2.9
   still loads as its replacement, with a deprecation warning;
   `compactFactorOperators` is reported as removed. Formatting no longer
   follows the editor's `tabSize` and `insertSpaces`.
