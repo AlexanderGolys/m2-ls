@@ -136,39 +136,136 @@ fixActionOnly = ["install-codomain-missing"]
 
 ## Formatting { #formatting }
 
-`formatting.indent` (`"editor"`, `"tab"`, or a number of spaces, default `"editor"`)
-: One indentation level. `"editor"` follows the editor's `insertSpaces` and
-  `tabSize`, and indents with tabs in standalone tools; `"tab"` always uses a
-  tab. JSON's `null` means `"editor"`. The 2.7.0 key `useTabs` is still read,
-  with a deprecation warning: `true` as `"tab"` with the old `indent` as
-  `tabWidth`, `false` as that many spaces.
+The [formatter](../writing/formatting.md) reproduces the layout of the
+Macaulay2 Core library. Keys a rule splits the Core files on accept
+`"detect"`: the file being formatted decides, by its own majority.
 
-`formatting.tabWidth` (unsigned integer, unset by default)
-: Columns a tab counts as when measuring line widths. Unset uses the
-  editor's `tabSize`, or `4` in standalone tools.
+`formatting.profile` (`"core"` or `"modern"`, default `"core"`)
+: A preset for every key below. `"modern"` sets `indent.width = 4`,
+  `indent.fallbackWidth = 4`, `indent.whitespace = "spaces"`,
+  `lines.breaks = "wrap"`, `spacing.comma = "space"`,
+  `spacing.lambdaParamComma = "sameAsComma"` and spaces `+ - * / // ..`.
+  Keys set explicitly win over the preset. `formatting.profiles.<name>`
+  defines further presets with the same keys.
 
-`formatting.softWrapWidth` (unsigned integer or `null`, default `78`)
-: Preferred line wrapping width. `0` or `null` disables this target.
+`formatting.detect.minSamples` (unsigned integer, default `3`), `formatting.detect.threshold` (number from 0 to 1, default `0.6`)
+: A `"detect"` rule follows the file only when the file shows at least
+  `minSamples` occurrences and its majority reaches `threshold` of them;
+  otherwise the rule's fallback applies.
 
-`formatting.hardLineWidth` (unsigned integer or `null`, default `90`)
-: Wrap at a legal break when this width is exceeded. `0` or `null` disables
-  this limit. An enabled soft target is clamped to an enabled hard width.
-  Neither width splits an indivisible token or rewrites a literal's contents.
+`formatting.indent.width` (`"detect"` or a positive integer, default `"detect"`)
+: Columns per open bracket. `"detect"` takes the step most of the file's
+  indentation steps take, among 2, 4 and 5, each divided by the brackets the
+  line before opens.
 
-`formatting.controlFlowLayout` (string, default `"multilineCompactElse"`)
-: One of `"compact"`, `"multiline"`, `"multilineCompactElse"`, or
-  `"leadingKeywords"`. See the [layout examples](../writing/formatting.md#control-flow).
+`formatting.indent.fallbackWidth` (positive integer, default `5`)
+: The width when detection finds no majority.
 
-`formatting.compactFactorOperators` (boolean, default `true`)
-: Write factor operations as `2*x` instead of `2 * x`.
+`formatting.indent.whitespace` (`"emacsTabs"`, `"spaces"` or `"tabs"`, default `"emacsTabs"`)
+: `"emacsTabs"` writes a tab for every `tabWidth` columns and then spaces, as
+  Emacs does; `"spaces"` only spaces; `"tabs"` one tab per indentation level.
 
-`formatting.breakAfterSemicolon` (boolean, default `false`)
-: Start the next semicolon-separated expression on a new line.
+`formatting.indent.tabWidth` (positive integer, default `8`)
+: Columns a tab counts as, for indentation and line widths.
 
-`formatting.keepLineBreaks` (boolean, default `false`)
-: Preserve existing line breaks and change only spacing and indentation.
-  Wrapping widths, conditional expansion, and `breakAfterSemicolon` have no
-  effect in this mode.
+`formatting.indent.closers` (`"body"` or `"opener"`, default `"body"`)
+: Whether a line starting with `)`, `}` or `]` keeps the body's indentation,
+  or moves back to the line that opened it.
+
+`formatting.lines.breaks` (`"keep"`, `"wrap"` or `"normalize"`, default `"keep"`)
+: `"keep"` changes only indentation and spacing; `"wrap"` also breaks lines
+  longer than `softWidth`; `"normalize"` also lays out every multi-line
+  construct as the `layout` keys say.
+
+`formatting.lines.softWidth` (unsigned integer or `null`, default `100`), `formatting.lines.hardWidth` (unsigned integer or `null`, default `null`)
+: Where `"wrap"` and `"normalize"` break long lines. `0` or `null` turns a
+  width off; a soft width beyond the hard one is clamped to it.
+
+`formatting.lines.maxBlankLines` (unsigned integer, default `1`)
+: Longer runs of blank lines shrink to this many. No blank line is ever added.
+
+`formatting.lines.trimBlankLinesInBrackets` (boolean, default `true`)
+: Drop blank lines just after an opening bracket and just before a closing one.
+
+`formatting.lines.finalNewline` (boolean, default `true`), `formatting.lines.trimTrailingWhitespace` (boolean, default `true`)
+: End the file with one line break; strip spaces at line ends.
+
+`formatting.layout.closeParen` (`"hug"` or `"ownLine"`, default `"hug"`), `formatting.layout.closeBrace` (`"ownLine"` or `"hug"`, default `"ownLine"`)
+: Where the closer of a multi-line group opened at the end of a line goes:
+  after the last element, `last)`, or on a line of its own. A group with
+  content after its opener always hugs.
+
+`formatting.layout.functionBody` (`"breakWhenMultiStatement"`, `"always"` or `"keep"`, default `"breakWhenMultiStatement"`)
+: When the line breaks after `-> (` or `do (`.
+
+`formatting.layout.statements` (`"onePerLine"` or `"keep"`, default `"onePerLine"`)
+: Start a line after each `;` in a multi-line bracket and between top-level
+  statements.
+
+`formatting.layout.singleLineIf` (`"whenFits"`, `"never"` or `"keep"`, default `"whenFits"`)
+: Join a multi-line `if` into one line when it fits, never write one on a
+  single line inside brackets, or leave it as written.
+
+`formatting.layout.elsePlacement` (`"ownLine"` or `"afterClose"`, default `"ownLine"`)
+: `else` of a multi-line `if` starts a line, or follows the `)` before it.
+
+`formatting.layout.thenPlacement` (`"withCondition"` or `"ownLine"`, default `"withCondition"`)
+: `then` ends the condition's last line, or starts a line when the condition
+  spans lines.
+
+`formatting.layout.conditionBreaks` (`"beforeOperator"` or `"afterOperator"`, default `"beforeOperator"`)
+: In a condition spread over lines, `or` and `and` start the continuation
+  lines, or end the lines before.
+
+The `layout` keys apply only under `lines.breaks = "normalize"`.
+
+`formatting.spacing.comma` (`"detect"`, `"space"` or `"tight"`, default `"detect"`; fallback `"space"`)
+: The gap after a comma: `f(a, b)` or `f(a,b)`.
+
+`formatting.spacing.lambdaParamComma` (`"detect"`, `"space"`, `"tight"` or `"sameAsComma"`, default `"detect"`; fallback `"tight"`)
+: The gap after a comma between lambda parameters: `(x,y) ->`.
+
+`formatting.spacing.semicolon` (`"space"` or `"tight"`, default `"space"`)
+: The gap after a `;` followed by more code on the line.
+
+`formatting.spacing.bracketsInside` (`"tight"`, `"space"` or `"keep"`, default `"tight"`)
+: `(x)` or `( x )`, likewise for `{}`, `[]` and `<||>`.
+
+`formatting.spacing.callParen` (`"tight"` or `"keep"`, default `"tight"`), `formatting.spacing.keywordParen` (`"space"` or `"keep"`, default `"space"`)
+: `f(x)` rather than `f (x)`, including method installations; `then (`
+  rather than `then(`.
+
+`formatting.spacing.indexContextTight` (boolean, default `true`)
+: `+ - * /` are tight inside the bracket of an index: `x#(i+1)`, `x_(n-1)`.
+
+`formatting.spacing.trailingComment` (`"oneSpace"` or `"keep"`, default `"oneSpace"`)
+: The gap before a comment that follows code.
+
+`formatting.spacing.preserveAlignment` (boolean, default `true`)
+: Keep padding of more than one space before an operator, after a comma or
+  before a trailing comment when that token sits at the same column on the
+  line above or below.
+
+`formatting.spacing.operators.spaced`, `.tight`, `.detect` (lists of binary operators)
+: Operators written `a := b`, those written `a^b`, and those that follow the
+  file, spaced when it says too little. Defaults: `spaced` holds
+  assignments, arrows, comparisons, `<<`, `>>`, `@@`, `\`, `++`, `?`,
+  `**`, `||`, `%`, `|`, `..<` and `&`; `tight` holds `#`, `.`, `.?`, `#?`,
+  `_`, `^` and `:`; `detect` holds `+ - * / // ..`. An operator in no list
+  keeps its spacing as written. Word operators (`and`, `or`, `xor`, `not`)
+  are always spaced; prefix operators are tight to their operand unless
+  `spaced` lists them, as `<< x`.
+
+Each list given replaces its default, and an operator a list names leaves the
+other lists' defaults, so `tight = ["+"]` alone takes `+` out of `detect`:
+
+```toml
+[formatting.spacing.operators]
+tight = ["+", "-"]          # a+b everywhere
+```
+
+`formatting.comments.bannerWidth` (unsigned integer or `null`, default `77`)
+: Rule-only comment lines of 60 to 90 dashes become this many dashes.
 
 `formatting.redundantParentheses` (string, default `"action"`)
 : Parentheses the code parses the same without, as in `(a*b) + c`. `"action"`
@@ -180,40 +277,39 @@ fixActionOnly = ["install-codomain-missing"]
 : Whether redundant parentheses around a call's argument go too: `"remove"`
   turns `f(x)` into `f x`, `"keep"` leaves calls as written.
 
-`formatting.operators.spacesAround.binary`, `formatting.operators.compact.binary` (lists of operators)
-: Binary operators written `a + b` and those written `a^b`. By default
-  comparisons, logic, sums, assignments, arrows and the factor operators
-  `*`, `/`, `%`, `**` are spaced (the factors then compacted by
-  `compactFactorOperators`); powers, subscripts, `@`, `·`, `#` and `#?` are
-  compact. The complete lists are in the [default configuration](#defaults).
-
-`formatting.operators.spacesAround.unary`, `formatting.operators.compact.unary` (lists of operators)
-: Prefix and postfix operators, spaced or compacted on their operand's side:
-  `<< x` is spaced by default, while signs, `#`, prefix comparisons and every
-  postfix operator (`n!`, `M^*`, `f(*)`) are compact.
-
-`formatting.brackets.spacesInside`, `formatting.brackets.compact` (lists of `"{}"`, `"()"`, `"[]"`, `"<||>"`, default `[]`)
-: Brackets padded as `{ x }` and those written `{x}`. `"()"` covers
-  parentheses, call arguments, parameter lists and parallel assignments.
-  Empty brackets are always closed up, as `{}`.
-
-Operators and brackets listed in neither list keep their spacing as written.
-Each list given replaces its default; a list left unset is its default minus
-whatever the other list names, so `compact.binary = ["+"]` alone takes `+`
-out of the spaced operators and leaves the other defaults alone. An entry that
-is not an operator of that arity, or not a bracket pair, is reported and
-ignored. The 2.7.0 key `spaceInBraces` is still read, as `"{}"` listed under
-`spacesInside` (`true`) or `compact` (`false`), with a deprecation warning.
-
 ```toml
-[formatting.operators.compact]
-binary = ["+", "-"]          # a+b, but `^` falls back to as-written
-[formatting.operators.spacesAround]
-unary = ["<<", "!"]          # n !
-[formatting.brackets]
-spacesInside = ["{}"]        # { 1, 2 }
-compact = ["()", "[]"]       # f(x), [1, 2]
+[formatting]
+profile = "core"
+
+[formatting.indent]
+width = 4
+whitespace = "spaces"
+
+[formatting.lines]
+breaks = "wrap"
+softWidth = 90
 ```
+
+### Previous formatting keys { #deprecated-formatting }
+
+The flat keys of 2.9 and earlier still load, each read as its replacement with
+a deprecation warning; a grouped key you also set wins.
+
+| Previous key | Read as |
+| --- | --- |
+| `indent` | `indent.width` with `whitespace = "spaces"`; `"tab"` as `whitespace = "tabs"`; `"editor"` as the defaults |
+| `tabWidth` | `indent.tabWidth` |
+| `keepLineBreaks` | `lines.breaks`: `"keep"`, or `"normalize"` when `false` |
+| `softWrapWidth`, `hardLineWidth` | `lines.softWidth`, `lines.hardWidth`, with `lines.breaks = "wrap"` |
+| `breakAfterSemicolon` | `layout.statements` |
+| `controlFlowLayout` | `layout.singleLineIf`, `elsePlacement` and `thenPlacement` |
+| `operators.spacesAround`, `operators.compact` | `spacing.operators.spaced`, `tight` |
+| `brackets.spacesInside`, `brackets.compact` | `spacing.bracketsInside` |
+| `useTabs`, `softLineWidth`, `spaceInBraces` (2.7) | as above |
+| `compactFactorOperators` | removed, reported and ignored: `spacing.indexContextTight` covers its measured case |
+
+Formatting no longer reads the editor's `tabSize` and `insertSpaces`; the
+`indent` keys decide.
 
 ## Inlay hints { #inlay-hints }
 
@@ -327,7 +423,7 @@ These keys belong to `inlayHints.hide`:
 The previous flat hint keys are accepted for compatibility. Grouped settings
 win when both are present. Use `types.after` for placement and `hide` for
 filters; `argNames` is now a group rather than a boolean. `softLineWidth` is
-accepted as an alias for `softWrapWidth`; older diagnostic warning-severity
+read as `lines.softWidth`; older diagnostic warning-severity
 lists remain accepted, while `emitAs` supports every severity.
 
 The earlier `expressionTypes`, `allKnownTypes`, `calls`, and `unknownTypes`

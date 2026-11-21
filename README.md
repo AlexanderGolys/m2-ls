@@ -116,7 +116,7 @@ Settings are grouped by what they control. The editor sends JSON under its
     "diagnostics": {
       "emitAs": { "hint": ["unused-binding"] }
     },
-    "formatting": { "softWrapWidth": 88 },
+    "formatting": { "indent": { "width": 4 } },
     "inlayHints": {
       "argNames": { "enabled": true, "requireBracket": true },
       "types": { "after": { "call": true } },
@@ -133,7 +133,7 @@ The [defaults file](src/settings/defaults.toml) is compiled into the server as t
 | `catalog` | `enabled = true`; set to `false` to skip catalog reads, downloads, and updates. `version = "0.1.*"` bounds updates to compatible M2Book releases. The server reads this group from `initializationOptions`; restart to change it. |
 | `diagnostics` | Enabled by default; `disabled` lists rule names or codes. |
 | `diagnostics.emitAs` | `error`, `warning`, `info`, `hint`, and `fixActionOnly` select publication categories; all lists default to empty. `fixActionOnly` retains quick fixes without publishing diagnostics. |
-| `formatting` | `indent = "editor"` (also `"tab"` or a number of spaces), soft wrapping at `78`, hard width `90`. `keepLineBreaks = true` preserves existing line breaks. `operators.spacesAround` / `operators.compact` (`binary`, `unary`) and `brackets.spacesInside` / `brackets.compact` choose `a + b` vs `a^b` and `{ x }` vs `{x}`; anything unlisted keeps its spacing. |
+| `formatting` | The Macaulay2 Core library's layout (`profile = "core"`; `"modern"` for 4 columns with spaces). `indent`, `lines`, `layout`, `spacing` and `comments` group the rules; `"detect"` values follow each file's own majority. Line breaks are kept unless `lines.breaks` is `"wrap"` or `"normalize"`. The flat 2.9 keys still load with a deprecation warning. |
 | `inlayHints.argNames` | Enabled; requires bracketed arguments, ignores variadic parameter names, and limits names to `15` characters. |
 | `inlayHints.types` | Enables type hints independently of argument names. `after` selects calls, line ends, cell ends, assignments, delimiters, and returns. Return hints default to off. |
 | `logging.level` | Operational verbosity: `off`, `error`, `warn`, `info` (default), `debug`, or `trace`. |
@@ -261,8 +261,7 @@ classification; for example, `Strategy => Linear` marks `Strategy` as an
 option key and leaves `Linear` as a symbol. Names without a known binding use
 plain variable tokens, without a separate unresolved modifier.
 
-Formatting defaults are defined in [`FormattingSettings::default()`](src/settings.rs);
-omitted settings use those values.
+Formatting defaults, like all others, are in the [defaults file](src/settings/defaults.toml).
 
 An invalid value only affects its own setting, which keeps its default; the
 server reports what it ignored in a warning message.

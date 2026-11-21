@@ -1,131 +1,181 @@
 # Formatting
 
-The formatter rewrites the whole document into one consistent layout:
-indentation, spacing around operators and commas, where long expressions wrap,
-and how control flow breaks across lines.
+The formatter lays a file out the way the Macaulay2 Core library is written.
+Its rules were measured on the Core sources: how far a bracket indents, where
+closing brackets go, which operators get spaces. Where those sources disagree
+among themselves, it follows the file it is formatting.
+
+By default it changes indentation and spacing within lines, and keeps every
+line break where you wrote it:
+
+```m2,pane="Before"
+normalize = (v,limit) -> (
+if v === null then 0
+else if v > limit then limit else v
+  )
+total = sum apply({1,2,3}, i -> 2 * i+1)
+scaled = apply(total, x -> x#(i + 1))
+```
+
+```m2,pane="After"
+normalize = (v,limit) -> (
+     if v === null then 0
+     else if v > limit then limit else v
+     )
+total = sum apply({1, 2, 3}, i -> 2 * i + 1)
+scaled = apply(total, x -> x#(i+1))
+```
+
+Format from the editor (`:lua vim.lsp.buf.format()` in Neovim), or from a
+terminal and CI with [`m2-fmt`](../beyond/command-line.md#formatting); both
+produce byte-identical results. Every key below is listed in the
+[configuration reference](../getting-started/configuration.md#formatting).
 
 Expression simplifications are separate [code actions](code-actions.md#rewrites).
 For example, formatting keeps `linked === true`; **Simplify Boolean comparison**
 can replace it with `linked` when its type is known to be Boolean.
 
-```m2,pane="Before"
-normalize = (§parameter.declaration|v§,§parameter.declaration|limit§) -> (
-if §parameter|v§ === §variable.readonly|null§ then 0 else if §parameter|v§ > §parameter|limit§ then §parameter|limit§ else §parameter|v§
-)
-total = §method.readonly|sum§ §function.defaultLibrary.readonly|apply§({1,2,3}, §parameter.declaration|i§ -> 2 * §parameter|i§+1)
+## Indentation { #indentation }
+
+Each line is indented from the line above it: one width further for every
+bracket that line leaves open, one width back for every bracket it closes.
+
+```m2
+f = (a,b) -> (
+     if a then (
+          b)
+     else a)
 ```
 
-```m2,pane="After"
-normalize = (§parameter.declaration|v§, §parameter.declaration|limit§) -> (
-    if §parameter|v§ === §variable.readonly|null§ then
-        0
-    else if §parameter|v§ > §parameter|limit§ then
-        §parameter|limit§
-    else §parameter|v§
-)
-total = §method.readonly|sum§ §function.defaultLibrary.readonly|apply§({1, 2, 3}, §parameter.declaration|i§ -> 2*§parameter|i§ + 1)
+That one rule gives the layout of Core:
+
+- A line starting with `)` or `}` keeps the indentation of the body it
+  closes; the line after it moves back. `indent.closers = "opener"` moves the
+  closer back instead, to the line that opened it.
+- A line that opens two brackets, as `scan(L, x -> (`, indents the next one
+  twice.
+- `then`, `else`, `or` and a line after `:=` or a trailing operator get no
+  extra indentation: an `else` lands under its `if`.
+- Lines inside a multi-line string or block comment are left exactly as they
+  are.
+
+`indent.width = "detect"` (the default) measures the file: the width most of
+its indentation steps take, among 2, 4 and 5. A file with too few steps, or no
+clear majority, gets `indent.fallbackWidth`, 5. The indentation is written as
+Emacs writes it: a tab for every 8 columns, then spaces. `indent.whitespace =
+"spaces"` writes spaces only.
+
+## Spacing { #spacing }
+
+Within a line, every gap between two tokens gets the first rule that applies:
+
+1. In a string or comment: untouched.
+2. Before a trailing comment: one space.
+3. Just inside brackets: none, `(x)`; empty brackets close up as `{}`.
+4. Before `,` and `;`: none.
+5. After `,`: one space, or none where the file mostly writes `f(a,b)`;
+   nothing beside an empty slot, `f(a,,b)`. Lambda parameters, `(x,y) ->`, are
+   counted apart and are tight unless the file mostly spaces them.
+6. After `;` followed by more code: one space.
+7. Between a keyword and a bracket: one space, `then (`.
+8. Between a function and its parenthesized argument: none, `f(x)`, also in
+   method installations, `f(ZZ,Ring) := …`.
+9. Around a binary operator: as `spacing.operators` lists it, with `+ - * /`
+   tight inside an index, `x#(i+1)`.
+10. Between a prefix operator and its operand: none, `-x`, `#L`.
+
+Anything else keeps the spacing you wrote.
+
+The operator lists say which operators are spaced (`a := b`, `a == b`), which
+are tight (`a^b`, `x_i`, `L#0`), and which follow the file (`+ - * / // ..`):
+spaced unless the file mostly writes them tight. Operators spelled as words,
+`and`, `or`, `not`, are always spaced. Closing up a gap never runs two tokens
+together: `L#0 .?key` keeps its space, since `0.` would read as a number.
+
+Padding of more than one space stays when it lines a token up with the same
+token on the line above or below:
+
+```m2
+isDocumentableThing    String :=
+isDocumentableThing  Sequence := key -> false
 ```
 
-Format from the editor (`:lua vim.lsp.buf.format()` in Neovim), or from a
-terminal and CI with [`m2-fmt`](../beyond/command-line.md#formatting) — both
-produce byte-identical results.
+Rule-only comment lines of 60 to 90 dashes become `comments.bannerWidth`
+dashes, 77. Runs of blank lines shrink to one, and blank lines just after an
+opening bracket or before a closing one go.
 
-## Control-flow layout { #control-flow }
+## Line breaks { #line-breaks }
 
-[`controlFlowLayout`](../getting-started/configuration.md#formatting) decides
-how an `if` that stands on its own line in a block is laid out. The same
-function under each value:
+`lines.breaks` decides whether the formatter may move line breaks.
 
-```m2,pane="compact"
-normalize = (§parameter.declaration|v§, §parameter.declaration|limit§) -> (
-    if §parameter|v§ === §variable.readonly|null§ then 0 else if §parameter|v§ > §parameter|limit§ then §parameter|limit§ else §parameter|v§
-)
-```
+`"keep"` (default)
+: Line breaks stay where they are; only indentation and spacing change.
 
-```m2,pane="multiline"
-normalize = (§parameter.declaration|v§, §parameter.declaration|limit§) -> (
-    if §parameter|v§ === §variable.readonly|null§ then
-        0
-    else if §parameter|v§ > §parameter|limit§ then
-        §parameter|limit§
-    else
-        §parameter|v§
-)
-```
+`"wrap"`
+: Lines longer than `lines.softWidth` (100) are broken, at the best place
+  they offer: after an opening `(` or `{`, then after the outermost commas,
+  then before `else`, `then`, `or`, `and`, `<<` or `|`, then after `:=` or
+  `=`, and only as a last resort after another operator.
 
-```m2,pane="multilineCompactElse (default)"
-normalize = (§parameter.declaration|v§, §parameter.declaration|limit§) -> (
-    if §parameter|v§ === §variable.readonly|null§ then
-        0
-    else if §parameter|v§ > §parameter|limit§ then
-        §parameter|limit§
-    else §parameter|v§
-)
-```
-
-```m2,pane="leadingKeywords"
-normalize = (§parameter.declaration|v§, §parameter.declaration|limit§) -> (
-    if §parameter|v§ === §variable.readonly|null§
-    then 0
-    else if §parameter|v§ > §parameter|limit§
-    then §parameter|limit§
-    else §parameter|v§
-)
-```
-
-An `if` used as a value inside a single line — `n -> if n > 0 then 1 else 0` —
-stays on that line under every layout until it outgrows the line width.
-
-## Spacing and lines { #spacing }
-
-`compactFactorOperators` (default `true`)
-: Multiplication and division bind tighter than addition, and the default
-  spacing shows it: `2*i + 1`. Set it to `false` for `2 * i + 1`.
-
-`breakAfterSemicolon` (default `false`)
-: Puts each `;`-separated expression on its own line.
-
-`keepLineBreaks` (default `false`)
-: Keeps every line break where you wrote it: only spacing within lines and
-  indentation change, so the line widths and `controlFlowLayout` no longer
-  apply.
-
-`operators.spacesAround` / `operators.compact`
-: Which operators get a space on each side — `a + b`, `<< x` — and which are
-  written tight — `a^b`, `-x`, `n!`. Each has a `binary` and a `unary` list;
-  an operator in neither keeps the spacing you wrote. Operators spelled as
-  words (`or`, `and`, `xor`, `not`, `SPACE`, and their qualified forms such
-  as `Core$or`) are always spaced; listing them changes nothing. Listing an operator in one list is enough to take it out of the
-  other's defaults:
-
-  ```toml
-  [formatting.operators.compact]
-  binary = ["+", "-", "^", "_", "#"]   # a+b-c, x_i^2
+  ```m2
+  result = someFunction(
+       firstArgument, secondArgument,
+       thirdArgument)
   ```
 
-`brackets.spacesInside` / `brackets.compact`
-: Which brackets are padded as `{ 1, 2 }` and which are written `{1, 2}`,
-  named `"{}"`, `"()"`, `"[]"` and `"<||>"`. Unlisted brackets keep what you
-  wrote, and empty ones are always `{}`.
+`"normalize"`
+: Also lays out every multi-line construct the way Core does, as the
+  `layout` keys say. A function body with several statements breaks after
+  `-> (`, one statement per line, and its `)` hugs the last one. A multi-line
+  `{` list closes with `}` on its own line. An `if` that fits on one line is
+  joined into one; otherwise `else` starts a line under its `if`, and
+  `else if` stays together.
 
-`softWrapWidth` / `hardLineWidth` (defaults `78` / `90`)
-: The formatter prefers to wrap at the soft width and always wraps, where a
-  break is possible, at the hard one. The outermost expression breaks first,
-  after a comma or an operator, and the continuation is indented one level.
-
-`indent` (default `"editor"`)
-: `"editor"` indents as the editor asks with each formatting request,
-  `"tab"` with tabs, and a number with that many spaces. `tabWidth` sets how
-  wide a tab counts for the line widths; the editor's tab size when unset.
-
-```m2,pane="Wrapped at the soft width"
-result = §variable|someFunction§(§variable|firstArgument§, §variable|secondArgument§, §variable|thirdArgument§) +
-    §variable|anotherFunction§(§variable|fourthArgument§, §variable|fifthArgument§)
+```m2,pane="Before"
+f = x -> ( y := x + 1; z := y * 2; if z > 10
+  then z
+  else y)
+opts = {
+  Strategy => Linear,
+  Limit => 10}
 ```
 
-```m2,pane="breakAfterSemicolon = true"
-total = §method.readonly|sum§ §variable|L§;
-scaled = 3*§variable|total§
+```m2,pane="normalize"
+f = x -> (
+     y := x + 1;
+     z := y * 2;
+     if z > 10 then z else y)
+opts = {
+     Strategy => Linear,
+     Limit => 10
+     }
+```
+
+## Profiles { #profiles }
+
+`profile = "core"` (default) is the layout described above. `profile =
+"modern"` is the four-column style of the newer Core files and the current
+Emacs `M2-mode`: width 4 with spaces, commas and arithmetic always spaced,
+and long lines wrapped. A key you set yourself wins over the profile:
+
+```toml
+[formatting]
+profile = "modern"
+
+[formatting.indent]
+width = 2
+```
+
+You can define your own under `formatting.profiles`, which takes the same
+keys:
+
+```toml
+[formatting]
+profile = "house"
+
+[formatting.profiles.house.indent]
+width = 3
+whitespace = "spaces"
 ```
 
 ## Redundant parentheses { #parentheses }
@@ -135,12 +185,12 @@ the **Remove redundant parentheses in file** source action, and, with
 `redundantParentheses = "format"`, by every format:
 
 ```m2,pane="Before"
-§variable|area§ = (§variable|w§*§variable|h§) + (§variable|a§ + §variable|b§)*§variable|c§
+§variable|area§ = (§variable|w§ * §variable|h§) + (§variable|a§ + §variable|b§) * §variable|c§
 if (§variable|ready§) then §variable|go§(§variable|x§)
 ```
 
 ```m2,pane="After"
-§variable|area§ = §variable|w§*§variable|h§ + (§variable|a§ + §variable|b§)*§variable|c§
+§variable|area§ = §variable|w§ * §variable|h§ + (§variable|a§ + §variable|b§) * §variable|c§
 if §variable|ready§ then §variable|go§ §variable|x§
 ```
 
@@ -188,5 +238,8 @@ unlike `x -> x`, it takes exactly one argument.
 - A file with syntax errors is left untouched rather than half formatted;
   `m2-fmt` reports `cannot format source with syntax errors`.
 - The formatter never changes what code means: it only moves whitespace and
-  line breaks, and, with `redundantParentheses = "format"`, removes
-  parentheses the parse does not need.
+  line breaks, evens out the dashes of section rules, and, with
+  `redundantParentheses = "format"`, removes parentheses the parse does not
+  need. It parses its own result once more and leaves the file as it is if
+  the syntax came out different, logging why.
+- Formatting is a fixpoint: formatting a formatted file changes nothing.

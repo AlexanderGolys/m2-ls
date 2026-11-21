@@ -23,8 +23,9 @@ Helix passes the server's `config` table as initialization options. For example,
 to change indentation:
 
 ```toml
-[language-server.m2-ls.config.formatting]
-indent = 4        # four spaces; "tab" or "editor" otherwise
+[language-server.m2-ls.config.formatting.indent]
+width = 4               # columns per bracket; "detect" follows the file
+whitespace = "spaces"   # "emacsTabs" (default) or "tabs" otherwise
 ```
 
 See [Helix's language configuration documentation](https://docs.helix-editor.com/languages.html)
