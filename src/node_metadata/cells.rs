@@ -5,7 +5,7 @@ use m2_syn::visit::{self, Visit};
 use m2_syn::{
     frame_recovering, lex_str_recovering, CellStream, CellTokenStream, Comment, Comments,
     Delimiter, DelimiterValue, LexError, LexErrorKind, NativeParseError, NativeParser, Parser,
-    Source, Span, Spanned, Token,
+    PrettyNode, PrettyTree, Source, Span, Spanned, Token,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -276,6 +276,26 @@ impl SyntaxSnapshot {
             .any(|cell| cell.parse_error().is_some() || !cell.lexer_diagnostics().is_empty())
     }
 
+    /// Whether `text` parses to the same syntax as this snapshot: the same
+    /// cells with the same typed trees, token spellings included, wherever
+    /// they sit. Only layout may differ, so `f(a,b)` and `f( a, b )` agree
+    /// while `f x_1` and `f(x)_1` do not, and neither do `{a,b}` and `{a,b,}`.
+    pub fn same_structure(&self, text: &str) -> bool {
+        let trees = |syntax: &Self| {
+            syntax
+                .cells()
+                .iter()
+                .filter_map(ParsedCell::syntax)
+                .map(PrettyTree::pretty_tree)
+                .collect::<Vec<_>>()
+        };
+        let other = Self::parse(text, None);
+        let (mine, theirs) = (trees(self), trees(&other));
+        self.has_error() == other.has_error()
+            && mine.len() == theirs.len()
+            && mine.iter().zip(&theirs).all(|(a, b)| a.same_shape(b))
+    }
+
     /// Frames changed source regions and shares unaffected cell allocations with the previous revision.
     pub fn parse(source: &str, previous: Option<&Self>) -> Self {
         let mut prefix = 0;
@@ -465,6 +485,27 @@ fn cell_end(tokens: &CellTokenStream, source: &str) -> usize {
         source[end..]
             .find('\n')
             .map_or(end, |newline| end + newline + 1)
+    }
+}
+
+/// Equality of presentation trees up to source location, which is what
+/// layout alone can change.
+trait SameShape {
+    /// Whether both trees name the same nodes, details and edges.
+    fn same_shape(&self, other: &Self) -> bool;
+}
+
+impl SameShape for PrettyNode {
+    fn same_shape(&self, other: &Self) -> bool {
+        self.name() == other.name()
+            && self.role() == other.role()
+            && self.detail() == other.detail()
+            && self.children().len() == other.children().len()
+            && self
+                .children()
+                .iter()
+                .zip(other.children())
+                .all(|(a, b)| a.label() == b.label() && a.node().same_shape(b.node()))
     }
 }
 

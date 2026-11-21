@@ -1011,7 +1011,7 @@ mod tests {
     fn formatted(text: &str, settings: &FormattingSettings) -> String {
         let syntax = SyntaxSnapshot::parse(text, None);
         assert!(!syntax.has_error(), "{text}");
-        format_document_with_options(&syntax, &FormatOptions::from(settings))
+        format_document_with_options(&syntax, &FormatOptions::from(settings)).unwrap()
     }
 
     #[test]

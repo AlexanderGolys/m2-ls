@@ -10,6 +10,7 @@
 //! it does not execute source or require the external builtin catalog.
 
 use std::collections::VecDeque;
+use std::fmt;
 
 use m2_syn::nodes::{
     Element, Elements, ElseClause, Expr, ExprFor as ForLoop, ExprIf as IfStatement, ExprList,
@@ -39,7 +40,7 @@ macro_rules! matches_tokens {
 use crate::settings::spacing::{
     BracketPair, BracketSpacingSettings, OperatorSpacingSettings, Spacing,
 };
-use crate::settings::{FormattingSettings, Indent, ServerSettings};
+use crate::settings::{FormattingSettings, Indent, LogLevel, ServerSettings};
 use crate::source::{SourceNavigation, SyntaxSource};
 use crate::syntax::{AssignmentSyntax, AssignmentTarget, AssignmentTraversal, ExpressionSyntax};
 use layout::LayoutSource;
@@ -206,10 +207,17 @@ pub fn document_formatting_text_edits(
 ) -> Vec<TextEdit> {
     let text = source.text();
     let options = FormatOptions::from_settings(tab_size, insert_spaces, settings);
-    let formatted = format_document_with_options(source.syntax(), &options);
-    if formatted == text {
-        return Vec::new();
-    }
+    let formatted = match format_document_with_options(source.syntax(), &options) {
+        Ok(formatted) if formatted != text => formatted,
+        Ok(_) => return Vec::new(),
+        Err(error) => {
+            crate::telemetry::event_at(
+                LogLevel::Error,
+                serde_json::json!({"operation": "formatting", "error": error.to_string()}),
+            );
+            return Vec::new();
+        }
+    };
 
     vec![TextEdit {
         range: source.full_range(),
@@ -263,10 +271,29 @@ struct FormatEdit {
     replacement: String,
 }
 
+/// The formatter's output would parse to different syntax than its input,
+/// so it is withheld: a layout rule broke the invariant that formatting only
+/// moves whitespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangedSyntax;
+
+impl fmt::Display for ChangedSyntax {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("formatting would change what the source parses to; left as it is")
+    }
+}
+
+impl std::error::Error for ChangedSyntax {}
+
 /// Format the whole document: whitespace normalization around operators and
 /// punctuation, tree-derived indentation, and width-based wrapping at parsed
 /// syntax boundaries, after removing redundant parentheses when configured.
-pub fn format_document_with_options(syntax: &SyntaxSnapshot, options: &FormatOptions) -> String {
+/// The result is checked to parse to the same syntax as `syntax`, its
+/// redundant parentheses aside.
+pub fn format_document_with_options(
+    syntax: &SyntaxSnapshot,
+    options: &FormatOptions,
+) -> Result<String, ChangedSyntax> {
     let ungrouped;
     let syntax = if options.removes_redundant_parentheses {
         ungrouped = syntax.without_redundant_parentheses(options.call_parentheses);
@@ -274,7 +301,11 @@ pub fn format_document_with_options(syntax: &SyntaxSnapshot, options: &FormatOpt
     } else {
         syntax
     };
-    formatted_layout(syntax, options).into_text()
+    let formatted = formatted_layout(syntax, options).into_text();
+    syntax
+        .same_structure(&formatted)
+        .then_some(formatted)
+        .ok_or(ChangedSyntax)
 }
 
 /// Format a replacement in its surrounding syntax, returning only the changed
@@ -2480,6 +2511,7 @@ mod tests {
 
     fn format_fixture_with_options(text: &str, options: &FormatOptions) -> String {
         format_document_with_options(&SyntaxSnapshot::parse(text, None), options)
+            .unwrap_or_else(|error| panic!("{error}:\n{text}"))
     }
 
     fn fold_fixture(text: &str) -> Vec<FormatFoldRange> {

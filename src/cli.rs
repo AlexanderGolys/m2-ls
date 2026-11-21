@@ -224,7 +224,8 @@ impl Tool {
             return Err("cannot format source with syntax errors".into());
         }
         let formatted =
-            format_document_with_options(&syntax, &FormatOptions::from(&settings.formatting));
+            format_document_with_options(&syntax, &FormatOptions::from(&settings.formatting))
+                .map_err(|error| error.to_string())?;
         match &options.input {
             _ if options.check => {
                 if formatted != text {
