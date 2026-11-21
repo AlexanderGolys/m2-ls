@@ -22,6 +22,7 @@
 
 use std::num::NonZeroUsize;
 
+use m2_syn::DelimiterKind;
 use serde::de::Error;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
@@ -109,6 +110,61 @@ macro_rules! word_or_value {
 
 word_or_value!(Detectable::Detect = "detect");
 word_or_value!(Keepable::Keep = "keep");
+
+/// `spacing.bracketsInside`: the gap just inside each kind of bracket pair,
+/// written as one value for every pair or a table by pair, so that lists can
+/// be padded while parentheses stay tight:
+///
+/// ```toml
+/// [formatting.spacing]
+/// bracketsInside = { "{}" = "space" }   # { 1, 2 }, but f(x) and [a]
+/// ```
+///
+/// An empty pair always closes up, as `{}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BracketsInside {
+    /// Parentheses, call arguments, parameter lists and parallel assignments.
+    #[serde(rename = "()")]
+    pub parentheses: Keepable<Spacing>,
+    /// Lists, `{1, 2}`.
+    #[serde(rename = "{}")]
+    pub braces: Keepable<Spacing>,
+    /// Arrays, `[1, 2]`.
+    #[serde(rename = "[]")]
+    pub brackets: Keepable<Spacing>,
+    /// Angle-bar lists, `<|1, 2|>`.
+    #[serde(rename = "<||>")]
+    pub angle_bars: Keepable<Spacing>,
+}
+
+impl BracketsInside {
+    /// The spacing inside pairs of `kind`.
+    pub fn of(&self, kind: DelimiterKind) -> Keepable<Spacing> {
+        match kind {
+            DelimiterKind::Parenthesis => self.parentheses,
+            DelimiterKind::Brace => self.braces,
+            DelimiterKind::Bracket => self.brackets,
+            DelimiterKind::AngleBar => self.angle_bars,
+        }
+    }
+
+    /// Read one value for every pair, `"tight"`, or a table by pair.
+    fn one_or_each<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            table @ Value::Object(_) => Self::deserialize(table).map_err(D::Error::custom),
+            one => {
+                let spacing = Keepable::deserialize(one).map_err(D::Error::custom)?;
+                Ok(Self {
+                    parentheses: spacing,
+                    braces: spacing,
+                    brackets: spacing,
+                    angle_bars: spacing,
+                })
+            }
+        }
+    }
+}
 
 /// `formatting.detect.*`: how much a document must say before `"detect"`
 /// follows it, e.g. 3 indent steps of which 60 % are 4 columns.
@@ -342,8 +398,9 @@ pub struct SpacingSettings {
     pub lambda_param_comma: Detectable<LambdaParamComma>,
     /// After a `;` followed by more code on the same line.
     pub semicolon: Spacing,
-    /// Just inside brackets: `(x)` or `( x )`, and likewise `{}` and `[]`.
-    pub brackets_inside: Keepable<Spacing>,
+    /// Just inside each kind of bracket pair: `(x)` or `( x )`.
+    #[serde(deserialize_with = "BracketsInside::one_or_each")]
+    pub brackets_inside: BracketsInside,
     /// Between a function and the parenthesis of its call: `f(x)`.
     pub call_paren: Keepable<Spacing>,
     /// Between a keyword and a following parenthesis: `then (`.
@@ -488,7 +545,7 @@ impl SettingsGroup for FormattingSettings {
     /// | `breakAfterSemicolon` | `layout.statements = "onePerLine"` or `"keep"` |
     /// | `controlFlowLayout` | `layout.singleLineIf`, `elsePlacement`, `thenPlacement` |
     /// | `operators.spacesAround`, `operators.compact` | `spacing.operators.spaced`, `tight` |
-    /// | `brackets.spacesInside`, `brackets.compact` | `spacing.bracketsInside` |
+    /// | `brackets.spacesInside`, `brackets.compact` | `spacing.bracketsInside`, pair by pair |
     /// | `compactFactorOperators` | removed: `spacing.indexContextTight` covers its one measured case |
     ///
     /// `useTabs`, `softLineWidth` and `spaceInBraces`, deprecated in 2.7.0,
@@ -655,17 +712,18 @@ impl FormattingSettings {
                 },
             ),
             Self::upgrade_deprecated_key(group, "brackets", "`spacing.bracketsInside`", |value| {
-                let lists = |name: &str| {
-                    value
-                        .get(name)
+                let mut pairs = Map::new();
+                for (list, spacing) in [("compact", "tight"), ("spacesInside", "space")] {
+                    let listed = value
+                        .get(list)
                         .and_then(Value::as_array)
-                        .is_some_and(|list| !list.is_empty())
-                };
-                match (lists("spacesInside"), lists("compact")) {
-                    (true, _) => json!({ "spacing": { "bracketsInside": "space" } }),
-                    (false, true) => json!({ "spacing": { "bracketsInside": "tight" } }),
-                    (false, false) => json!({}),
+                        .into_iter()
+                        .flatten();
+                    for pair in listed.filter_map(Value::as_str) {
+                        pairs.insert(pair.to_string(), json!(spacing));
+                    }
                 }
+                json!({ "spacing": { "bracketsInside": pairs } })
             }),
             group
                 .remove("compactFactorOperators")

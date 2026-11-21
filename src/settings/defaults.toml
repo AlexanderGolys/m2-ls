@@ -81,7 +81,8 @@ conditionBreaks = "beforeOperator"          # "beforeOperator": or/and start the
 comma = "detect"            # "space", "tight", or "detect" (fallback "space")
 lambdaParamComma = "detect" # "space", "tight", "sameAsComma", or "detect" (fallback "tight")
 semicolon = "space"         # before more code on the same line: "space" or "tight"
-bracketsInside = "tight"    # (x) or ( x ): "tight", "space", "keep"
+# (x) or ( x ), per pair: "tight", "space", "keep"; or one of these for all
+bracketsInside = { "()" = "tight", "{}" = "tight", "[]" = "tight", "<||>" = "tight" }
 callParen = "tight"         # f(x) or f (x): "tight", "space", "keep"
 keywordParen = "space"      # then ( / do ( / if (: "space", "tight", "keep"
 indexContextTight = true    # + - * / tight inside a bracket right after _ # ^ . : x#(i+1)

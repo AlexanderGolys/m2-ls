@@ -5,7 +5,8 @@
 //!
 //! 1. a gap inside a string or comment is never touched;
 //! 2. the gap before a trailing comment is one space;
-//! 3. just inside brackets, `spacing.bracketsInside`; an empty pair closes up;
+//! 3. just inside brackets, `spacing.bracketsInside` for that kind of pair;
+//!    an empty pair closes up;
 //! 4. before `,` and `;`, nothing;
 //! 5. after `,`, `spacing.comma`, or `spacing.lambdaParamComma` between lambda
 //!    parameters; nothing before a closer or beside an empty slot (`f(a,,b)`);
@@ -271,7 +272,9 @@ impl<'a> HorizontalSpacing<'a> {
             self.edits.push(FormatEdit::new(interior, ""));
             return;
         }
-        if let Keepable::Fixed(spacing) = self.style.settings.spacing.brackets_inside {
+        if let Keepable::Fixed(spacing) =
+            self.style.settings.spacing.brackets_inside.of(bracket.kind)
+        {
             for gap in [self.after(&bracket.open), self.before(close)]
                 .into_iter()
                 .flatten()

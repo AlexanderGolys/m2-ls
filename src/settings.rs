@@ -1386,7 +1386,7 @@ mod tests {
                 "breakAfterSemicolon": false,
                 "controlFlowLayout": "multilineCompactElse",
                 "operators": {"spacesAround": {"binary": ["^"]}, "compact": {"binary": ["+"]}},
-                "brackets": {"spacesInside": ["()"], "compact": []},
+                "brackets": {"spacesInside": ["{}"], "compact": ["[]"]},
                 "compactFactorOperators": true
             }
         }));
@@ -1424,10 +1424,31 @@ mod tests {
             formatting.spacing.operators.binary("+"),
             Some(OperatorSpacing::Fixed(Spacing::Tight))
         );
+        let brackets = formatting.spacing.brackets_inside;
+        assert_eq!(brackets.braces, Keepable::Fixed(Spacing::Spaced));
+        assert_eq!(brackets.brackets, Keepable::Fixed(Spacing::Tight));
+        assert_eq!(brackets.parentheses, Keepable::Fixed(Spacing::Tight));
+    }
+
+    /// `bracketsInside` is one value for every pair or a table by pair.
+    #[test]
+    fn brackets_inside_is_one_value_or_one_per_pair() {
+        let brackets = |value: Value| {
+            valid_settings(serde_json::json!({
+                "formatting": {"spacing": {"bracketsInside": value}}
+            }))
+            .formatting
+            .spacing
+            .brackets_inside
+        };
+        let all = brackets(serde_json::json!("keep"));
         assert_eq!(
-            formatting.spacing.brackets_inside,
-            Keepable::Fixed(Spacing::Spaced)
+            (all.parentheses, all.angle_bars),
+            (Keepable::Keep, Keepable::Keep)
         );
+        let lists = brackets(serde_json::json!({"{}": "space"}));
+        assert_eq!(lists.braces, Keepable::Fixed(Spacing::Spaced));
+        assert_eq!(lists.parentheses, Keepable::Fixed(Spacing::Tight));
     }
 
     #[test]

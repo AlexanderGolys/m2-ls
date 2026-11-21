@@ -228,8 +228,11 @@ The `layout` keys apply only under `lines.breaks = "normalize"`.
 `formatting.spacing.semicolon` (`"space"` or `"tight"`, default `"space"`)
 : The gap after a `;` followed by more code on the line.
 
-`formatting.spacing.bracketsInside` (`"tight"`, `"space"` or `"keep"`, default `"tight"`)
-: `(x)` or `( x )`, likewise for `{}`, `[]` and `<||>`.
+`formatting.spacing.bracketsInside` (`"tight"`, `"space"` or `"keep"`, or a table of those by pair; default `"tight"` for every pair)
+: `(x)` or `( x )`. One value sets every pair; a table keyed `"()"`, `"{}"`,
+  `"[]"` and `"<||>"` sets them apart, as `bracketsInside = { "{}" = "space" }`
+  for `{ 1, 2 }` with `f(x)`. `"()"` covers call arguments, parameter lists and
+  parallel assignments too. Empty pairs always close up.
 
 `formatting.spacing.callParen` (`"tight"` or `"keep"`, default `"tight"`), `formatting.spacing.keywordParen` (`"space"` or `"keep"`, default `"space"`)
 : `f(x)` rather than `f (x)`, including method installations; `then (`
@@ -304,7 +307,7 @@ a deprecation warning; a grouped key you also set wins.
 | `breakAfterSemicolon` | `layout.statements` |
 | `controlFlowLayout` | `layout.singleLineIf`, `elsePlacement` and `thenPlacement` |
 | `operators.spacesAround`, `operators.compact` | `spacing.operators.spaced`, `tight` |
-| `brackets.spacesInside`, `brackets.compact` | `spacing.bracketsInside` |
+| `brackets.spacesInside`, `brackets.compact` | `spacing.bracketsInside`, pair by pair: `spacesInside = ["{}"]` as `{ "{}" = "space" }` |
 | `useTabs`, `softLineWidth`, `spaceInBraces` (2.7) | as above |
 | `compactFactorOperators` | removed, reported and ignored: `spacing.indexContextTight` covers its measured case |
 

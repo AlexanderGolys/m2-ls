@@ -71,7 +71,8 @@ Within a line, every gap between two tokens gets the first rule that applies:
 
 1. In a string or comment: untouched.
 2. Before a trailing comment: one space.
-3. Just inside brackets: none, `(x)`; empty brackets close up as `{}`.
+3. Just inside brackets: none, `(x)`, unless `spacing.bracketsInside` pads
+   that kind of pair, as `{ 1, 2 }`; empty brackets close up as `{}`.
 4. Before `,` and `;`: none.
 5. After `,`: one space, or none where the file mostly writes `f(a,b)`;
    nothing beside an empty slot, `f(a,,b)`. Lambda parameters, `(x,y) ->`, are
