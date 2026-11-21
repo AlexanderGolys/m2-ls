@@ -1256,6 +1256,7 @@ mod tests {
             {
                 let mut settings = ServerSettings::defaults().formatting.clone();
                 settings.indent.whitespace = IndentWhitespace::Tabs;
+                settings.indent.width = settings.indent.tab_width;
                 settings.lines.breaks = LineBreaks::Normalize;
                 settings.layout.single_line_if = SingleLineIf::Never;
                 settings

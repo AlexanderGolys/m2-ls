@@ -1,16 +1,15 @@
 //! `formatting.*`: how the formatter lays out a document.
 //!
 //! Every key is one layout rule, grouped by what it governs, and its default
-//! reproduces the Macaulay2 Core library. A rule the Core library itself is
-//! split on accepts `"detect"`: the document being formatted is measured and
-//! its own majority followed, with a fallback when it says too little.
+//! is the layout of the Macaulay2 Core library. Each rule is one fixed
+//! choice, applied the same way to every document.
 //!
 //! ```toml
 //! [formatting]
 //! profile = "modern"          # start from the 4-column, spaces-only preset
 //!
 //! [formatting.indent]
-//! width = "detect"            # but follow each file's own indent step
+//! width = 2                   # but two columns per bracket
 //!
 //! [formatting.spacing.operators]
 //! tight = ["^", "_", "*"]     # 2*x, x^2
@@ -38,8 +37,6 @@ use crate::node_metadata::CallParentheses;
 pub struct FormattingSettings {
     /// The preset every other key starts from.
     pub profile: FormattingProfile,
-    /// `detect.*`: when a document says enough for `"detect"` to follow it.
-    pub detect: DetectionSettings,
     /// `indent.*`: how far each line is indented, and with what.
     pub indent: IndentSettings,
     /// `lines.*`: which line breaks the formatter may move, and blank lines.
@@ -63,22 +60,12 @@ pub struct FormattingSettings {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum FormattingProfile {
-    /// The Core library as it is: each file's own indent width and comma
-    /// style, Emacs tabification, line breaks kept.
+    /// The Core library: five columns per bracket written with Emacs tabs,
+    /// line breaks kept.
     Core,
     /// The newer Core files and the current Emacs `M2-mode`: four columns,
     /// spaces only, commas and arithmetic spaced, long lines wrapped.
     Modern,
-}
-
-/// A setting fixed to a value, or `"detect"`: measured on each document and
-/// its majority followed, as `width = "detect"` follows a file indented by 4.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Detectable<T> {
-    /// Measured on the document, with a fallback when it says too little.
-    Detect,
-    /// This value, whatever the document does.
-    Fixed(T),
 }
 
 /// A setting fixed to a value, or `"keep"`: left as each document writes it,
@@ -91,25 +78,23 @@ pub enum Keepable<T> {
     Fixed(T),
 }
 
-/// Implements `Deserialize` for a word-or-value setting: the word as its own
-/// variant, anything else read as the value with the value's own errors.
-macro_rules! word_or_value {
-    ($setting:ident :: $variant:ident = $word:literal) => {
-        impl<'de, T: Deserialize<'de>> Deserialize<'de> for $setting<T> {
-            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                match Value::deserialize(deserializer)? {
-                    Value::String(word) if word == $word => Ok(Self::$variant),
-                    value => T::deserialize(value)
-                        .map(Self::Fixed)
-                        .map_err(|error| D::Error::custom(format!("{error}, or \"{}\"", $word))),
-                }
-            }
-        }
-    };
+impl<T> Keepable<T> {
+    /// The word a setting is kept as written with.
+    const KEEP: &str = "keep";
 }
 
-word_or_value!(Detectable::Detect = "detect");
-word_or_value!(Keepable::Keep = "keep");
+/// The word `"keep"`, or anything else read as the value with the value's
+/// own errors.
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Keepable<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::String(word) if word == Self::KEEP => Ok(Self::Keep),
+            value => T::deserialize(value)
+                .map(Self::Fixed)
+                .map_err(|error| D::Error::custom(format!("{error}, or \"{}\"", Self::KEEP))),
+        }
+    }
+}
 
 /// `spacing.bracketsInside`: the gap just inside each kind of bracket pair,
 /// written as one value for every pair or a table by pair, so that lists can
@@ -166,73 +151,33 @@ impl BracketsInside {
     }
 }
 
-/// `formatting.detect.*`: how much a document must say before `"detect"`
-/// follows it, e.g. 3 indent steps of which 60 % are 4 columns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DetectionSettings {
-    /// The fewest occurrences a detected rule is decided on; fewer use the
-    /// rule's fallback.
-    pub min_samples: usize,
-    /// The share of the occurrences the document's majority must reach.
-    pub threshold: Share,
-}
-
-/// A share of a whole, between `0` and `1`, as `0.6` for 60 %.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-pub struct Share(f64);
-
-/// Shares are never NaN, which deserialization rules out.
-impl Eq for Share {}
-
-impl Share {
-    /// Whether `part` of `whole` reaches this share.
-    pub fn reached_by(self, part: usize, whole: usize) -> bool {
-        part as f64 >= self.0 * whole as f64
-    }
-}
-
-impl<'de> Deserialize<'de> for Share {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let share = f64::deserialize(deserializer)?;
-        (0.0..=1.0)
-            .contains(&share)
-            .then_some(Self(share))
-            .ok_or_else(|| D::Error::custom(format!("{share}: expected a share between 0 and 1")))
-    }
-}
-
 /// `formatting.indent.*`: how far each line is indented, and with what.
 /// A line is indented by its predecessor's indent plus `width` for every
 /// bracket the predecessor leaves open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct IndentSettings {
-    /// Columns per open bracket, or `"detect"`: the file's dominant step
-    /// among 2, 4 and 5.
-    pub width: Detectable<NonZeroUsize>,
-    /// The width `"detect"` uses when the file shows no majority.
-    pub fallback_width: NonZeroUsize,
+    /// Columns per open bracket.
+    pub width: NonZeroUsize,
     /// The characters an indent is written with.
     pub whitespace: IndentWhitespace,
-    /// Columns per tab, for `emacsTabs` and for measuring line widths.
+    /// Columns per tab, for writing `tabs` and for measuring line widths.
     pub tab_width: NonZeroUsize,
     /// Where a line starting with a closing bracket is indented.
     pub closers: CloserIndent,
 }
 
-/// The characters an indent is written with.
+/// The characters an indent of some columns is written with. With
+/// `width = tabWidth`, `tabs` writes one tab per open bracket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum IndentWhitespace {
-    /// One tab per `tabWidth` columns, then spaces, as Emacs writes 13
+    /// A tab for every `tabWidth` columns, then spaces, as Emacs writes 13
     /// columns: a tab and 5 spaces.
-    EmacsTabs,
+    Tabs,
     /// Spaces only.
     Spaces,
-    /// One tab per indent level.
-    Tabs,
 }
 
 /// Where a line starting with `)`, `}` or `]` is indented.
@@ -390,12 +335,10 @@ pub enum ConditionBreaks {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SpacingSettings {
-    /// After a comma; `"detect"` follows the document's commas inside `( )`,
-    /// falling back to a space.
-    pub comma: Detectable<Spacing>,
-    /// After a comma between lambda parameters, `(x,y) ->`; `"detect"`
-    /// follows the document's parameter lists, falling back to tight.
-    pub lambda_param_comma: Detectable<LambdaParamComma>,
+    /// After a comma: `f(a, b)` or `f(a,b)`.
+    pub comma: Spacing,
+    /// After a comma between lambda parameters, `(x,y) ->`.
+    pub lambda_param_comma: LambdaParamComma,
     /// After a `;` followed by more code on the same line.
     pub semicolon: Spacing,
     /// Just inside each kind of bracket pair: `(x)` or `( x )`.
@@ -413,8 +356,8 @@ pub struct SpacingSettings {
     /// Keep padding that lines a token up with the same token on the
     /// neighbouring line.
     pub preserve_alignment: bool,
-    /// `operators.*`: the binary operators written spaced, tight, or as
-    /// each document does.
+    /// `operators.*`: the binary operators written spaced and those written
+    /// tight.
     pub operators: OperatorSpacingSettings,
 }
 
@@ -451,6 +394,17 @@ pub enum LambdaParamComma {
     Tight,
     /// As `comma` decides.
     SameAsComma,
+}
+
+impl SpacingSettings {
+    /// The gap after a comma between lambda parameters.
+    pub fn lambda_param_comma(&self) -> Spacing {
+        match self.lambda_param_comma {
+            LambdaParamComma::Space => Spacing::Spaced,
+            LambdaParamComma::Tight => Spacing::Tight,
+            LambdaParamComma::SameAsComma => self.comma,
+        }
+    }
 }
 
 /// The gap before a comment ending a code line.
@@ -538,13 +492,13 @@ impl SettingsGroup for FormattingSettings {
     ///
     /// | Deprecated | Read as |
     /// |---|---|
-    /// | `indent = N` / `"tab"` / `"editor"` | `indent.width = N`, `whitespace = "spaces"` / `whitespace = "tabs"` / the defaults |
+    /// | `indent = N` / `"tab"` / `"editor"` | `indent.width = N`, `whitespace = "spaces"` / `whitespace = "tabs"` with `width = tabWidth` / the defaults |
     /// | `tabWidth` | `indent.tabWidth` |
     /// | `keepLineBreaks` | `lines.breaks = "keep"`, or `"normalize"` when false |
     /// | `softWrapWidth`, `hardLineWidth` | `lines.softWidth`, `lines.hardWidth`, with `lines.breaks = "wrap"` |
     /// | `breakAfterSemicolon` | `layout.statements = "onePerLine"` or `"keep"` |
     /// | `controlFlowLayout` | `layout.singleLineIf`, `elsePlacement`, `thenPlacement` |
-    /// | `operators.spacesAround`, `operators.compact` | `spacing.operators.spaced`, `tight` |
+    /// | `operators.spacesAround`, `operators.compact` | `spacing.operators.spaced` and `spacedPrefix`, `tight` |
     /// | `brackets.spacesInside`, `brackets.compact` | `spacing.bracketsInside`, pair by pair |
     /// | `compactFactorOperators` | removed: `spacing.indexContextTight` covers its one measured case |
     ///
@@ -617,6 +571,14 @@ impl FormattingSettings {
             Some(false) => no,
             None => json!({}),
         };
+        let tab_width = group.get("tabWidth").cloned().unwrap_or_else(|| {
+            json!(
+                super::ServerSettings::defaults()
+                    .formatting
+                    .indent
+                    .tab_width
+            )
+        });
         let indent = match group.get("indent") {
             Some(Value::Object(_)) | None => None,
             Some(_) => Self::upgrade_deprecated_key(
@@ -627,9 +589,10 @@ impl FormattingSettings {
                     Value::Number(width) => {
                         json!({ "indent": { "width": width, "whitespace": "spaces" } })
                     }
-                    Value::String(word) if word == "tab" => {
-                        json!({ "indent": { "whitespace": "tabs" } })
-                    }
+                    Value::String(word) if word == "tab" => json!({ "indent": {
+                        "whitespace": "tabs",
+                        "width": tab_width,
+                    } }),
                     Value::String(word) if word == "editor" => json!({}),
                     unreadable => json!({ "indent": { "width": unreadable } }),
                 },
@@ -696,18 +659,13 @@ impl FormattingSettings {
             Self::upgrade_deprecated_key(
                 group,
                 "operators",
-                "`spacing.operators.spaced` and `spacing.operators.tight`",
+                "`spacing.operators.spaced`, `spacedPrefix` and `tight`",
                 |value| {
                     let listed = |path: &str| value.pointer(path).cloned().unwrap_or(json!([]));
-                    let mut spaced = listed("/spacesAround/binary");
-                    if let (Some(spaced), Value::Array(unary)) =
-                        (spaced.as_array_mut(), listed("/spacesAround/unary"))
-                    {
-                        spaced.extend(unary);
-                    }
                     json!({ "spacing": { "operators": {
-                        "spaced": spaced,
+                        "spaced": listed("/spacesAround/binary"),
                         "tight": listed("/compact/binary"),
+                        "spacedPrefix": listed("/spacesAround/unary"),
                     } } })
                 },
             ),

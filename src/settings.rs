@@ -33,9 +33,9 @@ use crate::object_registry::ObjectName;
 mod formatting;
 mod project;
 pub use formatting::{
-    CloserIndent, CloserPlacement, ConditionBreaks, Detectable, DetectionSettings, ElsePlacement,
-    FormattingSettings, FunctionBodyLayout, IndentWhitespace, Keepable, LambdaParamComma,
-    LineBreaks, SingleLineIf, StatementLayout, ThenPlacement, TrailingComment,
+    CloserIndent, CloserPlacement, ConditionBreaks, ElsePlacement, FormattingSettings,
+    FunctionBodyLayout, IndentWhitespace, Keepable, LineBreaks, SingleLineIf, StatementLayout,
+    ThenPlacement, TrailingComment,
 };
 pub use project::ProjectConfiguration;
 pub mod spacing;
@@ -1007,7 +1007,7 @@ impl DiagnosticSettings {
 #[cfg(test)]
 mod tests {
     use super::formatting::FormattingProfile;
-    use super::spacing::{OperatorSpacing, Spacing};
+    use super::spacing::Spacing;
     use super::*;
     use std::num::NonZeroUsize;
 
@@ -1079,10 +1079,7 @@ mod tests {
             .allows(catalog::OPTION_KEY_CONVENTION.code));
         assert!(settings.diagnostics.allows(catalog::SYNTAX_ERROR.code));
         let formatting = &settings.formatting;
-        assert_eq!(
-            formatting.indent.width,
-            Detectable::Fixed(NonZeroUsize::new(2).unwrap())
-        );
+        assert_eq!(formatting.indent.width, NonZeroUsize::new(2).unwrap());
         assert_eq!(formatting.indent.whitespace, IndentWhitespace::Spaces);
         assert_eq!(formatting.line_widths(), (Some(88), Some(88)));
         assert_eq!(formatting.layout.single_line_if, SingleLineIf::Never);
@@ -1218,7 +1215,10 @@ mod tests {
         let settings = &parsed.settings;
         assert!(!settings.diagnostics.allows(catalog::UNUSED_BINDING.code));
         assert!(settings.diagnostics.allows(catalog::SYNTAX_ERROR.code));
-        assert_eq!(settings.formatting.indent.width, Detectable::Detect);
+        assert_eq!(
+            settings.formatting.indent.width,
+            ServerSettings::defaults().formatting.indent.width
+        );
         assert_eq!(settings.formatting.indent.tab_width.get(), 4);
         assert_eq!(
             settings.inlay_hints,
@@ -1335,25 +1335,17 @@ mod tests {
         }))
         .formatting;
         assert_eq!(modern.profile, FormattingProfile::Modern);
-        assert_eq!(
-            modern.indent.width,
-            Detectable::Fixed(NonZeroUsize::new(2).unwrap())
-        );
+        assert_eq!(modern.indent.width, NonZeroUsize::new(2).unwrap());
         assert_eq!(modern.indent.whitespace, IndentWhitespace::Spaces);
         assert_eq!(modern.lines.breaks, LineBreaks::Wrap);
-        assert_eq!(
-            modern.spacing.operators.binary("+"),
-            Some(OperatorSpacing::Fixed(Spacing::Spaced))
-        );
+        assert_eq!(modern.spacing.operators.binary("+"), Some(Spacing::Spaced));
+        assert_eq!(modern.spacing.lambda_param_comma(), Spacing::Spaced);
         let core = &ServerSettings::defaults().formatting;
         assert_eq!(core.profile, FormattingProfile::Core);
-        assert_eq!(
-            core.spacing.operators.binary("+"),
-            Some(OperatorSpacing::Detect)
-        );
+        assert_eq!(core.spacing.lambda_param_comma(), Spacing::Tight);
     }
 
-    /// Naming an operator in one list takes it out of the others' defaults.
+    /// Naming an operator in one list takes it out of the other's default.
     #[test]
     fn operator_lists_exclude_each_other() {
         let operators = valid_settings(serde_json::json!({
@@ -1362,15 +1354,9 @@ mod tests {
         .formatting
         .spacing
         .operators;
-        assert_eq!(
-            operators.binary("+"),
-            Some(OperatorSpacing::Fixed(Spacing::Tight))
-        );
-        assert_eq!(operators.binary("-"), Some(OperatorSpacing::Detect));
-        assert_eq!(
-            operators.binary("or"),
-            Some(OperatorSpacing::Fixed(Spacing::Spaced))
-        );
+        assert_eq!(operators.binary("+"), Some(Spacing::Tight));
+        assert_eq!(operators.binary("-"), Some(Spacing::Spaced));
+        assert_eq!(operators.binary("or"), Some(Spacing::Spaced));
         assert_eq!(operators.binary("^**"), None);
     }
 
@@ -1406,10 +1392,7 @@ mod tests {
             "{problems:?}"
         );
         let formatting = parsed.settings.formatting;
-        assert_eq!(
-            formatting.indent.width,
-            Detectable::Fixed(NonZeroUsize::new(2).unwrap())
-        );
+        assert_eq!(formatting.indent.width, NonZeroUsize::new(2).unwrap());
         assert_eq!(formatting.indent.whitespace, IndentWhitespace::Spaces);
         assert_eq!(formatting.indent.tab_width.get(), 4);
         assert_eq!(formatting.line_widths(), (Some(88), None));
@@ -1418,11 +1401,11 @@ mod tests {
         assert_eq!(formatting.layout.else_placement, ElsePlacement::AfterClose);
         assert_eq!(
             formatting.spacing.operators.binary("^"),
-            Some(OperatorSpacing::Fixed(Spacing::Spaced))
+            Some(Spacing::Spaced)
         );
         assert_eq!(
             formatting.spacing.operators.binary("+"),
-            Some(OperatorSpacing::Fixed(Spacing::Tight))
+            Some(Spacing::Tight)
         );
         let brackets = formatting.spacing.brackets_inside;
         assert_eq!(brackets.braces, Keepable::Fixed(Spacing::Spaced));

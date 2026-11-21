@@ -1,23 +1,22 @@
 //! `formatting.spacing.operators.*`: the binary operators the formatter
-//! writes spaced, those it writes tight, those it writes as the document
-//! mostly does, and that everything listed nowhere keeps its spacing as
-//! written.
+//! writes spaced and those it writes tight, an operator listed in neither
+//! keeping its spacing as written, and the prefix operators written apart
+//! from their operand.
 //!
 //! ```toml
 //! [formatting.spacing.operators]
-//! spaced = [":=", "=", "->", "=="]  # a := b
-//! tight = ["^", "_", "#"]           # a^b
-//! detect = ["+", "-"]               # a + b in a file that mostly spaces +
+//! spaced = [":=", "=", "->", "==", "+"]  # a := b, a + b
+//! tight = ["^", "_", "#"]                # a^b
+//! spacedPrefix = ["<<"]                  # << x, but -x and #L
 //! ```
 //!
-//! A list left unset is its default minus what the other lists name, so
-//! `tight = ["+"]` alone takes `+` out of the default `detect` list (see
-//! [`EXCLUSIVE_LISTS`]). An item several lists name is spaced, else tight.
+//! A list left unset is its default minus what the other list names, so
+//! `tight = ["+"]` alone takes `+` out of the default `spaced` list (see
+//! [`EXCLUSIVE_LISTS`]). An operator both lists name is spaced.
 //!
 //! Operators spelled as words (`or`, `and`, `xor`, `not`, `SPACE`, and their
 //! qualified `Core$or` forms) are always spaced, as `1 or 2` and `not x`;
-//! listing one changes nothing. A prefix operator is tight to its operand
-//! (`-x`, `#x`) unless `spaced` lists it, as `<< x`; a postfix one is tight.
+//! listing one changes nothing. A postfix operator is tight, as `n!`.
 
 use std::borrow::Borrow;
 use std::collections::HashSet;
@@ -38,7 +37,6 @@ const CORE_QUALIFIER: &str = "Core$";
 pub const EXCLUSIVE_LISTS: [&[&str]; 1] = [&[
     "/formatting/spacing/operators/spaced",
     "/formatting/spacing/operators/tight",
-    "/formatting/spacing/operators/detect",
 ]];
 
 /// A binary operator the grammar declares, as written in source: `"+"`,
@@ -82,18 +80,8 @@ impl fmt::Display for OperatorSpelling {
     }
 }
 
-/// How an operator's spacing is decided.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum OperatorSpacing {
-    /// Always this way.
-    Fixed(Spacing),
-    /// As the document mostly writes the operator.
-    Detect,
-}
-
-/// `formatting.spacing.operators.*`: the binary operators written spaced,
-/// tight, or as each document mostly writes them.
+/// `formatting.spacing.operators.*`: the binary operators written spaced
+/// and those written tight, and the prefix operators written spaced.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OperatorSpacingSettings {
@@ -101,29 +89,25 @@ pub struct OperatorSpacingSettings {
     pub spaced: HashSet<OperatorSpelling>,
     /// `a^b`.
     pub tight: HashSet<OperatorSpelling>,
-    /// As the document mostly does, spaced when it says too little.
-    pub detect: HashSet<OperatorSpelling>,
+    /// `<< x`; every other prefix operator is tight, `-x`.
+    pub spaced_prefix: HashSet<OperatorSpelling>,
 }
 
 impl OperatorSpacingSettings {
     /// How the binary `operator` is spaced; `None` keeps it as written. A
     /// word operator is always spaced: written tight it runs into its
     /// operands (`notx` is a name, and nobody means `1or 2`).
-    pub fn binary(&self, operator: &str) -> Option<OperatorSpacing> {
+    pub fn binary(&self, operator: &str) -> Option<Spacing> {
         if operator.starts_with(char::is_alphabetic) || self.spaced.contains(operator) {
-            Some(OperatorSpacing::Fixed(Spacing::Spaced))
-        } else if self.tight.contains(operator) {
-            Some(OperatorSpacing::Fixed(Spacing::Tight))
+            Some(Spacing::Spaced)
         } else {
-            self.detect
-                .contains(operator)
-                .then_some(OperatorSpacing::Detect)
+            self.tight.contains(operator).then_some(Spacing::Tight)
         }
     }
 
-    /// How a prefix or postfix `operator` is spaced from its operand.
-    pub fn unary(&self, operator: &str) -> Spacing {
-        if operator.starts_with(char::is_alphabetic) || self.spaced.contains(operator) {
+    /// How a prefix `operator` is spaced from its operand.
+    pub fn prefix(&self, operator: &str) -> Spacing {
+        if operator.starts_with(char::is_alphabetic) || self.spaced_prefix.contains(operator) {
             Spacing::Spaced
         } else {
             Spacing::Tight

@@ -41,16 +41,10 @@ redundantParentheses = "action"
 # "keep" spares call arguments: `f(x)` stays instead of becoming `f x`.
 callParentheses = "remove"
 
-# How much a document must show before a "detect" rule follows it.
-[formatting.detect]
-minSamples = 3      # fewer occurrences: the rule's fallback
-threshold = 0.6     # the share the document's majority must reach
-
 [formatting.indent]
-width = "detect"            # columns per open bracket, or "detect": 2, 4 or 5
-fallbackWidth = 5           # what "detect" uses without a majority
-whitespace = "emacsTabs"    # "emacsTabs": a tab per tabWidth columns, then spaces
-                            # "spaces", or "tabs": one tab per indent level
+width = 5                   # columns per open bracket
+whitespace = "tabs"         # "tabs": a tab per tabWidth columns, then spaces, as Emacs
+                            # writes; with width = tabWidth one tab per bracket. "spaces"
 tabWidth = 8                # columns per tab, also for measuring line widths
 closers = "body"            # "body": a line starting with ) } ] keeps the body's indent
                             # "opener": dedented to the opener line's indent
@@ -78,8 +72,8 @@ thenPlacement = "withCondition"             # "withCondition", or "ownLine" when
 conditionBreaks = "beforeOperator"          # "beforeOperator": or/and start the lines; "afterOperator"
 
 [formatting.spacing]
-comma = "detect"            # "space", "tight", or "detect" (fallback "space")
-lambdaParamComma = "detect" # "space", "tight", "sameAsComma", or "detect" (fallback "tight")
+comma = "space"             # f(a, b) or f(a,b): "space" or "tight"
+lambdaParamComma = "tight"  # (x,y) -> or (x, y) ->: "space", "tight", "sameAsComma"
 semicolon = "space"         # before more code on the same line: "space" or "tight"
 # (x) or ( x ), per pair: "tight", "space", "keep"; or one of these for all
 bracketsInside = { "()" = "tight", "{}" = "tight", "[]" = "tight", "<||>" = "tight" }
@@ -89,18 +83,19 @@ indexContextTight = true    # + - * / tight inside a bracket right after _ # ^ .
 trailingComment = "oneSpace"    # the gap before a trailing --: "oneSpace" or "keep"
 preserveAlignment = true    # keep padding lining a token up with the neighbouring line
 
-# Binary operators written `a + b`, `a^b`, or as the document mostly writes
-# them (spaced when it says too little). Listing an operator in one list
-# removes it from the others' defaults; operators in none keep their spacing.
-# Word operators (`or`, `and`, `xor`, `not`) are always spaced; prefix
-# operators are tight to their operand unless `spaced` lists them (`<< x`).
+# Binary operators written `a + b` and those written `a^b`. Listing an
+# operator in one list removes it from the other's default; operators in
+# neither keep their spacing. Prefix operators are tight to their operand
+# (`-x`, `#L`) unless `spacedPrefix` lists them (`<< x`); word operators
+# (`or`, `and`, `xor`, `not`) are always spaced.
 [formatting.spacing.operators]
 spaced = [
     ":=", "=", "->", "=>", "<-", "==", "===", "=!=", "!=", "<", ">", "<=", ">=",
     "<<", ">>", "@@", "\\", "++", "?", "**", "||", "%", "|", "..<", "&",
+    "+", "-", "*", "/", "//", "..",
 ]
 tight = ["#", ".", ".?", "#?", "_", "^", ":"]
-detect = ["+", "-", "*", "/", "//", ".."]
+spacedPrefix = ["<<"]
 
 [formatting.comments]
 bannerWidth = 77    # rule-only comment lines of 60 to 90 dashes; 0 or null: left
@@ -110,23 +105,13 @@ bannerWidth = 77    # rule-only comment lines of 60 to 90 dashes; 0 or null: lef
 
 [formatting.profiles.modern.indent]
 width = 4
-fallbackWidth = 4
 whitespace = "spaces"
 
 [formatting.profiles.modern.lines]
 breaks = "wrap"
 
 [formatting.profiles.modern.spacing]
-comma = "space"
 lambdaParamComma = "sameAsComma"
-
-[formatting.profiles.modern.spacing.operators]
-spaced = [
-    ":=", "=", "->", "=>", "<-", "==", "===", "=!=", "!=", "<", ">", "<=", ">=",
-    "<<", ">>", "@@", "\\", "++", "?", "**", "||", "%", "|", "..<", "&",
-    "+", "-", "*", "/", "//", "..",
-]
-detect = []
 
 
 [inlayHints]

@@ -11,8 +11,7 @@
 //!
 //! 1. indentation by the column model of [`indent`], first, so that the
 //!    next pass sees the columns tokens end up in;
-//! 2. horizontal spacing within each line ([`spacing`]), driven by the style
-//!    [`detect`] resolves for the document;
+//! 2. horizontal spacing within each line ([`spacing`]);
 //! 3. under `lines.breaks = "normalize"`, the line structure of multi-line
 //!    constructs ([`lines`]);
 //! 4. blank lines and the end of the file;
@@ -35,10 +34,8 @@ use crate::document::DocumentSnapshot;
 use crate::node_metadata::SyntaxSnapshot;
 use crate::settings::{FormattingSettings, LineBreaks, LogLevel};
 use crate::source::{SourceNavigation, SyntaxSource};
-use detect::FormatStyle;
 use layout::LayoutSource;
 
-mod detect;
 mod folding;
 mod indent;
 mod layout;
@@ -160,19 +157,18 @@ fn formatted_layout(syntax: &SyntaxSnapshot, settings: &FormattingSettings) -> L
     const MAX_LAYOUT_ROUNDS: usize = 64;
 
     let mut layout = LayoutSource::new(syntax);
-    let style = FormatStyle::for_document(settings, syntax, &layout);
     let newline = Whitespace::newline(syntax.source());
     let breaks = settings.lines.breaks;
     for _ in 0..MAX_LAYOUT_ROUNDS {
-        let mut changed = layout.apply(indent::ColumnIndent::edits(syntax, &layout, &style));
-        changed |= layout.apply(spacing::HorizontalSpacing::edits(syntax, &layout, &style));
+        let mut changed = layout.apply(indent::ColumnIndent::edits(syntax, &layout, settings));
+        changed |= layout.apply(spacing::HorizontalSpacing::edits(syntax, &layout, settings));
         if breaks == LineBreaks::Normalize {
-            changed |= lines::LineStructure::apply(syntax, &mut layout, &style, newline);
+            changed |= lines::LineStructure::apply(syntax, &mut layout, settings, newline);
         }
         changed |= layout.apply(lines::BlankLines::edits(syntax, &layout, settings, newline));
         if breaks != LineBreaks::Keep {
-            changed |= layout.apply(indent::ColumnIndent::edits(syntax, &layout, &style));
-            changed |= layout.apply(lines::Wrapping::edits(syntax, &layout, &style, newline));
+            changed |= layout.apply(indent::ColumnIndent::edits(syntax, &layout, settings));
+            changed |= layout.apply(lines::Wrapping::edits(syntax, &layout, settings, newline));
         }
         if !changed {
             break;

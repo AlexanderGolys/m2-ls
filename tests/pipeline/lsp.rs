@@ -1133,7 +1133,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         .expect("the unindented lambda body should produce a whole-document edit");
     assert!(
         formatted.contains(
-            "(m, block) ->\nresultSource (transformOf m)(tokenStream parseMacroTree block)"
+            "(m,block) ->\nresultSource (transformOf m)(tokenStream parseMacroTree block)"
         ),
         "a line ending in an operator does not indent the next: {formatted}"
     );

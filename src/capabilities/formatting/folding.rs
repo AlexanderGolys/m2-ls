@@ -18,7 +18,7 @@ use tower_lsp::lsp_types::{FoldingRange, FoldingRangeKind, FoldingRangeProviderC
 
 use super::indent::ColumnIndent;
 use super::layout::LayoutSource;
-use super::{FormatStyle, TextLine};
+use super::TextLine;
 use crate::node_metadata::SyntaxSnapshot;
 use crate::package_documentation::PackageDocumentation;
 use crate::settings::{CloserIndent, ServerSettings};
@@ -96,11 +96,10 @@ impl Folds<'_> {
     /// line, at the body's column.
     fn code(&mut self, syntax: &SyntaxSnapshot) {
         let settings = &ServerSettings::defaults().formatting;
-        let style = FormatStyle::for_document(settings, syntax, self.layout);
         let columns = ColumnIndent::compute(
             syntax,
             self.layout,
-            style.indent_width,
+            settings.indent.width.get(),
             settings.indent.closers,
             settings.indent.tab_width.get(),
         );

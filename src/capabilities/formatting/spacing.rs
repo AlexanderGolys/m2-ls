@@ -15,8 +15,9 @@
 //! 8. between a function and its parenthesized argument, `spacing.callParen`;
 //! 9. around a binary operator, `spacing.operators`, tight for `+ - * /`
 //!    inside an index bracket (`x#(i+1)`) under `spacing.indexContextTight`;
-//! 10. between a prefix or postfix operator and its operand, tight unless
-//!     `spacing.operators.spaced` lists it (`<< x`).
+//! 10. between a prefix operator and its operand, tight unless
+//!     `spacing.operators.spacedPrefix` lists it (`<< x`); a postfix operator
+//!     is tight.
 //!
 //! Anything else keeps its spacing. Under `spacing.preserveAlignment`, padding
 //! of more than one space before an operator, after a comma or before a
@@ -40,10 +41,10 @@ use m2_syn::visit::{self, Visit};
 use m2_syn::{CommentKind, Punctuated, Spanned};
 
 use super::layout::LayoutSource;
-use super::{Bracket, FormatEdit, FormatStyle, TextLine, Whitespace};
+use super::{Bracket, FormatEdit, TextLine, Whitespace};
 use crate::node_metadata::SyntaxSnapshot;
 use crate::settings::spacing::Spacing;
-use crate::settings::{Keepable, TrailingComment};
+use crate::settings::{FormattingSettings, Keepable, TrailingComment};
 use crate::source::SourceNavigation;
 use crate::syntax::{AssignmentSyntax, AssignmentTarget, AssignmentTraversal, ExpressionSyntax};
 
@@ -149,8 +150,8 @@ impl Alignment<'_> {
 pub(super) struct HorizontalSpacing<'a> {
     /// The document as written.
     layout: &'a LayoutSource,
-    /// The style in effect.
-    style: &'a FormatStyle<'a>,
+    /// The settings in effect.
+    settings: &'a FormattingSettings,
     /// Where padding lines tokens up.
     alignment: Alignment<'a>,
     /// Which brackets index.
@@ -170,16 +171,16 @@ impl<'a> HorizontalSpacing<'a> {
     pub(super) fn edits(
         syntax: &SyntaxSnapshot,
         layout: &'a LayoutSource,
-        style: &'a FormatStyle<'a>,
+        settings: &'a FormattingSettings,
     ) -> Vec<FormatEdit> {
         let text = layout.text();
         let mut spacing = Self {
             layout,
-            style,
+            settings,
             alignment: Alignment {
                 text,
                 lines: TextLine::all(text),
-                tab_width: style.settings.indent.tab_width.get(),
+                tab_width: settings.indent.tab_width.get(),
             },
             index: IndexContext::default(),
             edits: Vec::new(),
@@ -205,7 +206,7 @@ impl<'a> HorizontalSpacing<'a> {
             return;
         }
         let keeps_alignment = width > 1
-            && self.style.settings.spacing.preserve_alignment
+            && self.settings.spacing.preserve_alignment
             && aligned.is_some_and(|token| self.alignment.holds(token));
         if !keeps_alignment {
             self.edits.push(FormatEdit::new(bytes, spacing.padding()));
@@ -227,7 +228,6 @@ impl<'a> HorizontalSpacing<'a> {
     fn comments(&mut self, syntax: &SyntaxSnapshot) {
         let text = self.layout.text();
         let banner = self
-            .style
             .settings
             .comments
             .banner_width
@@ -244,7 +244,7 @@ impl<'a> HorizontalSpacing<'a> {
             let end = bytes.start + written.trim_end().len();
             match self.before(&(start..start)) {
                 Some(gap) => {
-                    if self.style.settings.spacing.trailing_comment == TrailingComment::OneSpace {
+                    if self.settings.spacing.trailing_comment == TrailingComment::OneSpace {
                         self.gap(gap, Spacing::Spaced, Some(start..start + 2));
                     }
                 }
@@ -272,9 +272,7 @@ impl<'a> HorizontalSpacing<'a> {
             self.edits.push(FormatEdit::new(interior, ""));
             return;
         }
-        if let Keepable::Fixed(spacing) =
-            self.style.settings.spacing.brackets_inside.of(bracket.kind)
-        {
+        if let Keepable::Fixed(spacing) = self.settings.spacing.brackets_inside.of(bracket.kind) {
             for gap in [self.after(&bracket.open), self.before(close)]
                 .into_iter()
                 .flatten()
@@ -330,7 +328,7 @@ impl<'a> HorizontalSpacing<'a> {
             let spacing = if matches!(text.as_bytes()[gap.end], b')' | b']' | b'}') {
                 Spacing::Tight
             } else {
-                self.style.settings.spacing.semicolon
+                self.settings.spacing.semicolon
             };
             self.gap(gap, spacing, None);
         }
@@ -357,11 +355,7 @@ impl<'a> HorizontalSpacing<'a> {
 
     /// Rule 7 for a keyword and the expression after it.
     fn keyword(&mut self, keyword: &impl Spanned, expression: &Expr) {
-        self.before_bracket(
-            keyword,
-            expression,
-            self.style.settings.spacing.keyword_paren,
-        );
+        self.before_bracket(keyword, expression, self.settings.spacing.keyword_paren);
     }
 
     /// Rule 9 for a binary operator: both gaps, tight only when both are on
@@ -371,7 +365,7 @@ impl<'a> HorizontalSpacing<'a> {
             return;
         };
         let spelling = &self.layout.text()[bytes.clone()];
-        let Some(spacing) = self.style.binary_spacing(spelling, self.index.is_inside()) else {
+        let Some(spacing) = self.binary_spacing(spelling) else {
             return;
         };
         let (before, after) = (self.before(&bytes), self.after(&bytes));
@@ -386,21 +380,30 @@ impl<'a> HorizontalSpacing<'a> {
         }
     }
 
+    /// How the binary `operator` is spaced here, tight inside an index when
+    /// `indexContextTight` says so; `None` keeps it as written.
+    fn binary_spacing(&self, operator: &str) -> Option<Spacing> {
+        let spacing = &self.settings.spacing;
+        let indexed = self.index.is_inside()
+            && spacing.index_context_tight
+            && IndexContext::ARITHMETIC.contains(&operator);
+        let configured = spacing.operators.binary(operator)?;
+        Some(if indexed { Spacing::Tight } else { configured })
+    }
+
     /// Rule 10 for a prefix (`operand_after`) or postfix operator.
     fn unary(&mut self, operator: &impl Spanned, operand_after: bool) {
         let Some(bytes) = self.layout.syntax_range(operator) else {
             return;
         };
-        let spacing = self
-            .style
-            .settings
-            .spacing
-            .operators
-            .unary(&self.layout.text()[bytes.clone()]);
-        let gap = if operand_after {
-            self.after(&bytes)
+        let (gap, spacing) = if operand_after {
+            let spelling = &self.layout.text()[bytes.clone()];
+            (
+                self.after(&bytes),
+                self.settings.spacing.operators.prefix(spelling),
+            )
         } else {
-            self.before(&bytes)
+            (self.before(&bytes), Spacing::Tight)
         };
         if let Some(gap) = gap {
             self.gap(gap, spacing, None);
@@ -421,7 +424,7 @@ impl<'ast> Visit<'ast> for HorizontalSpacing<'_> {
                 self.before_bracket(
                     node.left.as_ref(),
                     &node.right,
-                    self.style.settings.spacing.call_paren,
+                    self.settings.spacing.call_paren,
                 );
             }
         } else {
@@ -439,7 +442,7 @@ impl<'ast> Visit<'ast> for HorizontalSpacing<'_> {
     fn visit_expr_assign(&mut self, node: &'ast ExprAssign) {
         self.binary(&node.op);
         if let AssignmentTarget::Method { method, signature } = node.parts().target {
-            self.before_bracket(method, signature, self.style.settings.spacing.call_paren);
+            self.before_bracket(method, signature, self.settings.spacing.call_paren);
         }
         node.visit_installing(self);
     }
@@ -465,14 +468,18 @@ impl<'ast> Visit<'ast> for HorizontalSpacing<'_> {
     }
 
     fn visit_elements_pack(&mut self, node: &'ast ElementsPack) {
-        self.commas(&node.elems, self.style.comma, |element| {
+        self.commas(&node.elems, self.settings.spacing.comma, |element| {
             matches!(element, Element::Empty(_))
         });
         visit::visit_elements_pack(self, node);
     }
 
     fn visit_params_pack(&mut self, node: &'ast ParamsPack) {
-        self.commas(&node.params, self.style.lambda_param_comma, |_| false);
+        self.commas(
+            &node.params,
+            self.settings.spacing.lambda_param_comma(),
+            |_| false,
+        );
         visit::visit_params_pack(self, node);
     }
 

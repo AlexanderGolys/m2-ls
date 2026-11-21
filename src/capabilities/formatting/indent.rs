@@ -25,9 +25,9 @@
 use std::ops::Range;
 
 use super::layout::LayoutSource;
-use super::{Bracket, FormatEdit, FormatStyle, TextLine, Whitespace};
+use super::{Bracket, FormatEdit, TextLine, Whitespace};
 use crate::node_metadata::SyntaxSnapshot;
-use crate::settings::{CloserIndent, IndentWhitespace};
+use crate::settings::{CloserIndent, FormattingSettings, IndentWhitespace};
 use crate::source::SourceNavigation;
 
 /// How one line is indented.
@@ -155,20 +155,20 @@ impl ColumnIndent {
         }
     }
 
-    /// The edits indenting every line of `layout` as `style` says, and
+    /// The edits indenting every line of `layout` as `settings` say, and
     /// removing trailing whitespace when configured.
     pub(super) fn edits(
         syntax: &SyntaxSnapshot,
         layout: &LayoutSource,
-        style: &FormatStyle<'_>,
+        settings: &FormattingSettings,
     ) -> Vec<FormatEdit> {
-        let settings = &style.settings.indent;
-        let tab_width = settings.tab_width.get();
+        let configured = &settings.indent;
+        let tab_width = configured.tab_width.get();
         let columns = Self::compute(
             syntax,
             layout,
-            style.indent_width,
-            settings.closers,
+            configured.width.get(),
+            configured.closers,
             tab_width,
         );
         let text = layout.text();
@@ -181,12 +181,12 @@ impl ColumnIndent {
                 }
                 LineIndent::Column(column) => edits.push(FormatEdit::new(
                     leading,
-                    Self::written(column, settings.whitespace, tab_width, style.indent_width),
+                    Self::written(column, configured.whitespace, tab_width),
                 )),
                 LineIndent::Kept(_) => {}
             }
             let trailing = line.content_end(text).max(line.content_start(text))..line.end_byte;
-            if style.settings.lines.trim_trailing_whitespace
+            if settings.lines.trim_trailing_whitespace
                 && *indent != LineIndent::Blank
                 && !trailing.is_empty()
             {
@@ -225,16 +225,10 @@ impl ColumnIndent {
     }
 
     /// An indent of `column` columns written with `whitespace`.
-    fn written(
-        column: usize,
-        whitespace: IndentWhitespace,
-        tab_width: usize,
-        width: usize,
-    ) -> String {
+    fn written(column: usize, whitespace: IndentWhitespace, tab_width: usize) -> String {
         let (tabs, spaces) = match whitespace {
-            IndentWhitespace::EmacsTabs => (column / tab_width, column % tab_width),
+            IndentWhitespace::Tabs => (column / tab_width, column % tab_width),
             IndentWhitespace::Spaces => (0, column),
-            IndentWhitespace::Tabs => (column / width, column % width),
         };
         "\t".repeat(tabs) + &" ".repeat(spaces)
     }

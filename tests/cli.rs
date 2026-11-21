@@ -427,16 +427,22 @@ fn formatter_follows_the_core_layout_rules() {
     let workspace = Workspace::new();
     let cases: &[(&str, &str, &str, &str)] = &[
         (
-            "brackets indent by the fallback width, tabs from 8 columns",
+            "brackets indent by 5, written with a tab from 8 columns",
             "",
             "f = x -> (\nif x then (\ny)\nelse x)\n",
             "f = x -> (\n     if x then (\n\t  y)\n     else x)\n",
         ),
         (
-            "the indent width is the file's dominant step",
-            "",
-            "f = x -> (\n    a;\n    g(y -> (\n        b))\n    )\nh = x -> (\n    c)\n",
-            "f = x -> (\n    a;\n    g(y -> (\n\t    b))\n    )\nh = x -> (\n    c)\n",
+            "the configured width holds whatever the file does",
+            "[formatting.indent]\nwidth = 4\n",
+            "f = x -> (\n  a;\n  g(y -> (\n        b))\n     )\n",
+            "f = x -> (\n    a;\n    g(y -> (\n\t    b))\n    )\n",
+        ),
+        (
+            "a width of one tab writes one tab per open bracket",
+            "[formatting.indent]\nwidth = 8\n",
+            "f = x -> (\na;\ng(y -> (\nb)))\n",
+            "f = x -> (\n\ta;\n\tg(y -> (\n\t\t\tb)))\n",
         ),
         (
             "opener closers dedent to the opening line",
@@ -445,10 +451,10 @@ fn formatter_follows_the_core_layout_rules() {
             "f = x -> (\n     y\n)\n",
         ),
         (
-            "commas and operators follow the file's majority",
+            "commas and arithmetic are spaced, lambda parameters and indices tight",
             "",
-            "f(a,b)\ng(c,d)\nh(e,f)\nk = (x, y) -> x\na+b\nc+d\ne+f\ng-h\nx#(i + 1)\n",
-            "f(a,b)\ng(c,d)\nh(e,f)\nk = (x,y) -> x\na+b\nc+d\ne+f\ng - h\nx#(i+1)\n",
+            "f(a,b)\nk = (x, y) -> x\na+b\nx#(i + 1)\n",
+            "f(a, b)\nk = (x,y) -> x\na + b\nx#(i+1)\n",
         ),
         (
             "padding that aligns with a neighbour stays",

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use super::{ParsedSettings, ServerSettings, SettingIssue, SettingProblem};
+use crate::package_index::Macaulay2Environment;
 
 /// Conventional configuration locations shared by the server and CLI tools.
 #[derive(Debug, Clone, Copy, Default)]
@@ -27,10 +28,13 @@ impl ProjectConfiguration {
         Self::load_paths(global.as_deref(), project.as_deref(), client)
     }
 
-    /// Global settings path supplied by the operating system's user profile.
-    /// An unavailable home directory leaves only project and explicit settings.
+    /// Global settings path under the home directory, the same home package
+    /// discovery uses. With no home in the environment only project and
+    /// explicit settings apply.
     pub fn global_path() -> Option<PathBuf> {
-        std::env::home_dir().map(|home| home.join(Self::GLOBAL_DIRECTORY).join(Self::FILE_NAME))
+        Macaulay2Environment::current()
+            .home
+            .map(|home| home.join(Self::GLOBAL_DIRECTORY).join(Self::FILE_NAME))
     }
 
     /// Loads explicitly located files, keeping configuration tests independent

@@ -16,7 +16,7 @@ use m2_syn::visit::{self, Visit};
 use m2_syn::{Punctuated, Spanned};
 
 use super::layout::LayoutSource;
-use super::{Bracket, FormatEdit, FormatStyle, TextLine, Whitespace};
+use super::{Bracket, FormatEdit, TextLine, Whitespace};
 use crate::node_metadata::SyntaxSnapshot;
 use crate::settings::{
     CloserPlacement, ConditionBreaks, ElsePlacement, FormattingSettings, FunctionBodyLayout,
@@ -152,7 +152,7 @@ impl<'a> LineStructure<'a> {
     pub(super) fn apply(
         syntax: &SyntaxSnapshot,
         layout: &mut LayoutSource,
-        style: &FormatStyle<'_>,
+        settings: &FormattingSettings,
         newline: &'static str,
     ) -> bool {
         let mut changed = false;
@@ -164,7 +164,7 @@ impl<'a> LineStructure<'a> {
                     newline,
                     edits: Vec::new(),
                 },
-                settings: style.settings,
+                settings,
                 nesting: Nesting::new(&brackets),
                 stage,
                 conditions: 0,
@@ -173,7 +173,7 @@ impl<'a> LineStructure<'a> {
             let edits = structure.breaks.edits;
             changed |= layout.apply(edits);
         }
-        let edits = Self::closers(syntax, layout, style.settings, newline);
+        let edits = Self::closers(syntax, layout, settings, newline);
         layout.apply(edits) || changed
     }
 
@@ -554,10 +554,10 @@ impl<'a> Wrapping<'a> {
     pub(super) fn edits(
         syntax: &SyntaxSnapshot,
         layout: &'a LayoutSource,
-        style: &FormatStyle<'_>,
+        settings: &FormattingSettings,
         newline: &'static str,
     ) -> Vec<FormatEdit> {
-        let (soft, hard) = style.settings.line_widths();
+        let (soft, hard) = settings.line_widths();
         let Some(width) = soft.or(hard) else {
             return Vec::new();
         };
@@ -578,7 +578,7 @@ impl<'a> Wrapping<'a> {
         }
         syntax.visit(&mut wrapping);
         let text = layout.text();
-        let tab_width = style.settings.indent.tab_width.get();
+        let tab_width = settings.indent.tab_width.get();
         let column = |line: TextLine, byte: usize| {
             Whitespace::width(&text[line.start_byte..byte], tab_width)
         };
