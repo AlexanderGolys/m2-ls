@@ -2157,12 +2157,7 @@ impl LanguageServer for Backend {
             if document.properties().primary_code {
                 return Vec::new();
             }
-            document_formatting_text_edits(
-                document,
-                params.options.tab_size,
-                params.options.insert_spaces,
-                &settings.formatting,
-            )
+            document_formatting_text_edits(document, &settings.formatting)
         }))
     }
 

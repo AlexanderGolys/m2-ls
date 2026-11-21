@@ -16,7 +16,7 @@ use std::process::ExitCode;
 
 use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString, Url};
 
-use crate::capabilities::formatting::{format_document_with_options, FormatOptions};
+use crate::capabilities::formatting::format_document;
 use crate::catalog::CatalogSource;
 use crate::diagnostics::visible_diagnostics;
 use crate::document::{DocumentSnapshot, FileProperties};
@@ -224,8 +224,7 @@ impl Tool {
             return Err("cannot format source with syntax errors".into());
         }
         let formatted =
-            format_document_with_options(&syntax, &FormatOptions::from(&settings.formatting))
-                .map_err(|error| error.to_string())?;
+            format_document(&syntax, &settings.formatting).map_err(|error| error.to_string())?;
         match &options.input {
             _ if options.check => {
                 if formatted != text {

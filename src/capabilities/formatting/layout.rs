@@ -19,7 +19,8 @@ pub(super) struct LayoutSource {
     starts: Vec<usize>,
     /// Original byte boundaries mapped to current layout end coordinates.
     ends: Vec<usize>,
-    /// Original byte intervals of strings, comments, and malformed syntax that edits must not alter.
+    /// Original byte intervals of strings, comments, and malformed syntax
+    /// that edits must not alter, disjoint and in order.
     protected: Vec<Range<usize>>,
 }
 
@@ -55,12 +56,20 @@ impl LayoutSource {
                 ranges.push(cell.document_range());
             }
         }
+        ranges.sort_by_key(|range| range.start);
+        let mut protected: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            match protected.last_mut() {
+                Some(last) if range.start < last.end => last.end = last.end.max(range.end),
+                _ => protected.push(range),
+            }
+        }
         Self {
             original: source.clone(),
             source,
             starts: (0..=text.len()).collect(),
             ends: (0..=text.len()).collect(),
-            protected: ranges,
+            protected,
         }
     }
 
@@ -93,39 +102,95 @@ impl LayoutSource {
         &self.text()[start..end]
     }
 
-    /// Apply only whitespace edits, updating coordinates rather than syntax.
-    pub(super) fn apply(&mut self, mut edits: Vec<FormatEdit>) -> bool {
-        edits.retain(|edit| self.text()[edit.start_byte..edit.end_byte] != edit.replacement);
-        if edits.is_empty() {
-            return false;
-        }
-        edits.sort_by_key(|edit| (edit.start_byte, edit.end_byte));
-        if edits
-            .windows(2)
-            .any(|pair| pair[0].end_byte > pair[1].start_byte)
-            || edits.iter().any(|edit| {
-                !self.text()[edit.start_byte..edit.end_byte]
-                    .bytes()
-                    .all(|byte| byte.is_ascii_whitespace())
-                    || !edit
-                        .replacement
-                        .bytes()
-                        .all(|byte| byte.is_ascii_whitespace())
-                    || self.protected.iter().any(|span| {
-                        let start = self.starts[span.start];
-                        let end = self.ends[span.end];
-                        (edit.start_byte < end && start < edit.end_byte)
-                            || (edit.start_byte == edit.end_byte
-                                && start < edit.start_byte
-                                && edit.start_byte < end)
-                    })
-            })
-        {
-            return false;
-        }
+    /// Whether `byte` lies in a string, a comment or an unparsable region.
+    pub(super) fn is_protected_at(&self, byte: usize) -> bool {
+        self.is_protected_within(byte..byte + 1)
+    }
 
+    /// Whether any byte of `bytes` lies in a string, a comment or an
+    /// unparsable region.
+    pub(super) fn is_protected_within(&self, bytes: Range<usize>) -> bool {
+        let mapped = |span: &Range<usize>| {
+            let start = self.starts[span.start];
+            start..self.ends[span.end].max(start)
+        };
+        let first = self
+            .protected
+            .partition_point(|span| mapped(span).end <= bytes.start);
+        self.protected
+            .get(first)
+            .is_some_and(|span| mapped(span).start < bytes.end)
+    }
+
+    /// Whether a line comment starts at `byte`, as `--` outside a string.
+    pub(super) fn starts_line_comment(&self, byte: usize) -> bool {
+        self.is_protected_at(byte) && self.text()[byte..].starts_with(Self::LINE_COMMENT)
+    }
+
+    /// The width in bytes of the spaces and tabs filling `bytes`; `None`
+    /// when anything else, such as a line break, is there.
+    pub(super) fn horizontal_gap(&self, bytes: Range<usize>) -> Option<usize> {
+        let gap = self.text().get(bytes)?;
+        gap.bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t'))
+            .then_some(gap.len())
+    }
+
+    /// Apply the edits that are allowed, dropping the others: an edit must
+    /// replace whitespace outside protected regions with whitespace, or a
+    /// whole line comment with another one, and must not overlap an edit
+    /// listed before it. Returns whether the text changed.
+    pub(super) fn apply(&mut self, edits: Vec<FormatEdit>) -> bool {
+        let mut accepted: Vec<FormatEdit> = Vec::new();
+        for edit in edits {
+            let overlaps = accepted.iter().any(|kept| {
+                kept.start_byte < edit.end_byte && edit.start_byte < kept.end_byte
+                    || (kept.start_byte == edit.start_byte && kept.end_byte == edit.end_byte)
+            });
+            if !overlaps && self.allows(&edit) {
+                accepted.push(edit);
+            }
+        }
+        accepted.retain(|edit| self.text()[edit.start_byte..edit.end_byte] != edit.replacement);
+        if accepted.is_empty() {
+            return false;
+        }
+        accepted.sort_by_key(|edit| (edit.start_byte, edit.end_byte));
+        self.remap(&accepted);
+        let mut text = self.text().to_string();
+        for edit in accepted.into_iter().rev() {
+            text.replace_range(edit.start_byte..edit.end_byte, &edit.replacement);
+        }
+        self.source = DocumentSource::new(text);
+        true
+    }
+
+    /// Whether `edit` may be applied: see [`Self::apply`].
+    fn allows(&self, edit: &FormatEdit) -> bool {
+        let bytes = edit.start_byte..edit.end_byte;
+        let replaced = &self.text()[bytes.clone()];
+        let whitespace = |text: &str| text.bytes().all(|byte| byte.is_ascii_whitespace());
+        if whitespace(replaced) && whitespace(&edit.replacement) {
+            return if bytes.is_empty() {
+                bytes.start == 0
+                    || !(self.is_protected_at(bytes.start - 1) && self.is_protected_at(bytes.start))
+            } else {
+                !self.is_protected_within(bytes)
+            };
+        }
+        [replaced, edit.replacement.as_str()]
+            .iter()
+            .all(|text| text.starts_with(Self::LINE_COMMENT) && !text.contains('\n'))
+            && self.protected_ranges().any(|span| span == bytes)
+    }
+
+    /// The marker opening a line comment.
+    const LINE_COMMENT: &str = "--";
+
+    /// Move every original boundary past the sorted, disjoint `edits`.
+    fn remap(&mut self, edits: &[FormatEdit]) {
         let mut shifts = vec![0isize];
-        for edit in &edits {
+        for edit in edits {
             shifts.push(
                 shifts.last().unwrap() + edit.replacement.len() as isize
                     - (edit.end_byte - edit.start_byte) as isize,
@@ -152,12 +217,6 @@ impl LayoutSource {
         for position in &mut self.ends {
             *position = map(*position, false);
         }
-        let mut text = self.text().to_string();
-        for edit in edits.into_iter().rev() {
-            text.replace_range(edit.start_byte..edit.end_byte, &edit.replacement);
-        }
-        self.source = DocumentSource::new(text);
-        true
     }
 }
 

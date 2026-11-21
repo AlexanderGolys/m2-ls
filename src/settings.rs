@@ -26,16 +26,20 @@ use serde_json::{Map, Value};
 use serde_path_to_error::{Path, Segment};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-use crate::capabilities::formatting::{ControlFlowLayout, RedundantParentheses};
 use crate::diagnostics::{catalog, DiagnosticCode};
 use crate::init_file::InitFileChoice;
-use crate::node_metadata::CallParentheses;
 use crate::object_registry::ObjectName;
 
+mod formatting;
 mod project;
+pub use formatting::{
+    CloserIndent, CloserPlacement, ConditionBreaks, Detectable, DetectionSettings, ElsePlacement,
+    FormattingSettings, FunctionBodyLayout, IndentWhitespace, Keepable, LambdaParamComma,
+    LineBreaks, SingleLineIf, StatementLayout, ThenPlacement, TrailingComment,
+};
 pub use project::ProjectConfiguration;
 pub mod spacing;
-use spacing::{BracketSpacingSettings, OperatorSpacingSettings, OPPOSED_LISTS};
+use spacing::EXCLUSIVE_LISTS;
 
 /// The current value of a setting that requests read while the client
 /// replaces it.
@@ -179,85 +183,6 @@ pub struct DiagnosticSettings {
     /// `h.k ?? v` for `if h.k =!= null then h.k else v`, which yields `v`
     /// where the conditional fails because `h` lacks the key `k`.
     pub error_catching_rewrites: bool,
-}
-
-/// `formatting.*`: how the formatter lays out a document.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FormattingSettings {
-    /// One indentation level: `"editor"`, `"tab"` or a number of spaces.
-    pub indent: Indent,
-    /// Columns a tab is displayed as, for line widths; the editor's tab
-    /// size when unset.
-    pub tab_width: Option<u32>,
-    /// The width lines are preferably wrapped at; `0` or `null` disables it.
-    /// It never exceeds `hardLineWidth`.
-    #[serde(rename = "softWrapWidth")]
-    pub soft_line_width: Option<u32>,
-    /// The width lines are always wrapped at; `0` or `null` disables it.
-    pub hard_line_width: Option<u32>,
-    /// `compact`, `multiline`, `multilineCompactElse`, or `leadingKeywords`.
-    pub control_flow_layout: ControlFlowLayout,
-    /// `2*x` instead of `2 * x`.
-    pub compact_factor_operators: bool,
-    /// Whether the next expression after `;` starts on a new line.
-    pub break_after_semicolon: bool,
-    /// Keep every line break as written: only spacing within lines and
-    /// indentation change, so line widths and `controlFlowLayout` have no
-    /// effect.
-    pub keep_line_breaks: bool,
-    /// `operators.*`: operators written `a + b` and those written `a^b`.
-    pub operators: OperatorSpacingSettings,
-    /// `brackets.*`: brackets written `{ x }` and those written `{x}`.
-    pub brackets: BracketSpacingSettings,
-    /// `off`, `action` (a source action removes them) or `format` (also
-    /// removed by formatting): parentheses the syntax does not need.
-    pub redundant_parentheses: RedundantParentheses,
-    /// `remove` or `keep`: whether redundant parentheses around a call's
-    /// argument go too, `f(x)` as `f x`.
-    pub call_parentheses: CallParentheses,
-}
-
-/// One level of indentation, written `indent = "editor"`, `indent = "tab"`
-/// or `indent = 2` for two spaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "IndentValue")]
-pub enum Indent {
-    /// Tabs or spaces as the editor indents; JSON's `null` means the same.
-    Editor,
-    /// One tab.
-    Tab,
-    /// This many spaces.
-    Spaces(u32),
-}
-
-/// [`Indent`] as written: a word, a count, or JSON's `null`.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum IndentValue {
-    /// `null`.
-    Unset(()),
-    /// A number of spaces.
-    Spaces(u32),
-    /// `"editor"` or `"tab"`.
-    Word(String),
-}
-
-impl TryFrom<IndentValue> for Indent {
-    type Error = String;
-    fn try_from(value: IndentValue) -> Result<Self, String> {
-        match value {
-            IndentValue::Unset(()) => Ok(Self::Editor),
-            IndentValue::Spaces(columns) => Ok(Self::Spaces(columns)),
-            IndentValue::Word(word) => match word.as_str() {
-                "editor" => Ok(Self::Editor),
-                "tab" => Ok(Self::Tab),
-                _ => Err(format!(
-                    "`{word}`: expected \"editor\", \"tab\" or a number of spaces"
-                )),
-            },
-        }
-    }
 }
 
 /// `inlayHints.*`: which inferred types are shown inline, and where.
@@ -652,13 +577,18 @@ enum SettingIssue {
     Invalid(String),
     /// Its key is deprecated; it is read as the settings described.
     Deprecated(&'static str),
+    /// Its key no longer means anything, for the reason given; it is ignored.
+    Removed(&'static str),
 }
 
 impl SettingProblem {
-    /// Whether the value was read, under a deprecated key, rather than
-    /// dropped.
+    /// Whether the key is only out of date, read as its replacement or
+    /// retired, rather than holding a value that could not be read.
     pub fn is_deprecated(&self) -> bool {
-        matches!(self.issue, SettingIssue::Deprecated(_))
+        matches!(
+            self.issue,
+            SettingIssue::Deprecated(_) | SettingIssue::Removed(_)
+        )
     }
 }
 
@@ -674,6 +604,9 @@ impl fmt::Display for SettingProblem {
                     "`{}`: deprecated, read as {replacement}",
                     self.path
                 )
+            }
+            SettingIssue::Removed(reason) => {
+                write!(formatter, "`{}`: removed, ignored; {reason}", self.path)
             }
         }
     }
@@ -704,7 +637,8 @@ impl ServerSettings {
     /// The settings [`Self::DEFAULTS_FILE`] gives on its own.
     pub fn defaults() -> &'static Self {
         static DEFAULTS: LazyLock<ServerSettings> = LazyLock::new(|| {
-            serde_path_to_error::deserialize(ServerSettings::defaults_section())
+            let section = ServerSettings::over_defaults(&Value::Object(Map::new()));
+            serde_path_to_error::deserialize(&section)
                 .unwrap_or_else(|error| panic!("the defaults file: {error}"))
         });
         &DEFAULTS
@@ -719,21 +653,31 @@ impl ServerSettings {
         &SECTION
     }
 
-    /// `section` laid over the defaults file: tables merge, other values
-    /// replace. An item `section` lists in one of an opposed pair of lists
-    /// leaves the other list's default.
+    /// `section` laid over the defaults file, with the formatting preset
+    /// `section` names laid in between: tables merge, other values replace.
+    /// Presets `section` defines join the defaults file's. An item `section`
+    /// lists in one of a group of exclusive lists leaves the other lists'
+    /// defaults.
     fn over_defaults(section: &Value) -> Value {
         let mut merged = Self::defaults_section().clone();
-        for [first, second] in OPPOSED_LISTS {
-            for (listed, opposed) in [(first, second), (second, first)] {
-                if let (Some(Value::Array(listed)), Some(Value::Array(opposed))) =
-                    (section.pointer(listed), merged.pointer_mut(opposed))
-                {
-                    opposed.retain(|item| !listed.contains(item));
+        let mut section = section.clone();
+        if let Some(formatting) = merged.get_mut(FormattingSettings::SECTION_KEY) {
+            let client = section.get_mut(FormattingSettings::SECTION_KEY);
+            FormattingSettings::resolve_profile(formatting, client);
+        }
+        for group in EXCLUSIVE_LISTS {
+            for pointer in group {
+                let Some(Value::Array(listed)) = section.pointer(pointer) else {
+                    continue;
+                };
+                for other in group.iter().filter(|other| *other != pointer) {
+                    if let Some(Value::Array(defaults)) = merged.pointer_mut(other) {
+                        defaults.retain(|item| !listed.contains(item));
+                    }
                 }
             }
         }
-        ProjectConfiguration::merge(&mut merged, section);
+        ProjectConfiguration::merge(&mut merged, &section);
         merged
     }
 
@@ -907,73 +851,39 @@ trait SettingsGroup {
     /// [`Self::upgrade_deprecated_keys`] within the group's own fields.
     fn upgrade_group(group: &mut Map<String, Value>) -> Vec<SettingProblem>;
 
-    /// Remove the deprecated `key` from `group`, setting what `replacing`
-    /// translates its value into where the client has not, and report it
-    /// as read as `replacement`.
+    /// Remove the deprecated `key` from `group`, setting the table
+    /// `replacing` translates its value into wherever the client has not,
+    /// nested tables included, and report it as read as `replacement`.
     fn upgrade_deprecated_key(
         group: &mut Map<String, Value>,
         key: &str,
         replacement: &'static str,
-        replacing: impl FnOnce(&Value) -> Vec<(&'static str, Value)>,
+        replacing: impl FnOnce(&Value) -> Value,
     ) -> Option<SettingProblem> {
         let value = group.remove(key)?;
-        for (replacing_key, replacing_value) in replacing(&value) {
-            group.entry(replacing_key).or_insert(replacing_value);
+        if let Value::Object(replacing) = replacing(&value) {
+            Self::insert_missing(group, replacing);
         }
         Some(SettingProblem {
             path: format!("{}.{key}", Self::SECTION_KEY),
             issue: SettingIssue::Deprecated(replacement),
         })
     }
-}
 
-impl SettingsGroup for FormattingSettings {
-    const SECTION_KEY: &str = "formatting";
-
-    /// `softLineWidth` is read as `softWrapWidth`. `spaceInBraces` (2.7.0) is read as `{}` listed under
-    /// `brackets.spacesInside` or `brackets.compact`. `useTabs` (2.7.0) is
-    /// read into `indent`: its old companion `indent = N`, `4` when unset,
-    /// was the width of a tab or the count of spaces.
-    fn upgrade_group(group: &mut Map<String, Value>) -> Vec<SettingProblem> {
-        let columns = group
-            .get("indent")
-            .and_then(Value::as_u64)
-            .unwrap_or(Self::LEGACY_INDENT_COLUMNS);
-        let tabs = group.get("useTabs").and_then(Value::as_bool);
-        if tabs == Some(true) {
-            group.remove("indent");
+    /// Add to `fields` every value of `added` it lacks, merging tables both
+    /// hold; a value `fields` already has wins.
+    fn insert_missing(fields: &mut Map<String, Value>, added: Map<String, Value>) {
+        for (key, value) in added {
+            match (fields.get_mut(&key), value) {
+                (Some(Value::Object(present)), Value::Object(added)) => {
+                    Self::insert_missing(present, added);
+                }
+                (Some(_), _) => {}
+                (None, value) => {
+                    fields.insert(key, value);
+                }
+            }
         }
-        let use_tabs = Self::upgrade_deprecated_key(
-            group,
-            "useTabs",
-            "`indent = \"tab\"` with `tabWidth`, or `indent` spaces",
-            |_| match tabs {
-                Some(true) => vec![("indent", "tab".into()), ("tabWidth", columns.into())],
-                Some(false) => vec![("indent", columns.into())],
-                None => Vec::new(),
-            },
-        );
-        let soft_line_width =
-            Self::upgrade_deprecated_key(group, "softLineWidth", "`softWrapWidth`", |value| {
-                vec![("softWrapWidth", value.clone())]
-            });
-        let space_in_braces = Self::upgrade_deprecated_key(
-            group,
-            "spaceInBraces",
-            "`brackets.spacesInside` or `brackets.compact` listing `{}`",
-            |value| {
-                let list = match value.as_bool() {
-                    Some(true) => "spacesInside",
-                    Some(false) => "compact",
-                    None => return Vec::new(),
-                };
-                vec![("brackets", serde_json::json!({ list: ["{}"] }))]
-            },
-        );
-        [use_tabs, soft_line_width, space_in_braces]
-            .into_iter()
-            .flatten()
-            .collect()
     }
 }
 
@@ -982,9 +892,12 @@ impl SettingsGroup for SourceSettings {
 
     /// `paths` is read as `packagePaths`.
     fn upgrade_group(group: &mut Map<String, Value>) -> Vec<SettingProblem> {
-        Self::upgrade_deprecated_key(group, "paths", "`packagePaths`", |value| {
-            vec![("packagePaths", value.clone())]
-        })
+        Self::upgrade_deprecated_key(
+            group,
+            "paths",
+            "`packagePaths`",
+            |value| serde_json::json!({ "packagePaths": value }),
+        )
         .into_iter()
         .collect()
     }
@@ -995,24 +908,27 @@ impl SettingsGroup for InlayHintSettings {
 
     /// The keys 2.0.0 replaced.
     fn upgrade_group(group: &mut Map<String, Value>) -> Vec<SettingProblem> {
-        let enabled = |value: &Value| *value == Value::Bool(true);
+        use serde_json::json;
+        let when_enabled = |value: &Value, set: Value| {
+            if *value == Value::Bool(true) {
+                set
+            } else {
+                json!({})
+            }
+        };
         [
             Self::upgrade_deprecated_key(group, "expressionTypes", "`everywhere`", |value| {
-                [("everywhere", Value::Bool(true))]
-                    .into_iter()
-                    .filter(|_| enabled(value))
-                    .collect()
+                when_enabled(value, json!({ "everywhere": true }))
             }),
             Self::upgrade_deprecated_key(
                 group,
                 "allKnownTypes",
                 "`everywhere` with `showLiteral` and `showRepeated`",
                 |value| {
-                    ["everywhere", "showLiteral", "showRepeated"]
-                        .into_iter()
-                        .filter(|_| enabled(value))
-                        .map(|key| (key, Value::Bool(true)))
-                        .collect()
+                    when_enabled(
+                        value,
+                        json!({ "everywhere": true, "showLiteral": true, "showRepeated": true }),
+                    )
                 },
             ),
             Self::upgrade_deprecated_key(
@@ -1020,18 +936,18 @@ impl SettingsGroup for InlayHintSettings {
                 "calls",
                 "`afterLineEnd` or `afterCall`",
                 |value| match value.as_str() {
-                    Some("off") => vec![("afterLineEnd", Value::Bool(false))],
-                    Some("lineEnds") => vec![("afterLineEnd", Value::Bool(true))],
-                    Some("every") => vec![("afterCall", Value::Bool(true))],
-                    _ => Vec::new(),
+                    Some("off") => json!({ "afterLineEnd": false }),
+                    Some("lineEnds") => json!({ "afterLineEnd": true }),
+                    Some("every") => json!({ "afterCall": true }),
+                    _ => json!({}),
                 },
             ),
             Self::upgrade_deprecated_key(group, "unknownTypes", "`showThing`", |value| {
-                value
-                    .is_boolean()
-                    .then(|| ("showThing", value.clone()))
-                    .into_iter()
-                    .collect()
+                if value.is_boolean() {
+                    json!({ "showThing": value })
+                } else {
+                    json!({})
+                }
             }),
         ]
         .into_iter()
@@ -1088,26 +1004,12 @@ impl DiagnosticSettings {
     }
 }
 
-impl FormattingSettings {
-    /// The `indent` 2.7.0 assumed when unset, as a tab width or a count of
-    /// spaces depending on `useTabs`.
-    const LEGACY_INDENT_COLUMNS: u64 = 4;
-
-    /// The soft and hard wrapping widths in effect: a zero width is none, and
-    /// the soft width never exceeds the hard one.
-    pub fn line_widths(&self) -> (Option<u32>, Option<u32>) {
-        let hard = self.hard_line_width.filter(|width| *width > 0);
-        let soft = self
-            .soft_line_width
-            .filter(|width| *width > 0)
-            .map(|width| hard.map_or(width, |hard| width.min(hard)));
-        (soft, hard)
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::formatting::FormattingProfile;
+    use super::spacing::{OperatorSpacing, Spacing};
     use super::*;
+    use std::num::NonZeroUsize;
 
     /// Settings parsed from `value`, which must contain no invalid setting.
     fn valid_settings(value: Value) -> ServerSettings {
@@ -1148,12 +1050,9 @@ mod tests {
                     "disabled": ["unused-binding", "S01"]
                 },
                 "formatting": {
-                    "indent": 2,
-                    "softWrapWidth": 88,
-                    "hardLineWidth": 88,
-                    "controlFlowLayout": "multiline",
-                    "compactFactorOperators": true,
-                    "breakAfterSemicolon": false
+                    "indent": {"width": 2, "whitespace": "spaces"},
+                    "lines": {"breaks": "wrap", "softWidth": 88, "hardWidth": 88},
+                    "layout": {"singleLineIf": "never", "statements": "keep"}
                 },
                 "inlayHints": {
                     "afterCall": true,
@@ -1179,14 +1078,15 @@ mod tests {
             .diagnostics
             .allows(catalog::OPTION_KEY_CONVENTION.code));
         assert!(settings.diagnostics.allows(catalog::SYNTAX_ERROR.code));
-        assert_eq!(settings.formatting.indent, Indent::Spaces(2));
-        assert_eq!(settings.formatting.line_widths(), (Some(88), Some(88)));
+        let formatting = &settings.formatting;
         assert_eq!(
-            settings.formatting.control_flow_layout,
-            ControlFlowLayout::Multiline
+            formatting.indent.width,
+            Detectable::Fixed(NonZeroUsize::new(2).unwrap())
         );
-        assert!(settings.formatting.compact_factor_operators);
-        assert!(!settings.formatting.break_after_semicolon);
+        assert_eq!(formatting.indent.whitespace, IndentWhitespace::Spaces);
+        assert_eq!(formatting.line_widths(), (Some(88), Some(88)));
+        assert_eq!(formatting.layout.single_line_if, SingleLineIf::Never);
+        assert_eq!(formatting.layout.statements, StatementLayout::Keep);
         assert_eq!(
             settings.inlay_hints,
             InlayHintSettings {
@@ -1309,8 +1209,7 @@ mod tests {
                     "enabeld": false
                 },
                 "formatting": {
-                    "indent": "two",
-                    "tabWidth": 8
+                    "indent": {"width": "two", "tabWidth": 4}
                 },
                 "inlayHints": "on"
             }
@@ -1319,8 +1218,8 @@ mod tests {
         let settings = &parsed.settings;
         assert!(!settings.diagnostics.allows(catalog::UNUSED_BINDING.code));
         assert!(settings.diagnostics.allows(catalog::SYNTAX_ERROR.code));
-        assert_eq!(settings.formatting.indent, Indent::Editor);
-        assert_eq!(settings.formatting.tab_width, Some(8));
+        assert_eq!(settings.formatting.indent.width, Detectable::Detect);
+        assert_eq!(settings.formatting.indent.tab_width.get(), 4);
         assert_eq!(
             settings.inlay_hints,
             ServerSettings::defaults().inlay_hints.clone()
@@ -1341,7 +1240,7 @@ mod tests {
             "{problems:?}"
         );
         assert!(
-            problems[2].starts_with("`formatting.indent`: `two`: expected"),
+            problems[2].starts_with("`formatting.indent.width`: "),
             "{problems:?}"
         );
         assert!(
@@ -1404,8 +1303,7 @@ mod tests {
         for width in [Value::Null, serde_json::json!(0)] {
             let settings = valid_settings(serde_json::json!({
                 "formatting": {
-                    "softWrapWidth": width,
-                    "hardLineWidth": width
+                    "lines": {"breaks": "wrap", "softWidth": width, "hardWidth": width}
                 }
             }));
 
@@ -1414,42 +1312,136 @@ mod tests {
     }
 
     #[test]
-    fn parses_soft_and_hard_line_widths_and_clamps_the_soft_target() {
-        let settings = valid_settings(serde_json::json!({
-            "formatting": {
-                "softWrapWidth": 90,
-                "hardLineWidth": 110
-            }
-        }));
-        assert_eq!(settings.formatting.line_widths(), (Some(90), Some(110)));
+    fn line_widths_clamp_the_soft_target_and_need_breaks() {
+        let widths = |breaks: &str, soft: usize, hard: usize| {
+            valid_settings(serde_json::json!({
+                "formatting": {
+                    "lines": {"breaks": breaks, "softWidth": soft, "hardWidth": hard}
+                }
+            }))
+            .formatting
+            .line_widths()
+        };
+        assert_eq!(widths("wrap", 90, 110), (Some(90), Some(110)));
+        assert_eq!(widths("normalize", 140, 120), (Some(120), Some(120)));
+        assert_eq!(widths("keep", 90, 110), (None, None));
+    }
 
-        let clamped = valid_settings(serde_json::json!({
+    /// A profile sets every key it names, and a key set explicitly wins.
+    #[test]
+    fn profiles_lay_a_preset_under_explicit_keys() {
+        let modern = valid_settings(serde_json::json!({
+            "formatting": {"profile": "modern", "indent": {"width": 2}}
+        }))
+        .formatting;
+        assert_eq!(modern.profile, FormattingProfile::Modern);
+        assert_eq!(
+            modern.indent.width,
+            Detectable::Fixed(NonZeroUsize::new(2).unwrap())
+        );
+        assert_eq!(modern.indent.whitespace, IndentWhitespace::Spaces);
+        assert_eq!(modern.lines.breaks, LineBreaks::Wrap);
+        assert_eq!(
+            modern.spacing.operators.binary("+"),
+            Some(OperatorSpacing::Fixed(Spacing::Spaced))
+        );
+        let core = &ServerSettings::defaults().formatting;
+        assert_eq!(core.profile, FormattingProfile::Core);
+        assert_eq!(
+            core.spacing.operators.binary("+"),
+            Some(OperatorSpacing::Detect)
+        );
+    }
+
+    /// Naming an operator in one list takes it out of the others' defaults.
+    #[test]
+    fn operator_lists_exclude_each_other() {
+        let operators = valid_settings(serde_json::json!({
+            "formatting": {"spacing": {"operators": {"tight": ["+", "^"]}}}
+        }))
+        .formatting
+        .spacing
+        .operators;
+        assert_eq!(
+            operators.binary("+"),
+            Some(OperatorSpacing::Fixed(Spacing::Tight))
+        );
+        assert_eq!(operators.binary("-"), Some(OperatorSpacing::Detect));
+        assert_eq!(
+            operators.binary("or"),
+            Some(OperatorSpacing::Fixed(Spacing::Spaced))
+        );
+        assert_eq!(operators.binary("^**"), None);
+    }
+
+    /// Every key of the flat 2.x schema still loads, as its replacement and
+    /// with a deprecation notice; `compactFactorOperators` is reported removed.
+    #[test]
+    fn flat_formatting_keys_upgrade_with_notices() {
+        let parsed = ServerSettings::from_value(&serde_json::json!({
             "formatting": {
-                "softWrapWidth": 140,
-                "hardLineWidth": 120
+                "indent": 2,
+                "tabWidth": 4,
+                "softWrapWidth": 88,
+                "breakAfterSemicolon": false,
+                "controlFlowLayout": "multilineCompactElse",
+                "operators": {"spacesAround": {"binary": ["^"]}, "compact": {"binary": ["+"]}},
+                "brackets": {"spacesInside": ["()"], "compact": []},
+                "compactFactorOperators": true
             }
         }));
-        assert_eq!(clamped.formatting.line_widths(), (Some(120), Some(120)));
+        let problems = parsed
+            .problems
+            .iter()
+            .map(SettingProblem::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            parsed.problems.iter().all(SettingProblem::is_deprecated),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.starts_with("`formatting.compactFactorOperators`: removed")),
+            "{problems:?}"
+        );
+        let formatting = parsed.settings.formatting;
+        assert_eq!(
+            formatting.indent.width,
+            Detectable::Fixed(NonZeroUsize::new(2).unwrap())
+        );
+        assert_eq!(formatting.indent.whitespace, IndentWhitespace::Spaces);
+        assert_eq!(formatting.indent.tab_width.get(), 4);
+        assert_eq!(formatting.line_widths(), (Some(88), None));
+        assert_eq!(formatting.layout.statements, StatementLayout::Keep);
+        assert_eq!(formatting.layout.single_line_if, SingleLineIf::Never);
+        assert_eq!(formatting.layout.else_placement, ElsePlacement::AfterClose);
+        assert_eq!(
+            formatting.spacing.operators.binary("^"),
+            Some(OperatorSpacing::Fixed(Spacing::Spaced))
+        );
+        assert_eq!(
+            formatting.spacing.operators.binary("+"),
+            Some(OperatorSpacing::Fixed(Spacing::Tight))
+        );
+        assert_eq!(
+            formatting.spacing.brackets_inside,
+            Keepable::Fixed(Spacing::Spaced)
+        );
     }
 
     #[test]
-    fn parses_every_control_flow_layout_variant() {
-        for (name, expected) in [
-            ("compact", ControlFlowLayout::Compact),
-            ("multiline", ControlFlowLayout::Multiline),
-            (
-                "multilineCompactElse",
-                ControlFlowLayout::MultilineCompactElse,
-            ),
-        ] {
-            let settings = valid_settings(serde_json::json!({
-                "formatting": {
-                    "controlFlowLayout": name
-                }
-            }));
-
-            assert_eq!(settings.formatting.control_flow_layout, expected);
-        }
+    fn unknown_formatting_keys_are_reported() {
+        let parsed = ServerSettings::from_value(&serde_json::json!({
+            "formatting": {"lines": {"brakes": "keep"}}
+        }));
+        let problems = parsed
+            .problems
+            .iter()
+            .map(SettingProblem::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("unknown field"), "{problems:?}");
     }
 
     #[test]

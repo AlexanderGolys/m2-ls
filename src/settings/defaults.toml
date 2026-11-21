@@ -30,14 +30,10 @@ fixActionOnly = []
 
 
 [formatting]
-indent = "editor"   # "tab", or a number of spaces; standalone tools use tabs
-# tabWidth = 4      # columns a tab counts as; the editor's tab size when unset
-softWrapWidth = 78
-hardLineWidth = 90
-controlFlowLayout = "multilineCompactElse"
-compactFactorOperators = true
-breakAfterSemicolon = false
-keepLineBreaks = false
+# The preset under every key below: "core" reproduces the Macaulay2 Core
+# library, "modern" its newer 4-column files and Emacs M2-mode. Keys set
+# explicitly override the preset.
+profile = "core"
 # Parentheses the syntax does not need, as in `(a*b) + c`: "off", "action"
 # (the "Remove redundant parentheses in file" source action), or "format" (also
 # removed whenever the document is formatted).
@@ -45,35 +41,91 @@ redundantParentheses = "action"
 # "keep" spares call arguments: `f(x)` stays instead of becoming `f x`.
 callParentheses = "remove"
 
-# Operators written `a + b` and `<< x`. A unary operator is spaced on its
-# operand's side. Setting only one of the two lists below removes what it
-# names from the other's defaults; operators in neither keep their spacing.
-# Word operators (`or`, `and`, `xor`, `not`, `SPACE`, `Core$or`, ...) are
-# always spaced, listed or not.
-[formatting.operators.spacesAround]
-binary = [
-    "==", "!=", "===", "=!=", "<<", "<", ">", "<=", ">=", "??", "||", "|",
-    "^^", "&", "++", "+", "-", "\\", "\\\\", ":=", "=", "<-", "=>", "->", "//",
-    "*", "/", "%", "**", # compacted between adjacent factors by compactFactorOperators
-]
-unary = ["<<"]
+# How much a document must show before a "detect" rule follows it.
+[formatting.detect]
+minSamples = 3      # fewer occurrences: the rule's fallback
+threshold = 0.6     # the share the document's majority must reach
 
-# Operators written `a^b`, `-x` and `n!`.
-[formatting.operators.compact]
-binary = [
-    "·", "⊠", "⧢", "@", "@@", "@@?", "|_", "^", "^**", "^<", "^<=", "^>", "^>=",
-    "_", "_<", "_<=", "_>", "_>=", "#", "#?",
-]
-unary = [
-    "+", "-", "*", "#", "<", "<=", ">", ">=", "?", "|-", "<===", "<==", "??",
-    "!", "^!", "_!", "^*", "_*", "^~", "_~", "(*)",
-]
+[formatting.indent]
+width = "detect"            # columns per open bracket, or "detect": 2, 4 or 5
+fallbackWidth = 5           # what "detect" uses without a majority
+whitespace = "emacsTabs"    # "emacsTabs": a tab per tabWidth columns, then spaces
+                            # "spaces", or "tabs": one tab per indent level
+tabWidth = 8                # columns per tab, also for measuring line widths
+closers = "body"            # "body": a line starting with ) } ] keeps the body's indent
+                            # "opener": dedented to the opener line's indent
 
-# Brackets written `{ x }` and `{x}`: any of "{}", "()", "[]", "<||>".
-# Unlisted brackets keep their inner spacing; empty ones always close up.
-[formatting.brackets]
-spacesInside = []
-compact = []
+[formatting.lines]
+breaks = "keep"     # "keep": only indentation and spacing change
+                    # "wrap": also break lines longer than softWidth
+                    # "normalize": also apply every layout rule below
+softWidth = 100     # 0 or null: none
+hardWidth = 0       # never wrapped past; 0 or null: none
+maxBlankLines = 1
+trimBlankLinesInBrackets = true   # after a line-ending ( {, before a line-starting ) }
+finalNewline = true
+trimTrailingWhitespace = true
+
+# Read only when lines.breaks is not "keep".
+[formatting.layout]
+closeParen = "hug"                          # "hug": last); "ownLine"
+closeBrace = "ownLine"                      # "ownLine": } alone, at the body's indent; "hug"
+functionBody = "breakWhenMultiStatement"    # "always", "breakWhenMultiStatement", "keep"
+statements = "onePerLine"                   # "onePerLine": a line ends at each ;  "keep"
+singleLineIf = "whenFits"                   # "whenFits", "never", "keep"
+elsePlacement = "ownLine"                   # "ownLine": at the if line's indent; "afterClose": ) else (
+thenPlacement = "withCondition"             # "withCondition", or "ownLine" when the condition spans lines
+conditionBreaks = "beforeOperator"          # "beforeOperator": or/and start the lines; "afterOperator"
+
+[formatting.spacing]
+comma = "detect"            # "space", "tight", or "detect" (fallback "space")
+lambdaParamComma = "detect" # "space", "tight", "sameAsComma", or "detect" (fallback "tight")
+semicolon = "space"         # before more code on the same line: "space" or "tight"
+bracketsInside = "tight"    # (x) or ( x ): "tight", "space", "keep"
+callParen = "tight"         # f(x) or f (x): "tight", "space", "keep"
+keywordParen = "space"      # then ( / do ( / if (: "space", "tight", "keep"
+indexContextTight = true    # + - * / tight inside a bracket right after _ # ^ . : x#(i+1)
+trailingComment = "oneSpace"    # the gap before a trailing --: "oneSpace" or "keep"
+preserveAlignment = true    # keep padding lining a token up with the neighbouring line
+
+# Binary operators written `a + b`, `a^b`, or as the document mostly writes
+# them (spaced when it says too little). Listing an operator in one list
+# removes it from the others' defaults; operators in none keep their spacing.
+# Word operators (`or`, `and`, `xor`, `not`) are always spaced; prefix
+# operators are tight to their operand unless `spaced` lists them (`<< x`).
+[formatting.spacing.operators]
+spaced = [
+    ":=", "=", "->", "=>", "<-", "==", "===", "=!=", "!=", "<", ">", "<=", ">=",
+    "<<", ">>", "@@", "\\", "++", "?", "**", "||", "%", "|", "..<", "&",
+]
+tight = ["#", ".", ".?", "#?", "_", "^", ":"]
+detect = ["+", "-", "*", "/", "//", ".."]
+
+[formatting.comments]
+bannerWidth = 77    # rule-only comment lines of 60 to 90 dashes; 0 or null: left
+
+# What `profile` sets beneath the explicit keys. "core" is the table above.
+[formatting.profiles.core]
+
+[formatting.profiles.modern.indent]
+width = 4
+fallbackWidth = 4
+whitespace = "spaces"
+
+[formatting.profiles.modern.lines]
+breaks = "wrap"
+
+[formatting.profiles.modern.spacing]
+comma = "space"
+lambdaParamComma = "sameAsComma"
+
+[formatting.profiles.modern.spacing.operators]
+spaced = [
+    ":=", "=", "->", "=>", "<-", "==", "===", "=!=", "!=", "<", ">", "<=", ">=",
+    "<<", ">>", "@@", "\\", "++", "?", "**", "||", "%", "|", "..<", "&",
+    "+", "-", "*", "/", "//", "..",
+]
+detect = []
 
 
 [inlayHints]

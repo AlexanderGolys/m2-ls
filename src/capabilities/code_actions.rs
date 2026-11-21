@@ -26,7 +26,7 @@ use crate::syntax::CursorSyntax;
 use crate::util::TextRangeExt;
 use crate::workspace_index::{WorkspaceDefinitionKnowledge, WorkspaceIndex};
 
-use super::formatting::{format_action_edit, FormatOptions};
+use super::formatting::format_action_edit;
 use super::inlining::{Inlining, LoadedFiles};
 
 /// The fewest escapes that make a string literal worth writing raw.
@@ -657,7 +657,6 @@ pub fn available_code_actions(
     files: &LoadedFiles<'_>,
 ) -> Option<CodeActionResponse> {
     let context = CodeActionContext::new(document, uri, position, diagnostics, workspace)?;
-    let options = FormatOptions::from(formatting);
     let inlining = Inlining::new(document, uri, position);
     let mut actions: CodeActionResponse = context
         .finding_fixes()
@@ -671,7 +670,7 @@ pub fn available_code_actions(
         .map(|mut action| {
             if let Some(changes) = action.edit.as_mut().and_then(|edit| edit.changes.as_mut()) {
                 for edit in changes.values_mut().flatten() {
-                    format_action_edit(document, edit, &options);
+                    format_action_edit(document, edit, formatting);
                 }
             }
             action
@@ -679,7 +678,7 @@ pub fn available_code_actions(
         .chain(inlining.load_action(files))
         .map(CodeActionOrCommand::CodeAction)
         .collect();
-    if let Some(action) = fix_all_action(document, uri, diagnostics, &options) {
+    if let Some(action) = fix_all_action(document, uri, diagnostics, formatting) {
         actions.push(CodeActionOrCommand::CodeAction(action));
     }
     if formatting.redundant_parentheses.offers_action() {
@@ -738,7 +737,7 @@ fn fix_all_action(
     document: &DocumentSnapshot,
     uri: &Url,
     diagnostics: &[Diagnostic],
-    options: &FormatOptions,
+    formatting: &FormattingSettings,
 ) -> Option<CodeAction> {
     let cells = document
         .syntax()
@@ -813,7 +812,7 @@ fn fix_all_action(
         }) {
             continue;
         }
-        format_action_edit(document, &mut edit, options);
+        format_action_edit(document, &mut edit, formatting);
         compatible.push(edit);
     }
     if compatible.is_empty() {
@@ -999,19 +998,17 @@ fn unescape_string_literal_content(content: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capabilities::formatting::{
-        format_document_with_options, ControlFlowLayout, RedundantParentheses,
-    };
+    use crate::capabilities::formatting::{format_document, RedundantParentheses};
     use crate::diagnostics::visible_diagnostics;
     use crate::node_metadata::SyntaxSnapshot;
     use crate::object_registry::ObjectRegistry;
     use crate::package_index::SourceResolver;
-    use crate::settings::{Indent, ServerSettings};
+    use crate::settings::{IndentWhitespace, LineBreaks, ServerSettings, SingleLineIf};
 
     fn formatted(text: &str, settings: &FormattingSettings) -> String {
         let syntax = SyntaxSnapshot::parse(text, None);
         assert!(!syntax.has_error(), "{text}");
-        format_document_with_options(&syntax, &FormatOptions::from(settings)).unwrap()
+        format_document(&syntax, settings).unwrap()
     }
 
     #[test]
@@ -1031,7 +1028,7 @@ mod tests {
             &document,
             &uri,
             &diagnostics,
-            &FormatOptions::from(&ServerSettings::defaults().formatting),
+            &ServerSettings::defaults().formatting,
         )
         .expect("file-wide fixes should be offered");
         assert_eq!(action.kind, Some(CodeActionKind::SOURCE_FIX_ALL));
@@ -1048,7 +1045,7 @@ mod tests {
                 &edit.new_text,
             );
         }
-        assert_eq!(result, "-- λ 😀\nx#3\ny#4\nif ready then\n\tvalue\n");
+        assert_eq!(result, "-- λ 😀\nx#3\ny#4\nif ready then value\n");
         let rewritten = DocumentSnapshot::from_text(result, &registry).unwrap();
         let diagnostics = visible_diagnostics(
             &rewritten,
@@ -1061,7 +1058,7 @@ mod tests {
             &rewritten,
             &uri,
             &diagnostics,
-            &FormatOptions::from(&ServerSettings::defaults().formatting)
+            &ServerSettings::defaults().formatting
         )
         .is_none());
     }
@@ -1072,7 +1069,7 @@ mod tests {
     /// count.
     #[test]
     fn redundant_parentheses_follow_their_setting() {
-        let source = "x = (a*b) + c\ny = f(x)\n";
+        let source = "x = (a * b) + c\ny = f(x)\n";
         let document =
             DocumentSnapshot::from_text(source.into(), &ObjectRegistry::default()).unwrap();
         let uri = Url::parse("file:///test.m2").unwrap();
@@ -1103,11 +1100,11 @@ mod tests {
             })
         };
         let first_cell = TextEdit {
-            range: document.range_for_bytes(0..14),
-            new_text: "x = a*b + c\n".into(),
+            range: document.range_for_bytes(0..16),
+            new_text: "x = a * b + c\n".into(),
         };
         let second_cell = TextEdit {
-            range: document.range_for_bytes(14..23),
+            range: document.range_for_bytes(16..25),
             new_text: "y = f x\n".into(),
         };
 
@@ -1135,14 +1132,14 @@ mod tests {
                 source,
                 &with(RedundantParentheses::Format, CallParentheses::Remove)
             ),
-            "x = a*b + c\ny = f x\n"
+            "x = a * b + c\ny = f x\n"
         );
         assert_eq!(
             formatted(
                 source,
                 &with(RedundantParentheses::Format, CallParentheses::Keep)
             ),
-            "x = a*b + c\ny = f(x)\n"
+            "x = a * b + c\ny = f(x)\n"
         );
     }
 
@@ -1163,7 +1160,7 @@ mod tests {
             &document,
             &uri,
             &diagnostics,
-            &FormatOptions::from(&ServerSettings::defaults().formatting),
+            &ServerSettings::defaults().formatting,
         )
         .unwrap();
         let changes = action.edit.unwrap().changes.unwrap();
@@ -1249,16 +1246,19 @@ mod tests {
         let uri = Url::parse("file:///test.m2").unwrap();
         for settings in [
             ServerSettings::defaults().formatting.clone(),
-            FormattingSettings {
-                indent: Indent::Spaces(2),
-                soft_line_width: Some(40),
-                control_flow_layout: ControlFlowLayout::Compact,
-                ..ServerSettings::defaults().formatting.clone()
+            {
+                let mut settings = ServerSettings::defaults().formatting.clone();
+                settings.indent.whitespace = IndentWhitespace::Spaces;
+                settings.lines.breaks = LineBreaks::Normalize;
+                settings.lines.soft_width = Some(40);
+                settings
             },
-            FormattingSettings {
-                indent: Indent::Tab,
-                control_flow_layout: ControlFlowLayout::Multiline,
-                ..ServerSettings::defaults().formatting.clone()
+            {
+                let mut settings = ServerSettings::defaults().formatting.clone();
+                settings.indent.whitespace = IndentWhitespace::Tabs;
+                settings.lines.breaks = LineBreaks::Normalize;
+                settings.layout.single_line_if = SingleLineIf::Never;
+                settings
             },
         ] {
             for (expression, title) in cases {

@@ -1839,16 +1839,19 @@ async fn mapped_compositions_offer_simplification_hints_and_grouped_edits() {
     let definitions = "f = n -> n + 10\ng = n -> 2 * n\n";
     let mut session = DocumentSession::open("").await;
     for (expression, replacement) in [
-        ("apply(rows, x -> f(g(x)))", "rows/f@@g"),
-        ("apply(rows, x -> f(g x))", "rows/f@@g"),
-        ("apply(rows, x -> f (g x))", "rows/f@@g"),
+        ("apply(rows, x -> f(g(x)))", "rows / f @@ g"),
+        ("apply(rows, x -> f(g x))", "rows / f @@ g"),
+        ("apply(rows, x -> f (g x))", "rows / f @@ g"),
         (
             "apply(rows, r -> blocksOf(contents r))",
-            "rows/blocksOf@@contents",
+            "rows / blocksOf @@ contents",
         ),
-        ("apply(left | right, x -> f(g(x)))", "(left | right)/f@@g"),
-        ("2 * apply(rows, x -> f(g(x)))", "(rows/f@@g)"),
-        ("h apply(rows, x -> f(g(x)))", "(rows/f@@g)"),
+        (
+            "apply(left | right, x -> f(g(x)))",
+            "(left | right) / f @@ g",
+        ),
+        ("2 * apply(rows, x -> f(g(x)))", "(rows / f @@ g)"),
+        ("h apply(rows, x -> f(g(x)))", "(rows / f @@ g)"),
     ] {
         for suppressed in [false, true] {
             let directive = if suppressed {
@@ -2095,25 +2098,25 @@ async fn forwarding_callbacks_have_separate_rules_and_quick_fixes() {
             "x -> foo bar x",
             "S28",
             "Replace lambda with composition",
-            "foo@@bar",
+            "foo @@ bar",
         ),
         (
             "x -> foo(bar(x))",
             "S28",
             "Replace lambda with composition",
-            "foo@@bar",
+            "foo @@ bar",
         ),
         (
             "x -> ((foo (bar((x)))))",
             "S28",
             "Replace lambda with composition",
-            "foo@@bar",
+            "foo @@ bar",
         ),
         (
             "accept (x -> foo bar x)",
             "S28",
             "Replace lambda with composition",
-            "foo@@bar",
+            "foo @@ bar",
         ),
     ];
     let mut session = DocumentSession::open("").await;
@@ -2136,10 +2139,7 @@ async fn forwarding_callbacks_have_separate_rules_and_quick_fixes() {
                 assert_eq!(hints[0]["severity"], 4);
                 assert_eq!(
                     hints[0]["message"],
-                    format!(
-                        "This expression can be simplified to `{}`",
-                        replacement.replace("@@", " @@ ")
-                    )
+                    format!("This expression can be simplified to `{replacement}`")
                 );
             }
             let uri = session.uri().to_string();

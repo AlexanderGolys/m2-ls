@@ -505,7 +505,7 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
         (
             "tryResult",
             "Simplify try",
-            "try tryValue then\n\ttryResult",
+            "try tryValue then tryResult",
         ),
         ("bareTryValue", "Simplify try", "try bareTryValue"),
         (
@@ -774,8 +774,7 @@ async fn example_document_exercises_the_capability_spectrum_over_stdio() {
                             "enabled": false
                         },
                         "formatting": {
-                            "indent": 2,
-                            "compactFactorOperators": false
+                            "indent": {"width": 2, "whitespace": "spaces"}
                         },
                         "inlayHints": {
                             "afterLineEnd": false,
@@ -1134,13 +1133,13 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         .expect("the unindented lambda body should produce a whole-document edit");
     assert!(
         formatted.contains(
-            "(m, block) ->\n    resultSource (transformOf m)(tokenStream parseMacroTree block)"
+            "(m, block) ->\nresultSource (transformOf m)(tokenStream parseMacroTree block)"
         ),
-        "the lambda body should be indented as an operator continuation: {formatted}"
+        "a line ending in an operator does not indent the next: {formatted}"
     );
     assert!(
-        formatted.contains("    while k < #src do (\n        k = k + 1;\n    )"),
-        "a control-body opener should remain beside its keyword: {formatted}"
+        formatted.contains("     while k < #src do (\n\t  k = k + 1;\n\t  )"),
+        "a control-body opener stays beside its keyword, its body one width in: {formatted}"
     );
 
     let folding = server
@@ -1226,12 +1225,14 @@ async fn formatting_preserves_collection_and_assignment_control_flow_layout() {
             &workspace.root_uri(),
             json!({
                 "formatting": {
-                    "indent": 4,
-                    "softWrapWidth": null,
-                    "hardLineWidth": null,
-                    "controlFlowLayout": "multilineCompactElse",
-                    "compactFactorOperators": false,
-                    "breakAfterSemicolon": true
+                    "indent": {"width": 4, "whitespace": "spaces", "closers": "opener"},
+                    "lines": {"breaks": "normalize", "softWidth": null},
+                    "layout": {
+                        "closeParen": "ownLine",
+                        "singleLineIf": "never",
+                        "elsePlacement": "afterClose",
+                        "statements": "onePerLine"
+                    }
                 }
             }),
         )

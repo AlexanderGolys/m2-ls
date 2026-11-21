@@ -351,7 +351,7 @@ fn grouped_toml_configuration_controls_formatting_and_diagnostic_emission() {
     );
     assert!(formatted.status.success(), "{formatted:?}");
     assert!(
-        String::from_utf8_lossy(&formatted.stdout).contains("\tx + 1"),
+        String::from_utf8_lossy(&formatted.stdout).contains("\n     x + 1"),
         "{formatted:?}"
     );
     fs::write(
@@ -418,4 +418,96 @@ fn automatic_configuration_respects_overlay_precedence() {
     let invalid = workspace.run(LINT, &["-"], source);
     assert_eq!(invalid.status.code(), Some(2), "{invalid:?}");
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("M2LS.toml"));
+}
+
+/// Each formatting rule through `m2-fmt --config`: the settings, the source,
+/// and the Core-library layout it becomes. Every result is a fixpoint.
+#[test]
+fn formatter_follows_the_core_layout_rules() {
+    let workspace = Workspace::new();
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            "brackets indent by the fallback width, tabs from 8 columns",
+            "",
+            "f = x -> (\nif x then (\ny)\nelse x)\n",
+            "f = x -> (\n     if x then (\n\t  y)\n     else x)\n",
+        ),
+        (
+            "the indent width is the file's dominant step",
+            "",
+            "f = x -> (\n    a;\n    g(y -> (\n        b))\n    )\nh = x -> (\n    c)\n",
+            "f = x -> (\n    a;\n    g(y -> (\n\t    b))\n    )\nh = x -> (\n    c)\n",
+        ),
+        (
+            "opener closers dedent to the opening line",
+            "[formatting.indent]\nclosers = \"opener\"\nwhitespace = \"spaces\"\n",
+            "f = x -> (\n     y\n     )\n",
+            "f = x -> (\n     y\n)\n",
+        ),
+        (
+            "commas and operators follow the file's majority",
+            "",
+            "f(a,b)\ng(c,d)\nh(e,f)\nk = (x, y) -> x\na+b\nc+d\ne+f\ng-h\nx#(i + 1)\n",
+            "f(a,b)\ng(c,d)\nh(e,f)\nk = (x,y) -> x\na+b\nc+d\ne+f\ng - h\nx#(i+1)\n",
+        ),
+        (
+            "padding that aligns with a neighbour stays",
+            "",
+            "isDocumentableThing    String := a\nisDocumentableThing  Sequence := key -> false\nx   = 1\n",
+            "isDocumentableThing    String := a\nisDocumentableThing  Sequence := key -> false\nx = 1\n",
+        ),
+        (
+            "rules widen to the banner, blank lines collapse, comments sit one space off",
+            "",
+            concat!(
+                "------------------------------------------------------------------------\n",
+                "x = 1    -- note\n\n\n\ny = {\n\n  1}\n"
+            ),
+            concat!(
+                "-----------------------------------------------------------------------------\n",
+                "x = 1 -- note\n\ny = {\n     1}\n"
+            ),
+        ),
+        (
+            "closing up never fuses tokens",
+            "",
+            "f = mats#0 .?RingMap\ng = - -x\n",
+            "f = mats#0 .?RingMap\ng = - -x\n",
+        ),
+        (
+            "normalize lays out bodies, statements, lists and conditionals",
+            "[formatting.lines]\nbreaks = \"normalize\"\n",
+            concat!(
+                "f = x -> ( a := 1; b := 2; a + b)\ng = x -> ( x + 1)\n",
+                "h = {\n  a => 1,\n  b => 2}\nm = x -> (\n  if x\n  then y\n  else z)\n"
+            ),
+            concat!(
+                "f = x -> (\n     a := 1;\n     b := 2;\n     a + b)\ng = x -> (x + 1)\n",
+                "h = {\n     a => 1,\n     b => 2\n     }\nm = x -> (\n     if x then y else z)\n"
+            ),
+        ),
+        (
+            "wrapping breaks after an opener, then after the outermost commas",
+            "[formatting.lines]\nbreaks = \"wrap\"\nsoftWidth = 40\n",
+            "result = someFunction(firstArgument, secondArgument, thirdArgument)\n",
+            "result = someFunction(\n     firstArgument, secondArgument,\n     thirdArgument)\n",
+        ),
+        (
+            "the modern profile indents by 4 with spaces and spaces arithmetic",
+            "[formatting]\nprofile = \"modern\"\n",
+            "f = x -> (\nif x then (\ny)\nelse x+1)\n",
+            "f = x -> (\n    if x then (\n        y)\n    else x + 1)\n",
+        ),
+    ];
+    for (rule, settings, source, expected) in cases {
+        fs::write(workspace.0.join("settings.toml"), settings).unwrap();
+        let format = |text: &str| {
+            let output = workspace.run(FMT, &["--config", "settings.toml", "-"], text);
+            assert!(output.status.success(), "{rule}: {output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let formatted = format(source);
+        assert_eq!(formatted, *expected, "{rule}");
+        assert_eq!(format(&formatted), formatted, "{rule}: not a fixpoint");
+    }
 }
