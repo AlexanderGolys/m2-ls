@@ -12,14 +12,16 @@
 //! 1. indentation by the column model of [`indent`], first, so that the
 //!    next pass sees the columns tokens end up in;
 //! 2. horizontal spacing within each line ([`spacing`]), driven by the style
-//!    [`detect`] resolves for the document, repeated until it changes nothing:
-//!    padding kept for alignment goes once another edit moves the token it
-//!    lined up with, and since padding only ever shrinks, this ends;
+//!    [`detect`] resolves for the document;
 //! 3. under `lines.breaks = "normalize"`, the line structure of multi-line
 //!    constructs ([`lines`]);
 //! 4. blank lines and the end of the file;
-//! 5. indentation again, for the lines the line structure made, then, when
-//!    wrapping, breaking long lines and indenting again until no line changes.
+//! 5. unless `lines.breaks = "keep"`, indentation again and one break in
+//!    each line longer than the width.
+//!
+//! The passes repeat until a round changes nothing, so formatting the result
+//! again changes nothing either: each pass decides on the layout the others
+//! left, as padding kept for alignment does on its neighbour's columns.
 //!
 //! Folding ([`folding`]) reuses the indentation model on the unformatted text.
 
@@ -152,32 +154,28 @@ pub(super) fn format_action_edit(
 
 /// Runs the passes of the module documentation against one syntax snapshot.
 fn formatted_layout(syntax: &SyntaxSnapshot, settings: &FormattingSettings) -> LayoutSource {
-    /// Rounds of a line-breaking pass and re-indenting before its result is
-    /// taken as it is: a wrapping round breaks a long line once, so this
-    /// bounds how many pieces one written line is cut into.
+    /// Rounds of every pass before the result is taken as it is. A round
+    /// breaks each long line once, so this bounds how many pieces one
+    /// written line is cut into.
     const MAX_LAYOUT_ROUNDS: usize = 64;
 
     let mut layout = LayoutSource::new(syntax);
     let style = FormatStyle::for_document(settings, syntax, &layout);
     let newline = Whitespace::newline(syntax.source());
-    layout.apply(indent::ColumnIndent::edits(syntax, &layout, &style));
-    while layout.apply(spacing::HorizontalSpacing::edits(syntax, &layout, &style)) {}
-    if settings.lines.breaks == LineBreaks::Normalize {
-        for _ in 0..MAX_LAYOUT_ROUNDS {
-            if !lines::LineStructure::apply(syntax, &mut layout, &style, newline) {
-                break;
-            }
-            layout.apply(indent::ColumnIndent::edits(syntax, &layout, &style));
+    let breaks = settings.lines.breaks;
+    for _ in 0..MAX_LAYOUT_ROUNDS {
+        let mut changed = layout.apply(indent::ColumnIndent::edits(syntax, &layout, &style));
+        changed |= layout.apply(spacing::HorizontalSpacing::edits(syntax, &layout, &style));
+        if breaks == LineBreaks::Normalize {
+            changed |= lines::LineStructure::apply(syntax, &mut layout, &style, newline);
         }
-    }
-    layout.apply(lines::BlankLines::edits(syntax, &layout, settings, newline));
-    layout.apply(indent::ColumnIndent::edits(syntax, &layout, &style));
-    if settings.lines.breaks != LineBreaks::Keep {
-        for _ in 0..MAX_LAYOUT_ROUNDS {
-            if !layout.apply(lines::Wrapping::edits(syntax, &layout, &style, newline)) {
-                break;
-            }
-            layout.apply(indent::ColumnIndent::edits(syntax, &layout, &style));
+        changed |= layout.apply(lines::BlankLines::edits(syntax, &layout, settings, newline));
+        if breaks != LineBreaks::Keep {
+            changed |= layout.apply(indent::ColumnIndent::edits(syntax, &layout, &style));
+            changed |= layout.apply(lines::Wrapping::edits(syntax, &layout, &style, newline));
+        }
+        if !changed {
+            break;
         }
     }
     layout

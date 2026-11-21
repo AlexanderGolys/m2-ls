@@ -187,7 +187,10 @@ impl LayoutSource {
     /// The marker opening a line comment.
     const LINE_COMMENT: &str = "--";
 
-    /// Move every original boundary past the sorted, disjoint `edits`.
+    /// Move every original boundary past the sorted, disjoint `edits`. A
+    /// token starting where text is inserted starts after the insertion; one
+    /// starting where an edit replaces text, as a rewritten comment does,
+    /// starts where the replacement does.
     fn remap(&mut self, edits: &[FormatEdit]) {
         let mut shifts = vec![0isize];
         for edit in edits {
@@ -198,7 +201,8 @@ impl LayoutSource {
         }
         let map = |position: usize, is_start: bool| {
             let count = edits.partition_point(|edit| {
-                edit.start_byte < position || (is_start && edit.start_byte == position)
+                edit.start_byte < position
+                    || (is_start && edit.start_byte == position && edit.start_byte == edit.end_byte)
             });
             if count == 0 {
                 return position;
