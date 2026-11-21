@@ -54,6 +54,34 @@ f = §parameter.declaration|L§ -> (
     )
 ```
 
+A constructor named after a type makes that type whatever it is given, even
+when the argument's own type is unknown: `ideal`, `monomialIdeal`,
+`matrix`, `module`, `ring`, `monoid`, `net`, `vector` and `complex`. So the
+whole chain below is typed:
+
+```m2
+R = QQ[x, y, z]
+I1 = ideal R_*    -- Ideal
+I = I1^3          -- Ideal
+Q := R/I          -- QuotientRing
+```
+
+The output variables `oo`, `ooo`, `oooo` and `o1`, `o2`, … are typed as the
+Macaulay2 REPL would leave them when running the file line by line. Every
+top-level input is an output, even when a `;` mutes it, and each `;`-ended
+statement takes its own number. A `null` value binds no `oN`. It also leaves
+`oo` as it was, though it still moves `oo` to `ooo` and `ooo` to `oooo`:
+
+```m2
+1
+"a";
+null
+c = oooo    -- ZZ: null moved 1 from ooo to oooo, and left "a" in oo
+d = o3      -- Symbol: null bound nothing to o3
+e = o2      -- String: the muted "a" is output 2
+f = () -> oo    -- Thing: a function reads oo when it is called
+```
+
 A method function you wrote lists all its installations, with the codomains
 they declare or that inference deduces:
 

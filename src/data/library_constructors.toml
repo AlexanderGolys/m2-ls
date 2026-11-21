@@ -1,0 +1,20 @@
+# Library functions every method of which makes a value of the type their name
+# names Pascal-cased, whatever it is given: `ideal` makes an `Ideal`,
+# `monomialIdeal` a `MonomialIdeal`, `ring` a `Ring`. The type is a lower
+# bound: `ring` may make a `PolynomialRing` or a `SheafOfRings`. Checked
+# against Macaulay2 1.26.06 with Varieties loaded, by the declared returns of
+# every method and the classes of their results; `ring(ComplexMap)` declares
+# `Complex` but returns a ring. `sheaf` is not here: no type `Sheaf` exists,
+# and it makes sheaves of rings, coherent sheaves or maps of them.
+
+functions = [
+    "complex",
+    "ideal",
+    "matrix",
+    "module",
+    "monomialIdeal",
+    "monoid",
+    "net",
+    "ring",
+    "vector",
+]

@@ -14,6 +14,12 @@ pub trait ExpressionSyntax {
     fn delimiter(&self) -> Option<Delimiter>;
     /// Peels holders that contribute a value; an empty holder has no value.
     fn unparenthesized(&self) -> Option<&Expr>;
+    /// The expressions whose value this one ends with, as a function's body
+    /// ends with what it returns: itself seen through parentheses, split into
+    /// each branch of a final `if` or each outcome of a final `try`. In
+    /// `(x := f(); if x then y else z)` they are `y` and `z`. A `return` ends
+    /// with none, leaving early instead, and so does an empty holder `(x;)`.
+    fn final_values(&self) -> Vec<&Expr>;
     /// Symbol spelling when this exact expression is a symbol, without peeling holders.
     fn symbol_name(&self) -> Option<&str>;
     /// How an option key is spelled: a symbol by its name, `Eps`, a string
@@ -48,6 +54,43 @@ impl ExpressionSyntax for Expr {
             expression = holder.expr.as_deref()?;
         }
         Some(expression)
+    }
+
+    fn final_values(&self) -> Vec<&Expr> {
+        let Some(expression) = self.unparenthesized() else {
+            return Vec::new();
+        };
+        match expression {
+            Self::Return(_) => Vec::new(),
+            Self::If(branch) => branch
+                .then_clause
+                .expr
+                .final_values()
+                .into_iter()
+                .chain(
+                    branch
+                        .else_clause
+                        .iter()
+                        .flat_map(|clause| clause.expr.final_values()),
+                )
+                .collect(),
+            Self::Try(attempt) => {
+                let succeeded = attempt
+                    .then_clause
+                    .as_ref()
+                    .map_or(attempt.expr.as_ref(), |clause| clause.expr.as_ref());
+                let failed = attempt.fallback.as_ref().map(|fallback| match fallback {
+                    TryFallback::Else(clause) => clause.expr.as_ref(),
+                    TryFallback::Except(clause) => clause.expr.as_ref(),
+                });
+                succeeded
+                    .final_values()
+                    .into_iter()
+                    .chain(failed.into_iter().flat_map(Self::final_values))
+                    .collect()
+            }
+            _ => vec![expression],
+        }
     }
 
     fn symbol_name(&self) -> Option<&str> {

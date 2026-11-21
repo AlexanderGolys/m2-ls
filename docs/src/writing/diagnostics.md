@@ -110,7 +110,6 @@ next.
 | `S11` | `null-return-guard` | hint | an unused `if x === null then return y` guard expressible as `x ?? return y` |
 | `S12` | `mapped-composition` | hint | `apply(rows, x -> f(g(x)))` expressible as `rows / f @@ g` |
 | `S13` | `redundant-boolean-comparison` | hint | a known Boolean strictly compared with `true` or `false` |
-| `S14` | `forwarding-lambda` | hint | `c -> inlineOf c` or `c -> inlineOf(c)` expressible as `inlineOf` |
 | `S15` | `simplifiable-try` | hint | a `try` with a repeated success value or redundant `null` fallback |
 | `S33` | `redundant-coalesced-try` | hint | `(try f x) ?? y` expressible as `f x ?? y`, since `??` already turns an error on its left into the fallback |
 | `S16` | `simplifiable-if-condition` | hint | an `if` condition with an invertible comparison or cancellable double negation |

@@ -378,17 +378,6 @@ REDUNDANT_BOOLEAN_COMPARISON {
         severity: HINT,
     }
 
-    /// A callback whose sole effect is forwarding its parameter to a function.
-    ///
-    /// ```m2
-    /// c -> inlineOf c
-    /// ```
-FORWARDING_LAMBDA {
-        code: "S14",
-        name: "forwarding-lambda",
-        severity: HINT,
-    }
-
     /// A `try` with a repeated success value or redundant null fallback.
     ///
     /// ```m2

@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+- `oo`, `ooo`, `oooo` and `oN` are typed as `Core.m2` rotates them: muted
+  inputs count, each `;`-ended statement is its own numbered input, a `null`
+  value binds no `oN` and only shifts `ooo` and `oooo`, and inside a function
+  body they are unknown, as they are read at the call.
+- TEST blocks and documentation examples see everything their package
+  exports: globals the package file defines, those of the files it loads, and
+  symbols only the `export` creates, such as an option name. E22 and S31 no
+  longer flag them there.
+- S31 counts an earlier `export {"Name"}` as introducing `Name`.
+- Add the `boolean` semantic token type for `true`, `false` and other
+  `Boolean` values (`variable` under `standardOnly`), so booleans keep their
+  colour inside TEST blocks.
+- Highlighting a function's exits, from its `->` or a `return`, also lights
+  up the values its body ends with: each branch of a final `if`, each
+  outcome of a final `try`.
+- `ideal`, `monomialIdeal`, `matrix`, `module`, `ring`, `monoid`, `net`,
+  `vector` and `complex` are typed as making the type they are named after, whatever
+  their argument: `ideal R_*` is an `Ideal`, so `(ideal R_*)^3` is one and
+  `R/(ideal R_*)^3` a `QuotientRing`. Before, an argument of unknown type
+  left them `Thing`.
+- S19, S20 and S21 no longer offer `T X := f` for `new T from X := f`,
+  which installs a different method.
+- Remove S14 (`forwarding-lambda`): replacing `c -> f c` with `f` looks `f`
+  up at once instead of at the call, which breaks a name bound later, and
+  changes the class of the function.
+- Method dispatch counts only the methods whose domain types are all visible
+  in the packages loaded, as an orphan rule would: a method of a package's
+  own type, such as `ideal(LieAlgebra)` or `Permutation ^ ZZ`, no longer
+  widens results in a file that does not load the package.
+
 ## 2.9.0 - 2026-11-20
 
 - Add inline refactors: **Inline "f.m2"** replaces a top-level `load` with

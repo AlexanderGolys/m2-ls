@@ -1,27 +1,31 @@
 //! Positioned inference sessions with borrowed expression identity and scope-aware caching.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{OnceCell, Ref, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::ptr;
 
 use m2_syn::visit::{self, Visit};
 use m2_syn::{nodes::*, Spanned};
 use tower_lsp::lsp_types::Position;
 
-use crate::analysis::{CallStaticFacts, Operator, OutputReference, TypeChecker};
+use crate::analysis::{
+    CallStaticFacts, CellOutput, Operator, OutputHistory, OutputReference, TypeChecker,
+};
 use crate::node_metadata::SyntaxSnapshot;
 use crate::object_registry::{ObjectKnowledge, ObjectName, OperatorForm};
 use crate::source::SourceNavigation;
 use crate::typesystem::{
-    InferredType, LiteralOption, PositionedTypeKnowledge, Type, TypeKnowledge, TypeRole,
+    InferredType, LiteralOption, PositionedTypeKnowledge, SubtypeEvidence, Type, TypeKnowledge,
+    TypeRole,
 };
 
 use super::syntax::{InfixSyntax, MethodConstructor};
 use super::{InferType, InferenceContext};
 use crate::analysis::ring::values::RingValues;
 use crate::analysis::SourceRangeKey;
-use crate::syntax::ExpressionSyntax;
+use crate::syntax::{CursorSyntax, ExpressionSyntax};
 
 /// Borrowed identity of one generated expression, independent of source-span equality.
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +54,8 @@ pub struct InferenceSession<'ast, 'request, S: ?Sized, K: ?Sized> {
     expressions: OnceCell<HashMap<SourceRangeKey, &'ast Expr>>,
     /// Results for exact AST allocations in their requested lexical scopes.
     cache: RefCell<HashMap<(ExpressionIdentity<'ast>, usize), InferredType>>,
+    /// Outputs of the leading inputs, grown as output references need them.
+    outputs: RefCell<OutputHistory>,
 }
 
 impl<'ast, 'request, S, K> InferenceSession<'ast, 'request, S, K>
@@ -69,6 +75,9 @@ where
             snapshot,
             expressions: OnceCell::new(),
             cache: RefCell::new(HashMap::new()),
+            outputs: RefCell::new(OutputHistory::new(InferredType::exact_from_id(
+                TypeRole::Symbol.object_name(),
+            ))),
         }
     }
 
@@ -101,6 +110,44 @@ where
             .range_for_syntax(syntax)
             .and_then(|range| self.checker.find_scope_at(range.start))
             .unwrap_or(0)
+    }
+
+    /// The document's inputs with their extents: the cells holding code, which
+    /// Macaulay2 numbers `i1`, `i2`, … whether a newline or a `;` ends them.
+    fn inputs(&self) -> impl Iterator<Item = (Range<usize>, &'ast Cell)> + '_ {
+        self.snapshot
+            .cells()
+            .iter()
+            .filter_map(|cell| Some((cell.document_range(), cell.syntax()?)))
+    }
+
+    /// The output history covering at least the first `inputs` inputs.
+    fn outputs_before(&self, inputs: usize) -> Ref<'_, OutputHistory> {
+        let known = self.outputs.borrow().inputs();
+        for (_, cell) in self.inputs().take(inputs).skip(known) {
+            let output = self.cell_output(cell);
+            self.outputs.borrow_mut().push(output);
+        }
+        self.outputs.borrow()
+    }
+
+    /// What `cell` leaves for the output variables, inferred against the
+    /// outputs of the inputs before it.
+    fn cell_output(&self, cell: &'ast Cell) -> CellOutput {
+        let position = self
+            .source
+            .range_for_syntax(&cell.elems)
+            .expect("a document input has a source range")
+            .start;
+        let scope = self.checker.find_scope_at(position).unwrap_or(0);
+        let value = cell.elems.infer(&self.context(scope));
+        let knowledge = self.checker.knowledge_at(position);
+        let nothing = TypeRole::Nothing.object_name();
+        let may_be_null = value.possibility_by(&nothing, |candidate, bound| {
+            self.checker
+                .subtype_evidence(candidate, bound, position, &knowledge)
+        }) != SubtypeEvidence::Disproven;
+        CellOutput::new(value.without_leaf(&nothing), may_be_null)
     }
 
     /// Infers an expression, distinguishing identical spans and different lexical scopes.
@@ -192,45 +239,40 @@ where
         }
     }
 
-    /// Selects an earlier unmuted top-level value without navigating a synthetic tree.
+    /// What the output variable `symbol` holds where it is read. A function
+    /// body reads it when called, after outputs no document order fixes.
     pub fn output_type(&self, symbol: &'ast Symbol, reference: OutputReference) -> InferredType {
-        let Some(bytes) = self.session.source.syntax_bytes(symbol) else {
+        let (Some(bytes), Some(position)) = (
+            self.session.source.syntax_bytes(symbol),
+            self.position(symbol),
+        ) else {
             return InferredType::unknown();
         };
-        let cells = self.session.snapshot.cells();
-        let Some(current) = cells
+        let (input, cell) = self
+            .session
+            .inputs()
+            .enumerate()
+            .find_map(|(input, (range, cell))| {
+                range.contains(&bytes.start).then_some((input, cell))
+            })
+            .expect("a document symbol lies in an input");
+        let in_function = CursorSyntax::at([cell], bytes.start, self.session.source)
+            .expressions
             .iter()
-            .find(|cell| cell.document_range().contains(&bytes.start))
-        else {
-            return self.exact(symbol, TypeRole::Symbol);
-        };
-        if current
-            .syntax()
-            .is_none_or(|cell| cell.semi_token.is_some())
-        {
-            return self.exact(symbol, TypeRole::Symbol);
+            .any(|expression| matches!(expression, Expr::Function(_)));
+        if in_function {
+            return InferredType::unknown();
         }
-        let previous = cells
-            .iter()
-            .take_while(|cell| cell.document_range().end <= current.document_range().start)
-            .filter_map(|cell| cell.syntax())
-            .filter(|cell| cell.semi_token.is_none())
-            .collect::<Vec<_>>();
-        let selected = match reference {
-            OutputReference::Relative(distance) => {
-                previous.iter().rev().nth(distance.get() - 1).copied()
-            }
-            OutputReference::Absolute(number) => previous.get(number.get() - 1).copied(),
-            OutputReference::MissingAbsolute => None,
-        };
-        let Some(cell) = selected else {
-            return self.exact(symbol, TypeRole::Symbol);
-        };
-        let scope = self
-            .position(&cell.elems)
-            .and_then(|position| self.session.checker.find_scope_at(position))
-            .unwrap_or(self.scope);
-        cell.elems.infer(&self.session.context(scope))
+        let held = self
+            .session
+            .outputs_before(input)
+            .reference(reference, input);
+        let knowledge = self.session.checker.knowledge_at(position);
+        held.resolved_by(|name| {
+            self.session
+                .checker
+                .resolve_type_at(name, position, &knowledge)
+        })
     }
 
     /// Infers application with an explicitly selected argument, including precedence lowering.

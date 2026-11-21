@@ -2,6 +2,7 @@
 //! analysis for LSP requests.
 
 use crate::analysis::{Analysis, BindingView, FunctionInfo, MethodInstallation};
+use crate::builtin_index::{ObjectData, Record};
 use crate::diagnostics::suppression::{DiagnosticSuppressions, DIRECTIVE_MARKER, LINE_COMMENT};
 use crate::diagnostics::{self, M2Diagnostic};
 use crate::documentation::{
@@ -10,11 +11,14 @@ use crate::documentation::{
 use crate::file_load::FileLoad;
 use crate::init_file::InitFileDirective;
 use crate::node_metadata::SyntaxSnapshot;
-use crate::object_registry::{ObjectName, ObjectRegistry};
+use crate::object_hierarchy::{HierarchyObject, NamespaceId};
+use crate::object_registry::{ObjectId, ObjectKnowledge, ObjectName, ObjectRegistry};
 use crate::package_documentation::{DocumentationTextTag, PackageDocumentation};
 use crate::package_index::{collect_imported_packages_in_tree, PackageImport, SourceResolver};
 use crate::source::{ByteRange, DocumentSource, SourceNavigation, SymbolMention, SyntaxSource};
-use crate::source_package::{PackageSessionCode, SourcePackages};
+use crate::source_package::{
+    PackageDeclaration, PackageExport, PackageSessionCode, SourcePackages,
+};
 use crate::string_literal::LiteralSource;
 use crate::syntax::{
     AssignmentSyntax, AssignmentTarget, BindingReferences, CursorSyntax, ExpressionSyntax,
@@ -23,6 +27,8 @@ use crate::syntax::{
 use crate::typesystem::{TypeKnowledge, TypeRole};
 use m2_syn::nodes::{Expr, ExprAssign, Symbol};
 use m2_syn::visit::{self, Visit};
+use std::collections::HashMap;
+use std::iter;
 use std::ops::BitOr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -121,8 +127,9 @@ pub struct DocumentSnapshot {
     /// The package sessions of the previous snapshot, whose analyses unchanged
     /// sessions reuse.
     previous_sessions: Mutex<Vec<PackageSession>>,
-    /// The packages a package session starts with: the provider's, without an
-    /// init file.
+    /// The packages and source facts a package session starts from: the
+    /// provider's, without an init file. A session keeps only the source facts
+    /// its package exports.
     session_knowledge: ObjectRegistry,
 }
 
@@ -196,8 +203,9 @@ impl BitOr for FileProperties {
 pub struct PackageSession {
     /// The code and the package whose exports it sees.
     pub code: PackageSessionCode,
-    /// The packages the session loads along with the package.
-    pub exported_packages: Vec<ObjectName>,
+    /// The registry the session starts with: the package's exports and the
+    /// packages it exports along.
+    pub knowledge: ObjectRegistry,
     /// The code analyzed on its own.
     pub snapshot: Arc<DocumentSnapshot>,
 }
@@ -426,9 +434,7 @@ impl DocumentSnapshot {
             previous_sessions: Mutex::new(previous_sessions),
             // `check` and `installPackage` run the code with `-q`, which
             // skips the init file.
-            session_knowledge: knowledge_provider
-                .without_init_file()
-                .without_source_context(),
+            session_knowledge: knowledge_provider.without_init_file(),
         };
         if full {
             let _timing = crate::telemetry::Timing::start(
@@ -704,16 +710,109 @@ impl DocumentSnapshot {
                 .iter()
                 .chain(self.package_documentation.example_sessions())
                 .collect::<Vec<_>>();
+            let registries = self
+                .packages
+                .declarations()
+                .iter()
+                .map(|package| {
+                    (
+                        Some(package.name.clone()),
+                        self.package_session_registry(package),
+                    )
+                })
+                .chain(iter::once((
+                    None,
+                    self.session_knowledge.without_source_context(),
+                )))
+                .collect();
             let previous =
                 std::mem::take(&mut *self.previous_sessions.lock().expect("session cache lock"));
-            PackageSession::analyze_all(
-                &code,
-                &self.packages,
-                &self.source,
-                &self.session_knowledge,
-                previous,
-            )
+            PackageSession::analyze_all(&code, &self.source, &registries, previous)
         })
+    }
+
+    /// The registry a session that loaded `package` starts with: the globals
+    /// the package exports, whether this file or one it loads defines them,
+    /// and the packages it exports along, all visible from the start.
+    fn package_session_registry(&self, package: &PackageDeclaration) -> ObjectRegistry {
+        let exports = package
+            .exports
+            .iter()
+            .filter_map(|export| Some((self.exported_record(package, export)?, pos!())))
+            .collect();
+        let exported_packages = package
+            .exported_packages
+            .iter()
+            .map(|exported| PackageImport {
+                package: exported.clone(),
+                effective_from: pos!(),
+            })
+            .collect::<Vec<_>>();
+        self.session_knowledge
+            .with_source_context(exports)
+            .with_imports(&exported_packages)
+    }
+
+    /// The record of the global `export` stands for, named as `export` shows
+    /// it to the sessions that load `package`: the definition the package
+    /// ends with in this file, else one in a file the file loads, else the
+    /// bare symbol the export itself creates, as `export {"Highlight"}` makes
+    /// `Spectral$Highlight` for an option name nothing assigns.
+    fn exported_record(
+        &self,
+        package: &PackageDeclaration,
+        export: &PackageExport,
+    ) -> Option<Record> {
+        let owner = self.package_object(package)?;
+        let end = package.section.end;
+        let own = self.analysis.visible_source_binding_at(
+            export.definition.name(),
+            end,
+            &self.object_registry.at(end),
+        );
+        if let Some(binding) = own {
+            let object = HierarchyObject {
+                package: Some(owner.clone()),
+                ..HierarchyObject::of_binding(self, binding, NamespaceId::Package(owner), None)
+            };
+            return Some(object.record(
+                export.name.clone(),
+                &self.object_registry,
+                &HashMap::new(),
+            ));
+        }
+        let mut record = match self
+            .session_knowledge
+            .get_record(&export.definition)
+            .filter(|record| self.session_knowledge.is_source_object(&record.id))
+        {
+            Some(loaded) => loaded.clone(),
+            None => Record::from_source(
+                ObjectId::new(format!(
+                    "{}${}",
+                    package.name.name(),
+                    export.definition.name()
+                )),
+                export.definition.clone(),
+                TypeRole::Symbol.object_name(),
+                self.object_registry
+                    .resolve_type_id(&TypeRole::Symbol.object_name()),
+                owner,
+                ObjectData::Plain,
+            ),
+        };
+        record.name = export.name.clone();
+        Some(record)
+    }
+
+    /// The package object `newPackage` binds the name of `package` to.
+    pub fn package_object(&self, package: &PackageDeclaration) -> Option<ObjectId> {
+        let binding = self.analysis.binding_states().find(|binding| {
+            binding.name == package.name
+                && binding.state.presentation_kind == SymbolKind::NAMESPACE
+                && package.contains(binding.state.span.start)
+        })?;
+        Some(self.analysis.binding_object_id(binding))
     }
 
     /// The package session whose code contains `position`, which answers for
@@ -1083,38 +1182,24 @@ impl DocumentSnapshot {
 }
 
 impl PackageSession {
-    /// The sessions running `code`, declared in `source` with `packages`,
-    /// each analyzed alone against `knowledge_provider` plus the packages its
-    /// package exports along. A session whose code, positions, and packages
-    /// match one of `previous` keeps that analysis; the others are analyzed in
-    /// parallel.
+    /// The sessions running `code`, out of `source`, each analyzed alone
+    /// against the registry `registries` holds for its package. A session
+    /// whose code, positions, and registry match one of `previous` keeps that
+    /// analysis; the others are analyzed in parallel.
     fn analyze_all(
         code: &[&PackageSessionCode],
-        packages: &SourcePackages,
         source: &DocumentSource,
-        knowledge_provider: &ObjectRegistry,
+        registries: &HashMap<Option<ObjectName>, ObjectRegistry>,
         mut previous: Vec<PackageSession>,
     ) -> Vec<PackageSession> {
         let mut sessions = Vec::with_capacity(code.len());
         let mut pending = Vec::new();
         for (ordinal, session_code) in code.iter().copied().enumerate() {
             let isolated_source = session_code.isolated_source(source.text());
-            let exported_packages = session_code
-                .package
-                .as_ref()
-                .map(|package| {
-                    packages
-                        .declarations()
-                        .iter()
-                        .find(|declaration| declaration.name == *package)
-                        .expect("session code belongs to a package the document declares")
-                        .exported_packages
-                        .clone()
-                })
-                .unwrap_or_default();
+            let knowledge = &registries[&session_code.package];
             match previous.iter().position(|session| {
                 session.code.package == session_code.package
-                    && session.exported_packages == exported_packages
+                    && session.knowledge.same_environment(knowledge)
                     && session.snapshot.text() == isolated_source
             }) {
                 Some(unchanged) => {
@@ -1122,7 +1207,7 @@ impl PackageSession {
                     kept.code = session_code.clone();
                     sessions.push((ordinal, kept));
                 }
-                None => pending.push((ordinal, session_code, isolated_source, exported_packages)),
+                None => pending.push((ordinal, session_code, isolated_source, knowledge)),
             }
         }
 
@@ -1139,17 +1224,13 @@ impl PackageSession {
                         // Taken in its own statement, so the lock is released
                         // before the code is analyzed.
                         let next_code = queue.lock().expect("queue lock").next();
-                        let Some((ordinal, session_code, isolated_source, exported_packages)) =
-                            next_code
+                        let Some((ordinal, session_code, isolated_source, knowledge)) = next_code
                         else {
                             break;
                         };
-                        if let Some(session) = Self::analyze(
-                            session_code,
-                            isolated_source,
-                            exported_packages,
-                            knowledge_provider,
-                        ) {
+                        if let Some(session) =
+                            Self::analyze(session_code, isolated_source, knowledge)
+                        {
                             analyzed
                                 .lock()
                                 .expect("analyzed lock")
@@ -1164,28 +1245,16 @@ impl PackageSession {
         sessions.into_iter().map(|(_, session)| session).collect()
     }
 
-    /// `code`, isolated as `isolated_source`, analyzed against
-    /// `knowledge_provider` plus `exported_packages`.
+    /// `code`, isolated as `isolated_source`, analyzed against `knowledge`.
     fn analyze(
         code: &PackageSessionCode,
         isolated_source: String,
-        exported_packages: Vec<ObjectName>,
-        knowledge_provider: &ObjectRegistry,
+        knowledge: &ObjectRegistry,
     ) -> Option<Self> {
-        let session_imports = exported_packages
-            .iter()
-            .map(|exported| PackageImport {
-                package: exported.clone(),
-                effective_from: pos!(),
-            })
-            .collect::<Vec<_>>();
-        let snapshot = DocumentSnapshot::from_text(
-            isolated_source,
-            &knowledge_provider.with_imports(&session_imports),
-        )?;
+        let snapshot = DocumentSnapshot::from_text(isolated_source, knowledge)?;
         Some(Self {
             code: code.clone(),
-            exported_packages,
+            knowledge: knowledge.clone(),
             snapshot: Arc::new(snapshot),
         })
     }

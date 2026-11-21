@@ -23,7 +23,23 @@ On a keyword
 On `return`, `break` or `continue`
 : the function or loop it leaves, together with every other exit from it.
   Resting on the `->` of a function or on the keyword of a loop highlights all
-  its exits — handy for spotting an early `return` in a long body.
+  its exits — handy for spotting an early `return` in a long body. A
+  function's exits include the values its body ends with, the returns it
+  makes without `return`: through a final `if` each branch lights up, not
+  the whole `if`, and through a final `try` each outcome.
+
+```m2
+f = x -> (
+    if x === null then return 0;
+    y := g x;
+    if y > 0 then
+        y
+    else -y
+)
+```
+
+  On `->` or on the `return`, the highlights are `->`, `return`, `y` and
+  `-y`. Resting on `y` itself still highlights its references.
 
 On an indexed ring generator
 : that one variable: every access to the same index and the range in the

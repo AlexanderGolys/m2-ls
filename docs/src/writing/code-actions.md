@@ -125,12 +125,6 @@ Unknown and non-Boolean subjects keep their strict test. For example,
 `null === true` is `false`, while a bare `null` is not a valid Boolean
 condition. Comparisons using `==` or `!=` are left unchanged.
 
-**Replace forwarding lambda with function** — `S14`
-: `c -> inlineOf c` → `inlineOf`; `run -> inlineRun(run)` → `inlineRun`.
-  Parentheses around the call or its argument are allowed. The callback must
-  forward its sole parameter directly to a named lowercase function, with
-  no extra arguments or statements.
-
 **Replace lambda with composition** — `S28`
 : `x -> foo bar x` → `foo @@ bar`; `x -> foo(bar(x))` has the same rewrite.
   Both calls must be unary and use lowercase function names independent of
@@ -145,12 +139,19 @@ condition. Comparisons using `==` or `!=` are left unchanged.
   reordered or repeated parameters, and extra statements keep their wrappers.
 
 Each rule can be disabled independently. For example,
-`-- m2-ls: disable forwarding-lambda` silences `S14` while keeping
+`-- m2-ls: disable composed-lambda` silences `S28` while keeping
 `partial-application-lambda` (`S18`) enabled.
+
+A bare forward such as `c -> inlineOf c` is left alone: `inlineOf` in its
+place would be looked up when the line runs rather than when the callback is
+called, which breaks a name bound later, and would be a function of another
+class, which installations and checks of the callback's class notice.
 
 **Use self-initializing constructor call** — `S19`
 : `new T from value` → `T value`, when the metaclass is known to inherit from
-  `SelfInitializingType`, including source-defined metaclasses.
+  `SelfInitializingType`, including source-defined metaclasses. An
+  installation keeps its form: `new T from String := f` installs what `new`
+  does, while `T String := f` would install what calling `T` does.
 
 **Use header constructor call** — `S20`
 : The same shorthand for a known `HeaderType`, with List or Sequence input.

@@ -6,6 +6,8 @@ use m2_syn::nodes::{BinaryOperator, Expr, ExprBinary, ExprField, ExprQuote, Symb
 use m2_syn::visit::{self, Visit};
 
 use super::{DiagnosticSink, DocumentContext};
+use tower_lsp::lsp_types::Position;
+
 use crate::analysis::QuotedName;
 use crate::diagnostics::{catalog, Finding};
 use crate::node_metadata::ParsedCell;
@@ -42,6 +44,19 @@ impl SymbolIntroductions<'_, '_> {
     }
 }
 
+impl SymbolIntroductions<'_, '_> {
+    /// Whether an `export` ahead of `position` creates `name`, as
+    /// `export {"Highlight"}` makes the option name `Highlight` a symbol of the
+    /// package.
+    fn exported_before(&self, name: &str, position: Position) -> bool {
+        self.context
+            .packages
+            .exports_at(position)
+            .iter()
+            .any(|export| export.name.name() == name && export.range.end <= position)
+    }
+}
+
 impl<'ast> Visit<'ast> for SymbolIntroductions<'_, '_> {
     fn visit_symbol(&mut self, symbol: &'ast Symbol) {
         let Some(range) = self.context.source.range_for_syntax(symbol) else {
@@ -55,6 +70,7 @@ impl<'ast> Visit<'ast> for SymbolIntroductions<'_, '_> {
             .is_some()
             || knowledge.get_record(&ObjectName::new(name)).is_some()
             || self.protected.contains(name)
+            || self.exported_before(name, range.start)
         {
             return;
         }

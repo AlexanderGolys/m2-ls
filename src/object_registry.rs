@@ -140,7 +140,7 @@ struct SourceBindingSignature {
 }
 
 /// One source-ordered package inclusion in an object registry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PackageRegistration {
     /// The package loaded.
     package: ObjectId,
@@ -278,6 +278,12 @@ impl ObjectRegistry {
     /// Whether the file's initialization and imported source facts are unchanged.
     pub fn same_source_context(&self, other: &Self) -> bool {
         self.source_context.signature == other.source_context.signature
+    }
+
+    /// Whether both registries load the same packages, from the same
+    /// positions, and see the same source facts.
+    pub fn same_environment(&self, other: &Self) -> bool {
+        self.packages == other.packages && self.same_source_context(other)
     }
 
     /// Load the package `name` from the start of the source; returns whether
@@ -672,6 +678,16 @@ pub trait ObjectKnowledge: TypeStore {
     fn get_record(&self, name: &ObjectName) -> Option<&Record> {
         let object = self.resolve_object(name)?;
         self.object(&object)
+    }
+
+    /// Whether `object` is reachable by its own name: false for a type of a
+    /// package not loaded, such as `LieAlgebra` in a file loading only Core,
+    /// or for one a nearer binding of its name shadows.
+    fn is_visible(&self, object: &ObjectId) -> bool {
+        self.object(object)
+            .and_then(|record| self.resolve_object(&record.name))
+            .as_ref()
+            == Some(object)
     }
 
     /// The runtime class of any object, using its canonical identity.

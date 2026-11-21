@@ -1029,8 +1029,32 @@ async fn output_references_follow_prior_cell_types_without_semantic_tokens() {
         );
     }
 
+    // A muted input is still output: `;` only stops the printing.
     session.replace("1\n\"hidden\";\na = oo\n").await;
-    assert_eq!(hover_type_at(&mut session, 2, 0).await, "ZZ");
+    assert_eq!(hover_type_at(&mut session, 2, 0).await, "String");
+
+    // A null output shifts `ooo` and `oooo` but leaves `oo`, and binds no `oN`.
+    session
+        .replace("1\n\"a\"\nnull\nb = oo\nc = o3\nd = o1\n")
+        .await;
+    for (line, expected) in [(3, "String"), (4, "Symbol"), (5, "ZZ")] {
+        assert_eq!(hover_type_at(&mut session, line, 0).await, expected);
+    }
+    session
+        .replace("1\n\"a\";\nnull\nc = oooo\nd = o3\ne = o2\n")
+        .await;
+    for (line, expected) in [(3, "ZZ"), (4, "Symbol"), (5, "String")] {
+        assert_eq!(hover_type_at(&mut session, line, 0).await, expected);
+    }
+
+    // Each `;`-ended statement is its own input and takes its own number.
+    session.replace("1; \"a\"\nb = o2\nc = ooo\n").await;
+    assert_eq!(hover_type_at(&mut session, 1, 0).await, "String");
+    assert_eq!(hover_type_at(&mut session, 2, 0).await, "String");
+
+    // A function body reads `oo` when called, after any output.
+    session.replace("1\nf = () -> (y := oo; y)\n").await;
+    assert_eq!(hover_type_at(&mut session, 1, 11).await, "Thing");
 
     session.replace("o100 := \"hello\"\nx = o100\n").await;
     assert_eq!(hover_type_at(&mut session, 1, 0).await, "String");
@@ -2041,36 +2065,14 @@ async fn boolean_comparisons_offer_simplification_hints_and_quick_fixes() {
     session.shutdown().await;
 }
 
-/// Unary forwarding, composition, and fixed-first-argument callbacks have separate diagnostics
+/// Composition and fixed-first-argument callbacks have separate diagnostics
 /// and edits, including parenthesized calls. Statements and parameter-dependent
-/// callees or fixed arguments keep their callback wrappers.
+/// callees or fixed arguments keep their callback wrappers, and so does a bare
+/// forward `c -> inlineOf c`: `inlineOf` in its place would be looked up at
+/// once rather than when called, and be a function of another class.
 #[tokio::test]
 async fn forwarding_callbacks_have_separate_rules_and_quick_fixes() {
     let cases = [
-        (
-            "c -> inlineOf c",
-            "S14",
-            "Replace forwarding lambda with function",
-            "inlineOf",
-        ),
-        (
-            "run -> inlineRun(run)",
-            "S14",
-            "Replace forwarding lambda with function",
-            "inlineRun",
-        ),
-        (
-            "c -> ((inlineOf(c)))",
-            "S14",
-            "Replace forwarding lambda with function",
-            "inlineOf",
-        ),
-        (
-            "c -> inlineOf((c))",
-            "S14",
-            "Replace forwarding lambda with function",
-            "inlineOf",
-        ),
         (
             "y -> f(x, y)",
             "S18",
@@ -2183,6 +2185,8 @@ async fn forwarding_callbacks_have_separate_rules_and_quick_fixes() {
         "x -> (print x; foo bar x)",
         "x -> foo(bar(print x; x))",
         "x -> (foo -- keep this comment\n bar x)",
+        "c -> inlineOf c",
+        "run -> inlineRun(run)",
         "c -> inlineOf other",
         "c -> c c",
         "c -> (print c; inlineOf c)",
@@ -2206,23 +2210,10 @@ async fn forwarding_callbacks_have_separate_rules_and_quick_fixes() {
             session
                 .diagnostics()
                 .iter()
-                .all(|diagnostic| diagnostic["code"] != "S14"
-                    && diagnostic["code"] != "S18"
-                    && diagnostic["code"] != "S28"),
+                .all(|diagnostic| diagnostic["code"] != "S18" && diagnostic["code"] != "S28"),
             "unexpected forwarding rewrite for `{expression}`"
         );
     }
-    session
-        .replace("-- m2-ls: disable S14\nfirst = c -> inlineOf c\nsecond = y -> f(x, y)\n")
-        .await;
-    assert!(session
-        .diagnostics()
-        .iter()
-        .all(|diagnostic| diagnostic["code"] != "S14"));
-    assert!(session
-        .diagnostics()
-        .iter()
-        .any(|diagnostic| diagnostic["code"] == "S18"));
     session.shutdown().await;
 }
 
@@ -3580,7 +3571,7 @@ async fn disjoint_method_domains_warn_without_rejecting_uncertain_calls() {
             "f = method(Binary => true)\nf(ZZ,ZZ) := List => (x,y) -> {x,y}\nf(1,2,3)\n",
             true,
         ),
-        ("ideal true\n", false),
+        ("ideal true\n", true),
         ("binomial(1,2,3)\n", true),
         ("f = x -> x\nf \"text\"\n", false),
     ] {
@@ -4645,7 +4636,7 @@ async fn typed_inference_tracks_scope_output_history_and_revisions() {
     let mut session = DocumentSession::open(source).await;
     for (line, expected) in [
         (2, "ZZ"),
-        (4, "ZZ"),
+        (4, "Boolean"),
         (5, "Symbol"),
         (6, "String"),
         (8, "String"),
@@ -4656,7 +4647,7 @@ async fn typed_inference_tracks_scope_output_history_and_revisions() {
 
     let relocated = source.replacen("\"α\"", "\"αβγδε\"", 1);
     session.replace(&relocated).await;
-    assert_eq!(hover_type_at(&mut session, 4, 1).await, "ZZ");
+    assert_eq!(hover_type_at(&mut session, 4, 1).await, "Boolean");
     assert_eq!(hover_type_at(&mut session, 8, 1).await, "String");
 
     session

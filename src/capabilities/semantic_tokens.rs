@@ -1975,7 +1975,7 @@ matchingMacroClose = (src, bodyStart, outerName) -> (
         let tokens = collect_tokens(&document, &builtins, true);
 
         let indexed = token_at(&tokens, 0, 0).expect("indexed true should be highlighted");
-        assert_eq!(indexed.token_type, M2SemanticTokenType::Variable as u32);
+        assert_eq!(indexed.token_type, M2SemanticTokenType::Boolean as u32);
         assert_eq!(
             indexed.token_modifiers_bitset,
             (READONLY_MODIFIER | LIBRARY_CONST_MODIFIER)
@@ -2774,6 +2774,8 @@ Description
                 M2SemanticToken::new(token_type).encode(&standard_only).0,
                 if matches!(token_type, M2SemanticTokenType::EscapeSequence) {
                     M2SemanticTokenType::String as u32
+                } else if matches!(token_type, M2SemanticTokenType::Boolean) {
+                    M2SemanticTokenType::Variable as u32
                 } else if matches!(
                     token_type,
                     M2SemanticTokenType::Delimiter | M2SemanticTokenType::Punctuation

@@ -166,6 +166,15 @@ impl TypeRange {
             .any(|generator| *generator.name() == top)
     }
 
+    /// This range without the class `leaf`, which has no subclasses: a range
+    /// `ZZ | Nothing` without `Nothing` is `ZZ`. A family rooted above `leaf`
+    /// keeps it, as a `Thing` stays a `Thing`.
+    pub fn without_leaf(mut self, leaf: &ObjectName) -> Self {
+        self.exact.retain(|point| point.name() != leaf);
+        self.generators.retain(|generator| generator.name() != leaf);
+        self
+    }
+
     /// The sole named type when this range has a single expressible result.
     pub fn single(&self) -> Option<&ObjectName> {
         match (self.exact.len(), self.generators.len()) {

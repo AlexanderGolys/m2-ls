@@ -10,13 +10,14 @@ use std::fmt::Write;
 use serde::Serialize;
 use tower_lsp::lsp_types::{Location, Position, Url};
 
-use crate::analysis::TypeChecker;
-use crate::builtin_index::Record;
+use crate::analysis::{BindingView, TypeChecker};
+use crate::builtin_index::{CallableInfo, CallableKind, ObjectData, Record};
 use crate::document::DocumentSnapshot;
 use crate::macaulay2::Macaulay2Conventions;
 use crate::object_registry::{
-    ObjectId, ObjectKnowledge, ObjectRegistry, TypeData, TypeId, TypeStore,
+    ObjectId, ObjectKnowledge, ObjectName, ObjectRegistry, TypeData, TypeId, TypeStore,
 };
+use crate::typesystem::{TypeKnowledge, TypeRole};
 
 /// Borrowed object relations combining a document's facts with its environment.
 /// Neither traversal nor subtype logic distinguishes where an object originated.
@@ -179,6 +180,115 @@ pub struct HierarchyObject {
     pub scope: Option<usize>,
     /// Public dependency names for package objects; `None` means unknown metadata.
     pub package_exports: Option<Vec<String>>,
+}
+
+impl HierarchyObject {
+    /// The object `binding` of `document` holds, with the class and parent
+    /// edges its analysis gives it, bound in `namespace`.
+    pub fn of_binding(
+        document: &DocumentSnapshot,
+        binding: BindingView<'_>,
+        namespace: NamespaceId,
+        location: Option<Location>,
+    ) -> Self {
+        let analysis = document.analysis();
+        let registry = document.object_registry();
+        let relations = analysis.object_relations(registry);
+        let id = analysis.binding_object_id(binding);
+        Self {
+            name: binding.name.name().to_string(),
+            class_of: relations.class_of(&id),
+            parent_of: binding
+                .state
+                .source_type
+                .as_ref()
+                .and_then(|type_id| relations.parent_type_id(type_id)),
+            type_id: binding.state.source_type.clone(),
+            typical_value: analysis
+                .function_for_binding(binding)
+                .and_then(|function| function.typical_value.as_ref())
+                .and_then(|name| {
+                    TypeChecker::new(analysis, registry).resolve_type_id_at(
+                        name,
+                        binding.state.span.start,
+                        registry,
+                    )
+                }),
+            namespace,
+            package: None,
+            location,
+            scope: Some(binding.scope_idx),
+            package_exports: None,
+            id,
+        }
+    }
+
+    /// The object as a registry record, bound to `name` in the sessions that
+    /// see it: a type, a callable, or a plain value, by its class. The class
+    /// is named from `registry`, or else from `objects`, the source objects
+    /// it may be one of.
+    pub fn record(
+        &self,
+        name: ObjectName,
+        registry: &ObjectRegistry,
+        objects: &HashMap<&ObjectId, &HierarchyObject>,
+    ) -> Record {
+        let class = self
+            .class_of
+            .as_ref()
+            .and_then(|class| {
+                registry
+                    .object(class.object())
+                    .map(|record| record.name.clone())
+                    .or_else(|| {
+                        objects
+                            .get(class.object())
+                            .map(|object| ObjectName::new(&object.name))
+                    })
+            })
+            .unwrap_or_else(|| TypeRole::Thing.object_name());
+        let is_class = |roles: &[TypeRole]| {
+            roles
+                .iter()
+                .any(|role| registry.has_type_role(&class, *role) || class == role.object_name())
+        };
+        let methods = [
+            TypeRole::MethodFunction,
+            TypeRole::MethodFunctionBinary,
+            TypeRole::MethodFunctionSingle,
+            TypeRole::MethodFunctionWithOptions,
+        ];
+        let data = if self.type_id.is_some() {
+            ObjectData::Type(TypeData {
+                parent: self.parent_of.clone(),
+            })
+        } else if is_class(&methods) || is_class(&[TypeRole::Function]) {
+            ObjectData::Callable(CallableInfo {
+                kind: if is_class(&methods) {
+                    CallableKind::MethodFunction
+                } else {
+                    CallableKind::Function
+                },
+                typical_value: self.typical_value.clone(),
+                methods: Vec::new(),
+                options: Vec::new(),
+                option_passing: None,
+                receives_sequence: false,
+            })
+        } else {
+            ObjectData::Plain
+        };
+        Record::from_source(
+            self.id.clone(),
+            name,
+            class,
+            self.class_of.clone(),
+            self.package
+                .clone()
+                .unwrap_or_else(|| ObjectId::session_package(Macaulay2Conventions::USER_PACKAGE)),
+            data,
+        )
+    }
 }
 
 /// A package export binds a public name to an object from its private dictionary.
@@ -439,22 +549,13 @@ impl ObjectHierarchy {
     pub fn source_document(document: &DocumentSnapshot, uri: &Url) -> Self {
         let analysis = document.analysis();
         let registry = document.object_registry();
-        let relations = analysis.object_relations(registry);
         let mut result = Self::default();
         result.include_user_package(registry);
         let package_objects = document
             .packages()
             .declarations()
             .iter()
-            .filter_map(|package| {
-                let binding = analysis.binding_states().find(|binding| {
-                    binding.name == package.name
-                        && binding.state.presentation_kind
-                            == tower_lsp::lsp_types::SymbolKind::NAMESPACE
-                        && package.contains(binding.state.span.start)
-                })?;
-                Some((package.section.start, analysis.binding_object_id(binding)))
-            })
+            .filter_map(|package| Some((package.section.start, document.package_object(package)?)))
             .collect::<BTreeMap<_, _>>();
         for package in document.packages().declarations() {
             if let Some(owner) = package_objects.get(&package.section.start) {
@@ -515,32 +616,12 @@ impl ObjectHierarchy {
                 continue;
             }
             result.insert(
-                HierarchyObject {
-                    id: id.clone(),
-                    name: binding.name.name().to_string(),
-                    class_of: relations.class_of(&id),
-                    parent_of: binding
-                        .state
-                        .source_type
-                        .as_ref()
-                        .and_then(|type_id| relations.parent_type_id(type_id)),
-                    type_id: binding.state.source_type.clone(),
-                    typical_value: analysis
-                        .function_for_binding(binding)
-                        .and_then(|function| function.typical_value.as_ref())
-                        .and_then(|name| {
-                            TypeChecker::new(analysis, registry).resolve_type_id_at(
-                                name,
-                                binding.state.span.start,
-                                registry,
-                            )
-                        }),
+                HierarchyObject::of_binding(
+                    document,
+                    binding,
                     namespace,
-                    package: None,
-                    location: Some(Location::new(uri.clone(), binding.state.span)),
-                    scope: Some(binding.scope_idx),
-                    package_exports: None,
-                },
+                    Some(Location::new(uri.clone(), binding.state.span)),
+                ),
                 name,
             );
         }

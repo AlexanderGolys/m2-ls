@@ -1,4 +1,5 @@
-//! In-document highlighting for resolved symbols and compound-statement words.
+//! In-document highlighting for resolved symbols and compound-statement words,
+//! and for where control leaves a function or loop.
 
 use m2_syn::nodes::{Expr, ExprFunction};
 use m2_syn::{Lex, Span, Spanned, Token, TokenStream, TokenTree};
@@ -8,7 +9,7 @@ use crate::capabilities::navigation::{reference_ranges_resolved, unbound_referen
 use crate::document::DocumentSnapshot;
 use crate::object_registry::ObjectName;
 use crate::source::{SourceNavigation, SyntaxSource};
-use crate::syntax::StatementKeywords;
+use crate::syntax::{ExpressionSyntax, StatementKeywords};
 use crate::typesystem::TypeKnowledge;
 use tower_lsp::lsp_types::{
     DocumentHighlight, DocumentHighlightKind, DocumentHighlightOptions, OneOf, Position,
@@ -275,9 +276,12 @@ fn control_transfer_highlights(
                 LoopStatement::While(node) => node.keywords(),
             }
         }
-        ControlTransferTarget::Function(function) => {
-            lambda_operator(function).into_iter().collect()
-        }
+        ControlTransferTarget::Function(function) => function
+            .arrow_token
+            .try_span()
+            .into_iter()
+            .chain(final_values(function))
+            .collect(),
     };
     keywords.extend(owned_transfer_keywords(
         document,
@@ -303,7 +307,7 @@ fn control_owner_highlights(
     })?;
     let (transfers, byte) = control_transfers_at(document, position, knowledge)?;
     let mut keywords = match owner {
-        Expr::Function(function) => lambda_operator(function).into_iter().collect(),
+        Expr::Function(function) => function.arrow_token.try_span().into_iter().collect(),
         _ => owner.keywords(),
     };
     if !keywords
@@ -311,6 +315,9 @@ fn control_owner_highlights(
         .any(|keyword| spans_byte(document, keyword, byte))
     {
         return None;
+    }
+    if let Expr::Function(function) = owner {
+        keywords.extend(final_values(function));
     }
     keywords.extend(owned_transfer_keywords(document, &transfers, *owner));
     Some(highlights_for_spans(keywords, document))
@@ -344,9 +351,16 @@ fn transfer_keyword(transfer: &Expr) -> Option<&dyn Spanned> {
     }
 }
 
-/// The `->` of a function.
-fn lambda_operator(function: &ExprFunction) -> Option<Span> {
-    function.arrow_token.try_span()
+/// The values a function's body ends with, which it returns besides its
+/// `return`s. They light up with the function's exits but never trigger them:
+/// resting inside one highlights what is under the cursor there.
+fn final_values(function: &ExprFunction) -> Vec<Span> {
+    function
+        .body
+        .final_values()
+        .into_iter()
+        .filter_map(Spanned::try_span)
+        .collect()
 }
 
 /// Whether `syntax` covers the document byte `byte`.

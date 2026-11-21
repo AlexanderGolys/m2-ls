@@ -12,6 +12,7 @@
 //! before combining candidate codomains.
 
 use crate::builtin_index::CallableInfo;
+use crate::library_constructors::LibraryConstructors;
 use crate::node_metadata::SyntaxSnapshot;
 use std::ops::Deref;
 
@@ -375,6 +376,16 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         knowledge: &(impl TypeKnowledge + ?Sized),
     ) -> Option<InferredType> {
         let record = knowledge.get_record(callable)?;
+        // A constructor makes its type whatever it is given: the type its
+        // package names after it.
+        let made = LibraryConstructors::get()
+            .made_type(callable)
+            .and_then(|made| knowledge.get_record(&made))
+            .filter(|made| made.package == record.package)
+            .and_then(|made| knowledge.type_id(&made.id));
+        if let Some(made) = made {
+            return Some(self.inferred_external_type(made, knowledge));
+        }
         let callable_info = record.callable()?;
         if knowledge.has_type_role(&record.class, TypeRole::MethodFunctionBinary)
             && argument_types.len() > 2
@@ -425,7 +436,11 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
         }
     }
 
-    /// Dispatch domains supplied by the external object catalog.
+    /// Dispatch domains supplied by the external object catalog, of the methods
+    /// installed in the loaded packages. The catalog does not record which
+    /// package installs a method, so one is taken as installed, as by an orphan
+    /// rule, exactly when every type of its domain is visible, as the function
+    /// itself is: `ideal(LieAlgebra)` is not, in a file loading only Core.
     fn external_dispatch_domains(
         &self,
         callable: &CallableInfo,
@@ -435,6 +450,12 @@ impl<Knowledge: PositionedTypeKnowledge + ?Sized> TypeChecker<'_, '_, Knowledge>
             .methods
             .iter()
             .enumerate()
+            .filter(|(_, method)| {
+                method
+                    .domain
+                    .iter()
+                    .all(|object| knowledge.is_visible(object))
+            })
             .map(|(signature_index, method)| ResolvedDispatchDomain {
                 signature_index,
                 slots: method

@@ -21,12 +21,14 @@ pub use inference::syntax::{InfixSyntax, MethodConstructor};
 pub use installation::MethodDeclarationOption;
 mod inference;
 mod known_value;
+mod output_history;
 mod ring;
 mod semantic_tokens;
 mod syntax_roles;
 mod typechecker;
 
 pub use known_value::{KnownValue, MatrixShape};
+pub use output_history::{CellOutput, OutputHistory, OutputReference};
 pub use ring::RingVariableError;
 
 use m2_syn::nodes::{
@@ -35,7 +37,6 @@ use m2_syn::nodes::{
 use m2_syn::Token;
 use std::collections::{HashMap, HashSet};
 use std::iter;
-use std::num::NonZeroUsize;
 use std::ops::Deref;
 use syntax_roles::PropertyAccess;
 pub(crate) use syntax_roles::QuotedName;
@@ -699,43 +700,6 @@ struct SemanticRegistry {
     /// Where ring generators are declared, in the order their bindings were
     /// made: each bound constructor's variable list and `Variable` option.
     ring_generator_specs: Vec<TextRange>,
-}
-
-/// A reference to the output of an earlier cell: `oo`, `ooo`, or `o3`.
-#[derive(Clone, Copy)]
-pub enum OutputReference {
-    /// Output reference counted backward from the current source cell.
-    Relative(NonZeroUsize),
-    /// Output reference selecting the recorded absolute output number.
-    Absolute(NonZeroUsize),
-    /// Absolute output reference whose target is not available in the document.
-    MissingAbsolute,
-}
-
-impl OutputReference {
-    /// Parses the supplied source or name into this representation.
-    pub fn parse(name: &str) -> Option<Self> {
-        let relative_distance = match name {
-            "oo" => Some(1),
-            "ooo" => Some(2),
-            "oooo" => Some(3),
-            _ => None,
-        };
-        if let Some(distance) = relative_distance.and_then(NonZeroUsize::new) {
-            return Some(Self::Relative(distance));
-        }
-        let number = name.strip_prefix('o')?;
-        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        Some(
-            number
-                .parse()
-                .ok()
-                .and_then(NonZeroUsize::new)
-                .map_or(Self::MissingAbsolute, Self::Absolute),
-        )
-    }
 }
 
 #[derive(Debug, Clone)]

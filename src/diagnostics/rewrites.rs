@@ -61,8 +61,6 @@ pub enum RewriteKind {
     LambdaComposition,
     /// A Boolean expression strictly compared with `true` or `false`.
     BooleanComparison,
-    /// A callback doing nothing but forwarding its parameter to a named function.
-    ForwardingLambda,
     /// A callback forwarding its parameter after a fixed first argument.
     PartialApplicationLambda,
     /// A `new ... from ...` expression using a self-initializing metaclass.
@@ -95,7 +93,6 @@ impl RewriteKind {
                 | Self::MappingComposition
                 | Self::LambdaComposition
                 | Self::BooleanComparison
-                | Self::ForwardingLambda
                 | Self::PartialApplicationLambda
                 | Self::SelfInitializingConstructor
                 | Self::HeaderConstructor
@@ -122,7 +119,6 @@ impl RewriteKind {
             Self::MappingComposition => &catalog::MAPPED_COMPOSITION,
             Self::LambdaComposition => &catalog::COMPOSED_LAMBDA,
             Self::BooleanComparison => &catalog::REDUNDANT_BOOLEAN_COMPARISON,
-            Self::ForwardingLambda => &catalog::FORWARDING_LAMBDA,
             Self::PartialApplicationLambda => &catalog::PARTIAL_APPLICATION_LAMBDA,
             Self::SelfInitializingConstructor => &catalog::SELF_INITIALIZING_CONSTRUCTOR,
             Self::HeaderConstructor => &catalog::HEADER_CONSTRUCTOR,
@@ -318,8 +314,6 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             None,
             replacement,
         );
-        let replacement = self.forwarding_lambda(expression);
-        self.push(RewriteKind::ForwardingLambda, expression, None, replacement);
         let replacement = self.lambda_composition(expression);
         self.push(
             RewriteKind::LambdaComposition,
@@ -440,7 +434,15 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
 
     /// Call syntax for a named constructor, with parentheses where an argument
     /// would otherwise escape the application or capture surrounding syntax.
+    /// The target of an installation keeps its form: `new HLG from String :=
+    /// f` installs the constructor `HLG "Operator"` calls, while `HLG String
+    /// := f` would install a method that call never reaches.
     fn constructor_call(&self, expression: &Expr) -> Option<String> {
+        if self.parent.is_some_and(|parent| {
+            matches!(parent, Expr::Assign(assignment) if ptr::eq(assignment.left.as_ref(), expression))
+        }) {
+            return None;
+        }
         let construction = ConstructorCall::of(expression)?;
         let value = construction.value;
         let grouped = !matches!(
@@ -469,25 +471,6 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
         } else {
             replacement
         })
-    }
-
-    /// The named function supplied by `x -> f x` or `x -> f(x)`. A direct
-    /// variadic parameter forwards the same argument value as the original
-    /// function. Fixed parameter lists, computed callees, type constructors,
-    /// extra arguments, and statement-bearing holders keep their wrappers.
-    fn forwarding_lambda(&self, expression: &Expr) -> Option<String> {
-        let Expr::Function(lambda) = expression else {
-            return None;
-        };
-        let m2_syn::nodes::FunctionParams::Variadic(parameter) = &lambda.params else {
-            return None;
-        };
-        let call = UnarySymbolCall::of(&lambda.body)?;
-        let function = call.function.symbol_name()?;
-        (call.argument.symbol_name()? == parameter.text()
-            && function != parameter.text()
-            && UnarySymbolCall::has_function_name(call.function))
-        .then(|| self.text(call.function).trim().to_string())
     }
 
     /// Composition notation for a lambda passing its parameter through two

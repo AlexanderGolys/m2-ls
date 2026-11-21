@@ -14,14 +14,13 @@ use std::thread;
 use tower_lsp::lsp_types::{Location, Position, Range as TextRange, Url};
 
 use crate::analysis::AssignmentFactKind;
-use crate::builtin_index::{CallableInfo, CallableKind, ObjectData, Record};
 use crate::capabilities::document_symbols::{collect_workspace_symbols, WorkspaceSourceSymbol};
 use crate::diagnostics::M2Diagnostic;
 use crate::document::DocumentSnapshot;
 use crate::file_load::FileLoad;
 use crate::macaulay2::Macaulay2Conventions;
 use crate::object_hierarchy::HierarchySnapshot;
-use crate::object_registry::{ObjectId, ObjectName, ObjectRegistry, TypeData};
+use crate::object_registry::{ObjectName, ObjectRegistry};
 use crate::package_documentation::{DocumentationKey, DocumentationTextTag, DocumentedSubject};
 use crate::package_index::SourceResolver;
 use crate::semantic_token::{
@@ -30,7 +29,6 @@ use crate::semantic_token::{
 use crate::settings::SettingsStore;
 use crate::settings::WorkspaceSettings;
 use crate::source_package::{ExportAccess, PackageDeclaration, PackageExport};
-use crate::typesystem::{TypeKnowledge, TypeRole};
 
 mod repository;
 
@@ -441,54 +439,6 @@ impl WorkspaceIndex {
                     continue;
                 }
             }
-            let class = object.class_of.as_ref().and_then(|class| {
-                registry
-                    .object(class.object())
-                    .map(|record| record.name.clone())
-                    .or_else(|| {
-                        objects
-                            .get(class.object())
-                            .map(|object| ObjectName::new(&object.name))
-                    })
-            });
-            let class = class.unwrap_or_else(|| TypeRole::Thing.object_name());
-            let data = if object.type_id.is_some() {
-                ObjectData::Type(TypeData {
-                    parent: object.parent_of.clone(),
-                })
-            } else if [
-                TypeRole::Function,
-                TypeRole::MethodFunction,
-                TypeRole::MethodFunctionBinary,
-                TypeRole::MethodFunctionSingle,
-                TypeRole::MethodFunctionWithOptions,
-            ]
-            .into_iter()
-            .any(|role| registry.has_type_role(&class, role) || class == role.object_name())
-            {
-                let method = [
-                    TypeRole::MethodFunction,
-                    TypeRole::MethodFunctionBinary,
-                    TypeRole::MethodFunctionSingle,
-                    TypeRole::MethodFunctionWithOptions,
-                ]
-                .into_iter()
-                .any(|role| registry.has_type_role(&class, role) || class == role.object_name());
-                ObjectData::Callable(CallableInfo {
-                    kind: if method {
-                        CallableKind::MethodFunction
-                    } else {
-                        CallableKind::Function
-                    },
-                    typical_value: object.typical_value.clone(),
-                    methods: Vec::new(),
-                    options: Vec::new(),
-                    option_passing: None,
-                    receives_sequence: false,
-                })
-            } else {
-                ObjectData::Plain
-            };
             let effective_from = object
                 .location
                 .as_ref()
@@ -504,16 +454,7 @@ impl WorkspaceIndex {
                 })
                 .unwrap_or(pos!());
             records.push((
-                Record::from_source(
-                    object.id.clone(),
-                    entry.key().clone(),
-                    class,
-                    object.class_of.clone(),
-                    object.package.clone().unwrap_or_else(|| {
-                        ObjectId::session_package(Macaulay2Conventions::USER_PACKAGE)
-                    }),
-                    data,
-                ),
+                object.record(entry.key().clone(), registry, &objects),
                 effective_from,
             ));
         }

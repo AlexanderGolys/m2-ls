@@ -53,7 +53,7 @@ use crate::object_registry::{
 };
 use crate::settings::SemanticTokenSettings;
 use crate::source::DocumentSpan;
-use crate::typesystem::TypeKnowledge;
+use crate::typesystem::{TypeKnowledge, TypeRole};
 use m2_syn::{LiteralKind, Token, TokenTree};
 use serde::Deserialize;
 use std::ops::{BitOr, BitOrAssign};
@@ -145,6 +145,10 @@ pub enum M2SemanticTokenType {
     String = SemanticTokenType::STRING,
     /// Numeric literal classified using the protocol number token category.
     Number = SemanticTokenType::NUMBER,
+    /// A `Boolean` value, such as `true` or `false`. Sent as `boolean`, the
+    /// type rust-analyzer also uses; falls back to `variable` under
+    /// `standardOnly`.
+    Boolean = SemanticTokenType::new("boolean"),
     /// An operator callable or its syntax classification.
     Operator = SemanticTokenType::OPERATOR,
     /// A foldable or classified comment span.
@@ -522,6 +526,7 @@ impl M2SemanticToken {
             );
         let token_type = match self.token_type {
             M2SemanticTokenType::EscapeSequence => M2SemanticTokenType::String,
+            M2SemanticTokenType::Boolean => M2SemanticTokenType::Variable,
             M2SemanticTokenType::Delimiter | M2SemanticTokenType::Punctuation => {
                 M2SemanticTokenType::Operator
             }
@@ -821,6 +826,7 @@ fn local_symbol_static_type_token(
                 token.token_type,
                 M2SemanticTokenType::String
                     | M2SemanticTokenType::Number
+                    | M2SemanticTokenType::Boolean
                     | M2SemanticTokenType::Symbol
             ) =>
         {
@@ -941,6 +947,8 @@ pub fn semantic_token_for_static_type_from_knowledge(
         || subtype_of("ScriptedFunctor")
     {
         M2SemanticTokenType::Function
+    } else if subtype_of(TypeRole::Boolean.object_name().name()) {
+        M2SemanticTokenType::Boolean
     } else if subtype_of("File") {
         M2SemanticTokenType::Variable
     } else if subtype_of("Symbol") && !subtype_of("Keyword") && !subtype_of("Operator") {

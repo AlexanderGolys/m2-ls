@@ -51,6 +51,7 @@ mod document;
 mod documentation;
 mod file_load;
 mod init_file;
+mod library_constructors;
 mod library_globals;
 mod library_index;
 mod macaulay2;

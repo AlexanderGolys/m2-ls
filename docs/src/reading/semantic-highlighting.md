@@ -22,7 +22,9 @@ load §namespace|"lib/helper.m2"§              -- "lib/helper.m2" namespace
 Most tokens use standard LSP types. Embedded code uses custom `delimiter`
 and `punctuation` types for group boundaries and separators, both falling
 back to `operator` under `standardOnly`. Pattern escapes use the custom
-`escapeSequence` type; a theme can style this separately. The finer Macaulay2 distinctions travel as
+`escapeSequence` type; a theme can style this separately. Booleans use the custom `boolean` type, which rust-analyzer also
+emits, falling back to `variable`; inside TEST blocks and examples, where
+syntax highlighting sees only a string, it is what colours them. The finer Macaulay2 distinctions travel as
 modifiers, which a theme may style when it wants to.
 
 ## Token types { #types }
@@ -50,6 +52,7 @@ the second column — that is the name your editor and theme see.
 | Regular expression | `regexp` | special syntax within literal patterns of `match`, `regex`, `replace`, `select`, and `separate`; delimiters and plain text stay `string` | `+` in `replace(///a+///, "b", text)` |
 | Escape sequence | `escapeSequence` | escaped characters in patterns, retaining their source spelling | `\d`, `\.`, `\\d` in quoted strings |
 | Number | `number` | integer and float literals | `2`, `0.5` |
+| Boolean | `boolean` | a `Boolean` value; unlike numbers these are Core globals, not literals | `true`, `false` |
 | Operator | `operator` | operators | `=`, `:=`, `->`, `<<`, `_` |
 | Comment | `comment` | comments | `-- note` |
 | Delimiter | `delimiter` | group boundaries in embedded documentation code | `(`, `)`, `[`, `]`, `{`, `}` |
@@ -130,6 +133,7 @@ stable; emitted tokens use these fallbacks:
 | Full vocabulary | Standard-only output |
 | --- | --- |
 | `escapeSequence` type | `string` |
+| `boolean` type | `variable` |
 | `delimiter`, `punctuation` types | `operator` |
 | All other token types | unchanged |
 | `algebraic`, the seven kind modifiers, `nonsense` | `abstract` |

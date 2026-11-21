@@ -53,6 +53,8 @@ struct DocumentContext<'context> {
     source: &'context DocumentSource,
     /// Object visibility at each source occurrence.
     knowledge: &'context ObjectRegistry,
+    /// The packages the document declares, whose exports create their symbols.
+    packages: &'context SourcePackages,
 }
 
 /// What the documentation occasion provides: the package documentation the
@@ -174,6 +176,7 @@ pub fn collect(inputs: DiagnosticInputs<'_>, live: bool) -> Vec<M2Diagnostic> {
         syntax,
         source,
         knowledge,
+        packages,
     };
     let mut positioned = DiagnosticSink::default();
     document::naming_conventions(&context, &mut positioned);
