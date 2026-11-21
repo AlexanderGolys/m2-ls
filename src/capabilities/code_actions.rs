@@ -482,17 +482,23 @@ impl<'a> CodeActionContext<'a, '_> {
         self.diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.range.contains_position(self.position))
-            .filter_map(|diagnostic| {
-                let fix = recorded_fix(self.document, diagnostic)?;
-                Some(
-                    CodeActionSpec {
-                        title: fix.title.clone(),
-                        kind: CodeActionKind::QUICKFIX,
-                        is_preferred: Some(true),
-                        diagnostics: Some(vec![diagnostic.clone()]),
-                    }
-                    .build(self.uri, fix.range, fix.replacement.clone()),
-                )
+            .flat_map(|diagnostic| {
+                recorded_fixes(self.document, diagnostic)
+                    .iter()
+                    .enumerate()
+                    .map(|(index, fix)| {
+                        CodeActionSpec {
+                            title: fix.title.clone(),
+                            kind: CodeActionKind::QUICKFIX,
+                            is_preferred: Some(index == 0),
+                            diagnostics: Some(vec![diagnostic.clone()]),
+                        }
+                        .build(
+                            self.uri,
+                            fix.range,
+                            fix.replacement.clone(),
+                        )
+                    })
             })
             .collect()
     }
@@ -614,19 +620,16 @@ impl<'a> CodeActionContext<'a, '_> {
     }
 }
 
-/// The fix the document's finding behind the client's `diagnostic` records.
-fn recorded_fix<'a>(
-    document: &'a DocumentSnapshot,
-    diagnostic: &Diagnostic,
-) -> Option<&'a FindingFix> {
-    let code = DiagnosticCode::from_lsp(diagnostic)?;
-    document
-        .diagnostics()
-        .iter()
-        .find(|reported| reported.rule.code == code && reported.finding.range == diagnostic.range)?
-        .finding
-        .fix
-        .as_ref()
+/// The fixes the document's finding behind the client's `diagnostic`
+/// records, the preferred one first.
+fn recorded_fixes<'a>(document: &'a DocumentSnapshot, diagnostic: &Diagnostic) -> &'a [FindingFix] {
+    DiagnosticCode::from_lsp(diagnostic)
+        .and_then(|code| {
+            document.diagnostics().iter().find(|reported| {
+                reported.rule.code == code && reported.finding.range == diagnostic.range
+            })
+        })
+        .map_or(&[], |reported| reported.finding.fixes.as_slice())
 }
 
 /// The raw-string refactor of the string literal `literal`.
@@ -779,7 +782,7 @@ fn fix_all_action(
     };
     let mut edits = diagnostics
         .iter()
-        .filter_map(|diagnostic| recorded_fix(document, diagnostic))
+        .filter_map(|diagnostic| recorded_fixes(document, diagnostic).first())
         .map(|fix| TextEdit {
             range: fix.range,
             new_text: fix.replacement.clone(),

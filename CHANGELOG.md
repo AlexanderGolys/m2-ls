@@ -16,6 +16,10 @@
   `compactFactorOperators` is reported as removed. Formatting no longer
   follows the editor's `tabSize` and `insertSpaces`.
 
+- When every installation of a method returns the same type, T03 offers
+  declaring it once, `method(…, TypicalValue => Boolean)`, as its preferred
+  fix, ahead of annotating each installation; **Fix all in file** inserts it
+  once.
 - `oo`, `ooo`, `oooo` and `oN` are typed as `Core.m2` rotates them: muted
   inputs count, each `;`-ended statement is its own numbered input, a `null`
   value binds no `oN` and only shifts `ooo` and `oooo`, and inside a function

@@ -384,6 +384,7 @@ impl Analysis {
                 indexed_callable: None,
                 kind: LocalFunctionKind::Method(declaration.options()),
                 declared_options: declaration.declared_options(),
+                option_slot: declaration.option_slot(source),
             }
         } else if let Expr::Function(lambda) = value {
             FunctionInfo {
@@ -394,6 +395,7 @@ impl Analysis {
                 dispatch: Some(lambda.dispatch()),
                 kind: LocalFunctionKind::Plain,
                 declared_options: None,
+                option_slot: None,
             }
         } else if let Some(InstalledFunction::OptionDeclaring { declaration, .. }) =
             InstalledFunction::of(value)
@@ -406,6 +408,7 @@ impl Analysis {
                 dispatch: None,
                 kind: LocalFunctionKind::Plain,
                 declared_options: OptionDeclaration::declared_options(&declaration.left),
+                option_slot: None,
             }
         } else {
             return None;
@@ -468,6 +471,7 @@ impl Analysis {
                 CallableKind::Function | CallableKind::Operator(_) => LocalFunctionKind::Plain,
             },
             declared_options: None,
+            option_slot: None,
         };
         let object_id = CallableObjectId(self.registry.callable_objects.len());
         self.registry.callable_objects.push(function);

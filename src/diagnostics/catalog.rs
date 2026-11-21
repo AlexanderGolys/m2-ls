@@ -783,7 +783,9 @@ CONDITION_TYPE {
     }
 
     /// A method installation without a codomain where inference can deduce
-    /// one; the fix inserts `ZZ =>` here.
+    /// one; the fix inserts `ZZ =>` here. When every installation of the
+    /// method returns the same type, the preferred fix declares it once as
+    /// the `TypicalValue` of its `method(...)` instead.
     ///
     /// ```m2
     /// g = method()

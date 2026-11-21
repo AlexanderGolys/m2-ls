@@ -144,8 +144,8 @@ pub struct FindingFix {
 }
 
 /// What a check reports: the span it flags, the explanation, the related
-/// locations behind it, and the edit fixing it when the check knows one. The
-/// check's diagnostic supplies everything else.
+/// locations behind it, and the edits fixing it that the check knows, the
+/// preferred one first. The check's diagnostic supplies everything else.
 ///
 /// ```ignore
 /// let finding = Finding::new(range, "`protect x` evaluates the current value of `x`")
@@ -159,8 +159,9 @@ pub struct Finding {
     pub message: String,
     /// Locations that explain the finding.
     pub notes: Vec<RelatedNote>,
-    /// The edit fixing the finding, when the check knows one.
-    pub fix: Option<FindingFix>,
+    /// The edits fixing the finding, each offered as a quick fix; the first
+    /// is the preferred one, which "Fix all in file" applies.
+    pub fixes: Vec<FindingFix>,
 }
 
 impl Finding {
@@ -170,18 +171,18 @@ impl Finding {
             range,
             message: message.into(),
             notes: Vec::new(),
-            fix: None,
+            fixes: Vec::new(),
         }
     }
 
-    /// The finding, fixed by replacing `range` with `replacement`.
+    /// The finding, also fixed by replacing `range` with `replacement`.
     pub fn with_fix(
         mut self,
         title: impl Into<String>,
         range: TextRange,
         replacement: impl Into<String>,
     ) -> Self {
-        self.fix = Some(FindingFix {
+        self.fixes.push(FindingFix {
             title: title.into(),
             range,
             replacement: replacement.into(),

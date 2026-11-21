@@ -22,7 +22,7 @@ use super::DiagnosticSink;
 use crate::analysis::{
     Analysis, BindingId, CallOptionIssue, CallableHeadKind, ControlTransferTarget, Dispatch,
     InferenceSession, InfixSyntax, MethodCodomainEdit, MethodConstructor, MethodDeclarationOption,
-    MethodHead, OptionDeclaration, RingVariableError, TypeChecker,
+    MethodHead, MethodOptionSlot, OptionDeclaration, RingVariableError, TypeChecker,
 };
 use crate::diagnostics::rewrites::{RewriteKind, RewriteSite, RewriteSites};
 use crate::diagnostics::{catalog, DiagnosticRule, Finding};
@@ -1299,20 +1299,38 @@ impl<'a> ExpressionChecks<'a, '_> {
         };
         let codomain = &deduction.codomain;
         match (&deduction.edit, &deduction.annotated_codomain) {
-            (MethodCodomainEdit::Add(insertion), _) => self.sink.spawn(
-                &catalog::INSTALL_CODOMAIN_MISSING,
-                Finding::new(
-                    deduction.diagnostic_range,
-                    format!(
-                        "This method's lambda has the deducible codomain `{codomain}`. Add the codomain annotation."
+            (MethodCodomainEdit::Add(insertion), _) => {
+                let range = deduction.diagnostic_range;
+                let option = MethodDeclarationOption::TypicalValue;
+                let finding = match self.shared_codomain_declaration(assignment, codomain) {
+                    Some((name, slot)) => Finding::new(
+                        range,
+                        format!(
+                            "Every installation of `{name}` returns `{codomain}`: declare `{} => {codomain}` once in its `method(...)`, or annotate this one.",
+                            option.name()
+                        ),
+                    )
+                    .with_fix(
+                        format!("Declare `{} => {codomain}` on `{name}`", option.name()),
+                        slot.at,
+                        slot.written(option, codomain),
                     ),
-                )
-                .with_fix(
-                    "Add codomain annotation",
-                    *insertion,
-                    format!("{codomain} {} ", <Token![=>]>::SPELLING),
-                ),
-            ),
+                    None => Finding::new(
+                        range,
+                        format!(
+                            "This method's lambda has the deducible codomain `{codomain}`. Add the codomain annotation."
+                        ),
+                    ),
+                };
+                self.sink.spawn(
+                    &catalog::INSTALL_CODOMAIN_MISSING,
+                    finding.with_fix(
+                        "Add codomain annotation",
+                        *insertion,
+                        format!("{codomain} {} ", <Token![=>]>::SPELLING),
+                    ),
+                );
+            }
             (MethodCodomainEdit::Replace, Some(annotated)) => self.sink.spawn(
                 &catalog::INSTALL_CODOMAIN_MISMATCH,
                 Finding::new(
@@ -1324,6 +1342,22 @@ impl<'a> ExpressionChecks<'a, '_> {
             ),
             (MethodCodomainEdit::Replace, None) => {}
         }
+    }
+
+    /// The method `assignment` installs on and where its declaration takes
+    /// another option, when every installation of the method returns
+    /// `codomain`: one `TypicalValue` then annotates them all.
+    fn shared_codomain_declaration(
+        &self,
+        assignment: &ExprAssign,
+        codomain: &ObjectName,
+    ) -> Option<(ObjectName, MethodOptionSlot)> {
+        let analysis = self.context.analysis;
+        let installation = analysis.installation_for(assignment, self.context.source)?;
+        let function = analysis.installed_function(installation)?;
+        let slot = function.option_slot?;
+        (analysis.shared_codomain(function)? == codomain)
+            .then(|| (installation.method.head.name().clone(), slot))
     }
 
     /// Checks fixed source-lambda arity when the argument pack's size is

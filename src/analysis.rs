@@ -496,12 +496,41 @@ pub struct FunctionInfo {
     /// `{…} >> o -> …`; `None` when it declares none or they are not a
     /// literal list.
     pub declared_options: Option<Vec<CallableOption>>,
+    /// Where a further option of the `method(...)` call creating it is
+    /// written, for a method function the document declares.
+    pub option_slot: Option<MethodOptionSlot>,
 }
 
 impl FunctionInfo {
     /// Whether this node is a method function.
     pub fn is_method_function(&self) -> bool {
         matches!(self.kind, LocalFunctionKind::Method(_))
+    }
+}
+
+/// Where a further option of a `method(...)` call is written: before its
+/// `)`, after a comma unless the call has no arguments.
+///
+/// For `f = method(Dispatch => Type)` declaring `TypicalValue => ZZ` inserts
+/// `, TypicalValue => ZZ` before the `)`; for `f = method()` it inserts
+/// `TypicalValue => ZZ`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MethodOptionSlot {
+    /// The empty range the option is inserted at.
+    pub at: TextRange,
+    /// Whether the call has arguments already, so the option follows a comma.
+    pub after_arguments: bool,
+}
+
+impl MethodOptionSlot {
+    /// The text inserting `option => value` at the slot.
+    pub fn written(&self, option: MethodDeclarationOption, value: &ObjectName) -> String {
+        let separator = if self.after_arguments { ", " } else { "" };
+        format!(
+            "{separator}{} {} {value}",
+            option.name(),
+            <Token![=>]>::SPELLING
+        )
     }
 }
 
@@ -995,6 +1024,37 @@ impl Analysis {
         self.registry
             .callable_objects
             .get(binding.state.object_id?.0)
+    }
+
+    /// The method function the document declares that `installation`
+    /// installs on.
+    pub fn installed_function(&self, installation: &MethodInstallation) -> Option<&FunctionInfo> {
+        let MethodHead::Function(name) = &installation.method.head else {
+            return None;
+        };
+        self.function_for_binding(self.get_binding_at(name.name(), installation.span.start)?)
+    }
+
+    /// The codomain every effective installation of a method function
+    /// without a `TypicalValue` returns, annotated or deduced, when it has at
+    /// least two: declaring it once as the `TypicalValue` states them all. A
+    /// single installation says as much with its own annotation.
+    ///
+    /// ```m2
+    /// belowTen = method()
+    /// belowTen ZZ := n -> n < 10
+    /// belowTen QQ := q -> q < 10     -- shared codomain Boolean
+    /// ```
+    pub fn shared_codomain<'a>(&'a self, function: &'a FunctionInfo) -> Option<&'a ObjectName> {
+        if function.typical_value.is_some() {
+            return None;
+        }
+        let codomains = self
+            .effective_installations(function)
+            .map(|installation| installation.method.codomain.as_ref())
+            .collect::<Option<Vec<_>>>()?;
+        let (first, rest) = codomains.split_first()?;
+        (!rest.is_empty() && rest.iter().all(|codomain| codomain == first)).then_some(*first)
     }
 
     /// The installation each domain of `function` dispatches to, the last
@@ -1674,6 +1734,7 @@ impl Analysis {
                         indexed_callable: None,
                         kind: LocalFunctionKind::Plain,
                         declared_options: None,
+                        option_slot: None,
                     });
                 function.installations.push(installation.id);
                 MethodInstallationEffect::Effective

@@ -1463,6 +1463,69 @@ async fn method_codomain_diagnostics_offer_annotation_quick_fixes() {
 }
 
 #[tokio::test]
+async fn shared_method_codomain_is_declared_once_as_the_typical_value() {
+    let source = "f = method(Dispatch => Type)\nf ZZ := T -> true\nf QQ := T -> false\n";
+    let mut session = DocumentSession::open(source).await;
+    let uri = session.uri().to_string();
+    let hints = session
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| diagnostic["code"] == "T03")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(hints.len(), 2, "both installations deduce Boolean");
+
+    let actions = session
+        .request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": uri},
+                "range": hints[0]["range"],
+                "context": {"diagnostics": [hints[0]]}
+            }),
+        )
+        .await;
+    let actions = response_array(&actions);
+    let declare = &actions[0];
+    assert_eq!(declare["title"], "Declare `TypicalValue => Boolean` on `f`");
+    assert_eq!(declare["isPreferred"], true);
+    let insertion = json!({"line": 0, "character": 27});
+    assert_eq!(
+        declare["edit"]["changes"][&uri][0],
+        json!({
+            "range": {"start": insertion, "end": insertion},
+            "newText": ", TypicalValue => Boolean"
+        })
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|action| action["title"] == "Add codomain annotation"),
+        "annotating the one installation stays available"
+    );
+
+    let fix_all = actions
+        .iter()
+        .find(|action| action["title"] == "Fix all in file")
+        .expect("the hints feed the file-wide fix");
+    assert_eq!(
+        fix_all["edit"]["changes"][&uri],
+        json!([{
+            "range": {"start": insertion, "end": insertion},
+            "newText": ", TypicalValue => Boolean"
+        }]),
+        "the shared declaration is inserted once, not per installation"
+    );
+
+    session
+        .replace("f = method(Dispatch => Type, TypicalValue => Boolean)\nf ZZ := T -> true\nf QQ := T -> false\n")
+        .await;
+    assert!(!session.diagnostic_codes().contains(&"T03"));
+
+    session.shutdown().await;
+}
+
+#[tokio::test]
 async fn methods_with_options_install_functions_of_the_option_table() {
     let mut session = DocumentSession::open("f = method()\nf\n").await;
     for (declaration, class) in [

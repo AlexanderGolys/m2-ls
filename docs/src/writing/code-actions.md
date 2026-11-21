@@ -32,6 +32,21 @@ Each of these fixes the diagnostic it is attached to:
   inference deduced. `new` installations do not need this annotation:
   construction sets the result class to the requested type.
 
+**Declare `TypicalValue => T` on `f`** — `T03`
+: Offered first, and applied by **Fix all in file**, when every installation
+  of a method the file declares returns the same type, annotated or deduced,
+  and there are at least two. One option in the declaration then covers them
+  all:
+
+  ```m2
+  f = method(Dispatch => Type)
+  f ZZ := T -> true
+  f QQ := T -> false
+  ```
+
+  becomes `f = method(Dispatch => Type, TypicalValue => Boolean)`, with the
+  installations left as they are.
+
 **Capitalize option key** — `S01`
 : Changes `verbose` to `Verbose` in an option declaration or call, when
   capitalizing the first letter is enough to produce a PascalCase name.

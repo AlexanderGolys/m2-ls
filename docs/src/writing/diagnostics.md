@@ -91,7 +91,7 @@ next.
 | `E26` | `library-global-value` | error | giving a library setting Macaulay2 lets you rebind a value it cannot hold: another class than it holds, `allowableThreads = matrix {{1}}`, or an integer outside its accepted range, `allowableThreads = 0` |
 | `T01` | `parallel-assignment-type` | error | `(a, b) = 5` |
 | `T02` | `condition-type` | warning | an `if` or `while` condition known not to be `Boolean` |
-| `T03` | `install-codomain-missing` | hint | an installation other than `new` without a codomain that inference can deduce; fix: insert `ZZ =>` |
+| `T03` | `install-codomain-missing` | hint | an installation other than `new` without a codomain that inference can deduce; fix: insert `ZZ =>`, or `TypicalValue => ZZ` in the `method(...)` when every installation returns `ZZ` |
 | `T04` | `install-codomain-mismatch` | warning | a declared codomain contradicting the inferred result: `g ZZ := String => n -> n + 1` |
 | `T05` | `call-domain-mismatch` | warning | no known method domain can accept the inferred argument types; uncertain matches remain valid |
 | `T07` | `call-arity-mismatch` | warning | a fixed-parameter source lambda called with the wrong argument count; computed sequences of unknown length remain unchecked |

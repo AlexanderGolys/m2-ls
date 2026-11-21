@@ -9,7 +9,7 @@
 use m2_syn::nodes::{
     BinaryOperator, Expr, ExprAssign, ExprBinary, ExprFunction, ExprList, ExprNew,
 };
-use m2_syn::{Span, Spanned, Token};
+use m2_syn::{DelimiterValue, Span, Spanned, Token};
 
 use super::inference::syntax::{InfixSyntax, MethodConstructor};
 use super::syntax_roles::QuotedName;
@@ -197,6 +197,26 @@ impl<'ast> MethodDeclaration<'ast> {
             Some(Some("true")) => MethodOptions::Forwarded,
             Some(_) => MethodOptions::Table,
         }
+    }
+
+    /// Where a further option of the call is written, when its arguments are
+    /// a parenthesized option list: `method()` or `method(Dispatch => Type)`.
+    pub(super) fn option_slot(
+        self,
+        source: &(impl SourceNavigation + ?Sized),
+    ) -> Option<MethodOptionSlot> {
+        let (delimiter, after_arguments) = match self.call.right.as_ref() {
+            Expr::Sequence(arguments) if arguments.stmts.is_empty() => {
+                (&arguments.delimiter, arguments.elems.is_some())
+            }
+            Expr::Paren(argument) if argument.stmts.is_empty() => (&argument.delimiter, true),
+            _ => return None,
+        };
+        let closing = source.range_for_bytes(delimiter.delimiter().closing_span()?.range()?);
+        Some(MethodOptionSlot {
+            at: TextRange::new(closing.start, closing.start),
+            after_arguments,
+        })
     }
 
     /// The runtime class `method` picks: `Binary => true` first, then a single
