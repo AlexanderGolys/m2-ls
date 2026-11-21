@@ -1464,7 +1464,8 @@ async fn method_codomain_diagnostics_offer_annotation_quick_fixes() {
 
 #[tokio::test]
 async fn shared_method_codomain_is_declared_once_as_the_typical_value() {
-    let source = "f = method(Dispatch => Type)\nf ZZ := T -> true\nf QQ := T -> false\n";
+    // The declaration follows another statement: its cell starts mid-file.
+    let source = "n = 1\nf = method(Dispatch => Type)\nf ZZ := T -> true\nf QQ := T -> false\n";
     let mut session = DocumentSession::open(source).await;
     let uri = session.uri().to_string();
     let hints = session
@@ -1489,7 +1490,7 @@ async fn shared_method_codomain_is_declared_once_as_the_typical_value() {
     let declare = &actions[0];
     assert_eq!(declare["title"], "Declare `TypicalValue => Boolean` on `f`");
     assert_eq!(declare["isPreferred"], true);
-    let insertion = json!({"line": 0, "character": 27});
+    let insertion = json!({"line": 1, "character": 27});
     assert_eq!(
         declare["edit"]["changes"][&uri][0],
         json!({
@@ -1518,7 +1519,7 @@ async fn shared_method_codomain_is_declared_once_as_the_typical_value() {
     );
 
     session
-        .replace("f = method(Dispatch => Type, TypicalValue => Boolean)\nf ZZ := T -> true\nf QQ := T -> false\n")
+        .replace("n = 1\nf = method(Dispatch => Type, TypicalValue => Boolean)\nf ZZ := T -> true\nf QQ := T -> false\n")
         .await;
     assert!(!session.diagnostic_codes().contains(&"T03"));
 

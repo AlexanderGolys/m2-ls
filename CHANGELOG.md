@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- T03's "Declare `TypicalValue => …`" quick fix inserts the option into the
+  `method(...)` call wherever it stands in the file, not at the same offset
+  counted from the top of the file.
+
 ## 2.10.0 - 2026-11-21
 
 - The formatter lays files out as the Macaulay2 Core library is written:
