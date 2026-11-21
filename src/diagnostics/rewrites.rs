@@ -356,8 +356,12 @@ impl<'ast, 'source, Source: SourceNavigation + ?Sized> RewriteSites<'ast, 'sourc
             .iter()
             .find(|(slot, _)| ptr::eq(*slot, expression))
         {
-            // Parentheses around statements are a block, not a grouping.
-            if matches!(expression, Expr::Paren(holder) if holder.stmts.is_empty()) {
+            // Parentheses around statements are a block, not a grouping, and
+            // parentheses spanning lines free their content from the newline
+            // rule: without them `from (f)⏎ \ L` ends at the line break.
+            if matches!(expression, Expr::Paren(holder) if holder.stmts.is_empty())
+                && !self.text(expression).contains('\n')
+            {
                 let replacement = expression
                     .unparenthesized()
                     .map(|inner| self.text(inner).to_string());
@@ -1321,9 +1325,10 @@ mod tests {
     }
 
     /// Parentheses holding statements before their value are a block: removing
-    /// them would drop the statements, so they are never redundant.
+    /// them would drop the statements. Parentheses spanning lines keep their
+    /// content from ending at a line break. Neither is ever redundant.
     #[test]
-    fn parentheses_around_statements_are_not_redundant() {
+    fn parentheses_around_statements_or_lines_are_not_redundant() {
         let redundant = RewriteKind::RedundantControlParentheses;
 
         assert_eq!(
@@ -1332,6 +1337,14 @@ mod tests {
                 redundant
             ),
             Vec::<String>::new()
+        );
+        assert_eq!(
+            rewrites(
+                "f = v -> new M from ((e -> {e})\n     \\ toList v)\n",
+                redundant
+            ),
+            Vec::<String>::new(),
+            "without them the line break ends `new M from (e -> {{e}})`"
         );
         assert_eq!(
             rewrites("f = x -> if x then 1 else (2)\n", redundant),

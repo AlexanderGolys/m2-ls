@@ -16,6 +16,9 @@
   `compactFactorOperators` is reported as removed. Formatting no longer
   follows the editor's `tabSize` and `insertSpaces`.
 
+- Parentheses spanning lines are never reported as redundant control
+  parentheses: without them `new M from (f)` followed by `\ L` on the next
+  line would end at the line break.
 - When every installation of a method returns the same type, T03 offers
   declaring it once, `method(…, TypicalValue => Boolean)`, as its preferred
   fix, ahead of annotating each installation; **Fix all in file** inserts it
