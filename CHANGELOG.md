@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.10.0 - 2026-11-21
 
 - The formatter lays files out as the Macaulay2 Core library is written:
   each line indented from the one above by the brackets it leaves open, a
