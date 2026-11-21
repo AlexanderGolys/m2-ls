@@ -15,8 +15,8 @@
 //! tight = ["^", "_", "*"]     # 2*x, x^2
 //! ```
 //!
-//! `profile` names a preset in the defaults file's `[formatting.profiles]`;
-//! keys set explicitly override it. Keys this schema replaced are still read,
+//! `profile` names a built-in preset, [`FormattingProfile`]; keys set
+//! explicitly override it. Keys this schema replaced are still read,
 //! as the settings replacing them, and reported as deprecated.
 
 use std::num::NonZeroUsize;
@@ -55,7 +55,8 @@ pub struct FormattingSettings {
     pub call_parentheses: CallParentheses,
 }
 
-/// A preset for every formatting key, chosen with `profile`.
+/// A built-in preset of formatting keys, chosen with `profile`: the keys
+/// it sets lie between the defaults file and the configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -430,8 +431,6 @@ pub struct CommentSettings {
 }
 
 impl FormattingSettings {
-    /// The key presets sit under in the defaults file.
-    pub const PROFILES_KEY: &str = "profiles";
     /// The key naming the preset in effect.
     pub const PROFILE_KEY: &str = "profile";
 
@@ -449,39 +448,29 @@ impl FormattingSettings {
         (soft, hard)
     }
 
-    /// Lay the preset the client's `formatting` table names (else the
-    /// defaults') over the defaults-file `formatting` table, taking the
-    /// presets out of both; presets the client defines join the defaults'.
-    /// An unknown profile adds nothing: deserialization reports it.
-    ///
-    /// ```toml
-    /// [formatting]
-    /// profile = "mine"
-    /// [formatting.profiles.mine.indent]
-    /// width = 3
-    /// ```
-    pub fn resolve_profile(defaults: &mut Value, client: Option<&mut Value>) {
-        let mut presets = Self::take_presets(defaults);
-        let client = client.map(|client| {
-            super::ProjectConfiguration::merge(&mut presets, &Self::take_presets(client));
-            &*client
-        });
+    /// Lay the preset the client's `formatting` table names, else the
+    /// defaults', over the defaults-file `formatting` table. An unknown
+    /// profile adds nothing: deserialization reports it.
+    pub fn lay_profile(defaults: &mut Value, client: Option<&Value>) {
         let profile = client
             .and_then(|client| client.get(Self::PROFILE_KEY))
             .or_else(|| defaults.get(Self::PROFILE_KEY))
-            .and_then(Value::as_str);
-        if let Some(preset) = profile.and_then(|name| presets.get(name)).cloned() {
-            super::ProjectConfiguration::merge(defaults, &preset);
+            .and_then(|profile| FormattingProfile::deserialize(profile).ok());
+        if let Some(profile) = profile {
+            super::ProjectConfiguration::merge(defaults, &profile.preset());
         }
     }
+}
 
-    /// Remove the presets from a `formatting` table; an empty table when it
-    /// has none.
-    fn take_presets(formatting: &mut Value) -> Value {
-        formatting
-            .as_object_mut()
-            .and_then(|formatting| formatting.remove(Self::PROFILES_KEY))
-            .unwrap_or_else(|| Value::Object(Map::new()))
+impl FormattingProfile {
+    /// The keys this preset sets, as a `formatting` table. `core` sets none:
+    /// the defaults file holds its values.
+    fn preset(self) -> Value {
+        let preset = match self {
+            Self::Core => return Value::Object(Map::new()),
+            Self::Modern => include_str!("profiles/modern.toml"),
+        };
+        toml::from_str(preset).unwrap_or_else(|error| panic!("the {self:?} profile: {error}"))
     }
 }
 

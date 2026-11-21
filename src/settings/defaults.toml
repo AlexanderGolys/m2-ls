@@ -29,10 +29,11 @@ hint = []
 fixActionOnly = []
 
 
+# ANCHOR: formatting
 [formatting]
-# The preset under every key below: "core" reproduces the Macaulay2 Core
-# library, "modern" its newer 4-column files and Emacs M2-mode. Keys set
-# explicitly override the preset.
+# The preset under every key below: "core" is this table, the layout of the
+# Macaulay2 Core library; "modern" (src/settings/profiles/modern.toml) its
+# newer 4-column files and Emacs M2-mode. Keys set explicitly override it.
 profile = "core"
 # Parentheses the syntax does not need, as in `(a*b) + c`: "off", "action"
 # (the "Remove redundant parentheses in file" source action), or "format" (also
@@ -100,19 +101,7 @@ spacedPrefix = ["<<"]
 [formatting.comments]
 bannerWidth = 77    # rule-only comment lines of 60 to 90 dashes; 0 or null: left
 
-# What `profile` sets beneath the explicit keys. "core" is the table above.
-[formatting.profiles.core]
-
-[formatting.profiles.modern.indent]
-width = 4
-whitespace = "spaces"
-
-[formatting.profiles.modern.lines]
-breaks = "wrap"
-
-[formatting.profiles.modern.spacing]
-lambdaParamComma = "sameAsComma"
-
+# ANCHOR_END: formatting
 
 [inlayHints]
 argTypes = false

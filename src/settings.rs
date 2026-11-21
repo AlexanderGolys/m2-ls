@@ -655,15 +655,16 @@ impl ServerSettings {
 
     /// `section` laid over the defaults file, with the formatting preset
     /// `section` names laid in between: tables merge, other values replace.
-    /// Presets `section` defines join the defaults file's. An item `section`
+    /// An item `section`
     /// lists in one of a group of exclusive lists leaves the other lists'
     /// defaults.
     fn over_defaults(section: &Value) -> Value {
         let mut merged = Self::defaults_section().clone();
-        let mut section = section.clone();
         if let Some(formatting) = merged.get_mut(FormattingSettings::SECTION_KEY) {
-            let client = section.get_mut(FormattingSettings::SECTION_KEY);
-            FormattingSettings::resolve_profile(formatting, client);
+            FormattingSettings::lay_profile(
+                formatting,
+                section.get(FormattingSettings::SECTION_KEY),
+            );
         }
         for group in EXCLUSIVE_LISTS {
             for pointer in group {
@@ -677,7 +678,7 @@ impl ServerSettings {
                 }
             }
         }
-        ProjectConfiguration::merge(&mut merged, &section);
+        ProjectConfiguration::merge(&mut merged, section);
         merged
     }
 
@@ -1436,16 +1437,20 @@ mod tests {
 
     #[test]
     fn unknown_formatting_keys_are_reported() {
-        let parsed = ServerSettings::from_value(&serde_json::json!({
-            "formatting": {"lines": {"brakes": "keep"}}
-        }));
-        let problems = parsed
-            .problems
-            .iter()
-            .map(SettingProblem::to_string)
-            .collect::<Vec<_>>();
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("unknown field"), "{problems:?}");
+        for formatting in [
+            serde_json::json!({"lines": {"brakes": "keep"}}),
+            serde_json::json!({"profiles": {"mine": {"indent": {"width": 3}}}}),
+        ] {
+            let parsed =
+                ServerSettings::from_value(&serde_json::json!({ "formatting": formatting }));
+            let problems = parsed
+                .problems
+                .iter()
+                .map(SettingProblem::to_string)
+                .collect::<Vec<_>>();
+            assert_eq!(problems.len(), 1, "{problems:?}");
+            assert!(problems[0].contains("unknown field"), "{problems:?}");
+        }
     }
 
     #[test]

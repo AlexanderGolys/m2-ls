@@ -1,0 +1,14 @@
+# The `modern` formatting profile: the four-column style of the newer Core
+# files and of the current Emacs M2-mode. Every key not named here keeps its
+# value from the defaults file, and a key the configuration sets wins over
+# both.
+
+[indent]
+width = 4
+whitespace = "spaces"
+
+[lines]
+breaks = "wrap"
+
+[spacing]
+lambdaParamComma = "sameAsComma"
