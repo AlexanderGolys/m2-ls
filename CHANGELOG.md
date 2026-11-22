@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.11.0 - 2026-11-22
 
 - T03's "Declare `TypicalValue => …`" quick fix inserts the option into the
   `method(...)` call wherever it stands in the file, not at the same offset
